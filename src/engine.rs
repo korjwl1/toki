@@ -1,5 +1,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use crossbeam_channel::Receiver;
 
 use crate::checkpoint::{hash_line, read_checkpoint_bytes, read_from_offset, verify_checkpoint, recover_by_hash};
 use crate::common::types::{FileCheckpoint, LogParser, ModelUsageSummary, UsageEvent};
@@ -179,6 +182,84 @@ impl TrackerEngine {
                 Some(offset) => Ok(offset),
                 None => Ok(0),
             }
+        }
+    }
+
+    /// Watch loop: receive file change events, process incrementally,
+    /// backup poll on timeout, flush checkpoints periodically.
+    /// Runs until stop_rx receives a signal.
+    pub fn watch_loop(
+        &mut self,
+        event_rx: Receiver<String>,
+        stop_rx: Receiver<()>,
+        parser: &dyn LogParser,
+        root_dir: &str,
+        poll_interval: Duration,
+        flush_interval: Duration,
+    ) {
+        let mut last_flush = Instant::now();
+
+        loop {
+            // Check stop signal (non-blocking)
+            if stop_rx.try_recv().is_ok() {
+                break;
+            }
+
+            // Wait for events with timeout (backup polling interval)
+            match event_rx.recv_timeout(poll_interval) {
+                Ok(path) => {
+                    // Process this event + drain any queued events
+                    let mut paths = std::collections::HashSet::new();
+                    paths.insert(path);
+                    while let Ok(more) = event_rx.try_recv() {
+                        paths.insert(more);
+                    }
+
+                    for path in paths {
+                        match self.process_file(&path, parser) {
+                            Ok(events) => {
+                                for event in &events {
+                                    print_event(event);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("[webtrace] Error processing {}: {}", path, e);
+                            }
+                        }
+                    }
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    // Backup polling: check all files for size changes
+                    for pattern in parser.file_patterns(root_dir) {
+                        if let Ok(entries) = glob::glob(&pattern) {
+                            for entry in entries.flatten() {
+                                let path_str = entry.to_string_lossy().to_string();
+                                if let Ok(events) = self.process_file(&path_str, parser) {
+                                    for event in &events {
+                                        print_event(event);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    break;
+                }
+            }
+
+            // Periodic checkpoint flush
+            if last_flush.elapsed() >= flush_interval {
+                if let Err(e) = self.flush_checkpoints() {
+                    eprintln!("[webtrace] Flush error: {}", e);
+                }
+                last_flush = Instant::now();
+            }
+        }
+
+        // Final flush on exit
+        if let Err(e) = self.flush_checkpoints() {
+            eprintln!("[webtrace] Final flush error: {}", e);
         }
     }
 

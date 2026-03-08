@@ -23,6 +23,7 @@ crossbeam-channel = "0.5"
 dirs = "5"
 glob = "0.3"
 num_cpus = "1"
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

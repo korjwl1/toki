@@ -1,4 +1,9 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use webtrace::Config;
+
+// Global flag for signal handler
+static RUNNING: std::sync::atomic::AtomicBool = AtomicBool::new(true);
 
 fn main() {
     let mut config = Config::new();
@@ -14,6 +19,31 @@ fn main() {
     println!("[webtrace] Claude Code root: {}", config.claude_code_root);
     println!("[webtrace] Database: {}", config.db_path.display());
 
-    // TODO: Phase 4 - start(config) -> Handle, Ctrl+C signal handling
-    println!("[webtrace] Not yet implemented. See Phase 4.");
+    let handle = match webtrace::start(config) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("[webtrace] Failed to start: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    println!("[webtrace] Listening for file changes... (Ctrl+C to stop)");
+
+    // Register SIGINT handler
+    unsafe {
+        libc::signal(libc::SIGINT, sigint_handler as libc::sighandler_t);
+    }
+
+    // Wait until SIGINT
+    while RUNNING.load(Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    println!("\n[webtrace] Shutting down...");
+    handle.stop();
+    println!("[webtrace] Done.");
+}
+
+extern "C" fn sigint_handler(_: libc::c_int) {
+    RUNNING.store(false, Ordering::SeqCst);
 }
