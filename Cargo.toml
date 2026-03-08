@@ -1,0 +1,25 @@
+[package]
+name = "webtrace"
+version = "0.1.0"
+edition = "2021"
+description = "AI CLI tool token usage tracker module"
+
+[lib]
+name = "webtrace"
+path = "src/lib.rs"
+
+[[bin]]
+name = "webtrace"
+path = "src/main.rs"
+
+[dependencies]
+notify = "6"
+redb = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+md-5 = "0.10"
+bincode = "1"
+crossbeam-channel = "0.5"
+dirs = "5"
+glob = "0.3"
+num_cpus = "1"
