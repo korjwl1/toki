@@ -18,6 +18,7 @@ cargo run --release
 ```bash
 WEBTRACE_CLAUDE_ROOT=/path/to/custom/.claude cargo run --release
 WEBTRACE_DB_PATH=/path/to/custom.db cargo run --release
+WEBTRACE_DEBUG=1 cargo run --release   # 성능 타이밍 로그 출력
 ```
 
 ### 라이브러리로 사용
@@ -93,15 +94,15 @@ flowchart TB
     end
 
     subgraph WT["worker thread"]
-        loop["loop"]
-        recv["rx.recv_timeout(30s)"]
+        loop["select! loop"]
+        recv["event_rx"]
         process["process_file()"]
         poll["backup poll (glob)"]
-        flush["flush checkpoints"]
+        db_write["db.upsert_checkpoint()"]
         loop --> recv
         recv -->|"Ok(path)"| process
-        recv -->|Timeout| poll
-        loop -->|"every 10s"| flush
+        process --> db_write
+        loop -->|"default(30s)"| poll
     end
 
     callback -->|"tx.send(path)"| recv
@@ -111,8 +112,8 @@ flowchart TB
         settings["settings table"]
     end
 
-    flush --> checkpoints
-    process --> DB
+    db_write --> checkpoints
+    poll --> process
 
     stop -->|"stop_tx.send()"| loop
 ```
@@ -158,22 +159,25 @@ flowchart LR
 flowchart TD
     start2["process_file(path)"] --> has_cp{"checkpoint\nexists?"}
 
-    has_cp -->|No| case1["CASE 1: offset = 0\n전체 읽기"]
-    has_cp -->|Yes| verify["verify_checkpoint()\n128바이트 비교"]
+    has_cp -->|No| case1["offset = 0\n전체 읽기"]
+    has_cp -->|Yes| find["find_resume_offset()\n역순 라인 스캔"]
 
-    verify -->|Valid| case2["CASE 2: offset = last_offset\n증분 읽기"]
-    verify -->|Invalid| recover["recover_by_hash()\nMD5 줄 스캔"]
+    find -->|Found| case2["offset = matched + 1\n증분 읽기"]
+    find -->|Not Found| case1
 
-    recover -->|Found| case3["CASE 3: offset = hash 위치\n부분 복구"]
-    recover -->|Not Found| case1
-
-    case1 --> read["read_from_offset()\n불완전 마지막 줄 버림"]
+    case1 --> read["read_lines_from(offset)\n불완전 마지막 줄: bracket-depth 검사"]
     case2 --> read
-    case3 --> read
 
     read --> parse["parse_line() × N"]
-    parse --> update["update checkpoint\n(offset, hash, 128 bytes)"]
+    parse --> update["db.upsert_checkpoint()\n즉시 저장"]
 ```
+
+**역순 스캔 알고리즘**:
+- 파일 끝에서 4KB 청크 단위로 역순 읽기
+- 라인 길이 pre-filter (O(1) 정수 비교, ~85% 후보 제거)
+- 길이 일치 시에만 xxHash3-64 비교 (30GB/s)
+- 청크 경계를 넘는 라인은 fragment 누적으로 처리
+- Compaction으로 바이트 위치가 변해도 라인 해시로 복구
 
 ### 데이터 흐름
 
@@ -221,9 +225,8 @@ flowchart LR
 | 필드 | 타입 | 설명 |
 |------|------|------|
 | `file_path` | String | JSONL 파일 절대 경로 (key) |
-| `last_offset` | u64 | 마지막 읽기 바이트 위치 |
-| `last_line_hash` | String | 마지막 처리 줄의 MD5 해시 |
-| `checkpoint_bytes` | Vec\<u8\> | offset 직전 128바이트 (검증용) |
+| `last_line_len` | u64 | 마지막 처리 줄의 바이트 길이 (pre-filter용) |
+| `last_line_hash` | u64 | 마지막 처리 줄의 xxHash3-64 해시 |
 
 ### Config
 
@@ -232,7 +235,6 @@ flowchart LR
 | `claude_code_root` | String | `~/.claude` | 루트 디렉토리 |
 | `db_path` | PathBuf | `~/.config/webtrace/webtrace.db` | DB 파일 경로 |
 | `poll_interval_secs` | u64 | 30 | 백업 폴링 간격 |
-| `flush_interval_secs` | u64 | 10 | 체크포인트 flush 간격 |
 
 설정 우선순위: **환경변수** > **DB settings 테이블** > **기본값**
 
@@ -248,7 +250,7 @@ module/webtrace/
 │   ├── config.rs                       # Config + 환경변수/DB 우선순위
 │   ├── db.rs                           # redb 래퍼 (checkpoints + settings)
 │   ├── engine.rs                       # TrackerEngine: cold_start + watch_loop
-│   ├── checkpoint.rs                   # 오프셋 읽기, 검증, MD5 해시 복구
+│   ├── checkpoint.rs                   # 역순 라인 스캔, xxHash3 매칭, JSON 완성도 검사
 │   ├── common/
 │   │   ├── mod.rs
 │   │   └── types.rs                    # UsageEvent, FileCheckpoint, LogParser trait
@@ -266,7 +268,7 @@ module/webtrace/
 │       ├── macos/mod.rs               # macOS 기본 경로
 │       ├── windows/mod.rs             # TODO
 │       └── linux/mod.rs               # TODO
-└── tests/                             # 40 unit tests (cargo test)
+└── tests/                             # 58+ unit tests (cargo test)
 ```
 
 ## Tech Stack
@@ -277,7 +279,7 @@ module/webtrace/
 | 동시성 | std::thread + crossbeam-channel | 런타임 충돌 없음, 라이브러리 안전 |
 | 파일 감시 | notify 6.x | macOS FSEvents 자동 사용 |
 | 직렬화 | bincode 1.x (checkpoint), serde_json (JSONL) | 바이너리 최소 오버헤드 |
-| 해시 | md-5 0.10.x | 체크포인트 줄 식별 |
+| 해시 | xxhash-rust 0.8 (xxh3) | 체크포인트 줄 식별 (30GB/s, 비암호화) |
 
 ## JSONL 구조 참고
 

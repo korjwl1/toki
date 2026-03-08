@@ -4,14 +4,26 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
 
-use crate::checkpoint::{hash_line, read_checkpoint_bytes, read_from_offset, verify_checkpoint, recover_by_hash};
+use crate::checkpoint::{find_resume_offset, hash_line, read_lines_from};
 use crate::common::types::{FileCheckpoint, LogParser, ModelUsageSummary, UsageEvent};
 use crate::db::Database;
+
+/// Debug logging: enabled by WEBTRACE_DEBUG=1 environment variable.
+fn debug_enabled() -> bool {
+    std::env::var("WEBTRACE_DEBUG").map_or(false, |v| v == "1" || v == "true")
+}
+
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        if debug_enabled() {
+            eprintln!("[webtrace:debug] {}", format!($($arg)*));
+        }
+    };
+}
 
 pub struct TrackerEngine {
     db: Database,
     checkpoints: HashMap<String, FileCheckpoint>,
-    dirty_checkpoints: Vec<String>,
 }
 
 impl TrackerEngine {
@@ -19,7 +31,6 @@ impl TrackerEngine {
         TrackerEngine {
             db,
             checkpoints: HashMap::new(),
-            dirty_checkpoints: Vec::new(),
         }
     }
 
@@ -48,8 +59,8 @@ impl TrackerEngine {
         let max_threads = num_cpus::get();
         let semaphore = Arc::new(Mutex::new(max_threads));
 
-        // Collect all (path, events) results from parallel processing
-        let all_results: Arc<Mutex<Vec<(String, Vec<UsageEvent>, u64, String, Vec<u8>)>>> =
+        // Collect all (path, events, last_line_len, last_line_hash) results from parallel processing
+        let all_results: Arc<Mutex<Vec<(String, Vec<UsageEvent>, u64, u64)>>> =
             Arc::new(Mutex::new(Vec::new()));
 
         std::thread::scope(|s| {
@@ -86,9 +97,9 @@ impl TrackerEngine {
                             *count += 1;
                         }
 
-                        if let Ok(Some((events, new_offset, last_hash, cp_bytes))) = result {
+                        if let Ok(Some((events, last_line_len, last_line_hash))) = result {
                             let mut r = results.lock().unwrap();
-                            r.push((path_str, events, new_offset, last_hash, cp_bytes));
+                            r.push((path_str, events, last_line_len, last_line_hash));
                         }
                     });
                 }
@@ -99,7 +110,8 @@ impl TrackerEngine {
         let mut summaries: HashMap<String, ModelUsageSummary> = HashMap::new();
         let results = Arc::try_unwrap(all_results).unwrap().into_inner().unwrap();
 
-        for (path, events, new_offset, last_hash, cp_bytes) in results {
+        let mut batch: Vec<FileCheckpoint> = Vec::with_capacity(results.len());
+        for (path, events, last_line_len, last_line_hash) in results {
             for event in &events {
                 let summary = summaries
                     .entry(event.model.clone())
@@ -110,38 +122,47 @@ impl TrackerEngine {
                 summary.accumulate(event);
             }
 
-            // Update checkpoint
             let cp = FileCheckpoint {
                 file_path: path.clone(),
-                last_offset: new_offset,
-                last_line_hash: last_hash,
-                checkpoint_bytes: cp_bytes,
+                last_line_len,
+                last_line_hash,
             };
-            self.checkpoints.insert(path.clone(), cp);
-            self.dirty_checkpoints.push(path);
+            self.checkpoints.insert(path, cp.clone());
+            batch.push(cp);
         }
 
         // Print summary
         print_summary(&summaries);
 
-        // Flush checkpoints
-        self.flush_checkpoints()?;
+        // Batch flush for cold start (single transaction).
+        let t_flush = Instant::now();
+        self.db.flush_checkpoints(&batch)?;
+        debug_log!("cold_start — {} files, {} checkpoints flushed in {}µs",
+            sessions.len(), batch.len(), t_flush.elapsed().as_micros());
 
         Ok(summaries)
     }
 
     /// Process a single file change (watch mode).
+    /// Checkpoint is written to DB immediately after processing.
     pub fn process_file(
         &mut self,
         path: &str,
         parser: &dyn LogParser,
     ) -> Result<Vec<UsageEvent>, Box<dyn std::error::Error>> {
-        let metadata = std::fs::metadata(path)?;
-        let file_size = metadata.len();
-        let offset = self.determine_offset(path, file_size)?;
+        let t_total = Instant::now();
 
-        let (lines, bytes_read) = read_from_offset(path, offset)?;
+        let t0 = Instant::now();
+        let offset = self.determine_offset(path)?;
+        let find_us = t0.elapsed().as_micros();
+
+        let t1 = Instant::now();
+        let (lines, bytes_read) = read_lines_from(path, offset)?;
+        let read_us = t1.elapsed().as_micros();
+
         if lines.is_empty() {
+            debug_log!("process_file {} — no new lines (find_resume: {}µs, read: {}µs)",
+                path, find_us, read_us);
             return Ok(Vec::new());
         }
 
@@ -152,42 +173,53 @@ impl TrackerEngine {
             }
         }
 
-        let new_offset = offset + bytes_read;
         let last_line = lines.last().unwrap();
-        let last_hash = hash_line(last_line);
-        let cp_bytes = read_checkpoint_bytes(path, new_offset)?;
-
         let cp = FileCheckpoint {
             file_path: path.to_string(),
-            last_offset: new_offset,
-            last_line_hash: last_hash,
-            checkpoint_bytes: cp_bytes,
+            last_line_len: last_line.len() as u64,
+            last_line_hash: hash_line(last_line.as_bytes()),
         };
+        let t2 = Instant::now();
+        self.db.upsert_checkpoint(&cp).map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+        let db_us = t2.elapsed().as_micros();
         self.checkpoints.insert(path.to_string(), cp);
-        self.dirty_checkpoints.push(path.to_string());
+
+        debug_log!("process_file {} — {} lines, {} bytes, {} events | find_resume: {}µs, read: {}µs, db_write: {}µs, total: {}µs",
+            path, lines.len(), bytes_read, events.len(),
+            find_us, read_us, db_us, t_total.elapsed().as_micros());
 
         Ok(events)
     }
 
-    fn determine_offset(&self, path: &str, file_size: u64) -> Result<u64, Box<dyn std::error::Error>> {
+    fn process_and_print(&mut self, path: &str, parser: &dyn LogParser) {
+        match self.process_file(path, parser) {
+            Ok(events) => {
+                for event in &events {
+                    print_event(event);
+                }
+            }
+            Err(e) => {
+                eprintln!("[webtrace] Error processing {}: {}", path, e);
+            }
+        }
+    }
+
+    fn determine_offset(&self, path: &str) -> Result<u64, Box<dyn std::error::Error>> {
         let cp = match self.checkpoints.get(path) {
             None => return Ok(0),
             Some(cp) => cp,
         };
 
-        if file_size >= cp.last_offset && verify_checkpoint(path, cp)? {
-            Ok(cp.last_offset)
-        } else {
-            match recover_by_hash(path, &cp.last_line_hash)? {
-                Some(offset) => Ok(offset),
-                None => Ok(0),
-            }
+        match find_resume_offset(path, cp)? {
+            Some(offset) => Ok(offset),
+            None => Ok(0), // Line not found, full reprocess.
         }
     }
 
     /// Watch loop: receive file change events, process incrementally,
-    /// backup poll on timeout, flush checkpoints periodically.
-    /// Runs until stop_rx receives a signal.
+    /// backup poll on timeout. Runs until stop signal received.
+    /// Each file's checkpoint is persisted to DB immediately in process_file.
+    /// Graceful shutdown: finishes current file processing before exiting.
     pub fn watch_loop(
         &mut self,
         event_rx: Receiver<String>,
@@ -195,116 +227,61 @@ impl TrackerEngine {
         parser: &dyn LogParser,
         root_dir: &str,
         poll_interval: Duration,
-        flush_interval: Duration,
     ) {
-        let mut last_flush = Instant::now();
-
         loop {
-            // Check stop signal (non-blocking)
-            if stop_rx.try_recv().is_ok() {
-                break;
-            }
-
-            // Wait for events with timeout (backup polling interval)
-            match event_rx.recv_timeout(poll_interval) {
-                Ok(path) => {
-                    // Process this event + drain any queued events
-                    let mut paths = std::collections::HashSet::new();
-                    paths.insert(path);
-                    while let Ok(more) = event_rx.try_recv() {
-                        paths.insert(more);
-                    }
-
-                    for path in paths {
-                        match self.process_file(&path, parser) {
-                            Ok(events) => {
-                                for event in &events {
-                                    print_event(event);
-                                }
+            // Wait for file event OR stop signal, whichever comes first.
+            crossbeam_channel::select! {
+                recv(stop_rx) -> _ => break,
+                recv(event_rx) -> msg => {
+                    match msg {
+                        Ok(path) => {
+                            // Drain any queued events (dedup by path).
+                            let mut paths = std::collections::HashSet::new();
+                            paths.insert(path);
+                            while let Ok(more) = event_rx.try_recv() {
+                                paths.insert(more);
                             }
-                            Err(e) => {
-                                eprintln!("[webtrace] Error processing {}: {}", path, e);
+                            debug_log!("watch event — {} unique paths queued", paths.len());
+
+                            for path in paths {
+                                self.process_and_print(&path, parser);
                             }
                         }
+                        Err(_) => break, // event channel disconnected
                     }
                 }
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                    // Backup polling: check all files for size changes
+                default(poll_interval) => {
+                    // Backup polling: check all files for changes.
                     for pattern in parser.file_patterns(root_dir) {
                         if let Ok(entries) = glob::glob(&pattern) {
                             for entry in entries.flatten() {
                                 let path_str = entry.to_string_lossy().to_string();
-                                if let Ok(events) = self.process_file(&path_str, parser) {
-                                    for event in &events {
-                                        print_event(event);
-                                    }
-                                }
+                                self.process_and_print(&path_str, parser);
                             }
                         }
                     }
                 }
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                    break;
-                }
-            }
-
-            // Periodic checkpoint flush
-            if last_flush.elapsed() >= flush_interval {
-                if let Err(e) = self.flush_checkpoints() {
-                    eprintln!("[webtrace] Flush error: {}", e);
-                }
-                last_flush = Instant::now();
             }
         }
-
-        // Final flush on exit
-        if let Err(e) = self.flush_checkpoints() {
-            eprintln!("[webtrace] Final flush error: {}", e);
-        }
-    }
-
-    /// Flush dirty checkpoints to database.
-    pub fn flush_checkpoints(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if self.dirty_checkpoints.is_empty() {
-            return Ok(());
-        }
-
-        let to_flush: Vec<FileCheckpoint> = self
-            .dirty_checkpoints
-            .drain(..)
-            .filter_map(|path| self.checkpoints.get(&path).cloned())
-            .collect();
-
-        self.db.flush_checkpoints(&to_flush)?;
-        Ok(())
     }
 }
 
 /// Process a single file during cold start (called from scoped threads).
-/// Returns (events, new_offset, last_line_hash, checkpoint_bytes) or None if no new data.
+/// Returns (events, last_line_len, last_line_hash) or None if no new data.
 fn process_file_cold(
     path: &str,
     parser: &(dyn LogParser + Sync),
     checkpoints: &HashMap<String, FileCheckpoint>,
-) -> Result<Option<(Vec<UsageEvent>, u64, String, Vec<u8>)>, Box<dyn std::error::Error>> {
-    let metadata = std::fs::metadata(path)?;
-    let file_size = metadata.len();
-
+) -> Result<Option<(Vec<UsageEvent>, u64, u64)>, Box<dyn std::error::Error>> {
     // Determine offset
     let offset = match checkpoints.get(path) {
         None => 0,
-        Some(cp) => {
-            if file_size >= cp.last_offset && verify_checkpoint(path, cp).unwrap_or(false) {
-                cp.last_offset
-            } else {
-                recover_by_hash(path, &cp.last_line_hash)
-                    .unwrap_or(None)
-                    .unwrap_or(0)
-            }
-        }
+        Some(cp) => find_resume_offset(path, cp)
+            .unwrap_or(None)
+            .unwrap_or(0),
     };
 
-    let (lines, bytes_read) = read_from_offset(path, offset)?;
+    let (lines, _bytes_read) = read_lines_from(path, offset)?;
     if lines.is_empty() {
         return Ok(None);
     }
@@ -316,12 +293,11 @@ fn process_file_cold(
         }
     }
 
-    let new_offset = offset + bytes_read;
     let last_line = lines.last().unwrap();
-    let last_hash = hash_line(last_line);
-    let cp_bytes = read_checkpoint_bytes(path, new_offset)?;
+    let last_line_len = last_line.len() as u64;
+    let last_line_hash = hash_line(last_line.as_bytes());
 
-    Ok(Some((events, new_offset, last_hash, cp_bytes)))
+    Ok(Some((events, last_line_len, last_line_hash)))
 }
 
 /// Print cold start summary.
@@ -566,7 +542,7 @@ mod tests {
         // Verify checkpoint was saved
         let path_str = jsonl_path.to_str().unwrap();
         assert!(engine.checkpoints.contains_key(path_str));
-        assert!(engine.checkpoints[path_str].last_offset > 0);
+        assert!(engine.checkpoints[path_str].last_line_len > 0);
     }
 
     #[test]
@@ -618,5 +594,102 @@ mod tests {
         assert_eq!(format_number(123), "123");
         assert_eq!(format_number(1234), "1,234");
         assert_eq!(format_number(1234567), "1,234,567");
+    }
+
+    #[test]
+    #[ignore] // Run with: cargo test bench_timing -- --ignored --nocapture
+    fn bench_timing() {
+        use crate::checkpoint::{find_resume_offset, hash_line, read_lines_from};
+        use std::time::Instant;
+
+        let dir = tempfile::tempdir().unwrap();
+        let iterations = 200;
+
+        // Create 500-line JSONL file (~realistic session)
+        let projects_dir = dir.path().join("projects").join("test");
+        std::fs::create_dir_all(&projects_dir).unwrap();
+        let session_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let jsonl_path = projects_dir.join(format!("{}.jsonl", session_id));
+        {
+            let mut f = std::fs::File::create(&jsonl_path).unwrap();
+            for i in 0..500 {
+                writeln!(f, "{}", make_assistant_line(
+                    &format!("msg_{}", i), "claude-opus-4-6",
+                    i * 10, i * 100, i * 50, i * 5
+                )).unwrap();
+            }
+        }
+
+        let path_str = jsonl_path.to_str().unwrap();
+        let file_size = std::fs::metadata(path_str).unwrap().len();
+
+        // Build checkpoint on line 490
+        let content = std::fs::read_to_string(path_str).unwrap();
+        let line_490: Vec<&str> = content.lines().collect();
+        let target = line_490[490];
+        let cp = FileCheckpoint {
+            file_path: path_str.to_string(),
+            last_line_len: target.len() as u64,
+            last_line_hash: hash_line(target.as_bytes()),
+        };
+
+        // Bench find_resume_offset
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let _ = find_resume_offset(path_str, &cp).unwrap();
+        }
+        let find_us = start.elapsed().as_micros() / iterations as u128;
+
+        // Bench read_lines_from (last 10 lines)
+        let offset = find_resume_offset(path_str, &cp).unwrap().unwrap();
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let _ = read_lines_from(path_str, offset).unwrap();
+        }
+        let read_us = start.elapsed().as_micros() / iterations as u128;
+
+        // Bench DB upsert
+        let db_path = dir.path().join("bench.db");
+        let db = Database::open(&db_path).unwrap();
+        let start = Instant::now();
+        for _ in 0..iterations {
+            db.upsert_checkpoint(&cp).unwrap();
+        }
+        let db_us = start.elapsed().as_micros() / iterations as u128;
+
+        // Bench full process_file (cold start + incremental)
+        let db2 = Database::open(&dir.path().join("bench2.db")).unwrap();
+        let mut engine = TrackerEngine::new(db2);
+        let parser = TestParser;
+
+        let start = Instant::now();
+        engine.cold_start(&parser, dir.path().to_str().unwrap()).unwrap();
+        let cold_us = start.elapsed().as_micros();
+
+        // Append 10 lines, measure incremental
+        {
+            let mut f = std::fs::OpenOptions::new().append(true).open(&jsonl_path).unwrap();
+            for i in 500..510 {
+                writeln!(f, "{}", make_assistant_line(
+                    &format!("msg_{}", i), "claude-opus-4-6",
+                    i * 10, 0, 0, i * 5
+                )).unwrap();
+            }
+        }
+        let start = Instant::now();
+        let events = engine.process_file(path_str, &parser).unwrap();
+        let incr_us = start.elapsed().as_micros();
+
+        println!("\n=== webtrace benchmark ===");
+        println!("File: {} lines, {} bytes ({} KB)", 500, file_size, file_size / 1024);
+        println!();
+        println!("Per-operation (avg of {} runs):", iterations);
+        println!("  find_resume_offset:   {:>6}µs", find_us);
+        println!("  read_lines_from:      {:>6}µs", read_us);
+        println!("  db.upsert_checkpoint: {:>6}µs", db_us);
+        println!();
+        println!("End-to-end:");
+        println!("  cold_start (500 lines):    {:>6}µs", cold_us);
+        println!("  process_file (10 new):     {:>6}µs  ({} events)", incr_us, events.len());
     }
 }

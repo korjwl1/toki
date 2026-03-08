@@ -14,12 +14,13 @@ pub struct UsageEvent {
 }
 
 /// File checkpoint for incremental reading.
+/// Uses line-length pre-filter + xxHash3-64 for fast reverse-scan matching.
+/// No byte offset stored — immune to compaction shifting file contents.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileCheckpoint {
     pub file_path: String,
-    pub last_offset: u64,
-    pub last_line_hash: String,
-    pub checkpoint_bytes: Vec<u8>,
+    pub last_line_len: u64,
+    pub last_line_hash: u64,
 }
 
 /// Aggregated usage per model.

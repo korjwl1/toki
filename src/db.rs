@@ -137,18 +137,16 @@ mod tests {
 
         let cp = FileCheckpoint {
             file_path: "/test/file.jsonl".to_string(),
-            last_offset: 12345,
-            last_line_hash: "abc123".to_string(),
-            checkpoint_bytes: vec![1, 2, 3, 4],
+            last_line_len: 256,
+            last_line_hash: 12345678901234,
         };
 
         db.upsert_checkpoint(&cp).unwrap();
 
         let loaded = db.get_checkpoint("/test/file.jsonl").unwrap().unwrap();
         assert_eq!(loaded.file_path, cp.file_path);
-        assert_eq!(loaded.last_offset, cp.last_offset);
+        assert_eq!(loaded.last_line_len, cp.last_line_len);
         assert_eq!(loaded.last_line_hash, cp.last_line_hash);
-        assert_eq!(loaded.checkpoint_bytes, cp.checkpoint_bytes);
     }
 
     #[test]
@@ -157,35 +155,32 @@ mod tests {
 
         let cp1 = FileCheckpoint {
             file_path: "/test/file.jsonl".to_string(),
-            last_offset: 100,
-            last_line_hash: "hash1".to_string(),
-            checkpoint_bytes: vec![],
+            last_line_len: 100,
+            last_line_hash: 111,
         };
         db.upsert_checkpoint(&cp1).unwrap();
 
         let cp2 = FileCheckpoint {
             file_path: "/test/file.jsonl".to_string(),
-            last_offset: 200,
-            last_line_hash: "hash2".to_string(),
-            checkpoint_bytes: vec![5, 6],
+            last_line_len: 200,
+            last_line_hash: 222,
         };
         db.upsert_checkpoint(&cp2).unwrap();
 
         let loaded = db.get_checkpoint("/test/file.jsonl").unwrap().unwrap();
-        assert_eq!(loaded.last_offset, 200);
-        assert_eq!(loaded.last_line_hash, "hash2");
+        assert_eq!(loaded.last_line_len, 200);
+        assert_eq!(loaded.last_line_hash, 222);
     }
 
     #[test]
     fn test_load_all_checkpoints() {
         let (db, _dir) = temp_db();
 
-        for i in 0..3 {
+        for i in 0..3u64 {
             let cp = FileCheckpoint {
                 file_path: format!("/test/file{}.jsonl", i),
-                last_offset: i * 100,
-                last_line_hash: format!("hash{}", i),
-                checkpoint_bytes: vec![],
+                last_line_len: i * 100,
+                last_line_hash: i * 1000,
             };
             db.upsert_checkpoint(&cp).unwrap();
         }
@@ -198,12 +193,11 @@ mod tests {
     fn test_flush_checkpoints_batch() {
         let (db, _dir) = temp_db();
 
-        let cps: Vec<FileCheckpoint> = (0..5)
+        let cps: Vec<FileCheckpoint> = (0..5u64)
             .map(|i| FileCheckpoint {
                 file_path: format!("/batch/file{}.jsonl", i),
-                last_offset: i * 50,
-                last_line_hash: format!("batchhash{}", i),
-                checkpoint_bytes: vec![],
+                last_line_len: i * 50,
+                last_line_hash: i * 500,
             })
             .collect();
 
@@ -219,9 +213,8 @@ mod tests {
 
         let cp = FileCheckpoint {
             file_path: "/remove/me.jsonl".to_string(),
-            last_offset: 42,
-            last_line_hash: "removehash".to_string(),
-            checkpoint_bytes: vec![],
+            last_line_len: 42,
+            last_line_hash: 999,
         };
         db.upsert_checkpoint(&cp).unwrap();
 

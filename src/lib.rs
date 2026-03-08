@@ -82,7 +82,6 @@ pub fn start(config: Config) -> Result<Handle, WebtraceError> {
     let (stop_tx, stop_rx) = crossbeam_channel::bounded::<()>(1);
 
     let poll_interval = Duration::from_secs(config.poll_interval_secs);
-    let flush_interval = Duration::from_secs(config.flush_interval_secs);
 
     // Spawn worker thread
     let worker_handle = std::thread::Builder::new()
@@ -94,7 +93,6 @@ pub fn start(config: Config) -> Result<Handle, WebtraceError> {
                 &parser,
                 &root_dir,
                 poll_interval,
-                flush_interval,
             );
         })
         .map_err(|e| WebtraceError::Io(e))?;

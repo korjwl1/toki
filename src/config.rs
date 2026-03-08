@@ -7,7 +7,6 @@ pub struct Config {
     pub claude_code_root: String,
     pub db_path: PathBuf,
     pub poll_interval_secs: u64,
-    pub flush_interval_secs: u64,
 }
 
 impl Config {
@@ -18,7 +17,6 @@ impl Config {
             claude_code_root: home.join(".claude").to_string_lossy().to_string(),
             db_path: home.join(".config").join("webtrace").join("webtrace.db"),
             poll_interval_secs: 30,
-            flush_interval_secs: 10,
         }
     }
 
@@ -45,11 +43,6 @@ impl Config {
                 self.poll_interval_secs = v;
             }
         }
-        if let Ok(Some(val)) = db.get_setting("flush_interval_secs") {
-            if let Ok(v) = val.parse() {
-                self.flush_interval_secs = v;
-            }
-        }
     }
 }
 
@@ -63,7 +56,6 @@ mod tests {
         assert!(config.claude_code_root.ends_with(".claude"));
         assert!(config.db_path.ends_with("webtrace.db"));
         assert_eq!(config.poll_interval_secs, 30);
-        assert_eq!(config.flush_interval_secs, 10);
     }
 
     #[test]
