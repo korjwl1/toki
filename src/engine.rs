@@ -8,14 +8,20 @@ use crate::checkpoint::{find_resume_offset, hash_line, read_lines_from};
 use crate::common::types::{FileCheckpoint, LogParser, ModelUsageSummary, UsageEvent};
 use crate::db::Database;
 
-/// Debug logging: enabled by WEBTRACE_DEBUG=1 environment variable.
-fn debug_enabled() -> bool {
-    std::env::var("WEBTRACE_DEBUG").map_or(false, |v| v == "1" || v == "true")
+/// Debug level: 0=off, 1=debug logging, 2=debug + force cold start (clear DB).
+pub fn debug_level() -> u8 {
+    std::env::var("WEBTRACE_DEBUG").map_or(0, |v| {
+        match v.as_str() {
+            "true" | "1" => 1,
+            "2" => 2,
+            _ => 0,
+        }
+    })
 }
 
 macro_rules! debug_log {
     ($($arg:tt)*) => {
-        if debug_enabled() {
+        if debug_level() >= 1 {
             eprintln!("[webtrace:debug] {}", format!($($arg)*));
         }
     };
@@ -24,6 +30,8 @@ macro_rules! debug_log {
 pub struct TrackerEngine {
     db: Database,
     checkpoints: HashMap<String, FileCheckpoint>,
+    /// Cached file sizes for fast skip when size unchanged.
+    file_sizes: HashMap<String, u64>,
 }
 
 impl TrackerEngine {
@@ -31,6 +39,7 @@ impl TrackerEngine {
         TrackerEngine {
             db,
             checkpoints: HashMap::new(),
+            file_sizes: HashMap::new(),
         }
     }
 
@@ -50,11 +59,18 @@ impl TrackerEngine {
         parser: &(dyn LogParser + Sync),
         root_dir: &str,
     ) -> Result<HashMap<String, ModelUsageSummary>, Box<dyn std::error::Error>> {
+        let t_cold = Instant::now();
         let sessions = parser.discover_sessions(root_dir);
 
         if sessions.is_empty() {
+            debug_log!("cold_start — 0 sessions, 0 files ({}µs)", t_cold.elapsed().as_micros());
             return Ok(HashMap::new());
         }
+
+        // Count total files (parent + subagents)
+        let total_files: usize = sessions.iter()
+            .map(|s| 1 + s.subagent_jsonls.len())
+            .sum();
 
         let max_threads = num_cpus::get();
         let semaphore = Arc::new(Mutex::new(max_threads));
@@ -137,8 +153,8 @@ impl TrackerEngine {
         // Batch flush for cold start (single transaction).
         let t_flush = Instant::now();
         self.db.flush_checkpoints(&batch)?;
-        debug_log!("cold_start — {} files, {} checkpoints flushed in {}µs",
-            sessions.len(), batch.len(), t_flush.elapsed().as_micros());
+        debug_log!("cold_start — {} sessions, {} files, {} checkpoints flushed (flush: {}µs, total: {}µs)",
+            sessions.len(), total_files, batch.len(), t_flush.elapsed().as_micros(), t_cold.elapsed().as_micros());
 
         Ok(summaries)
     }
@@ -152,6 +168,18 @@ impl TrackerEngine {
     ) -> Result<Vec<UsageEvent>, Box<dyn std::error::Error>> {
         let t_total = Instant::now();
 
+        // Fast path: skip if file size unchanged (stat only, no file open).
+        if let Ok(meta) = std::fs::metadata(path) {
+            let current_size = meta.len();
+            if let Some(&cached_size) = self.file_sizes.get(path) {
+                if current_size == cached_size {
+                    debug_log!("process_file {} — size unchanged ({}B), skipped ({}µs)",
+                        path, current_size, t_total.elapsed().as_micros());
+                    return Ok(Vec::new());
+                }
+            }
+        }
+
         let t0 = Instant::now();
         let offset = self.determine_offset(path)?;
         let find_us = t0.elapsed().as_micros();
@@ -161,6 +189,10 @@ impl TrackerEngine {
         let read_us = t1.elapsed().as_micros();
 
         if lines.is_empty() {
+            // Update cached size so next event can fast-skip via stat().
+            if let Ok(meta) = std::fs::metadata(path) {
+                self.file_sizes.insert(path.to_string(), meta.len());
+            }
             debug_log!("process_file {} — no new lines (find_resume: {}µs, read: {}µs)",
                 path, find_us, read_us);
             return Ok(Vec::new());
@@ -183,6 +215,11 @@ impl TrackerEngine {
         self.db.upsert_checkpoint(&cp).map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
         let db_us = t2.elapsed().as_micros();
         self.checkpoints.insert(path.to_string(), cp);
+
+        // Update cached file size after successful processing.
+        if let Ok(meta) = std::fs::metadata(path) {
+            self.file_sizes.insert(path.to_string(), meta.len());
+        }
 
         debug_log!("process_file {} — {} lines, {} bytes, {} events | find_resume: {}µs, read: {}µs, db_write: {}µs, total: {}µs",
             path, lines.len(), bytes_read, events.len(),

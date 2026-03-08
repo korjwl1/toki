@@ -98,6 +98,24 @@ impl Database {
         Ok(())
     }
 
+    /// Remove all checkpoints (used for forced cold start).
+    pub fn clear_checkpoints(&self) -> Result<(), redb::Error> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(CHECKPOINTS)?;
+            // Collect keys first, then remove
+            let keys: Vec<String> = {
+                let iter = table.iter()?;
+                iter.filter_map(|e| e.ok().map(|e| e.0.value().to_string())).collect()
+            };
+            for key in &keys {
+                table.remove(key.as_str())?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     // -- Settings operations --
 
     pub fn get_setting(&self, key: &str) -> Result<Option<String>, redb::Error> {

@@ -52,6 +52,12 @@ impl Drop for Handle {
 pub fn start(config: Config) -> Result<Handle, WebtraceError> {
     let db = Database::open(&config.db_path).map_err(|e| WebtraceError::Db(e.into()))?;
 
+    // DEBUG=2: clear checkpoints for forced full cold start.
+    if engine::debug_level() >= 2 {
+        eprintln!("[webtrace:debug] DEBUG=2 — clearing all checkpoints for forced cold start");
+        db.clear_checkpoints().map_err(|e| WebtraceError::Db(e.into()))?;
+    }
+
     let mut engine = TrackerEngine::new(db);
     engine.load_checkpoints().map_err(|e| WebtraceError::Db(e.into()))?;
 

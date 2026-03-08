@@ -18,7 +18,8 @@ cargo run --release
 ```bash
 WEBTRACE_CLAUDE_ROOT=/path/to/custom/.claude cargo run --release
 WEBTRACE_DB_PATH=/path/to/custom.db cargo run --release
-WEBTRACE_DEBUG=1 cargo run --release   # 성능 타이밍 로그 출력
+WEBTRACE_DEBUG=1 cargo run --release   # 디버그 로그 (성능 타이밍, cold start 통계)
+WEBTRACE_DEBUG=2 cargo run --release   # 디버그 로그 + DB 초기화 후 강제 full cold start
 ```
 
 ### 라이브러리로 사용
@@ -157,7 +158,10 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    start2["process_file(path)"] --> has_cp{"checkpoint\nexists?"}
+    start2["process_file(path)"] --> size_check{"file size\nchanged?"}
+
+    size_check -->|No| skip["즉시 스킵 (~1-5µs)\nstat() only, no file I/O"]
+    size_check -->|Yes| has_cp{"checkpoint\nexists?"}
 
     has_cp -->|No| case1["offset = 0\n전체 읽기"]
     has_cp -->|Yes| find["find_resume_offset()\n역순 라인 스캔"]
@@ -171,6 +175,11 @@ flowchart TD
     read --> parse["parse_line() × N"]
     parse --> update["db.upsert_checkpoint()\n즉시 저장"]
 ```
+
+**파일 크기 기반 fast skip**:
+- watch 이벤트 수신 시 `stat()`으로 파일 크기만 확인 (파일 open/read 없음)
+- 크기 변화 없으면 즉시 스킵 (~1-5µs vs 기존 ~150-300µs)
+- JSONL 특성상 새 줄 추가 = 크기 증가, compaction = 크기 감소이므로 false negative 없음
 
 **역순 스캔 알고리즘**:
 - 파일 끝에서 4KB 청크 단위로 역순 읽기
