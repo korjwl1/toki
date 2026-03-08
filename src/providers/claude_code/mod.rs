@@ -1,1 +1,3 @@
-// TODO: Phase 2 - parser.rs, discovery.rs
+pub mod parser;
+
+pub use parser::ClaudeCodeParser;
