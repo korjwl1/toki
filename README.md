@@ -18,8 +18,10 @@ cargo run --release
 ```bash
 WEBTRACE_CLAUDE_ROOT=/path/to/custom/.claude cargo run --release
 WEBTRACE_DB_PATH=/path/to/custom.db cargo run --release
-WEBTRACE_DEBUG=1 cargo run --release   # 디버그 로그 (성능 타이밍, cold start 통계)
-WEBTRACE_DEBUG=2 cargo run --release   # 디버그 로그 + DB 초기화 후 강제 full cold start
+WEBTRACE_DEBUG=1 cargo run --release   # 디버그 로그 (상태 전이, 이벤트, 타이밍)
+WEBTRACE_DEBUG=2 cargo run --release   # 레벨 1 + DB 초기화 후 강제 full cold start
+WEBTRACE_DEBUG=3 cargo run --release   # 레벨 1 + verbose (size unchanged, no new lines 스킵 로그)
+WEBTRACE_DEBUG=4 cargo run --release   # 레벨 2 + verbose (강제 cold start + 모든 스킵 로그)
 ```
 
 ### 라이브러리로 사용
@@ -154,27 +156,43 @@ flowchart LR
     merge --> flush2["flush_checkpoints()"]
 ```
 
-### 체크포인트 무결성
+### Active/Idle 파일 분류 & 체크포인트
+
+macOS FSEvents가 디렉토리 내 파일 하나가 변해도 같은 디렉토리의 모든 파일에 이벤트를 발생시키므로, 파일별 active/idle 상태를 추적하여 불필요한 처리를 최소화한다.
 
 ```mermaid
 flowchart TD
-    start2["process_file(path)"] --> size_check{"file size\nchanged?"}
+    start2["process_file(path)"] --> state{"FileActivity\n존재?"}
 
-    size_check -->|No| skip["즉시 스킵 (~1-5µs)\nstat() only, no file I/O"]
-    size_check -->|Yes| has_cp{"checkpoint\nexists?"}
+    state -->|No| new_active["새 파일 → Active"]
+    state -->|Yes| idle_check{"now - last_active\n> 15s?"}
 
-    has_cp -->|No| case1["offset = 0\n전체 읽기"]
-    has_cp -->|Yes| find["find_resume_offset()\n역순 라인 스캔"]
+    idle_check -->|Yes| demote["Active → Idle 전환"]
+    idle_check -->|No| keep["상태 유지"]
 
-    find -->|Found| case2["offset = matched + 1\n증분 읽기"]
-    find -->|Not Found| case1
+    new_active --> cooldown
+    demote --> cooldown
+    keep --> cooldown
 
-    case1 --> read["read_lines_from(offset)\n불완전 마지막 줄: bracket-depth 검사"]
-    case2 --> read
+    cooldown{"쿨다운 체크\nActive: 150ms\nIdle: 500ms"} -->|"too soon"| skip_cd["즉시 return"]
+    cooldown -->|"passed"| size_check{"stat()\nsize 변화?"}
 
-    read --> parse["parse_line() × N"]
-    parse --> update["db.upsert_checkpoint()\n즉시 저장"]
+    size_check -->|No| skip["스킵 (stat only)"]
+    size_check -->|Yes| find["find_resume_offset()\n+ read_lines_from()"]
+
+    find --> new_lines{"새 줄\n있음?"}
+
+    new_lines -->|No| skip2["상태 유지, return"]
+    new_lines -->|Yes| parse["parse + checkpoint"]
+
+    parse --> promote["→ Active 승격\n(Idle이었으면 promote 로그)"]
 ```
+
+| 상수 | 값 | 역할 |
+|------|----|------|
+| `ACTIVE_COOLDOWN` | 150ms | Active 파일 재처리 최소 간격 |
+| `IDLE_COOLDOWN` | 500ms | Idle 파일 stat() 최소 간격 |
+| `IDLE_TRANSITION` | 15s | 새 줄 없이 경과 시 Idle로 전환 |
 
 **파일 크기 기반 fast skip**:
 - watch 이벤트 수신 시 `stat()`으로 파일 크기만 확인 (파일 open/read 없음)

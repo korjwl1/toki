@@ -10,7 +10,6 @@ pub use common::types::{UsageEvent, ModelUsageSummary, SessionGroup, WebtraceErr
 pub use config::Config;
 
 use std::thread::JoinHandle;
-use std::time::Duration;
 
 use db::Database;
 use engine::TrackerEngine;
@@ -52,9 +51,9 @@ impl Drop for Handle {
 pub fn start(config: Config) -> Result<Handle, WebtraceError> {
     let db = Database::open(&config.db_path).map_err(|e| WebtraceError::Db(e.into()))?;
 
-    // DEBUG=2: clear checkpoints for forced full cold start.
-    if engine::debug_level() >= 2 {
-        eprintln!("[webtrace:debug] DEBUG=2 — clearing all checkpoints for forced cold start");
+    // DEBUG=2|4: clear checkpoints for forced full cold start.
+    if engine::debug_level() == 2 || engine::debug_level() == 4 {
+        eprintln!("[webtrace:debug] DEBUG={} — clearing all checkpoints for forced cold start", engine::debug_level());
         db.clear_checkpoints().map_err(|e| WebtraceError::Db(e.into()))?;
     }
 
@@ -87,8 +86,6 @@ pub fn start(config: Config) -> Result<Handle, WebtraceError> {
     // Stop channel
     let (stop_tx, stop_rx) = crossbeam_channel::bounded::<()>(1);
 
-    let poll_interval = Duration::from_secs(config.poll_interval_secs);
-
     // Spawn worker thread
     let worker_handle = std::thread::Builder::new()
         .name("webtrace-worker".to_string())
@@ -97,8 +94,6 @@ pub fn start(config: Config) -> Result<Handle, WebtraceError> {
                 event_rx,
                 stop_rx,
                 &parser,
-                &root_dir,
-                poll_interval,
             );
         })
         .map_err(|e| WebtraceError::Io(e))?;
