@@ -476,20 +476,41 @@ pub fn print_summary(summaries: &HashMap<String, ModelUsageSummary>) {
 
 /// Print a single watch-mode event.
 pub fn print_event(event: &UsageEvent) {
-    let filename = event
-        .source_file
-        .rsplit('/')
-        .next()
-        .unwrap_or(&event.source_file);
+    let label = format_source_label(&event.source_file);
     println!(
         "[webtrace] {} | {} | in:{} cc:{} cr:{} out:{}",
         event.model,
-        filename,
+        label,
         event.input_tokens,
         event.cache_creation_input_tokens,
         event.cache_read_input_tokens,
         event.output_tokens,
     );
+}
+
+/// Extract a human-readable label from a source file path.
+///   Parent:   .../projects/<dir>/<UUID>.jsonl        → "<UUID short>"
+///   Subagent: .../<UUID>/subagents/agent-<id>.jsonl  → "<UUID short>/agent-<id short>"
+fn format_source_label(path: &str) -> String {
+    let parts: Vec<&str> = path.rsplit('/').collect();
+    // parts[0] = filename, parts[1] = parent dir, parts[2] = grandparent, ...
+
+    let filename = parts.first().map_or("", |s| s.trim_end_matches(".jsonl"));
+
+    // Subagent: parts = ["agent-xxx.jsonl", "subagents", "<UUID>", ...]
+    if parts.len() >= 3 && parts[1] == "subagents" {
+        let session_id = shorten_id(parts[2]);
+        let agent_id = shorten_id(filename);
+        return format!("{}/{}", session_id, agent_id);
+    }
+
+    // Parent session
+    shorten_id(filename).to_string()
+}
+
+/// Shorten a UUID or agent ID to first 8 chars.
+fn shorten_id(id: &str) -> &str {
+    if id.len() > 8 { &id[..8] } else { id }
 }
 
 fn format_number(n: u64) -> String {
