@@ -77,6 +77,126 @@ pub struct TrackerEngine {
     dirty: HashSet<String>,
 }
 
+struct ColdStartResult {
+    summaries: HashMap<String, ModelUsageSummary>,
+    checkpoints: Vec<FileCheckpoint>,
+    session_count: usize,
+    total_files: usize,
+}
+
+fn cold_start_collect(
+    parser: &(dyn LogParser + Sync),
+    root_dir: &str,
+    checkpoints: &HashMap<String, FileCheckpoint>,
+) -> Result<ColdStartResult, Box<dyn std::error::Error>> {
+    let sessions = parser.discover_sessions(root_dir);
+
+    if sessions.is_empty() {
+        return Ok(ColdStartResult {
+            summaries: HashMap::new(),
+            checkpoints: Vec::new(),
+            session_count: 0,
+            total_files: 0,
+        });
+    }
+
+    // Count total files (parent + subagents)
+    let total_files: usize = sessions.iter()
+        .map(|s| 1 + s.subagent_jsonls.len())
+        .sum();
+
+    let max_threads = num_cpus::get();
+    let semaphore = Arc::new(Mutex::new(max_threads));
+
+    // Collect all (path, events, last_line_len, last_line_hash) results from parallel processing
+    let all_results: Arc<Mutex<Vec<(String, Vec<UsageEvent>, u64, u64)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+
+    std::thread::scope(|s| {
+        for session in &sessions {
+            // Collect all files in this session (parent + subagents)
+            let mut files: Vec<&std::path::Path> = vec![session.parent_jsonl.as_path()];
+            for sub in &session.subagent_jsonls {
+                files.push(sub.as_path());
+            }
+
+            for file_path in files {
+                let sem = Arc::clone(&semaphore);
+                let results = Arc::clone(&all_results);
+                let checkpoints = checkpoints;
+
+                s.spawn(move || {
+                    // Acquire semaphore slot
+                    {
+                        let mut count = sem.lock().unwrap();
+                        while *count == 0 {
+                            drop(count);
+                            std::thread::yield_now();
+                            count = sem.lock().unwrap();
+                        }
+                        *count -= 1;
+                    }
+
+                    let path_str = file_path.to_string_lossy().to_string();
+                    let result = process_file_cold(&path_str, parser, checkpoints);
+
+                    // Release semaphore slot
+                    {
+                        let mut count = sem.lock().unwrap();
+                        *count += 1;
+                    }
+
+                    if let Ok(Some((events, last_line_len, last_line_hash))) = result {
+                        let mut r = results.lock().unwrap();
+                        r.push((path_str, events, last_line_len, last_line_hash));
+                    }
+                });
+            }
+        }
+    });
+
+    // Merge results into summaries and checkpoints
+    let mut summaries: HashMap<String, ModelUsageSummary> = HashMap::new();
+    let results = Arc::try_unwrap(all_results).unwrap().into_inner().unwrap();
+
+    let mut batch: Vec<FileCheckpoint> = Vec::with_capacity(results.len());
+    for (path, events, last_line_len, last_line_hash) in results {
+        for event in &events {
+            let summary = summaries
+                .entry(event.model.clone())
+                .or_insert_with(|| ModelUsageSummary {
+                    model: event.model.clone(),
+                    ..Default::default()
+                });
+            summary.accumulate(event);
+        }
+
+        let cp = FileCheckpoint {
+            file_path: path.clone(),
+            last_line_len,
+            last_line_hash,
+        };
+        batch.push(cp);
+    }
+
+    Ok(ColdStartResult {
+        summaries,
+        checkpoints: batch,
+        session_count: sessions.len(),
+        total_files,
+    })
+}
+
+pub fn cold_start_report(
+    parser: &(dyn LogParser + Sync),
+    root_dir: &str,
+) -> Result<HashMap<String, ModelUsageSummary>, Box<dyn std::error::Error>> {
+    let empty = HashMap::new();
+    let result = cold_start_collect(parser, root_dir, &empty)?;
+    print_summary(&result.summaries);
+    Ok(result.summaries)
+}
+
 impl TrackerEngine {
     pub fn new(db: Database) -> Self {
         TrackerEngine {
@@ -105,103 +225,27 @@ impl TrackerEngine {
         root_dir: &str,
     ) -> Result<HashMap<String, ModelUsageSummary>, Box<dyn std::error::Error>> {
         let t_cold = Instant::now();
-        let sessions = parser.discover_sessions(root_dir);
+        let result = cold_start_collect(parser, root_dir, &self.checkpoints)?;
 
-        if sessions.is_empty() {
+        if result.session_count == 0 {
             debug_log!("cold_start — 0 sessions, 0 files ({}µs)", t_cold.elapsed().as_micros());
             return Ok(HashMap::new());
         }
 
-        // Count total files (parent + subagents)
-        let total_files: usize = sessions.iter()
-            .map(|s| 1 + s.subagent_jsonls.len())
-            .sum();
-
-        let max_threads = num_cpus::get();
-        let semaphore = Arc::new(Mutex::new(max_threads));
-
-        // Collect all (path, events, last_line_len, last_line_hash) results from parallel processing
-        let all_results: Arc<Mutex<Vec<(String, Vec<UsageEvent>, u64, u64)>>> =
-            Arc::new(Mutex::new(Vec::new()));
-
-        std::thread::scope(|s| {
-            for session in &sessions {
-                // Collect all files in this session (parent + subagents)
-                let mut files: Vec<&std::path::Path> = vec![session.parent_jsonl.as_path()];
-                for sub in &session.subagent_jsonls {
-                    files.push(sub.as_path());
-                }
-
-                for file_path in files {
-                    let sem = Arc::clone(&semaphore);
-                    let results = Arc::clone(&all_results);
-                    let checkpoints = &self.checkpoints;
-
-                    s.spawn(move || {
-                        // Acquire semaphore slot
-                        {
-                            let mut count = sem.lock().unwrap();
-                            while *count == 0 {
-                                drop(count);
-                                std::thread::yield_now();
-                                count = sem.lock().unwrap();
-                            }
-                            *count -= 1;
-                        }
-
-                        let path_str = file_path.to_string_lossy().to_string();
-                        let result = process_file_cold(&path_str, parser, checkpoints);
-
-                        // Release semaphore slot
-                        {
-                            let mut count = sem.lock().unwrap();
-                            *count += 1;
-                        }
-
-                        if let Ok(Some((events, last_line_len, last_line_hash))) = result {
-                            let mut r = results.lock().unwrap();
-                            r.push((path_str, events, last_line_len, last_line_hash));
-                        }
-                    });
-                }
-            }
-        });
-
-        // Merge results into summaries and update checkpoints
-        let mut summaries: HashMap<String, ModelUsageSummary> = HashMap::new();
-        let results = Arc::try_unwrap(all_results).unwrap().into_inner().unwrap();
-
-        let mut batch: Vec<FileCheckpoint> = Vec::with_capacity(results.len());
-        for (path, events, last_line_len, last_line_hash) in results {
-            for event in &events {
-                let summary = summaries
-                    .entry(event.model.clone())
-                    .or_insert_with(|| ModelUsageSummary {
-                        model: event.model.clone(),
-                        ..Default::default()
-                    });
-                summary.accumulate(event);
-            }
-
-            let cp = FileCheckpoint {
-                file_path: path.clone(),
-                last_line_len,
-                last_line_hash,
-            };
-            self.checkpoints.insert(path, cp.clone());
-            batch.push(cp);
+        for cp in &result.checkpoints {
+            self.checkpoints.insert(cp.file_path.clone(), cp.clone());
         }
 
         // Print summary
-        print_summary(&summaries);
+        print_summary(&result.summaries);
 
         // Batch flush for cold start (single transaction).
         let t_flush = Instant::now();
-        self.db.flush_checkpoints(&batch)?;
+        self.db.flush_checkpoints(&result.checkpoints)?;
         debug_log!("cold_start — {} sessions, {} files, {} checkpoints flushed (flush: {}µs, total: {}µs)",
-            sessions.len(), total_files, batch.len(), t_flush.elapsed().as_micros(), t_cold.elapsed().as_micros());
+            result.session_count, result.total_files, result.checkpoints.len(), t_flush.elapsed().as_micros(), t_cold.elapsed().as_micros());
 
-        Ok(summaries)
+        Ok(result.summaries)
     }
 
     /// Process a single file change (watch mode).
