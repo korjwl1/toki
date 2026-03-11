@@ -57,6 +57,12 @@ enum ReportCommands {
         #[arg(long = "start-of-week", short = 'w')]
         start_of_week: Option<String>,
     },
+    /// Group summary by hour (requires --since or --from-beginning).
+    Hourly {
+        /// Allow full scan without --since
+        #[arg(long = "from-beginning")]
+        from_beginning: bool,
+    },
     /// Group summary by year.
     Yearly,
 }
@@ -214,6 +220,13 @@ fn main() {
                         }
                     };
                     Some(clitrace::engine::ReportGroupBy::Week { start_of_week: start })
+                }
+                Some(ReportCommands::Hourly { from_beginning }) => {
+                    if since_dt.is_none() && !from_beginning {
+                        eprintln!("[clitrace] Hourly report requires --since or --from-beginning");
+                        std::process::exit(1);
+                    }
+                    Some(clitrace::engine::ReportGroupBy::Hour)
                 }
                 Some(ReportCommands::Yearly) => Some(clitrace::engine::ReportGroupBy::Year),
                 None => None,

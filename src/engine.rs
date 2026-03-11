@@ -203,6 +203,7 @@ pub enum ReportGroupBy {
     Day,
     Week { start_of_week: Weekday },
     Year,
+    Hour,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -286,7 +287,7 @@ where
             if !filter_match(ts, filter) {
                 continue;
             }
-            let bucket = bucket_from_date(ts.date(), group_by);
+            let bucket = bucket_from_datetime(ts, group_by);
             let by_model = grouped.entry(bucket).or_insert_with(HashMap::new);
             let summary = by_model.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
                 model: event.model.clone(),
@@ -821,7 +822,8 @@ fn filter_match(ts: NaiveDateTime, filter: ReportFilter) -> bool {
     true
 }
 
-fn bucket_from_date(date: NaiveDate, group_by: ReportGroupBy) -> String {
+fn bucket_from_datetime(ts: NaiveDateTime, group_by: ReportGroupBy) -> String {
+    let date = ts.date();
     match group_by {
         ReportGroupBy::Day => date.format("%Y-%m-%d").to_string(),
         ReportGroupBy::Year => format!("{:04}", date.year()),
@@ -829,6 +831,7 @@ fn bucket_from_date(date: NaiveDate, group_by: ReportGroupBy) -> String {
             let (week_year, week) = week_bucket(date, start_of_week);
             format!("{:04}-W{:02}", week_year, week)
         }
+        ReportGroupBy::Hour => ts.format("%Y-%m-%d %H:00").to_string(),
     }
 }
 
