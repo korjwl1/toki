@@ -18,8 +18,10 @@ cargo run --release -- trace
 
 ```bash
 cargo run --release -- report
-cargo run --release -- report --group-by day
-cargo run --release -- report -g week
+cargo run --release -- report daily
+cargo run --release -- report weekly
+cargo run --release -- report weekly --start-of-week tue
+cargo run --release -- report yearly
 ```
 
 ### 환경변수 오버라이드

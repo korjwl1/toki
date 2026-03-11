@@ -35,10 +35,23 @@ enum Commands {
         /// Claude Code root directory (default: ~/.claude)
         #[arg(long)]
         claude_root: Option<String>,
-        /// Group summary by: day, week, year
-        #[arg(long, short = 'g')]
-        group_by: Option<String>,
+        #[command(subcommand)]
+        command: Option<ReportCommands>,
     },
+}
+
+#[derive(Subcommand)]
+enum ReportCommands {
+    /// Group summary by day.
+    Daily,
+    /// Group summary by week.
+    Weekly {
+        /// Start of week: mon, tue, wed, thu, fri, sat
+        #[arg(long = "start-of-week", short = 'w')]
+        start_of_week: Option<String>,
+    },
+    /// Group summary by year.
+    Yearly,
 }
 
 fn build_config(claude_root: Option<String>, db_path: Option<PathBuf>) -> Config {
@@ -118,23 +131,35 @@ fn main() {
             handle.stop();
             println!("[clitrace] Done.");
         }
-        Commands::Report { claude_root, group_by } => {
+        Commands::Report { claude_root, command } => {
             let config = build_config(claude_root, None);
             println!("[clitrace] Running report...");
             println!("[clitrace] Claude Code root: {}", config.claude_code_root);
 
             let parser = clitrace::providers::claude_code::ClaudeCodeParser;
+            let group_by = match command {
+                Some(ReportCommands::Daily) => Some(clitrace::engine::ReportGroupBy::Day),
+                Some(ReportCommands::Weekly { start_of_week }) => {
+                    let start = match start_of_week.as_deref().unwrap_or("mon") {
+                        "mon" => chrono::Weekday::Mon,
+                        "tue" => chrono::Weekday::Tue,
+                        "wed" => chrono::Weekday::Wed,
+                        "thu" => chrono::Weekday::Thu,
+                        "fri" => chrono::Weekday::Fri,
+                        "sat" => chrono::Weekday::Sat,
+                        _ => {
+                            eprintln!("[clitrace] Invalid start-of-week (use mon|tue|wed|thu|fri|sat)");
+                            std::process::exit(1);
+                        }
+                    };
+                    Some(clitrace::engine::ReportGroupBy::Week { start_of_week: start })
+                }
+                Some(ReportCommands::Yearly) => Some(clitrace::engine::ReportGroupBy::Year),
+                None => None,
+            };
+
             if let Some(group_by) = group_by {
-                let parsed = match group_by.as_str() {
-                    "day" => clitrace::engine::ReportGroupBy::Day,
-                    "week" => clitrace::engine::ReportGroupBy::Week,
-                    "year" => clitrace::engine::ReportGroupBy::Year,
-                    _ => {
-                        eprintln!("[clitrace] Invalid group-by: {} (use day|week|year)", group_by);
-                        std::process::exit(1);
-                    }
-                };
-                if let Err(e) = clitrace::engine::cold_start_report_grouped(&parser, &config.claude_code_root, parsed) {
+                if let Err(e) = clitrace::engine::cold_start_report_grouped(&parser, &config.claude_code_root, group_by) {
                     eprintln!("[clitrace] Report failed: {}", e);
                     std::process::exit(1);
                 }

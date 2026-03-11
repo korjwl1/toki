@@ -6,7 +6,7 @@ use crossbeam_channel::Receiver;
 
 use crate::checkpoint::{find_resume_offset, process_lines_streaming};
 use crate::common::types::{FileCheckpoint, LogParser, LogParserWithTs, ModelUsageSummary, UsageEvent, UsageEventWithTs};
-use chrono::{DateTime, Datelike, NaiveDate};
+use chrono::{DateTime, Datelike, NaiveDate, Weekday};
 use crate::db::Database;
 
 /// Debug level:
@@ -201,7 +201,7 @@ pub fn cold_start_report(
 #[derive(Debug, Clone, Copy)]
 pub enum ReportGroupBy {
     Day,
-    Week,
+    Week { start_of_week: Weekday },
     Year,
 }
 
@@ -705,41 +705,52 @@ fn parse_bucket(ts: &str, group_by: ReportGroupBy) -> Option<String> {
     match group_by {
         ReportGroupBy::Day => Some(date.format("%Y-%m-%d").to_string()),
         ReportGroupBy::Year => Some(format!("{:04}", date.year())),
-        ReportGroupBy::Week => {
-            let (iso_year, iso_week) = iso_week(date);
-            Some(format!("{:04}-W{:02}", iso_year, iso_week))
+        ReportGroupBy::Week { start_of_week } => {
+            let (week_year, week) = week_bucket(date, start_of_week);
+            Some(format!("{:04}-W{:02}", week_year, week))
         }
     }
 }
 
-fn iso_week(date: NaiveDate) -> (i32, u32) {
-    let year = date.year();
-    let jan4 = NaiveDate::from_ymd_opt(year, 1, 4).unwrap();
-    let jan4_weekday = jan4.weekday().number_from_monday() as i32;
-    let week1_start = jan4 - chrono::Duration::days((jan4_weekday - 1) as i64);
+fn week_bucket(date: NaiveDate, start_of_week: Weekday) -> (i32, u32) {
+    let date_week_start = week_start(date, start_of_week);
+    let mut year = date_week_start.year();
 
-    let date_weekday = date.weekday().number_from_monday() as i32;
-    let date_week_start = date - chrono::Duration::days((date_weekday - 1) as i64);
-
-    if date_week_start < week1_start {
-        return iso_week(NaiveDate::from_ymd_opt(year - 1, 12, 31).unwrap());
+    let first_start = first_week_start(year, start_of_week);
+    if date_week_start < first_start {
+        year -= 1;
     }
+    let first_start = first_week_start(year, start_of_week);
+    let days = date_week_start.signed_duration_since(first_start).num_days();
+    let week = (days / 7 + 1) as u32;
+    (year, week)
+}
 
-    let days = date_week_start.signed_duration_since(week1_start).num_days();
-    let mut week = (days / 7 + 1) as u32;
-    let mut iso_year = year;
+fn week_start(date: NaiveDate, start_of_week: Weekday) -> NaiveDate {
+    let date_idx = weekday_index(date.weekday());
+    let start_idx = weekday_index(start_of_week);
+    let delta = (7 + date_idx - start_idx) % 7;
+    date - chrono::Duration::days(delta as i64)
+}
 
-    if week == 53 {
-        let jan4_next = NaiveDate::from_ymd_opt(year + 1, 1, 4).unwrap();
-        let jan4_next_weekday = jan4_next.weekday().number_from_monday() as i32;
-        let week1_next_start = jan4_next - chrono::Duration::days((jan4_next_weekday - 1) as i64);
-        if date_week_start >= week1_next_start {
-            iso_year = year + 1;
-            week = 1;
-        }
+fn first_week_start(year: i32, start_of_week: Weekday) -> NaiveDate {
+    let mut d = NaiveDate::from_ymd_opt(year, 1, 1).unwrap();
+    while d.weekday() != start_of_week {
+        d = d + chrono::Duration::days(1);
     }
+    d
+}
 
-    (iso_year, week)
+fn weekday_index(day: Weekday) -> i32 {
+    match day {
+        Weekday::Mon => 0,
+        Weekday::Tue => 1,
+        Weekday::Wed => 2,
+        Weekday::Thu => 3,
+        Weekday::Fri => 4,
+        Weekday::Sat => 5,
+        Weekday::Sun => 6,
+    }
 }
 
 #[cfg(test)]
