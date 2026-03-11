@@ -169,57 +169,6 @@ fn is_complete_json_object(bytes: &[u8]) -> bool {
     depth == 0
 }
 
-/// Read complete lines from a file starting at the given byte offset.
-/// Lines ending with `\n` are always included.
-/// A trailing segment without `\n` is included only if it forms a complete JSON object
-/// (balanced `{}`), otherwise it is dropped as an incomplete write.
-/// Returns (lines, bytes_consumed).
-pub fn read_lines_from(path: &str, offset: u64) -> std::io::Result<(Vec<String>, u64)> {
-    let file = std::fs::File::open(path)?;
-    let file_size = file.metadata()?.len();
-    let remaining = file_size.saturating_sub(offset);
-
-    if remaining == 0 {
-        return Ok((Vec::new(), 0));
-    }
-
-    let mut reader = std::io::BufReader::new(file);
-    reader.seek(SeekFrom::Start(offset))?;
-
-    let mut lines = Vec::new();
-    let mut bytes_consumed: u64 = 0;
-    let mut trailing_line: Option<String> = None;
-
-    let mut line_buf = String::new();
-    loop {
-        line_buf.clear();
-        let n = reader.read_line(&mut line_buf)?;
-        if n == 0 {
-            break;
-        }
-        if line_buf.ends_with('\n') {
-            // Complete line — strip newline and keep
-            let trimmed = line_buf.trim_end_matches('\n').trim_end_matches('\r');
-            lines.push(trimmed.to_string());
-            bytes_consumed += n as u64;
-        } else {
-            // Trailing segment without \n — defer decision
-            trailing_line = Some(line_buf.clone());
-        }
-    }
-
-    // Handle trailing segment without \n
-    if let Some(trailing) = trailing_line {
-        if is_complete_json_object(trailing.as_bytes()) {
-            bytes_consumed += trailing.len() as u64;
-            lines.push(trailing);
-        }
-        // else: incomplete write — drop it, bytes_consumed stays at last \n
-    }
-
-    Ok((lines, bytes_consumed))
-}
-
 /// Streaming line processor: reads lines from offset and calls a closure for each line,
 /// avoiding accumulation of all lines in memory. Used for cold start.
 /// Returns (count, bytes_consumed, last_line_len, last_line_hash) or None if no lines.
@@ -321,46 +270,103 @@ mod tests {
         assert_ne!(h1, h2);
     }
 
-    // -- read_lines_from tests --
+    // -- Helper: collect lines via process_lines_streaming --
+
+    fn collect_lines(path: &str, offset: u64) -> (Vec<String>, Option<(u64, u64, u64)>) {
+        let mut lines = Vec::new();
+        let result = process_lines_streaming(path, offset, |line| {
+            lines.push(line.to_string());
+        }).unwrap();
+        (lines, result)
+    }
+
+    // -- process_lines_streaming tests --
 
     #[test]
-    fn test_read_lines_from_start() {
+    fn test_streaming_from_start() {
         let (_f, path) = create_test_file("line1\nline2\nline3\n");
-        let (lines, bytes) = read_lines_from(&path, 0).unwrap();
+        let (lines, result) = collect_lines(&path, 0);
         assert_eq!(lines, vec!["line1", "line2", "line3"]);
+        let (bytes, _, _) = result.unwrap();
         assert_eq!(bytes, 18);
     }
 
     #[test]
-    fn test_read_lines_from_middle() {
+    fn test_streaming_from_middle() {
         let (_f, path) = create_test_file("line1\nline2\nline3\n");
-        let (lines, bytes) = read_lines_from(&path, 6).unwrap();
+        let (lines, result) = collect_lines(&path, 6);
         assert_eq!(lines, vec!["line2", "line3"]);
+        let (bytes, _, _) = result.unwrap();
         assert_eq!(bytes, 12);
     }
 
     #[test]
-    fn test_read_lines_drops_incomplete() {
+    fn test_streaming_drops_incomplete() {
         let (_f, path) = create_test_file("line1\nline2\nincomple");
-        let (lines, bytes) = read_lines_from(&path, 0).unwrap();
+        let (lines, result) = collect_lines(&path, 0);
         assert_eq!(lines, vec!["line1", "line2"]);
+        let (bytes, _, _) = result.unwrap();
         assert_eq!(bytes, 12);
     }
 
     #[test]
-    fn test_read_lines_empty() {
+    fn test_streaming_empty() {
         let (_f, path) = create_test_file("");
-        let (lines, bytes) = read_lines_from(&path, 0).unwrap();
+        let (lines, result) = collect_lines(&path, 0);
         assert!(lines.is_empty());
-        assert_eq!(bytes, 0);
+        assert!(result.is_none());
     }
 
     #[test]
-    fn test_read_lines_no_complete_line() {
+    fn test_streaming_no_complete_line() {
         let (_f, path) = create_test_file("no newline here");
-        let (lines, bytes) = read_lines_from(&path, 0).unwrap();
+        let (lines, result) = collect_lines(&path, 0);
         assert!(lines.is_empty());
-        assert_eq!(bytes, 0);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_streaming_complete_json_no_trailing_newline() {
+        let (_f, path) = create_test_file("{\"a\":1}\n{\"b\":2}");
+        let (lines, result) = collect_lines(&path, 0);
+        assert_eq!(lines, vec![r#"{"a":1}"#, r#"{"b":2}"#]);
+        let (bytes, _, _) = result.unwrap();
+        assert_eq!(bytes, 15);
+    }
+
+    #[test]
+    fn test_streaming_incomplete_json_no_trailing_newline() {
+        let (_f, path) = create_test_file("{\"a\":1}\n{\"b\":2,\"incompl");
+        let (lines, result) = collect_lines(&path, 0);
+        assert_eq!(lines, vec![r#"{"a":1}"#]);
+        let (bytes, _, _) = result.unwrap();
+        assert_eq!(bytes, 8);
+    }
+
+    #[test]
+    fn test_streaming_only_incomplete_no_newline() {
+        let (_f, path) = create_test_file("{\"incomplete");
+        let (lines, result) = collect_lines(&path, 0);
+        assert!(lines.is_empty());
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_streaming_only_complete_no_newline() {
+        let (_f, path) = create_test_file(r#"{"only":true}"#);
+        let (lines, result) = collect_lines(&path, 0);
+        assert_eq!(lines, vec![r#"{"only":true}"#]);
+        let (bytes, _, _) = result.unwrap();
+        assert_eq!(bytes, 13);
+    }
+
+    #[test]
+    fn test_streaming_tracks_last_line_hash() {
+        let (_f, path) = create_test_file("line1\nline2\nline3\n");
+        let (_, result) = collect_lines(&path, 0);
+        let (_, last_len, last_hash) = result.unwrap();
+        assert_eq!(last_len, 5); // "line3"
+        assert_eq!(last_hash, hash_line(b"line3"));
     }
 
     // -- find_resume_offset tests --
@@ -370,7 +376,6 @@ mod tests {
         let (_f, path) = create_test_file("line1\nline2\nline3\n");
         let cp = make_checkpoint("line3", &path);
         let offset = find_resume_offset(&path, &cp).unwrap().unwrap();
-        // "line1\nline2\nline3\n" = 18 bytes, resume after line3 = 18
         assert_eq!(offset, 18);
     }
 
@@ -379,7 +384,6 @@ mod tests {
         let (_f, path) = create_test_file("line1\nline2\nline3\n");
         let cp = make_checkpoint("line2", &path);
         let offset = find_resume_offset(&path, &cp).unwrap().unwrap();
-        // "line1\nline2\n" = 12 bytes
         assert_eq!(offset, 12);
     }
 
@@ -407,17 +411,14 @@ mod tests {
 
     #[test]
     fn test_find_resume_after_compaction() {
-        // Simulate: original file had lines A,B,C,D. Compaction removed A,B.
-        // Checkpoint was on C. File now has C,D.
         let (_f, path) = create_test_file("lineC\nlineD\n");
         let cp = make_checkpoint("lineC", &path);
         let offset = find_resume_offset(&path, &cp).unwrap().unwrap();
-        assert_eq!(offset, 6); // after "lineC\n"
+        assert_eq!(offset, 6);
     }
 
     #[test]
     fn test_find_resume_compaction_removed_checkpoint_line() {
-        // Checkpoint was on line B, but compaction removed everything up to D.
         let (_f, path) = create_test_file("lineD\nlineE\n");
         let cp = make_checkpoint("lineB", &path);
         assert!(find_resume_offset(&path, &cp).unwrap().is_none());
@@ -425,17 +426,14 @@ mod tests {
 
     #[test]
     fn test_find_resume_duplicate_lines() {
-        // If duplicate lines exist, should match the LAST occurrence (scanning from end).
         let (_f, path) = create_test_file("dup\nother\ndup\n");
         let cp = make_checkpoint("dup", &path);
         let offset = find_resume_offset(&path, &cp).unwrap().unwrap();
-        // Last "dup\n" ends at 4+6+4 = 14
         assert_eq!(offset, 14);
     }
 
     #[test]
     fn test_find_resume_large_file_across_chunks() {
-        // Create a file larger than CHUNK_SIZE to test chunk-boundary handling.
         let mut content = String::new();
         let target_line = "TARGET_LINE_HERE_12345";
         for i in 0..200 {
@@ -449,20 +447,16 @@ mod tests {
 
         let (_f, path) = create_test_file(&content);
         let cp = make_checkpoint(target_line, &path);
-
         let offset = find_resume_offset(&path, &cp).unwrap().unwrap();
 
-        // Verify: reading from offset should give us the trailing lines.
-        let (lines, _) = read_lines_from(&path, offset).unwrap();
+        let (lines, _) = collect_lines(&path, offset);
         assert_eq!(lines.len(), 10);
         assert!(lines[0].starts_with("trailing line 200"));
     }
 
     #[test]
     fn test_find_resume_line_spanning_chunk_boundary() {
-        // Create a line that's likely to span a chunk boundary.
         let mut content = String::new();
-        // Fill most of a chunk with small lines.
         let mut byte_count: usize = 0;
         let mut line_num = 0;
         while byte_count < (CHUNK_SIZE as usize - 50) {
@@ -471,7 +465,6 @@ mod tests {
             content.push_str(&line);
             line_num += 1;
         }
-        // Now add a long line that will definitely span the boundary.
         let long_line = "X".repeat(200);
         content.push_str(&long_line);
         content.push('\n');
@@ -479,16 +472,15 @@ mod tests {
 
         let (_f, path) = create_test_file(&content);
         let cp = make_checkpoint(&long_line, &path);
-
         let offset = find_resume_offset(&path, &cp).unwrap().unwrap();
-        let (lines, _) = read_lines_from(&path, offset).unwrap();
+
+        let (lines, _) = collect_lines(&path, offset);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0], "after_long");
     }
 
     #[test]
     fn test_find_resume_line_exceeding_chunk_size() {
-        // Line bigger than CHUNK_SIZE (4KB) — spans multiple chunks.
         let big_json = format!(r#"{{"type":"assistant","data":"{}"}}"#, "X".repeat(10000));
         let mut content = String::new();
         content.push_str("before1\n");
@@ -499,16 +491,15 @@ mod tests {
 
         let (_f, path) = create_test_file(&content);
         let cp = make_checkpoint(&big_json, &path);
-
         let offset = find_resume_offset(&path, &cp).unwrap().unwrap();
-        let (lines, _) = read_lines_from(&path, offset).unwrap();
+
+        let (lines, _) = collect_lines(&path, offset);
         assert_eq!(lines.len(), 1);
         assert_eq!(lines[0], "after1");
     }
 
     #[test]
     fn test_find_resume_very_large_line_multi_chunk() {
-        // 66KB line — realistic file-history-snapshot size, spans ~16 chunks.
         let huge_line = "Y".repeat(66000);
         let mut content = String::new();
         content.push_str("small\n");
@@ -518,9 +509,9 @@ mod tests {
 
         let (_f, path) = create_test_file(&content);
         let cp = make_checkpoint(&huge_line, &path);
-
         let offset = find_resume_offset(&path, &cp).unwrap().unwrap();
-        let (lines, _) = read_lines_from(&path, offset).unwrap();
+
+        let (lines, _) = collect_lines(&path, offset);
         assert_eq!(lines, vec!["end"]);
     }
 
@@ -562,53 +553,17 @@ mod tests {
         assert!(!is_complete_json_object(b""));
     }
 
-    // -- read_lines_from: trailing line without \n --
-
-    #[test]
-    fn test_read_lines_complete_json_no_trailing_newline() {
-        let (_f, path) = create_test_file(r#"{"a":1}
-{"b":2}"#);
-        let (lines, bytes) = read_lines_from(&path, 0).unwrap();
-        assert_eq!(lines, vec![r#"{"a":1}"#, r#"{"b":2}"#]);
-        assert_eq!(bytes, 15); // entire file
-    }
-
-    #[test]
-    fn test_read_lines_incomplete_json_no_trailing_newline() {
-        let (_f, path) = create_test_file("{\"a\":1}\n{\"b\":2,\"incompl");
-        let (lines, bytes) = read_lines_from(&path, 0).unwrap();
-        assert_eq!(lines, vec![r#"{"a":1}"#]);
-        assert_eq!(bytes, 8); // only up to first \n
-    }
-
-    #[test]
-    fn test_read_lines_only_incomplete_no_newline() {
-        let (_f, path) = create_test_file("{\"incomplete");
-        let (lines, bytes) = read_lines_from(&path, 0).unwrap();
-        assert!(lines.is_empty());
-        assert_eq!(bytes, 0);
-    }
-
-    #[test]
-    fn test_read_lines_only_complete_no_newline() {
-        let (_f, path) = create_test_file(r#"{"only":true}"#);
-        let (lines, bytes) = read_lines_from(&path, 0).unwrap();
-        assert_eq!(lines, vec![r#"{"only":true}"#]);
-        assert_eq!(bytes, 13);
-    }
-
     // -- find_resume_offset: no trailing \n --
 
     #[test]
     fn test_find_resume_no_trailing_newline() {
-        // File doesn't end with \n but last line is complete.
         let (_f, path) = create_test_file("line1\nline2");
         let cp = make_checkpoint("line2", &path);
         let offset = find_resume_offset(&path, &cp).unwrap().unwrap();
-        assert_eq!(offset, 11); // EOF
+        assert_eq!(offset, 11);
     }
 
-    // -- Integration: find_resume + read_lines --
+    // -- Integration: find_resume + streaming --
 
     #[test]
     fn test_incremental_read_after_append() {
@@ -616,20 +571,17 @@ mod tests {
         let path = dir.path().join("test.jsonl");
         let path_str = path.to_str().unwrap();
 
-        // Initial write.
         std::fs::write(&path, "line1\nline2\n").unwrap();
-        let (lines, _) = read_lines_from(path_str, 0).unwrap();
+        let (lines, _) = collect_lines(path_str, 0);
         assert_eq!(lines, vec!["line1", "line2"]);
 
         let cp = make_checkpoint("line2", path_str);
 
-        // Append new data.
         let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
         f.write_all(b"line3\nline4\n").unwrap();
 
-        // Resume from checkpoint.
         let offset = find_resume_offset(path_str, &cp).unwrap().unwrap();
-        let (new_lines, _) = read_lines_from(path_str, offset).unwrap();
+        let (new_lines, _) = collect_lines(path_str, offset);
         assert_eq!(new_lines, vec!["line3", "line4"]);
     }
 
@@ -639,15 +591,13 @@ mod tests {
         let path = dir.path().join("test.jsonl");
         let path_str = path.to_str().unwrap();
 
-        // Original: 4 lines.
         std::fs::write(&path, "line1\nline2\nline3\nline4\n").unwrap();
         let cp = make_checkpoint("line3", path_str);
 
-        // Compaction: remove first 2 lines, add a new one.
         std::fs::write(&path, "line3\nline4\nline5\n").unwrap();
 
         let offset = find_resume_offset(path_str, &cp).unwrap().unwrap();
-        let (new_lines, _) = read_lines_from(path_str, offset).unwrap();
+        let (new_lines, _) = collect_lines(path_str, offset);
         assert_eq!(new_lines, vec!["line4", "line5"]);
     }
 }

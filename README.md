@@ -178,7 +178,7 @@ flowchart TD
     cooldown -->|"passed"| size_check{"stat()\nsize 변화?"}
 
     size_check -->|No| skip["스킵 (stat only)"]
-    size_check -->|Yes| find["find_resume_offset()\n+ read_lines_from()"]
+    size_check -->|Yes| find["find_resume_offset()\n+ process_lines_streaming()"]
 
     find --> new_lines{"새 줄\n있음?"}
 

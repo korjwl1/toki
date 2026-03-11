@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
 
-use crate::checkpoint::{find_resume_offset, hash_line, process_lines_streaming, read_lines_from};
+use crate::checkpoint::{find_resume_offset, process_lines_streaming};
 use crate::common::types::{FileCheckpoint, LogParser, ModelUsageSummary, UsageEvent};
 use crate::db::Database;
 
@@ -259,13 +259,20 @@ impl TrackerEngine {
             }
         }
 
-        // Step 4: Size changed → find_resume + read_lines
+        // Step 4: Size changed → find_resume + streaming read/parse
         let t0 = Instant::now();
         let offset = self.determine_offset(path)?;
         let find_us = t0.elapsed().as_micros();
 
         let t1 = Instant::now();
-        let (lines, bytes_read) = read_lines_from(path, offset)?;
+        let mut events = Vec::new();
+        let mut line_count: u64 = 0;
+        let result = process_lines_streaming(path, offset, |line| {
+            if let Some(event) = parser.parse_line(line, path) {
+                events.push(event);
+            }
+            line_count += 1;
+        })?;
         let read_us = t1.elapsed().as_micros();
 
         // Update cached file size
@@ -273,51 +280,45 @@ impl TrackerEngine {
             self.file_sizes.insert(path.to_string(), meta.len());
         }
 
-        if lines.is_empty() {
-            let act = self.activity.entry(path.to_string()).or_insert(FileActivity {
-                state,
-                last_active: now,
-                last_checked: now,
-            });
-            act.last_checked = now;
-            act.state = state;
-            debug_log_verbose!("process_file {} — no new lines (find_resume: {}µs, read: {}µs)",
-                path, find_us, read_us);
-            return Ok(Vec::new());
-        }
+        match result {
+            None => {
+                let act = self.activity.entry(path.to_string()).or_insert(FileActivity {
+                    state,
+                    last_active: now,
+                    last_checked: now,
+                });
+                act.last_checked = now;
+                act.state = state;
+                debug_log_verbose!("process_file {} — no new lines (find_resume: {}µs, read: {}µs)",
+                    path, find_us, read_us);
+                return Ok(Vec::new());
+            }
+            Some((bytes_read, last_line_len, last_line_hash)) => {
+                let cp = FileCheckpoint {
+                    file_path: path.to_string(),
+                    last_line_len,
+                    last_line_hash,
+                };
+                self.checkpoints.insert(path.to_string(), cp);
+                self.dirty.insert(path.to_string());
 
-        // Step 5: New lines found → parse + checkpoint + promote to Active
-        let mut events = Vec::new();
-        for line in &lines {
-            if let Some(event) = parser.parse_line(line, path) {
-                events.push(event);
+                // Promote to Active if was Idle
+                if state == FileState::Idle {
+                    debug_log!("promote {} → Active ({} new lines)", path, line_count);
+                }
+                self.activity.insert(path.to_string(), FileActivity {
+                    state: FileState::Active,
+                    last_active: now,
+                    last_checked: now,
+                });
+
+                debug_log!("process_file {} — {} lines, {} bytes, {} events, Active | find_resume: {}µs, read: {}µs, total: {}µs",
+                    path, line_count, bytes_read, events.len(),
+                    find_us, read_us, t_total.elapsed().as_micros());
+
+                Ok(events)
             }
         }
-
-        let last_line = lines.last().unwrap();
-        let cp = FileCheckpoint {
-            file_path: path.to_string(),
-            last_line_len: last_line.len() as u64,
-            last_line_hash: hash_line(last_line.as_bytes()),
-        };
-        self.checkpoints.insert(path.to_string(), cp);
-        self.dirty.insert(path.to_string());
-
-        // Promote to Active if was Idle
-        if state == FileState::Idle {
-            debug_log!("promote {} → Active ({} new lines)", path, lines.len());
-        }
-        self.activity.insert(path.to_string(), FileActivity {
-            state: FileState::Active,
-            last_active: now,
-            last_checked: now,
-        });
-
-        debug_log!("process_file {} — {} lines, {} bytes, {} events, Active | find_resume: {}µs, read: {}µs, total: {}µs",
-            path, lines.len(), bytes_read, events.len(),
-            find_us, read_us, t_total.elapsed().as_micros());
-
-        Ok(events)
     }
 
     fn process_and_print(&mut self, path: &str, parser: &dyn LogParser) {
@@ -760,7 +761,7 @@ mod tests {
     #[test]
     #[ignore] // Run with: cargo test bench_timing -- --ignored --nocapture
     fn bench_timing() {
-        use crate::checkpoint::{find_resume_offset, hash_line, read_lines_from};
+        use crate::checkpoint::{find_resume_offset, hash_line, process_lines_streaming};
         use std::time::Instant;
 
         let dir = tempfile::tempdir().unwrap();
@@ -801,11 +802,11 @@ mod tests {
         }
         let find_us = start.elapsed().as_micros() / iterations as u128;
 
-        // Bench read_lines_from (last 10 lines)
+        // Bench process_lines_streaming (last 10 lines)
         let offset = find_resume_offset(path_str, &cp).unwrap().unwrap();
         let start = Instant::now();
         for _ in 0..iterations {
-            let _ = read_lines_from(path_str, offset).unwrap();
+            let _ = process_lines_streaming(path_str, offset, |_| {}).unwrap();
         }
         let read_us = start.elapsed().as_micros() / iterations as u128;
 
@@ -845,9 +846,9 @@ mod tests {
         println!("File: {} lines, {} bytes ({} KB)", 500, file_size, file_size / 1024);
         println!();
         println!("Per-operation (avg of {} runs):", iterations);
-        println!("  find_resume_offset:   {:>6}µs", find_us);
-        println!("  read_lines_from:      {:>6}µs", read_us);
-        println!("  db.upsert_checkpoint: {:>6}µs", db_us);
+        println!("  find_resume_offset:        {:>6}µs", find_us);
+        println!("  process_lines_streaming:   {:>6}µs", read_us);
+        println!("  db.upsert_checkpoint:      {:>6}µs", db_us);
         println!();
         println!("End-to-end:");
         println!("  cold_start (500 lines):    {:>6}µs", cold_us);
