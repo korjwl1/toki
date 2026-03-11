@@ -15,7 +15,7 @@ use crate::db::Database;
 ///   3 = level 1 + verbose (size-unchanged, no-new-lines skips)
 ///   4 = level 2 + verbose (force cold start + all skip logs)
 pub fn debug_level() -> u8 {
-    std::env::var("WEBTRACE_DEBUG").map_or(0, |v| {
+    std::env::var("CLITRACE_DEBUG").map_or(0, |v| {
         match v.as_str() {
             "true" | "1" => 1,
             "2" => 2,
@@ -29,7 +29,7 @@ pub fn debug_level() -> u8 {
 macro_rules! debug_log {
     ($($arg:tt)*) => {
         if debug_level() >= 1 {
-            eprintln!("[webtrace:debug] {}", format!($($arg)*));
+            eprintln!("[clitrace:debug] {}", format!($($arg)*));
         }
     };
 }
@@ -39,7 +39,7 @@ macro_rules! debug_log {
 macro_rules! debug_log_verbose {
     ($($arg:tt)*) => {
         if debug_level() >= 3 {
-            eprintln!("[webtrace:debug] {}", format!($($arg)*));
+            eprintln!("[clitrace:debug] {}", format!($($arg)*));
         }
     };
 }
@@ -328,7 +328,7 @@ impl TrackerEngine {
                 }
             }
             Err(e) => {
-                eprintln!("[webtrace] Error processing {}: {}", path, e);
+                eprintln!("[clitrace] Error processing {}: {}", path, e);
             }
         }
     }
@@ -344,7 +344,7 @@ impl TrackerEngine {
         let count = batch.len();
         let t = Instant::now();
         if let Err(e) = self.db.flush_checkpoints(&batch) {
-            eprintln!("[webtrace] flush error: {}", e);
+            eprintln!("[clitrace] flush error: {}", e);
             return;
         }
         self.dirty.clear();
@@ -443,39 +443,39 @@ fn process_file_cold(
 /// Print cold start summary.
 pub fn print_summary(summaries: &HashMap<String, ModelUsageSummary>) {
     if summaries.is_empty() {
-        println!("[webtrace] No usage data found.");
+        println!("[clitrace] No usage data found.");
         return;
     }
 
-    println!("[webtrace] ═══════════════════════════════════════════");
-    println!("[webtrace] Token Usage Summary");
+    println!("[clitrace] ═══════════════════════════════════════════");
+    println!("[clitrace] Token Usage Summary");
 
     let mut sorted: Vec<_> = summaries.values().collect();
     sorted.sort_by(|a, b| b.event_count.cmp(&a.event_count));
 
     for s in &sorted {
-        println!("[webtrace] ───────────────────────────────────────────");
-        println!("[webtrace] Model: {}", s.model);
+        println!("[clitrace] ───────────────────────────────────────────");
+        println!("[clitrace] Model: {}", s.model);
         println!(
-            "[webtrace]   Input: {:>12} | Cache Create: {:>12}",
+            "[clitrace]   Input: {:>12} | Cache Create: {:>12}",
             format_number(s.input_tokens),
             format_number(s.cache_creation_input_tokens),
         );
         println!(
-            "[webtrace]   Cache Read: {:>8} | Output: {:>12}",
+            "[clitrace]   Cache Read: {:>8} | Output: {:>12}",
             format_number(s.cache_read_input_tokens),
             format_number(s.output_tokens),
         );
-        println!("[webtrace]   Events: {}", s.event_count);
+        println!("[clitrace]   Events: {}", s.event_count);
     }
-    println!("[webtrace] ═══════════════════════════════════════════");
+    println!("[clitrace] ═══════════════════════════════════════════");
 }
 
 /// Print a single watch-mode event.
 pub fn print_event(event: &UsageEvent) {
     let label = format_source_label(&event.source_file);
     println!(
-        "[webtrace] {} | {} | in:{} cc:{} cr:{} out:{}",
+        "[clitrace] {} | {} | in:{} cc:{} cr:{} out:{}",
         event.model,
         label,
         event.input_tokens,
@@ -841,7 +841,7 @@ mod tests {
         let events = engine.process_file(path_str, &parser).unwrap();
         let incr_us = start.elapsed().as_micros();
 
-        println!("\n=== webtrace benchmark ===");
+        println!("\n=== clitrace benchmark ===");
         println!("File: {} lines, {} bytes ({} KB)", 500, file_size, file_size / 1024);
         println!();
         println!("Per-operation (avg of {} runs):", iterations);

@@ -6,7 +6,7 @@ pub mod checkpoint;
 pub mod platform;
 pub mod providers;
 
-pub use common::types::{UsageEvent, ModelUsageSummary, SessionGroup, WebtraceError};
+pub use common::types::{UsageEvent, ModelUsageSummary, SessionGroup, ClitraceError};
 pub use config::Config;
 
 use std::thread::JoinHandle;
@@ -15,7 +15,7 @@ use db::Database;
 use engine::TrackerEngine;
 use providers::claude_code::ClaudeCodeParser;
 
-/// Running webtrace instance handle.
+/// Running clitrace instance handle.
 /// Drop triggers automatic stop().
 pub struct Handle {
     stop_tx: Option<crossbeam_channel::Sender<()>>,
@@ -25,7 +25,7 @@ pub struct Handle {
 }
 
 impl Handle {
-    /// Gracefully stop webtrace: flush dirty checkpoints and join worker thread.
+    /// Gracefully stop clitrace: flush dirty checkpoints and join worker thread.
     pub fn stop(mut self) {
         self.shutdown();
     }
@@ -46,27 +46,27 @@ impl Drop for Handle {
     }
 }
 
-/// Start webtrace: cold start scan, then enter watch mode.
+/// Start clitrace: cold start scan, then enter watch mode.
 /// Returns a Handle to control the running instance.
-pub fn start(config: Config) -> Result<Handle, WebtraceError> {
-    let db = Database::open(&config.db_path).map_err(|e| WebtraceError::Db(e.into()))?;
+pub fn start(config: Config) -> Result<Handle, ClitraceError> {
+    let db = Database::open(&config.db_path).map_err(|e| ClitraceError::Db(e.into()))?;
 
     // DEBUG=2|4: clear checkpoints for forced full cold start.
     if engine::debug_level() == 2 || engine::debug_level() == 4 {
-        eprintln!("[webtrace:debug] DEBUG={} — clearing all checkpoints for forced cold start", engine::debug_level());
-        db.clear_checkpoints().map_err(|e| WebtraceError::Db(e.into()))?;
+        eprintln!("[clitrace:debug] DEBUG={} — clearing all checkpoints for forced cold start", engine::debug_level());
+        db.clear_checkpoints().map_err(|e| ClitraceError::Db(e.into()))?;
     }
 
     let mut engine = TrackerEngine::new(db);
-    engine.load_checkpoints().map_err(|e| WebtraceError::Db(e.into()))?;
+    engine.load_checkpoints().map_err(|e| ClitraceError::Db(e.into()))?;
 
     let parser = ClaudeCodeParser;
     let root_dir = config.claude_code_root.clone();
 
     // Cold start
-    println!("[webtrace] Running initial scan...");
+    println!("[clitrace] Running initial scan...");
     if let Err(e) = engine.cold_start(&parser, &root_dir) {
-        eprintln!("[webtrace] Cold start error: {}", e);
+        eprintln!("[clitrace] Cold start error: {}", e);
     }
 
     // Set up file watcher
@@ -77,10 +77,10 @@ pub fn start(config: Config) -> Result<Handle, WebtraceError> {
     let projects_dir = format!("{}/projects", root_dir);
     if std::path::Path::new(&projects_dir).exists() {
         platform::watch_directory(&mut watcher, &projects_dir)?;
-        println!("[webtrace] Watching: {}", projects_dir);
+        println!("[clitrace] Watching: {}", projects_dir);
     } else {
         platform::watch_directory(&mut watcher, &root_dir)?;
-        println!("[webtrace] Watching: {}", root_dir);
+        println!("[clitrace] Watching: {}", root_dir);
     }
 
     // Stop channel
@@ -88,7 +88,7 @@ pub fn start(config: Config) -> Result<Handle, WebtraceError> {
 
     // Spawn worker thread
     let worker_handle = std::thread::Builder::new()
-        .name("webtrace-worker".to_string())
+        .name("clitrace-worker".to_string())
         .spawn(move || {
             engine.watch_loop(
                 event_rx,
@@ -96,7 +96,7 @@ pub fn start(config: Config) -> Result<Handle, WebtraceError> {
                 &parser,
             );
         })
-        .map_err(|e| WebtraceError::Io(e))?;
+        .map_err(|e| ClitraceError::Io(e))?;
 
     Ok(Handle {
         stop_tx: Some(stop_tx),

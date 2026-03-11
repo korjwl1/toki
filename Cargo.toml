@@ -1,15 +1,15 @@
 [package]
-name = "webtrace"
+name = "clitrace"
 version = "0.1.0"
 edition = "2021"
 description = "AI CLI tool token usage tracker module"
 
 [lib]
-name = "webtrace"
+name = "clitrace"
 path = "src/lib.rs"
 
 [[bin]]
-name = "webtrace"
+name = "clitrace"
 path = "src/main.rs"
 
 [dependencies]

@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-use webtrace::Config;
+use clitrace::Config;
 
 // Global flag for signal handler
 static RUNNING: std::sync::atomic::AtomicBool = AtomicBool::new(true);
@@ -12,26 +12,26 @@ static RUNNING: std::sync::atomic::AtomicBool = AtomicBool::new(true);
 fn main() {
     let mut config = Config::new();
 
-    if let Ok(root) = std::env::var("WEBTRACE_CLAUDE_ROOT") {
+    if let Ok(root) = std::env::var("CLITRACE_CLAUDE_ROOT") {
         config = config.with_claude_root(root);
     }
-    if let Ok(db_path) = std::env::var("WEBTRACE_DB_PATH") {
+    if let Ok(db_path) = std::env::var("CLITRACE_DB_PATH") {
         config = config.with_db_path(db_path.into());
     }
 
-    println!("[webtrace] Starting...");
-    println!("[webtrace] Claude Code root: {}", config.claude_code_root);
-    println!("[webtrace] Database: {}", config.db_path.display());
+    println!("[clitrace] Starting...");
+    println!("[clitrace] Claude Code root: {}", config.claude_code_root);
+    println!("[clitrace] Database: {}", config.db_path.display());
 
-    let handle = match webtrace::start(config) {
+    let handle = match clitrace::start(config) {
         Ok(h) => h,
         Err(e) => {
-            eprintln!("[webtrace] Failed to start: {}", e);
+            eprintln!("[clitrace] Failed to start: {}", e);
             std::process::exit(1);
         }
     };
 
-    println!("[webtrace] Listening for file changes... (Ctrl+C to stop)");
+    println!("[clitrace] Listening for file changes... (Ctrl+C to stop)");
 
     // Register SIGINT handler
     unsafe {
@@ -43,9 +43,9 @@ fn main() {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
-    println!("\n[webtrace] Shutting down...");
+    println!("\n[clitrace] Shutting down...");
     handle.stop();
-    println!("[webtrace] Done.");
+    println!("[clitrace] Done.");
 }
 
 extern "C" fn sigint_handler(_: libc::c_int) {

@@ -59,40 +59,40 @@ pub trait LogParser: Send + Sync {
     fn discover_sessions(&self, root_dir: &str) -> Vec<SessionGroup>;
 }
 
-/// Webtrace error types.
+/// Clitrace error types.
 #[derive(Debug)]
-pub enum WebtraceError {
+pub enum ClitraceError {
     Db(redb::Error),
     Io(std::io::Error),
     Watcher(notify::Error),
 }
 
-impl std::fmt::Display for WebtraceError {
+impl std::fmt::Display for ClitraceError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WebtraceError::Db(e) => write!(f, "database error: {}", e),
-            WebtraceError::Io(e) => write!(f, "io error: {}", e),
-            WebtraceError::Watcher(e) => write!(f, "watcher error: {}", e),
+            ClitraceError::Db(e) => write!(f, "database error: {}", e),
+            ClitraceError::Io(e) => write!(f, "io error: {}", e),
+            ClitraceError::Watcher(e) => write!(f, "watcher error: {}", e),
         }
     }
 }
 
-impl std::error::Error for WebtraceError {}
+impl std::error::Error for ClitraceError {}
 
-impl From<redb::Error> for WebtraceError {
+impl From<redb::Error> for ClitraceError {
     fn from(e: redb::Error) -> Self {
-        WebtraceError::Db(e)
+        ClitraceError::Db(e)
     }
 }
 
-impl From<std::io::Error> for WebtraceError {
+impl From<std::io::Error> for ClitraceError {
     fn from(e: std::io::Error) -> Self {
-        WebtraceError::Io(e)
+        ClitraceError::Io(e)
     }
 }
 
-impl From<notify::Error> for WebtraceError {
+impl From<notify::Error> for ClitraceError {
     fn from(e: notify::Error) -> Self {
-        WebtraceError::Watcher(e)
+        ClitraceError::Watcher(e)
     }
 }

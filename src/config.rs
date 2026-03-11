@@ -14,7 +14,7 @@ impl Config {
 
         Config {
             claude_code_root: home.join(".claude").to_string_lossy().to_string(),
-            db_path: home.join(".config").join("webtrace").join("webtrace.db"),
+            db_path: home.join(".config").join("clitrace").join("clitrace.db"),
         }
     }
 
@@ -31,7 +31,7 @@ impl Config {
     /// Load overrides from DB settings table.
     /// Priority: env var > DB > default (env already applied before this call).
     pub fn load_from_db(&mut self, db: &Database) {
-        if std::env::var("WEBTRACE_CLAUDE_ROOT").is_err() {
+        if std::env::var("CLITRACE_CLAUDE_ROOT").is_err() {
             if let Ok(Some(root)) = db.get_setting("claude_code_root") {
                 self.claude_code_root = root;
             }
@@ -47,7 +47,7 @@ mod tests {
     fn test_config_defaults() {
         let config = Config::new();
         assert!(config.claude_code_root.ends_with(".claude"));
-        assert!(config.db_path.ends_with("webtrace.db"));
+        assert!(config.db_path.ends_with("clitrace.db"));
     }
 
     #[test]
@@ -68,7 +68,7 @@ mod tests {
 
         db.set_setting("claude_code_root", "/from/db").unwrap();
         // Remove env var to allow DB override
-        std::env::remove_var("WEBTRACE_CLAUDE_ROOT");
+        std::env::remove_var("CLITRACE_CLAUDE_ROOT");
 
         let mut config = Config::new();
         config.load_from_db(&db);
@@ -84,7 +84,7 @@ mod tests {
 
         db.set_setting("claude_code_root", "/from/db").unwrap();
 
-        std::env::set_var("WEBTRACE_CLAUDE_ROOT", "/from/env");
+        std::env::set_var("CLITRACE_CLAUDE_ROOT", "/from/env");
 
         let mut config = Config::new()
             .with_claude_root("/from/env".to_string());
@@ -92,6 +92,6 @@ mod tests {
 
         assert_eq!(config.claude_code_root, "/from/env");
 
-        std::env::remove_var("WEBTRACE_CLAUDE_ROOT");
+        std::env::remove_var("CLITRACE_CLAUDE_ROOT");
     }
 }
