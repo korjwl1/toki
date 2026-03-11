@@ -55,6 +55,14 @@ impl ModelUsageSummary {
         self.output_tokens += event.output_tokens;
         self.event_count += 1;
     }
+
+    pub fn accumulate_with_ts(&mut self, event: &UsageEventWithTs) {
+        self.input_tokens += event.input_tokens;
+        self.cache_creation_input_tokens += event.cache_creation_input_tokens;
+        self.cache_read_input_tokens += event.cache_read_input_tokens;
+        self.output_tokens += event.output_tokens;
+        self.event_count += 1;
+    }
 }
 
 /// A session group: parent JSONL + subagent JSONLs.

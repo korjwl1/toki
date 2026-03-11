@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
@@ -97,88 +97,36 @@ fn cold_start_collect(
         });
     }
 
-    // Count total files (parent + subagents)
     let total_files: usize = sessions.iter()
         .map(|s| 1 + s.subagent_jsonls.len())
         .sum();
 
-    let max_threads = num_cpus::get();
-    let semaphore = Arc::new(Mutex::new(max_threads));
+    let summaries: Mutex<HashMap<String, ModelUsageSummary>> = Mutex::new(HashMap::new());
+    let cp_batch: Mutex<Vec<FileCheckpoint>> = Mutex::new(Vec::new());
 
-    // Collect all (path, events, last_line_len, last_line_hash) results from parallel processing
-    let all_results: Arc<Mutex<Vec<(String, Vec<UsageEvent>, u64, u64)>>> =
-        Arc::new(Mutex::new(Vec::new()));
-
-    std::thread::scope(|s| {
-        for session in &sessions {
-            // Collect all files in this session (parent + subagents)
-            let mut files: Vec<&std::path::Path> = vec![session.parent_jsonl.as_path()];
-            for sub in &session.subagent_jsonls {
-                files.push(sub.as_path());
-            }
-
-            for file_path in files {
-                let sem = Arc::clone(&semaphore);
-                let results = Arc::clone(&all_results);
-                let checkpoints = checkpoints;
-
-                s.spawn(move || {
-                    // Acquire semaphore slot
-                    {
-                        let mut count = sem.lock().unwrap();
-                        while *count == 0 {
-                            drop(count);
-                            std::thread::yield_now();
-                            count = sem.lock().unwrap();
-                        }
-                        *count -= 1;
-                    }
-
-                    let path_str = file_path.to_string_lossy().to_string();
-                    let result = process_file_cold(&path_str, parser, checkpoints);
-
-                    // Release semaphore slot
-                    {
-                        let mut count = sem.lock().unwrap();
-                        *count += 1;
-                    }
-
-                    if let Ok(Some((events, last_line_len, last_line_hash))) = result {
-                        let mut r = results.lock().unwrap();
-                        r.push((path_str, events, last_line_len, last_line_hash));
-                    }
-                });
-            }
-        }
-    });
-
-    // Merge results into summaries and checkpoints
-    let mut summaries: HashMap<String, ModelUsageSummary> = HashMap::new();
-    let results = Arc::try_unwrap(all_results).unwrap().into_inner().unwrap();
-
-    let mut batch: Vec<FileCheckpoint> = Vec::with_capacity(results.len());
-    for (path, events, last_line_len, last_line_hash) in results {
-        for event in &events {
-            let summary = summaries
-                .entry(event.model.clone())
-                .or_insert_with(|| ModelUsageSummary {
+    parallel_scan(&sessions, checkpoints, |path, offset| {
+        let result = process_lines_streaming(path, offset, |line| {
+            if let Some(event) = parser.parse_line(line, path) {
+                let mut s = summaries.lock().unwrap();
+                let summary = s.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
                     model: event.model.clone(),
                     ..Default::default()
                 });
-            summary.accumulate(event);
+                summary.accumulate(&event);
+            }
+        });
+        if let Ok(Some((_bytes, last_line_len, last_line_hash))) = result {
+            cp_batch.lock().unwrap().push(FileCheckpoint {
+                file_path: path.to_string(),
+                last_line_len,
+                last_line_hash,
+            });
         }
-
-        let cp = FileCheckpoint {
-            file_path: path.clone(),
-            last_line_len,
-            last_line_hash,
-        };
-        batch.push(cp);
-    }
+    });
 
     Ok(ColdStartResult {
-        summaries,
-        checkpoints: batch,
+        summaries: summaries.into_inner().unwrap(),
+        checkpoints: cp_batch.into_inner().unwrap(),
         session_count: sessions.len(),
         total_files,
     })
@@ -225,97 +173,26 @@ where
         return Ok(());
     }
 
-    let max_threads = num_cpus::get();
-    let semaphore = Arc::new(Mutex::new(max_threads));
+    let grouped: Mutex<HashMap<String, HashMap<String, ModelUsageSummary>>> =
+        Mutex::new(HashMap::new());
 
-    let grouped: Arc<Mutex<HashMap<String, HashMap<String, ModelUsageSummary>>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-
-    std::thread::scope(|s| {
-        for session in &sessions {
-            let mut files: Vec<&std::path::Path> = vec![session.parent_jsonl.as_path()];
-            for sub in &session.subagent_jsonls {
-                files.push(sub.as_path());
-            }
-
-            for file_path in files {
-                let sem = Arc::clone(&semaphore);
-                let grouped = Arc::clone(&grouped);
-
-                s.spawn(move || {
-                    {
-                        let mut count = sem.lock().unwrap();
-                        while *count == 0 {
-                            drop(count);
-                            std::thread::yield_now();
-                            count = sem.lock().unwrap();
-                        }
-                        *count -= 1;
-                    }
-
-                    let path_str = file_path.to_string_lossy().to_string();
-                    let _ = process_lines_streaming(&path_str, resolve_offset(&path_str, checkpoints), |line| {
-                        if let Some(event) = parser.parse_line_with_ts(line, &path_str) {
-                            if let Some(bucket) = bucket_from_timestamp_filtered(&event.timestamp, group_by, filter) {
-                                let mut g = grouped.lock().unwrap();
-                                let by_model = g.entry(bucket).or_insert_with(HashMap::new);
-                                let summary = by_model.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
-                                    model: event.model.clone(),
-                                    ..Default::default()
-                                });
-                                summary.input_tokens += event.input_tokens;
-                                summary.cache_creation_input_tokens += event.cache_creation_input_tokens;
-                                summary.cache_read_input_tokens += event.cache_read_input_tokens;
-                                summary.output_tokens += event.output_tokens;
-                                summary.event_count += 1;
-                            }
-                        }
+    parallel_scan(&sessions, checkpoints, |path, offset| {
+        let _ = process_lines_streaming(path, offset, |line| {
+            if let Some(event) = parser.parse_line_with_ts(line, path) {
+                if let Some(bucket) = bucket_from_timestamp_filtered(&event.timestamp, group_by, filter) {
+                    let mut g = grouped.lock().unwrap();
+                    let by_model = g.entry(bucket).or_insert_with(HashMap::new);
+                    let summary = by_model.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
+                        model: event.model.clone(),
+                        ..Default::default()
                     });
-
-                    {
-                        let mut count = sem.lock().unwrap();
-                        *count += 1;
-                    }
-                });
+                    summary.accumulate_with_ts(&event);
+                }
             }
-        }
+        });
     });
 
-    let grouped = Arc::try_unwrap(grouped).unwrap().into_inner().unwrap();
-    if grouped.is_empty() {
-        println!("[clitrace] No usage data found.");
-        return Ok(());
-    }
-
-    let mut buckets: Vec<_> = grouped.keys().cloned().collect();
-    buckets.sort();
-
-    for bucket in buckets {
-        println!("[clitrace] ═══════════════════════════════════════════");
-        println!("[clitrace] Token Usage Summary ({})", bucket);
-        if let Some(models) = grouped.get(&bucket) {
-            let mut sorted: Vec<_> = models.values().collect();
-            sorted.sort_by(|a, b| b.event_count.cmp(&a.event_count));
-
-            for s in &sorted {
-                println!("[clitrace] ───────────────────────────────────────────");
-                println!("[clitrace] Model: {}", s.model);
-                println!(
-                    "[clitrace]   Input: {:>12} | Cache Create: {:>12}",
-                    format_number(s.input_tokens),
-                    format_number(s.cache_creation_input_tokens),
-                );
-                println!(
-                    "[clitrace]   Cache Read: {:>8} | Output: {:>12}",
-                    format_number(s.cache_read_input_tokens),
-                    format_number(s.output_tokens),
-                );
-                println!("[clitrace]   Events: {}", s.event_count);
-            }
-        }
-    }
-
-    println!("[clitrace] ═══════════════════════════════════════════");
+    print_grouped_summary(&grouped.into_inner().unwrap());
     Ok(())
 }
 
@@ -333,72 +210,29 @@ where
         return Ok(HashMap::new());
     }
 
-    let max_threads = num_cpus::get();
-    let semaphore = Arc::new(Mutex::new(max_threads));
+    let summaries: Mutex<HashMap<String, ModelUsageSummary>> = Mutex::new(HashMap::new());
 
-    let summaries: Arc<Mutex<HashMap<String, ModelUsageSummary>>> =
-        Arc::new(Mutex::new(HashMap::new()));
-
-    std::thread::scope(|s| {
-        for session in &sessions {
-            let mut files: Vec<&std::path::Path> = vec![session.parent_jsonl.as_path()];
-            for sub in &session.subagent_jsonls {
-                files.push(sub.as_path());
-            }
-
-            for file_path in files {
-                let sem = Arc::clone(&semaphore);
-                let summaries = Arc::clone(&summaries);
-
-                s.spawn(move || {
-                    {
-                        let mut count = sem.lock().unwrap();
-                        while *count == 0 {
-                            drop(count);
-                            std::thread::yield_now();
-                            count = sem.lock().unwrap();
-                        }
-                        *count -= 1;
-                    }
-
-                    let path_str = file_path.to_string_lossy().to_string();
-                    let _ = process_lines_streaming(
-                        &path_str,
-                        resolve_offset(&path_str, checkpoints),
-                        |line| {
-                            if let Some(event) = parser.parse_line_with_ts(line, &path_str) {
-                                let ts = match parse_timestamp(&event.timestamp) {
-                                    Some(t) => t,
-                                    None => return,
-                                };
-                                if !filter_match(ts, filter) {
-                                    return;
-                                }
-                                let mut s = summaries.lock().unwrap();
-                                let summary = s.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
-                                    model: event.model.clone(),
-                                    ..Default::default()
-                                });
-                                summary.input_tokens += event.input_tokens;
-                                summary.cache_creation_input_tokens += event.cache_creation_input_tokens;
-                                summary.cache_read_input_tokens += event.cache_read_input_tokens;
-                                summary.output_tokens += event.output_tokens;
-                                summary.event_count += 1;
-                            }
-                        },
-                    );
-
-                    {
-                        let mut count = sem.lock().unwrap();
-                        *count += 1;
-                    }
+    parallel_scan(&sessions, checkpoints, |path, offset| {
+        let _ = process_lines_streaming(path, offset, |line| {
+            if let Some(event) = parser.parse_line_with_ts(line, path) {
+                let ts = match parse_timestamp(&event.timestamp) {
+                    Some(t) => t,
+                    None => return,
+                };
+                if !filter_match(ts, filter) {
+                    return;
+                }
+                let mut s = summaries.lock().unwrap();
+                let summary = s.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
+                    model: event.model.clone(),
+                    ..Default::default()
                 });
+                summary.accumulate_with_ts(&event);
             }
-        }
+        });
     });
 
-    let summaries = Arc::try_unwrap(summaries).unwrap().into_inner().unwrap();
-    Ok(summaries)
+    Ok(summaries.into_inner().unwrap())
 }
 
 impl TrackerEngine {
@@ -450,6 +284,70 @@ impl TrackerEngine {
             result.session_count, result.total_files, result.checkpoints.len(), t_flush.elapsed().as_micros(), t_cold.elapsed().as_micros());
 
         Ok(result.summaries)
+    }
+
+    /// Cold start with time-bucket grouping (e.g. hourly/daily).
+    /// Streams events into buckets, saves checkpoints, and prints grouped summary.
+    pub fn cold_start_grouped<P>(
+        &mut self,
+        parser: &P,
+        root_dir: &str,
+        group_by: ReportGroupBy,
+    ) -> Result<(), Box<dyn std::error::Error>>
+    where
+        P: LogParser + LogParserWithTs + Sync,
+    {
+        let t_cold = Instant::now();
+        let sessions = parser.discover_sessions(root_dir);
+        if sessions.is_empty() {
+            println!("[clitrace] No usage data found.");
+            debug_log!("cold_start_grouped — 0 sessions ({}µs)", t_cold.elapsed().as_micros());
+            return Ok(());
+        }
+
+        let grouped: Mutex<HashMap<String, HashMap<String, ModelUsageSummary>>> =
+            Mutex::new(HashMap::new());
+        let cp_batch: Mutex<Vec<FileCheckpoint>> = Mutex::new(Vec::new());
+        let filter = ReportFilter::default();
+
+        parallel_scan(&sessions, &self.checkpoints, |path, offset| {
+            let result = process_lines_streaming(path, offset, |line| {
+                if let Some(event) = parser.parse_line_with_ts(line, path) {
+                    if let Some(bucket) = bucket_from_timestamp_filtered(&event.timestamp, group_by, filter) {
+                        let mut g = grouped.lock().unwrap();
+                        let by_model = g.entry(bucket).or_insert_with(HashMap::new);
+                        let summary = by_model.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
+                            model: event.model.clone(),
+                            ..Default::default()
+                        });
+                        summary.accumulate_with_ts(&event);
+                    }
+                }
+            });
+            if let Ok(Some((_bytes, last_line_len, last_line_hash))) = result {
+                cp_batch.lock().unwrap().push(FileCheckpoint {
+                    file_path: path.to_string(),
+                    last_line_len,
+                    last_line_hash,
+                });
+            }
+        });
+
+        // Save checkpoints
+        let batch = cp_batch.into_inner().unwrap();
+        if !batch.is_empty() {
+            for cp in &batch {
+                self.checkpoints.insert(cp.file_path.clone(), cp.clone());
+            }
+            let t_flush = Instant::now();
+            self.db.flush_checkpoints(&batch)?;
+            debug_log!("cold_start_grouped — {} checkpoints flushed ({}µs)",
+                batch.len(), t_flush.elapsed().as_micros());
+        }
+
+        print_grouped_summary(&grouped.into_inner().unwrap());
+        debug_log!("cold_start_grouped — ({}µs)", t_cold.elapsed().as_micros());
+        Ok(())
     }
 
     /// Process a single file change (watch mode).
@@ -658,44 +556,96 @@ impl TrackerEngine {
     }
 }
 
-/// Process a single file during cold start (called from scoped threads).
-/// Uses streaming line reader to avoid holding all lines in memory.
-/// Returns (events, last_line_len, last_line_hash) or None if no new data.
-fn process_file_cold(
-    path: &str,
-    parser: &(dyn LogParser + Sync),
-    checkpoints: &HashMap<String, FileCheckpoint>,
-) -> Result<Option<(Vec<UsageEvent>, u64, u64)>, Box<dyn std::error::Error>> {
-    // Determine offset
-    let offset = match checkpoints.get(path) {
-        None => 0,
-        Some(cp) => find_resume_offset(path, cp)
-            .unwrap_or(None)
-            .unwrap_or(0),
-    };
-
-    let mut events = Vec::new();
-    let result = process_lines_streaming(path, offset, |line| {
-        if let Some(event) = parser.parse_line(line, path) {
-            events.push(event);
-        }
-    })?;
-
-    match result {
-        Some((_bytes, last_line_len, last_line_hash)) => {
-            Ok(Some((events, last_line_len, last_line_hash)))
-        }
-        None => Ok(None),
-    }
-}
-
-/// Process a single file during cold start with timestamps (incremental only).
-/// If no checkpoint exists or resume line is missing, returns None (no full rescan).
 fn resolve_offset(path: &str, checkpoints: &HashMap<String, FileCheckpoint>) -> u64 {
     match checkpoints.get(path) {
         None => 0,
         Some(cp) => find_resume_offset(path, cp).ok().flatten().unwrap_or(0),
     }
+}
+
+/// Common parallel file scan over all sessions.
+/// Resolves checkpoint offsets and runs `on_file(path, offset)` in parallel threads.
+fn parallel_scan<F>(
+    sessions: &[crate::common::types::SessionGroup],
+    checkpoints: &HashMap<String, FileCheckpoint>,
+    on_file: F,
+)
+where
+    F: Fn(&str, u64) + Sync,
+{
+    let max_threads = num_cpus::get();
+    let semaphore = Mutex::new(max_threads);
+
+    std::thread::scope(|s| {
+        for session in sessions {
+            let mut files: Vec<&std::path::Path> = vec![session.parent_jsonl.as_path()];
+            for sub in &session.subagent_jsonls {
+                files.push(sub.as_path());
+            }
+
+            for file_path in files {
+                let sem = &semaphore;
+                let on_file = &on_file;
+                s.spawn(move || {
+                    {
+                        let mut count = sem.lock().unwrap();
+                        while *count == 0 {
+                            drop(count);
+                            std::thread::yield_now();
+                            count = sem.lock().unwrap();
+                        }
+                        *count -= 1;
+                    }
+
+                    let path_str = file_path.to_string_lossy().to_string();
+                    let offset = resolve_offset(&path_str, checkpoints);
+                    on_file(&path_str, offset);
+
+                    {
+                        let mut count = sem.lock().unwrap();
+                        *count += 1;
+                    }
+                });
+            }
+        }
+    });
+}
+
+/// Print grouped summary (shared by report and trace grouped outputs).
+fn print_grouped_summary(grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>) {
+    if grouped.is_empty() {
+        println!("[clitrace] No usage data found.");
+        return;
+    }
+
+    let mut buckets: Vec<_> = grouped.keys().cloned().collect();
+    buckets.sort();
+
+    for bucket in buckets {
+        println!("[clitrace] ═══════════════════════════════════════════");
+        println!("[clitrace] Token Usage Summary ({})", bucket);
+        if let Some(models) = grouped.get(&bucket) {
+            let mut sorted: Vec<_> = models.values().collect();
+            sorted.sort_by(|a, b| b.event_count.cmp(&a.event_count));
+
+            for s in &sorted {
+                println!("[clitrace] ───────────────────────────────────────────");
+                println!("[clitrace] Model: {}", s.model);
+                println!(
+                    "[clitrace]   Input: {:>12} | Cache Create: {:>12}",
+                    format_number(s.input_tokens),
+                    format_number(s.cache_creation_input_tokens),
+                );
+                println!(
+                    "[clitrace]   Cache Read: {:>8} | Output: {:>12}",
+                    format_number(s.cache_read_input_tokens),
+                    format_number(s.output_tokens),
+                );
+                println!("[clitrace]   Events: {}", s.event_count);
+            }
+        }
+    }
+    println!("[clitrace] ═══════════════════════════════════════════");
 }
 
 fn filter_active(filter: ReportFilter) -> bool {

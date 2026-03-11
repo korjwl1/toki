@@ -12,7 +12,7 @@ pub use config::Config;
 use std::thread::JoinHandle;
 
 use db::Database;
-use engine::TrackerEngine;
+use engine::{ReportGroupBy, TrackerEngine};
 use providers::claude_code::ClaudeCodeParser;
 
 /// Running clitrace instance handle.
@@ -48,7 +48,7 @@ impl Drop for Handle {
 
 /// Start clitrace: cold start scan, then enter watch mode.
 /// Returns a Handle to control the running instance.
-pub fn start(config: Config) -> Result<Handle, ClitraceError> {
+pub fn start(config: Config, startup_group_by: Option<ReportGroupBy>) -> Result<Handle, ClitraceError> {
     let db = Database::open(&config.db_path).map_err(|e| ClitraceError::Db(e.into()))?;
 
     // Full rescan: clear checkpoints.
@@ -65,7 +65,11 @@ pub fn start(config: Config) -> Result<Handle, ClitraceError> {
 
     // Cold start
     println!("[clitrace] Running initial scan...");
-    if let Err(e) = engine.cold_start(&parser, &root_dir) {
+    if let Some(group_by) = startup_group_by {
+        if let Err(e) = engine.cold_start_grouped(&parser, &root_dir, group_by) {
+            eprintln!("[clitrace] Cold start error: {}", e);
+        }
+    } else if let Err(e) = engine.cold_start(&parser, &root_dir) {
         eprintln!("[clitrace] Cold start error: {}", e);
     }
 

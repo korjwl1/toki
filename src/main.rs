@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Weekday};
 use clitrace::Config;
 use fs2::FileExt;
@@ -33,6 +33,9 @@ enum Commands {
         /// Clear checkpoints and perform full rescan on startup
         #[arg(long)]
         full_rescan: bool,
+        /// Group startup summary by time period: hour, day, week, month, year
+        #[arg(long = "startup-group-by")]
+        startup_group_by: Option<String>,
     },
     /// Report mode: one-shot summary without writing checkpoints.
     Report {
@@ -50,22 +53,49 @@ enum Commands {
     },
 }
 
+#[derive(Args, Clone)]
+struct ReportFilterArgs {
+    /// Filter start time (inclusive, UTC): YYYYMMDD or YYYYMMDDhhmmss
+    #[arg(long)]
+    since: Option<String>,
+    /// Filter end time (inclusive, UTC): YYYYMMDD or YYYYMMDDhhmmss
+    #[arg(long)]
+    until: Option<String>,
+    /// Allow full scan without --since (for hourly/daily/weekly)
+    #[arg(long)]
+    from_beginning: bool,
+}
+
 #[derive(Subcommand)]
 enum ReportCommands {
     /// Group summary by day.
-    Daily,
+    Daily {
+        #[command(flatten)]
+        filter: ReportFilterArgs,
+    },
     /// Group summary by week.
     Weekly {
         /// Start of week: mon, tue, wed, thu, fri, sat, sun
         #[arg(long = "start-of-week", short = 'w')]
         start_of_week: Option<String>,
+        #[command(flatten)]
+        filter: ReportFilterArgs,
     },
     /// Group summary by month.
-    Monthly,
+    Monthly {
+        #[command(flatten)]
+        filter: ReportFilterArgs,
+    },
     /// Group summary by year.
-    Yearly,
+    Yearly {
+        #[command(flatten)]
+        filter: ReportFilterArgs,
+    },
     /// Group summary by hour.
-    Hourly,
+    Hourly {
+        #[command(flatten)]
+        filter: ReportFilterArgs,
+    },
 }
 
 fn parse_range_arg(value: &str, is_until: bool) -> Result<NaiveDateTime, String> {
@@ -133,10 +163,36 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Trace { claude_root, db_path, full_rescan } => {
+        Commands::Trace { claude_root, db_path, full_rescan, startup_group_by } => {
             let mut config = build_config(claude_root, db_path);
             if full_rescan {
                 config = config.with_full_rescan(true);
+            }
+
+            // Parse --startup-group-by
+            let group_by = match startup_group_by.as_deref() {
+                Some("hour") => Some(clitrace::engine::ReportGroupBy::Hour),
+                Some("day") => Some(clitrace::engine::ReportGroupBy::Date),
+                Some("week") => Some(clitrace::engine::ReportGroupBy::Week { start_of_week: Weekday::Mon }),
+                Some("month") => Some(clitrace::engine::ReportGroupBy::Month),
+                Some("year") => Some(clitrace::engine::ReportGroupBy::Year),
+                Some(v) => {
+                    eprintln!("[clitrace] Invalid --startup-group-by: {} (use hour|day|week|month|year)", v);
+                    std::process::exit(1);
+                }
+                None => None,
+            };
+
+            // Guard: hour requires existing checkpoints and cannot be used with --full-rescan
+            if matches!(group_by, Some(clitrace::engine::ReportGroupBy::Hour)) {
+                if full_rescan {
+                    eprintln!("[clitrace] --startup-group-by hour cannot be used with --full-rescan");
+                    std::process::exit(1);
+                }
+                if !config.db_path.exists() {
+                    eprintln!("[clitrace] --startup-group-by hour requires existing checkpoints (run trace once first)");
+                    std::process::exit(1);
+                }
             }
 
             let _lock = match acquire_trace_lock(&config.db_path) {
@@ -151,7 +207,7 @@ fn main() {
             println!("[clitrace] Claude Code root: {}", config.claude_code_root);
             println!("[clitrace] Database: {}", config.db_path.display());
 
-            let handle = match clitrace::start(config) {
+            let handle = match clitrace::start(config, group_by) {
                 Ok(h) => h,
                 Err(e) => {
                     eprintln!("[clitrace] Failed to start: {}", e);
@@ -181,7 +237,99 @@ fn main() {
             println!("[clitrace] Claude Code root: {}", config.claude_code_root);
 
             let parser = clitrace::providers::claude_code::ClaudeCodeParser;
-            let since_dt = match since.as_deref() {
+
+            let command = match command {
+                Some(cmd) => cmd,
+                None => {
+                    // No subcommand: total report (with optional since/until filter)
+                    let since_dt = match since.as_deref() {
+                        Some(v) => match parse_range_arg(v, false) {
+                            Ok(dt) => Some(dt),
+                            Err(e) => {
+                                eprintln!("[clitrace] Invalid --since: {} ({})", v, e);
+                                std::process::exit(1);
+                            }
+                        },
+                        None => None,
+                    };
+                    let until_dt = match until.as_deref() {
+                        Some(v) => match parse_range_arg(v, true) {
+                            Ok(dt) => Some(dt),
+                            Err(e) => {
+                                eprintln!("[clitrace] Invalid --until: {} ({})", v, e);
+                                std::process::exit(1);
+                            }
+                        },
+                        None => None,
+                    };
+                    if let (Some(s), Some(u)) = (since_dt, until_dt) {
+                        if u < s {
+                            eprintln!("[clitrace] Invalid range: --until is earlier than --since");
+                            std::process::exit(1);
+                        }
+                    }
+
+                    if since_dt.is_some() || until_dt.is_some() {
+                        let filter = clitrace::engine::ReportFilter { since: since_dt, until: until_dt };
+                        let db = match clitrace::db::Database::open(&config.db_path) {
+                            Ok(db) => db,
+                            Err(e) => {
+                                eprintln!("[clitrace] Failed to open DB: {}", e);
+                                std::process::exit(1);
+                            }
+                        };
+                        let mut checkpoints = std::collections::HashMap::new();
+                        if let Ok(cps) = db.load_all_checkpoints() {
+                            for cp in cps {
+                                checkpoints.insert(cp.file_path.clone(), cp);
+                            }
+                        }
+                        match clitrace::engine::cold_start_report_filtered(
+                            &parser,
+                            &config.claude_code_root,
+                            &checkpoints,
+                            filter,
+                        ) {
+                            Ok(summaries) => clitrace::engine::print_summary(&summaries),
+                            Err(e) => {
+                                eprintln!("[clitrace] Report failed: {}", e);
+                                std::process::exit(1);
+                            }
+                        }
+                    } else if let Err(e) = clitrace::engine::cold_start_report(&parser, &config.claude_code_root) {
+                        eprintln!("[clitrace] Report failed: {}", e);
+                        std::process::exit(1);
+                    }
+                    return;
+                }
+            };
+
+            // Extract filter args and group_by from subcommand
+            let (filter_args, group_by) = match &command {
+                ReportCommands::Hourly { filter } => (filter.clone(), clitrace::engine::ReportGroupBy::Hour),
+                ReportCommands::Daily { filter } => (filter.clone(), clitrace::engine::ReportGroupBy::Date),
+                ReportCommands::Weekly { start_of_week, filter } => {
+                    let start = match start_of_week.as_deref().unwrap_or("mon") {
+                        "mon" => Weekday::Mon,
+                        "tue" => Weekday::Tue,
+                        "wed" => Weekday::Wed,
+                        "thu" => Weekday::Thu,
+                        "fri" => Weekday::Fri,
+                        "sat" => Weekday::Sat,
+                        "sun" => Weekday::Sun,
+                        _ => {
+                            eprintln!("[clitrace] Invalid start-of-week (use mon|tue|wed|thu|fri|sat|sun)");
+                            std::process::exit(1);
+                        }
+                    };
+                    (filter.clone(), clitrace::engine::ReportGroupBy::Week { start_of_week: start })
+                }
+                ReportCommands::Monthly { filter } => (filter.clone(), clitrace::engine::ReportGroupBy::Month),
+                ReportCommands::Yearly { filter } => (filter.clone(), clitrace::engine::ReportGroupBy::Year),
+            };
+
+            // Parse filter values
+            let since_dt = match filter_args.since.as_deref() {
                 Some(v) => match parse_range_arg(v, false) {
                     Ok(dt) => Some(dt),
                     Err(e) => {
@@ -191,7 +339,7 @@ fn main() {
                 },
                 None => None,
             };
-            let until_dt = match until.as_deref() {
+            let until_dt = match filter_args.until.as_deref() {
                 Some(v) => match parse_range_arg(v, true) {
                     Ok(dt) => Some(dt),
                     Err(e) => {
@@ -207,82 +355,40 @@ fn main() {
                     std::process::exit(1);
                 }
             }
-            let filter = clitrace::engine::ReportFilter { since: since_dt, until: until_dt };
-            let group_by = match command {
-                Some(ReportCommands::Daily) => Some(clitrace::engine::ReportGroupBy::Date),
-                Some(ReportCommands::Monthly) => Some(clitrace::engine::ReportGroupBy::Month),
-                Some(ReportCommands::Yearly) => Some(clitrace::engine::ReportGroupBy::Year),
-                Some(ReportCommands::Hourly) => Some(clitrace::engine::ReportGroupBy::Hour),
-                Some(ReportCommands::Weekly { start_of_week }) => {
-                    let start = match start_of_week.as_deref().unwrap_or("mon") {
-                        "mon" => Weekday::Mon,
-                        "tue" => Weekday::Tue,
-                        "wed" => Weekday::Wed,
-                        "thu" => Weekday::Thu,
-                        "fri" => Weekday::Fri,
-                        "sat" => Weekday::Sat,
-                        "sun" => Weekday::Sun,
-                        _ => {
-                            eprintln!("[clitrace] Invalid start-of-week (use mon|tue|wed|thu|fri|sat|sun)");
-                            std::process::exit(1);
-                        }
-                    };
-                    Some(clitrace::engine::ReportGroupBy::Week { start_of_week: start })
-                }
-                None => None,
-            };
 
-            if let Some(group_by) = group_by {
-                let db = match clitrace::db::Database::open(&config.db_path) {
-                    Ok(db) => db,
-                    Err(e) => {
-                        eprintln!("[clitrace] Failed to open DB: {}", e);
-                        std::process::exit(1);
-                    }
-                };
-                let mut checkpoints = std::collections::HashMap::new();
-                if let Ok(cps) = db.load_all_checkpoints() {
-                    for cp in cps {
-                        checkpoints.insert(cp.file_path.clone(), cp);
-                    }
-                }
-                if let Err(e) = clitrace::engine::cold_start_report_grouped(
-                    &parser,
-                    &config.claude_code_root,
-                    group_by,
-                    &checkpoints,
-                    filter,
-                ) {
-                    eprintln!("[clitrace] Report failed: {}", e);
+            // Guard: hourly/daily/weekly require --since or --from-beginning
+            let requires_range = matches!(
+                group_by,
+                clitrace::engine::ReportGroupBy::Hour
+                    | clitrace::engine::ReportGroupBy::Date
+                    | clitrace::engine::ReportGroupBy::Week { .. }
+            );
+            if requires_range && !filter_args.from_beginning && since_dt.is_none() {
+                eprintln!("[clitrace] hourly/daily/weekly requires --since or --from-beginning");
+                std::process::exit(1);
+            }
+
+            let filter = clitrace::engine::ReportFilter { since: since_dt, until: until_dt };
+            let db = match clitrace::db::Database::open(&config.db_path) {
+                Ok(db) => db,
+                Err(e) => {
+                    eprintln!("[clitrace] Failed to open DB: {}", e);
                     std::process::exit(1);
                 }
-            } else if filter.since.is_some() || filter.until.is_some() {
-                let db = match clitrace::db::Database::open(&config.db_path) {
-                    Ok(db) => db,
-                    Err(e) => {
-                        eprintln!("[clitrace] Failed to open DB: {}", e);
-                        std::process::exit(1);
-                    }
-                };
-                let mut checkpoints = std::collections::HashMap::new();
-                if let Ok(cps) = db.load_all_checkpoints() {
-                    for cp in cps {
-                        checkpoints.insert(cp.file_path.clone(), cp);
-                    }
+            };
+            let mut checkpoints = std::collections::HashMap::new();
+            if let Ok(cps) = db.load_all_checkpoints() {
+                for cp in cps {
+                    checkpoints.insert(cp.file_path.clone(), cp);
                 }
-                match clitrace::engine::cold_start_report_filtered(
-                    &parser,
-                    &config.claude_code_root,
-                    &checkpoints,
-                    filter,
-                ) {
-                    Ok(summaries) => clitrace::engine::print_summary(&summaries),
-                    Err(e) => {
-                        eprintln!("[clitrace] Report failed: {}", e);
-                        std::process::exit(1);
-                    }
-                }
-            } else if let Err(e) = clitrace::engine::cold_start_report(&parser, &config.claude_code_root) {
+            }
+            if let Err(e) = clitrace::engine::cold_start_report_grouped(
+                &parser,
+                &config.claude_code_root,
+                group_by,
+                &checkpoints,
+                filter,
+            ) {
                 eprintln!("[clitrace] Report failed: {}", e);
                 std::process::exit(1);
             }

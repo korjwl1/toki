@@ -15,27 +15,46 @@ cargo run --release -- trace
 `trace` 모드는 동일 DB 경로 기준 단일 인스턴스만 허용한다.
 전체 재스캔이 필요하면 `--full-rescan`을 사용한다.
 
+```bash
+# 시작 시 일별 그룹핑으로 요약 출력
+cargo run --release -- trace --startup-group-by day
+
+# 시작 시 시간별 그룹핑 (체크포인트 필수, --full-rescan 불가)
+cargo run --release -- trace --startup-group-by hour
+```
+
+Trace 옵션:
+- `--startup-group-by hour|day|week|month|year`: cold start 시 시간 단위 그룹핑 요약
+  - `hour`는 기존 체크포인트가 있어야 사용 가능 (증분 데이터만 출력)
+  - `hour`는 `--full-rescan`과 함께 사용 불가
+
 ### Report 모드 (one-shot)
 
 ```bash
 cargo run --release -- report
-cargo run --release -- report daily
-cargo run --release -- report weekly
-cargo run --release -- report weekly --start-of-week tue
-cargo run --release -- report monthly
-cargo run --release -- report yearly
-cargo run --release -- report hourly
+cargo run --release -- report --since 20260301
 cargo run --release -- report --since 20260301 --until 20260331
+cargo run --release -- report monthly
+cargo run --release -- report monthly --since 20260301
+cargo run --release -- report yearly
+cargo run --release -- report daily --since 20260301
+cargo run --release -- report daily --from-beginning
+cargo run --release -- report weekly --since 20260301 --start-of-week tue
 cargo run --release -- report hourly --since 20260301
+cargo run --release -- report hourly --from-beginning
 ```
 
 Report 옵션:
+- 서브커맨드 없이 실행하면 전체 총합 출력 (`--since`/`--until` 선택적)
 - 서브커맨드: `daily | weekly | monthly | yearly | hourly`
+  - `hourly`, `daily`, `weekly`는 `--since` 또는 `--from-beginning` 필수
+  - `monthly`, `yearly`는 제한 없음
   - `--start-of-week`는 `weekly`에서만 사용 가능
 - `--since` (inclusive, UTC, `>=`): `YYYYMMDD` 또는 `YYYYMMDDhhmmss`
   - `YYYYMMDD`는 해당 날짜의 `00:00:00` UTC로 해석
 - `--until` (inclusive, UTC, `<=`): `YYYYMMDD` 또는 `YYYYMMDDhhmmss`
   - `YYYYMMDD`는 해당 날짜의 `23:59:59` UTC로 해석
+- `--from-beginning`: `--since` 없이 전체 데이터 그룹핑 허용
 
 ### 환경변수 오버라이드
 
@@ -61,7 +80,7 @@ fn main() {
     let config = Config::new()
         .with_claude_root("/custom/path/.claude".to_string());
 
-    let handle = start(config).expect("Failed to start clitrace");
+    let handle = start(config, None).expect("Failed to start clitrace");
 
     // ... 호스트 애플리케이션 로직 ...
 
@@ -173,9 +192,8 @@ flowchart LR
         end
     end
 
-    scope --> merge["Merge → ModelUsageSummary"]
-    merge --> print["print_summary()"]
-    merge --> flush2["flush_checkpoints()"]
+    scope --> print["print_summary() / print_grouped_summary()"]
+    scope --> flush2["flush_checkpoints()"]
 ```
 
 ### Active/Idle 파일 분류 & 체크포인트
@@ -283,7 +301,7 @@ flowchart LR
 |------|------|--------|------|
 | `claude_code_root` | String | `~/.claude` | 루트 디렉토리 |
 | `db_path` | PathBuf | `~/.config/clitrace/clitrace.db` | DB 파일 경로 |
-| `poll_interval_secs` | u64 | 30 | 백업 폴링 간격 |
+| `full_rescan` | bool | false | 시작 시 체크포인트 초기화 |
 
 설정 우선순위: **환경변수** > **DB settings 테이블** > **기본값**
 
