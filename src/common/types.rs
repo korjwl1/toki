@@ -13,6 +13,19 @@ pub struct UsageEvent {
     pub output_tokens: u64,
 }
 
+/// A single usage event with timestamp.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsageEventWithTs {
+    pub event_key: String,
+    pub source_file: String,
+    pub model: String,
+    pub input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    pub output_tokens: u64,
+    pub timestamp: String,
+}
+
 /// File checkpoint for incremental reading.
 /// Uses line-length pre-filter + xxHash3-64 for fast reverse-scan matching.
 /// No byte offset stored — immune to compaction shifting file contents.

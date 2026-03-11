@@ -1,4 +1,4 @@
-use crate::common::types::{LogParser, SessionGroup, UsageEvent};
+use crate::common::types::{LogParser, SessionGroup, UsageEvent, UsageEventWithTs};
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -32,6 +32,13 @@ struct UsageData {
     output_tokens: u64,
 }
 
+struct ParsedLine<'a> {
+    message_id: &'a str,
+    model: &'a str,
+    timestamp: &'a str,
+    usage: UsageData,
+}
+
 pub struct ClaudeCodeParser;
 
 impl ClaudeCodeParser {
@@ -46,10 +53,8 @@ impl ClaudeCodeParser {
             part.len() == len && part.chars().all(|c| c.is_ascii_hexdigit())
         })
     }
-}
 
-impl LogParser for ClaudeCodeParser {
-    fn parse_line(&self, line: &str, source_file: &str) -> Option<UsageEvent> {
+    fn parse_line_common<'a>(&self, line: &'a str) -> Option<ParsedLine<'a>> {
         // Pre-filter: skip lines that can't be assistant type
         if !line.contains("\"assistant\"") {
             return None;
@@ -64,20 +69,46 @@ impl LogParser for ClaudeCodeParser {
         let msg = parsed.message?;
         let usage = msg.usage?;
 
-        let event_key = format!(
-            "{}:{}",
-            msg.id.unwrap_or(""),
-            parsed.timestamp.unwrap_or(""),
-        );
+        Some(ParsedLine {
+            message_id: msg.id.unwrap_or(""),
+            model: msg.model.unwrap_or("unknown"),
+            timestamp: parsed.timestamp.unwrap_or(""),
+            usage,
+        })
+    }
+
+    pub fn parse_line_with_ts(&self, line: &str, source_file: &str) -> Option<UsageEventWithTs> {
+        let parsed = self.parse_line_common(line)?;
+
+        let event_key = format!("{}:{}", parsed.message_id, parsed.timestamp);
+
+        Some(UsageEventWithTs {
+            event_key,
+            source_file: source_file.to_string(),
+            model: parsed.model.to_string(),
+            input_tokens: parsed.usage.input_tokens,
+            cache_creation_input_tokens: parsed.usage.cache_creation_input_tokens,
+            cache_read_input_tokens: parsed.usage.cache_read_input_tokens,
+            output_tokens: parsed.usage.output_tokens,
+            timestamp: parsed.timestamp.to_string(),
+        })
+    }
+}
+
+impl LogParser for ClaudeCodeParser {
+    fn parse_line(&self, line: &str, source_file: &str) -> Option<UsageEvent> {
+        let parsed = self.parse_line_common(line)?;
+
+        let event_key = format!("{}:{}", parsed.message_id, parsed.timestamp);
 
         Some(UsageEvent {
             event_key,
             source_file: source_file.to_string(),
-            model: msg.model.unwrap_or("unknown").to_string(),
-            input_tokens: usage.input_tokens,
-            cache_creation_input_tokens: usage.cache_creation_input_tokens,
-            cache_read_input_tokens: usage.cache_read_input_tokens,
-            output_tokens: usage.output_tokens,
+            model: parsed.model.to_string(),
+            input_tokens: parsed.usage.input_tokens,
+            cache_creation_input_tokens: parsed.usage.cache_creation_input_tokens,
+            cache_read_input_tokens: parsed.usage.cache_read_input_tokens,
+            output_tokens: parsed.usage.output_tokens,
         })
     }
 
@@ -153,6 +184,21 @@ mod tests {
         assert_eq!(event.cache_creation_input_tokens, 5139);
         assert_eq!(event.cache_read_input_tokens, 9631);
         assert_eq!(event.output_tokens, 14);
+        assert_eq!(event.event_key, "msg_123:2026-03-08T12:00:00Z");
+    }
+
+    #[test]
+    fn test_parse_assistant_line_with_ts() {
+        let line = r#"{"type":"assistant","message":{"id":"msg_123","model":"claude-opus-4-6","usage":{"input_tokens":3,"cache_creation_input_tokens":5139,"cache_read_input_tokens":9631,"output_tokens":14}},"timestamp":"2026-03-08T12:00:00Z"}"#;
+        let parser = ClaudeCodeParser;
+        let event = parser.parse_line_with_ts(line, "/test/file.jsonl").unwrap();
+
+        assert_eq!(event.model, "claude-opus-4-6");
+        assert_eq!(event.input_tokens, 3);
+        assert_eq!(event.cache_creation_input_tokens, 5139);
+        assert_eq!(event.cache_read_input_tokens, 9631);
+        assert_eq!(event.output_tokens, 14);
+        assert_eq!(event.timestamp, "2026-03-08T12:00:00Z");
         assert_eq!(event.event_key, "msg_123:2026-03-08T12:00:00Z");
     }
 

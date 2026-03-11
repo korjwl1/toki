@@ -6,7 +6,7 @@ pub mod checkpoint;
 pub mod platform;
 pub mod providers;
 
-pub use common::types::{UsageEvent, ModelUsageSummary, SessionGroup, ClitraceError};
+pub use common::types::{UsageEvent, UsageEventWithTs, ModelUsageSummary, SessionGroup, ClitraceError};
 pub use config::Config;
 
 use std::thread::JoinHandle;
