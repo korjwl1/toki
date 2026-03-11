@@ -68,10 +68,16 @@ impl ClaudeCodeParser {
 
         let msg = parsed.message?;
         let usage = msg.usage?;
+        let model = msg.model.unwrap_or("unknown");
+
+        // Skip synthetic events (internally generated, no real API call)
+        if model == "<synthetic>" {
+            return None;
+        }
 
         Some(ParsedLine {
             message_id: msg.id.unwrap_or(""),
-            model: msg.model.unwrap_or("unknown"),
+            model,
             timestamp: parsed.timestamp.unwrap_or(""),
             usage,
         })
@@ -219,6 +225,14 @@ mod tests {
         // file-history-snapshot type
         let line = r#"{"type":"file-history-snapshot","messageId":"abc","snapshot":{}}"#;
         assert!(parser.parse_line(line, "/test.jsonl").is_none());
+    }
+
+    #[test]
+    fn test_skip_synthetic_model() {
+        let parser = ClaudeCodeParser;
+        let line = r#"{"type":"assistant","message":{"id":"msg_syn","model":"<synthetic>","usage":{"input_tokens":0,"output_tokens":0}},"timestamp":"2026-03-08T12:00:00Z"}"#;
+        assert!(parser.parse_line(line, "/test.jsonl").is_none());
+        assert!(parser.parse_line_with_ts_inner(line, "/test.jsonl").is_none());
     }
 
     #[test]
