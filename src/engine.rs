@@ -206,128 +206,6 @@ pub fn cold_start_report_grouped<P>(
     parser: &P,
     root_dir: &str,
     group_by: ReportGroupBy,
-) -> Result<(), Box<dyn std::error::Error>>
-where
-    P: LogParser + LogParserWithTs + Sync,
-{
-    let sessions = parser.discover_sessions(root_dir);
-    if sessions.is_empty() {
-        println!("[clitrace] No usage data found.");
-        return Ok(());
-    }
-
-    let max_threads = num_cpus::get();
-    let semaphore = Arc::new(Mutex::new(max_threads));
-
-    let all_results: Arc<Mutex<Vec<Vec<UsageEventWithTs>>>> =
-        Arc::new(Mutex::new(Vec::new()));
-
-    std::thread::scope(|s| {
-        for session in &sessions {
-            let mut files: Vec<&std::path::Path> = vec![session.parent_jsonl.as_path()];
-            for sub in &session.subagent_jsonls {
-                files.push(sub.as_path());
-            }
-
-            for file_path in files {
-                let sem = Arc::clone(&semaphore);
-                let results = Arc::clone(&all_results);
-
-                s.spawn(move || {
-                    {
-                        let mut count = sem.lock().unwrap();
-                        while *count == 0 {
-                            drop(count);
-                            std::thread::yield_now();
-                            count = sem.lock().unwrap();
-                        }
-                        *count -= 1;
-                    }
-
-                    let path_str = file_path.to_string_lossy().to_string();
-                    let mut events: Vec<UsageEventWithTs> = Vec::new();
-                    if let Ok(Some((_bytes, _len, _hash))) = process_lines_streaming(&path_str, 0, |line| {
-                        if let Some(event) = parser.parse_line_with_ts(line, &path_str) {
-                            events.push(event);
-                        }
-                    }) {
-                        let mut r = results.lock().unwrap();
-                        r.push(events);
-                    }
-
-                    {
-                        let mut count = sem.lock().unwrap();
-                        *count += 1;
-                    }
-                });
-            }
-        }
-    });
-
-    let results = Arc::try_unwrap(all_results).unwrap().into_inner().unwrap();
-
-    let mut grouped: HashMap<String, HashMap<String, ModelUsageSummary>> = HashMap::new();
-    for batch in results {
-        for event in batch {
-            let ts = match parse_timestamp(&event.timestamp) {
-                Some(t) => t,
-                None => continue,
-            };
-            let bucket = bucket_from_datetime(ts, group_by);
-            let by_model = grouped.entry(bucket).or_insert_with(HashMap::new);
-            let summary = by_model.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
-                model: event.model.clone(),
-                ..Default::default()
-            });
-            summary.input_tokens += event.input_tokens;
-            summary.cache_creation_input_tokens += event.cache_creation_input_tokens;
-            summary.cache_read_input_tokens += event.cache_read_input_tokens;
-            summary.output_tokens += event.output_tokens;
-            summary.event_count += 1;
-        }
-    }
-
-    if grouped.is_empty() {
-        println!("[clitrace] No usage data found.");
-        return Ok(());
-    }
-
-    let mut buckets: Vec<_> = grouped.keys().cloned().collect();
-    buckets.sort();
-
-    for bucket in buckets {
-        println!("[clitrace] ═══════════════════════════════════════════");
-        println!("[clitrace] Token Usage Summary ({})", bucket);
-        if let Some(models) = grouped.get(&bucket) {
-            let mut sorted: Vec<_> = models.values().collect();
-            sorted.sort_by(|a, b| b.event_count.cmp(&a.event_count));
-
-            for s in &sorted {
-                println!("[clitrace] ───────────────────────────────────────────");
-                println!("[clitrace] Model: {}", s.model);
-                println!(
-                    "[clitrace]   Input: {:>12} | Cache Create: {:>12}",
-                    format_number(s.input_tokens),
-                    format_number(s.cache_creation_input_tokens),
-                );
-                println!(
-                    "[clitrace]   Cache Read: {:>8} | Output: {:>12}",
-                    format_number(s.cache_read_input_tokens),
-                    format_number(s.output_tokens),
-                );
-                println!("[clitrace]   Events: {}", s.event_count);
-            }
-        }
-    }
-
-    println!("[clitrace] ═══════════════════════════════════════════");
-    Ok(())
-}
-
-pub fn cold_start_report_grouped_incremental<P>(
-    parser: &P,
-    root_dir: &str,
-    group_by: ReportGroupBy,
     checkpoints: &HashMap<String, FileCheckpoint>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
@@ -355,7 +233,6 @@ where
             for file_path in files {
                 let sem = Arc::clone(&semaphore);
                 let results = Arc::clone(&all_results);
-                let checkpoints = checkpoints;
 
                 s.spawn(move || {
                     {
@@ -742,14 +619,9 @@ fn process_file_cold_with_ts<P>(
 where
     P: LogParserWithTs + Sync,
 {
-    let cp = match checkpoints.get(path) {
-        None => return Ok(None),
-        Some(cp) => cp,
-    };
-
-    let offset = match find_resume_offset(path, cp)? {
-        Some(off) => off,
-        None => return Ok(None),
+    let offset = match checkpoints.get(path) {
+        None => 0,
+        Some(cp) => find_resume_offset(path, cp)?.unwrap_or(0),
     };
 
     let mut events = Vec::new();

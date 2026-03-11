@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -144,37 +143,24 @@ fn main() {
             };
 
             if let Some(group_by) = group_by {
-                if matches!(group_by, clitrace::engine::ReportGroupBy::Hour) {
-                    let db = match clitrace::db::Database::open(&config.db_path) {
-                        Ok(db) => db,
-                        Err(e) => {
-                            eprintln!("[clitrace] Failed to open DB: {}", e);
-                            std::process::exit(1);
-                        }
-                    };
-                    let mut checkpoints = HashMap::new();
-                    if let Ok(cps) = db.load_all_checkpoints() {
-                        for cp in cps {
-                            checkpoints.insert(cp.file_path.clone(), cp);
-                        }
-                    }
-                    if checkpoints.is_empty() {
-                        eprintln!("[clitrace] Hour report requires existing checkpoints. Run trace first.");
+                let db = match clitrace::db::Database::open(&config.db_path) {
+                    Ok(db) => db,
+                    Err(e) => {
+                        eprintln!("[clitrace] Failed to open DB: {}", e);
                         std::process::exit(1);
                     }
-                    if let Err(e) = clitrace::engine::cold_start_report_grouped_incremental(
-                        &parser,
-                        &config.claude_code_root,
-                        group_by,
-                        &checkpoints,
-                    ) {
-                        eprintln!("[clitrace] Report failed: {}", e);
-                        std::process::exit(1);
+                };
+                let mut checkpoints = std::collections::HashMap::new();
+                if let Ok(cps) = db.load_all_checkpoints() {
+                    for cp in cps {
+                        checkpoints.insert(cp.file_path.clone(), cp);
                     }
-                } else if let Err(e) = clitrace::engine::cold_start_report_grouped(
+                }
+                if let Err(e) = clitrace::engine::cold_start_report_grouped(
                     &parser,
                     &config.claude_code_root,
                     group_by,
+                    &checkpoints,
                 ) {
                     eprintln!("[clitrace] Report failed: {}", e);
                     std::process::exit(1);

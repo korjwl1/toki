@@ -49,6 +49,12 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn test_config_defaults() {
@@ -71,6 +77,7 @@ mod tests {
 
     #[test]
     fn test_config_db_override() {
+        let _guard = env_lock().lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let db = Database::open(&db_path).unwrap();
@@ -87,6 +94,7 @@ mod tests {
 
     #[test]
     fn test_config_env_overrides_db() {
+        let _guard = env_lock().lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let db = Database::open(&db_path).unwrap();
