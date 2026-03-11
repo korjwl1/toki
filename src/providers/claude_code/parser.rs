@@ -1,6 +1,36 @@
 use crate::common::types::{LogParser, SessionGroup, UsageEvent};
-use serde_json::Value;
+use serde::Deserialize;
 use std::path::PathBuf;
+
+/// Minimal struct for targeted deserialization.
+/// Only extracts fields we need — serde skips over content, thinking, etc.
+/// without heap-allocating them.
+#[derive(Deserialize)]
+struct JsonlLine<'a> {
+    #[serde(rename = "type")]
+    line_type: &'a str,
+    message: Option<MessagePartial<'a>>,
+    timestamp: Option<&'a str>,
+}
+
+#[derive(Deserialize)]
+struct MessagePartial<'a> {
+    id: Option<&'a str>,
+    model: Option<&'a str>,
+    usage: Option<UsageData>,
+}
+
+#[derive(Deserialize)]
+struct UsageData {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    cache_creation_input_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+}
 
 pub struct ClaudeCodeParser;
 
@@ -20,45 +50,34 @@ impl ClaudeCodeParser {
 
 impl LogParser for ClaudeCodeParser {
     fn parse_line(&self, line: &str, source_file: &str) -> Option<UsageEvent> {
-        let v: Value = serde_json::from_str(line).ok()?;
-
-        // Only process "assistant" type lines
-        if v.get("type")?.as_str()? != "assistant" {
+        // Pre-filter: skip lines that can't be assistant type
+        if !line.contains("\"assistant\"") {
             return None;
         }
 
-        let msg = v.get("message")?;
-        let usage = msg.get("usage")?;
+        let parsed: JsonlLine = serde_json::from_str(line).ok()?;
 
-        let input_tokens = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-        let cache_creation_input_tokens = usage
-            .get("cache_creation_input_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let cache_read_input_tokens = usage
-            .get("cache_read_input_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let output_tokens = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+        if parsed.line_type != "assistant" {
+            return None;
+        }
 
-        let model = msg
-            .get("model")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string();
+        let msg = parsed.message?;
+        let usage = msg.usage?;
 
-        let message_id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        let timestamp = v.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
-        let event_key = format!("{}:{}", message_id, timestamp);
+        let event_key = format!(
+            "{}:{}",
+            msg.id.unwrap_or(""),
+            parsed.timestamp.unwrap_or(""),
+        );
 
         Some(UsageEvent {
             event_key,
             source_file: source_file.to_string(),
-            model,
-            input_tokens,
-            cache_creation_input_tokens,
-            cache_read_input_tokens,
-            output_tokens,
+            model: msg.model.unwrap_or("unknown").to_string(),
+            input_tokens: usage.input_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            cache_read_input_tokens: usage.cache_read_input_tokens,
+            output_tokens: usage.output_tokens,
         })
     }
 
