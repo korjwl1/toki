@@ -6,6 +6,7 @@ use crate::db::Database;
 pub struct Config {
     pub claude_code_root: String,
     pub db_path: PathBuf,
+    pub full_rescan: bool,
 }
 
 impl Config {
@@ -15,6 +16,7 @@ impl Config {
         Config {
             claude_code_root: home.join(".claude").to_string_lossy().to_string(),
             db_path: home.join(".config").join("clitrace").join("clitrace.db"),
+            full_rescan: false,
         }
     }
 
@@ -25,6 +27,11 @@ impl Config {
 
     pub fn with_db_path(mut self, path: PathBuf) -> Self {
         self.db_path = path;
+        self
+    }
+
+    pub fn with_full_rescan(mut self, enabled: bool) -> Self {
+        self.full_rescan = enabled;
         self
     }
 
@@ -54,10 +61,12 @@ mod tests {
     fn test_config_builder() {
         let config = Config::new()
             .with_claude_root("/custom/root".to_string())
-            .with_db_path("/custom/db.redb".into());
+            .with_db_path("/custom/db.redb".into())
+            .with_full_rescan(true);
 
         assert_eq!(config.claude_code_root, "/custom/root");
         assert_eq!(config.db_path, PathBuf::from("/custom/db.redb"));
+        assert!(config.full_rescan);
     }
 
     #[test]

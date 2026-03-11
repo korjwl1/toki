@@ -6,22 +6,18 @@ use crossbeam_channel::Receiver;
 
 use crate::checkpoint::{find_resume_offset, process_lines_streaming};
 use crate::common::types::{FileCheckpoint, LogParser, LogParserWithTs, ModelUsageSummary, UsageEvent, UsageEventWithTs};
-use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, Weekday};
+use chrono::{DateTime, Datelike, NaiveDateTime};
 use crate::db::Database;
 
 /// Debug level:
 ///   0 = off
 ///   1 = normal debug logging (state transitions, events, timing)
-///   2 = level 1 + force cold start (clear DB)
-///   3 = level 1 + verbose (size-unchanged, no-new-lines skips)
-///   4 = level 2 + verbose (force cold start + all skip logs)
+///   2 = level 1 + verbose (size-unchanged, no-new-lines skips)
 pub fn debug_level() -> u8 {
     std::env::var("CLITRACE_DEBUG").map_or(0, |v| {
         match v.as_str() {
             "true" | "1" => 1,
             "2" => 2,
-            "3" => 3,
-            "4" => 4,
             _ => 0,
         }
     })
@@ -35,11 +31,11 @@ macro_rules! debug_log {
     };
 }
 
-/// Verbose debug log — only emitted at level 3+.
+/// Verbose debug log — only emitted at level 2.
 /// Used for high-frequency skip events (size unchanged, no new lines).
 macro_rules! debug_log_verbose {
     ($($arg:tt)*) => {
-        if debug_level() >= 3 {
+        if debug_level() >= 2 {
             eprintln!("[clitrace:debug] {}", format!($($arg)*));
         }
     };
@@ -200,24 +196,16 @@ pub fn cold_start_report(
 
 #[derive(Debug, Clone, Copy)]
 pub enum ReportGroupBy {
-    Day,
-    Week { start_of_week: Weekday },
+    Date,
     Month,
     Year,
     Hour,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-pub struct ReportFilter {
-    pub since: Option<NaiveDateTime>,
-    pub until: Option<NaiveDateTime>,
 }
 
 pub fn cold_start_report_grouped<P>(
     parser: &P,
     root_dir: &str,
     group_by: ReportGroupBy,
-    filter: ReportFilter,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     P: LogParser + LogParserWithTs + Sync,
@@ -285,9 +273,6 @@ where
                 Some(t) => t,
                 None => continue,
             };
-            if !filter_match(ts, filter) {
-                continue;
-            }
             let bucket = bucket_from_datetime(ts, group_by);
             let by_model = grouped.entry(bucket).or_insert_with(HashMap::new);
             let summary = by_model.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
@@ -339,17 +324,19 @@ where
     Ok(())
 }
 
-pub fn cold_start_report_filtered<P>(
+pub fn cold_start_report_grouped_incremental<P>(
     parser: &P,
     root_dir: &str,
-    filter: ReportFilter,
-) -> Result<HashMap<String, ModelUsageSummary>, Box<dyn std::error::Error>>
+    group_by: ReportGroupBy,
+    checkpoints: &HashMap<String, FileCheckpoint>,
+) -> Result<(), Box<dyn std::error::Error>>
 where
     P: LogParser + LogParserWithTs + Sync,
 {
     let sessions = parser.discover_sessions(root_dir);
     if sessions.is_empty() {
-        return Ok(HashMap::new());
+        println!("[clitrace] No usage data found.");
+        return Ok(());
     }
 
     let max_threads = num_cpus::get();
@@ -368,6 +355,7 @@ where
             for file_path in files {
                 let sem = Arc::clone(&semaphore);
                 let results = Arc::clone(&all_results);
+                let checkpoints = checkpoints;
 
                 s.spawn(move || {
                     {
@@ -381,12 +369,8 @@ where
                     }
 
                     let path_str = file_path.to_string_lossy().to_string();
-                    let mut events: Vec<UsageEventWithTs> = Vec::new();
-                    if let Ok(Some((_bytes, _len, _hash))) = process_lines_streaming(&path_str, 0, |line| {
-                        if let Some(event) = parser.parse_line_with_ts(line, &path_str) {
-                            events.push(event);
-                        }
-                    }) {
+                    let result = process_file_cold_with_ts(&path_str, parser, checkpoints);
+                    if let Ok(Some((events, _last_line_len, _last_line_hash))) = result {
                         let mut r = results.lock().unwrap();
                         r.push(events);
                     }
@@ -401,23 +385,20 @@ where
     });
 
     let results = Arc::try_unwrap(all_results).unwrap().into_inner().unwrap();
-    let mut summaries: HashMap<String, ModelUsageSummary> = HashMap::new();
 
+    let mut grouped: HashMap<String, HashMap<String, ModelUsageSummary>> = HashMap::new();
     for batch in results {
         for event in batch {
             let ts = match parse_timestamp(&event.timestamp) {
                 Some(t) => t,
                 None => continue,
             };
-            if !filter_match(ts, filter) {
-                continue;
-            }
-            let summary = summaries
-                .entry(event.model.clone())
-                .or_insert_with(|| ModelUsageSummary {
-                    model: event.model.clone(),
-                    ..Default::default()
-                });
+            let bucket = bucket_from_datetime(ts, group_by);
+            let by_model = grouped.entry(bucket).or_insert_with(HashMap::new);
+            let summary = by_model.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
+                model: event.model.clone(),
+                ..Default::default()
+            });
             summary.input_tokens += event.input_tokens;
             summary.cache_creation_input_tokens += event.cache_creation_input_tokens;
             summary.cache_read_input_tokens += event.cache_read_input_tokens;
@@ -426,7 +407,41 @@ where
         }
     }
 
-    Ok(summaries)
+    if grouped.is_empty() {
+        println!("[clitrace] No usage data found.");
+        return Ok(());
+    }
+
+    let mut buckets: Vec<_> = grouped.keys().cloned().collect();
+    buckets.sort();
+
+    for bucket in buckets {
+        println!("[clitrace] ═══════════════════════════════════════════");
+        println!("[clitrace] Token Usage Summary ({})", bucket);
+        if let Some(models) = grouped.get(&bucket) {
+            let mut sorted: Vec<_> = models.values().collect();
+            sorted.sort_by(|a, b| b.event_count.cmp(&a.event_count));
+
+            for s in &sorted {
+                println!("[clitrace] ───────────────────────────────────────────");
+                println!("[clitrace] Model: {}", s.model);
+                println!(
+                    "[clitrace]   Input: {:>12} | Cache Create: {:>12}",
+                    format_number(s.input_tokens),
+                    format_number(s.cache_creation_input_tokens),
+                );
+                println!(
+                    "[clitrace]   Cache Read: {:>8} | Output: {:>12}",
+                    format_number(s.cache_read_input_tokens),
+                    format_number(s.output_tokens),
+                );
+                println!("[clitrace]   Events: {}", s.event_count);
+            }
+        }
+    }
+
+    println!("[clitrace] ═══════════════════════════════════════════");
+    Ok(())
 }
 
 impl TrackerEngine {
@@ -717,6 +732,41 @@ fn process_file_cold(
     }
 }
 
+/// Process a single file during cold start with timestamps (incremental only).
+/// If no checkpoint exists or resume line is missing, returns None (no full rescan).
+fn process_file_cold_with_ts<P>(
+    path: &str,
+    parser: &P,
+    checkpoints: &HashMap<String, FileCheckpoint>,
+) -> Result<Option<(Vec<UsageEventWithTs>, u64, u64)>, Box<dyn std::error::Error>>
+where
+    P: LogParserWithTs + Sync,
+{
+    let cp = match checkpoints.get(path) {
+        None => return Ok(None),
+        Some(cp) => cp,
+    };
+
+    let offset = match find_resume_offset(path, cp)? {
+        Some(off) => off,
+        None => return Ok(None),
+    };
+
+    let mut events = Vec::new();
+    let result = process_lines_streaming(path, offset, |line| {
+        if let Some(event) = parser.parse_line_with_ts(line, path) {
+            events.push(event);
+        }
+    })?;
+
+    match result {
+        Some((_bytes, last_line_len, last_line_hash)) => {
+            Ok(Some((events, last_line_len, last_line_hash)))
+        }
+        None => Ok(None),
+    }
+}
+
 /// Print cold start summary.
 pub fn print_summary(summaries: &HashMap<String, ModelUsageSummary>) {
     if summaries.is_empty() {
@@ -809,74 +859,16 @@ fn parse_timestamp(ts: &str) -> Option<NaiveDateTime> {
     None
 }
 
-fn filter_match(ts: NaiveDateTime, filter: ReportFilter) -> bool {
-    if let Some(since) = filter.since {
-        if ts < since {
-            return false;
-        }
-    }
-    if let Some(until) = filter.until {
-        if ts > until {
-            return false;
-        }
-    }
-    true
-}
-
 fn bucket_from_datetime(ts: NaiveDateTime, group_by: ReportGroupBy) -> String {
     let date = ts.date();
     match group_by {
-        ReportGroupBy::Day => date.format("%Y-%m-%d").to_string(),
+        ReportGroupBy::Date => date.format("%Y-%m-%d").to_string(),
         ReportGroupBy::Month => date.format("%Y-%m").to_string(),
         ReportGroupBy::Year => format!("{:04}", date.year()),
-        ReportGroupBy::Week { start_of_week } => {
-            let (week_year, week) = week_bucket(date, start_of_week);
-            format!("{:04}-W{:02}", week_year, week)
-        }
         ReportGroupBy::Hour => ts.format("%Y-%m-%d %H:00").to_string(),
     }
 }
 
-fn week_bucket(date: NaiveDate, start_of_week: Weekday) -> (i32, u32) {
-    let date_week_start = week_start(date, start_of_week);
-    let mut year = date_week_start.year();
-
-    let first_start = first_week_start(year, start_of_week);
-    if date_week_start < first_start {
-        year -= 1;
-    }
-    let first_start = first_week_start(year, start_of_week);
-    let days = date_week_start.signed_duration_since(first_start).num_days();
-    let week = (days / 7 + 1) as u32;
-    (year, week)
-}
-
-fn week_start(date: NaiveDate, start_of_week: Weekday) -> NaiveDate {
-    let date_idx = weekday_index(date.weekday());
-    let start_idx = weekday_index(start_of_week);
-    let delta = (7 + date_idx - start_idx) % 7;
-    date - chrono::Duration::days(delta as i64)
-}
-
-fn first_week_start(year: i32, start_of_week: Weekday) -> NaiveDate {
-    let mut d = NaiveDate::from_ymd_opt(year, 1, 1).unwrap();
-    while d.weekday() != start_of_week {
-        d = d + chrono::Duration::days(1);
-    }
-    d
-}
-
-fn weekday_index(day: Weekday) -> i32 {
-    match day {
-        Weekday::Mon => 0,
-        Weekday::Tue => 1,
-        Weekday::Wed => 2,
-        Weekday::Thu => 3,
-        Weekday::Fri => 4,
-        Weekday::Sat => 5,
-        Weekday::Sun => 6,
-    }
-}
 
 #[cfg(test)]
 mod tests {

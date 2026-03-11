@@ -51,9 +51,9 @@ impl Drop for Handle {
 pub fn start(config: Config) -> Result<Handle, ClitraceError> {
     let db = Database::open(&config.db_path).map_err(|e| ClitraceError::Db(e.into()))?;
 
-    // DEBUG=2|4: clear checkpoints for forced full cold start.
-    if engine::debug_level() == 2 || engine::debug_level() == 4 {
-        eprintln!("[clitrace:debug] DEBUG={} — clearing all checkpoints for forced cold start", engine::debug_level());
+    // Full rescan: clear checkpoints.
+    if config.full_rescan {
+        eprintln!("[clitrace] Full rescan requested — clearing all checkpoints");
         db.clear_checkpoints().map_err(|e| ClitraceError::Db(e.into()))?;
     }
 

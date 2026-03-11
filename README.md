@@ -13,28 +13,21 @@ cargo run --release -- trace
 
 기본 설정으로 `~/.claude/projects/` 스캔 후 watch mode 진입.
 `trace` 모드는 동일 DB 경로 기준 단일 인스턴스만 허용한다.
+전체 재스캔이 필요하면 `--full-rescan`을 사용한다.
 
 ### Report 모드 (one-shot)
 
 ```bash
 cargo run --release -- report
-cargo run --release -- report daily
-cargo run --release -- report weekly
-cargo run --release -- report weekly --start-of-week tue
-cargo run --release -- report hourly --since 20260301
-cargo run --release -- report hourly --from-beginning
-cargo run --release -- report monthly
-cargo run --release -- report yearly
-cargo run --release -- report --since 20260301 --until 20260331
-cargo run --release -- report weekly -w mon --since 20260301 --until 20260331235959
+cargo run --release -- report --group-by hour
+cargo run --release -- report --group-by date
+cargo run --release -- report --group-by month
+cargo run --release -- report --group-by year
 ```
 
-Report 필터 옵션:
-- `--since` (inclusive, `>=`): `YYYYMMDD` 또는 `YYYYMMDDhhmmss`
-  - `YYYYMMDD`는 해당 날짜의 `00:00:00`으로 해석
-- `--until` (inclusive, `<=`): `YYYYMMDD` 또는 `YYYYMMDDhhmmss`
-  - `YYYYMMDD`는 해당 날짜의 `23:59:59`로 해석
-- `hourly`는 `--since`가 필요하며, 전체 스캔을 원하면 `--from-beginning` 사용
+Report 옵션:
+- `--group-by`: `hour | date | month | year`
+  - `hour`는 기존 체크포인트 기준 증분 스캔만 수행 (전체 스캔 없음)
 
 ### 환경변수 오버라이드
 
@@ -42,9 +35,7 @@ Report 필터 옵션:
 CLITRACE_CLAUDE_ROOT=/path/to/custom/.claude cargo run --release -- trace
 CLITRACE_DB_PATH=/path/to/custom.db cargo run --release -- trace
 CLITRACE_DEBUG=1 cargo run --release -- trace   # 디버그 로그 (상태 전이, 이벤트, 타이밍)
-CLITRACE_DEBUG=2 cargo run --release -- trace   # 레벨 1 + DB 초기화 후 강제 full cold start
-CLITRACE_DEBUG=3 cargo run --release -- trace   # 레벨 1 + verbose (size unchanged, no new lines 스킵 로그)
-CLITRACE_DEBUG=4 cargo run --release -- trace   # 레벨 2 + verbose (강제 cold start + 모든 스킵 로그)
+CLITRACE_DEBUG=2 cargo run --release -- trace   # 레벨 1 + verbose (size unchanged, no new lines 스킵 로그)
 ```
 
 ### 라이브러리로 사용
