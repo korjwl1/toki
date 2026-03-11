@@ -63,6 +63,8 @@ enum ReportCommands {
         #[arg(long = "from-beginning")]
         from_beginning: bool,
     },
+    /// Group summary by month.
+    Monthly,
     /// Group summary by year.
     Yearly,
 }
@@ -228,6 +230,7 @@ fn main() {
                     }
                     Some(clitrace::engine::ReportGroupBy::Hour)
                 }
+                Some(ReportCommands::Monthly) => Some(clitrace::engine::ReportGroupBy::Month),
                 Some(ReportCommands::Yearly) => Some(clitrace::engine::ReportGroupBy::Year),
                 None => None,
             };

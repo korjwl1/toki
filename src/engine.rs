@@ -202,6 +202,7 @@ pub fn cold_start_report(
 pub enum ReportGroupBy {
     Day,
     Week { start_of_week: Weekday },
+    Month,
     Year,
     Hour,
 }
@@ -826,6 +827,7 @@ fn bucket_from_datetime(ts: NaiveDateTime, group_by: ReportGroupBy) -> String {
     let date = ts.date();
     match group_by {
         ReportGroupBy::Day => date.format("%Y-%m-%d").to_string(),
+        ReportGroupBy::Month => date.format("%Y-%m").to_string(),
         ReportGroupBy::Year => format!("{:04}", date.year()),
         ReportGroupBy::Week { start_of_week } => {
             let (week_year, week) = week_bucket(date, start_of_week);

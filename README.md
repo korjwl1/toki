@@ -23,6 +23,7 @@ cargo run --release -- report weekly
 cargo run --release -- report weekly --start-of-week tue
 cargo run --release -- report hourly --since 20260301
 cargo run --release -- report hourly --from-beginning
+cargo run --release -- report monthly
 cargo run --release -- report yearly
 cargo run --release -- report --since 20260301 --until 20260331
 cargo run --release -- report weekly -w mon --since 20260301 --until 20260331235959
