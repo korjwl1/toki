@@ -19,17 +19,19 @@ cargo run --release -- trace
 
 ```bash
 cargo run --release -- report
-cargo run --release -- report --group-by hour
-cargo run --release -- report --group-by date
-cargo run --release -- report --group-by month
-cargo run --release -- report --group-by year
+cargo run --release -- report daily
+cargo run --release -- report weekly
+cargo run --release -- report weekly --start-of-week tue
+cargo run --release -- report monthly
+cargo run --release -- report yearly
+cargo run --release -- report hourly
 cargo run --release -- report --since 20260301 --until 20260331
-cargo run --release -- report --group-by hour --since 20260301
+cargo run --release -- report hourly --since 20260301
 ```
 
 Report 옵션:
-- `--group-by`: `hour | date | month | year`
-  - `hour`는 기존 체크포인트 기준 증분 스캔만 수행 (전체 스캔 없음)
+- 서브커맨드: `daily | weekly | monthly | yearly | hourly`
+  - `weekly`는 `--start-of-week` 사용 가능
 - `--since` (inclusive, UTC, `>=`): `YYYYMMDD` 또는 `YYYYMMDDhhmmss`
   - `YYYYMMDD`는 해당 날짜의 `00:00:00` UTC로 해석
 - `--until` (inclusive, UTC, `<=`): `YYYYMMDD` 또는 `YYYYMMDDhhmmss`

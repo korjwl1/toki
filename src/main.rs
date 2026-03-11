@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use clap::{Parser, Subcommand};
-use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Weekday};
 use clitrace::Config;
 use fs2::FileExt;
 
@@ -39,16 +39,33 @@ enum Commands {
         /// Claude Code root directory (default: ~/.claude)
         #[arg(long)]
         claude_root: Option<String>,
-        /// Group summary by: hour, date, month, year
-        #[arg(long)]
-        group_by: Option<String>,
         /// Filter start time (inclusive, UTC): YYYYMMDD or YYYYMMDDhhmmss
         #[arg(long)]
         since: Option<String>,
         /// Filter end time (inclusive, UTC): YYYYMMDD or YYYYMMDDhhmmss
         #[arg(long)]
         until: Option<String>,
+        #[command(subcommand)]
+        command: Option<ReportCommands>,
     },
+}
+
+#[derive(Subcommand)]
+enum ReportCommands {
+    /// Group summary by day.
+    Daily,
+    /// Group summary by week.
+    Weekly {
+        /// Start of week: mon, tue, wed, thu, fri, sat, sun
+        #[arg(long = "start-of-week", short = 'w')]
+        start_of_week: Option<String>,
+    },
+    /// Group summary by month.
+    Monthly,
+    /// Group summary by year.
+    Yearly,
+    /// Group summary by hour.
+    Hourly,
 }
 
 fn parse_range_arg(value: &str, is_until: bool) -> Result<NaiveDateTime, String> {
@@ -158,23 +175,12 @@ fn main() {
             handle.stop();
             println!("[clitrace] Done.");
         }
-        Commands::Report { claude_root, group_by, since, until } => {
+        Commands::Report { claude_root, since, until, command } => {
             let config = build_config(claude_root, None);
             println!("[clitrace] Running report...");
             println!("[clitrace] Claude Code root: {}", config.claude_code_root);
 
             let parser = clitrace::providers::claude_code::ClaudeCodeParser;
-            let group_by = match group_by.as_deref() {
-                Some("hour") => Some(clitrace::engine::ReportGroupBy::Hour),
-                Some("date") => Some(clitrace::engine::ReportGroupBy::Date),
-                Some("month") => Some(clitrace::engine::ReportGroupBy::Month),
-                Some("year") => Some(clitrace::engine::ReportGroupBy::Year),
-                Some(v) => {
-                    eprintln!("[clitrace] Invalid --group-by: {} (use hour|date|month|year)", v);
-                    std::process::exit(1);
-                }
-                None => None,
-            };
             let since_dt = match since.as_deref() {
                 Some(v) => match parse_range_arg(v, false) {
                     Ok(dt) => Some(dt),
@@ -202,6 +208,29 @@ fn main() {
                 }
             }
             let filter = clitrace::engine::ReportFilter { since: since_dt, until: until_dt };
+            let group_by = match command {
+                Some(ReportCommands::Daily) => Some(clitrace::engine::ReportGroupBy::Date),
+                Some(ReportCommands::Monthly) => Some(clitrace::engine::ReportGroupBy::Month),
+                Some(ReportCommands::Yearly) => Some(clitrace::engine::ReportGroupBy::Year),
+                Some(ReportCommands::Hourly) => Some(clitrace::engine::ReportGroupBy::Hour),
+                Some(ReportCommands::Weekly { start_of_week }) => {
+                    let start = match start_of_week.as_deref().unwrap_or("mon") {
+                        "mon" => Weekday::Mon,
+                        "tue" => Weekday::Tue,
+                        "wed" => Weekday::Wed,
+                        "thu" => Weekday::Thu,
+                        "fri" => Weekday::Fri,
+                        "sat" => Weekday::Sat,
+                        "sun" => Weekday::Sun,
+                        _ => {
+                            eprintln!("[clitrace] Invalid start-of-week (use mon|tue|wed|thu|fri|sat|sun)");
+                            std::process::exit(1);
+                        }
+                    };
+                    Some(clitrace::engine::ReportGroupBy::Week { start_of_week: start })
+                }
+                None => None,
+            };
 
             if let Some(group_by) = group_by {
                 let db = match clitrace::db::Database::open(&config.db_path) {

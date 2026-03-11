@@ -6,7 +6,7 @@ use crossbeam_channel::Receiver;
 
 use crate::checkpoint::{find_resume_offset, process_lines_streaming};
 use crate::common::types::{FileCheckpoint, LogParser, LogParserWithTs, ModelUsageSummary, UsageEvent};
-use chrono::{DateTime, Datelike, NaiveDateTime};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, Weekday};
 use crate::db::Database;
 
 /// Debug level:
@@ -197,6 +197,7 @@ pub fn cold_start_report(
 #[derive(Debug, Clone, Copy)]
 pub enum ReportGroupBy {
     Date,
+    Week { start_of_week: Weekday },
     Month,
     Year,
     Hour,
@@ -807,6 +808,7 @@ fn bucket_from_timestamp(ts: &str, group_by: ReportGroupBy) -> Option<String> {
                 let hour = &ts[0..13];
                 return Some(format!("{}:00", hour));
             }
+            ReportGroupBy::Week { .. } => {}
             _ => {}
         }
     }
@@ -841,9 +843,54 @@ fn bucket_from_datetime(ts: NaiveDateTime, group_by: ReportGroupBy) -> String {
     let date = ts.date();
     match group_by {
         ReportGroupBy::Date => date.format("%Y-%m-%d").to_string(),
+        ReportGroupBy::Week { start_of_week } => {
+            let (week_year, week) = week_bucket(date, start_of_week);
+            format!("{:04}-W{:02}", week_year, week)
+        }
         ReportGroupBy::Month => date.format("%Y-%m").to_string(),
         ReportGroupBy::Year => format!("{:04}", date.year()),
         ReportGroupBy::Hour => ts.format("%Y-%m-%dT%H:00").to_string(),
+    }
+}
+
+fn week_bucket(date: NaiveDate, start_of_week: Weekday) -> (i32, u32) {
+    let date_week_start = week_start(date, start_of_week);
+    let mut year = date_week_start.year();
+
+    let first_start = first_week_start(year, start_of_week);
+    if date_week_start < first_start {
+        year -= 1;
+    }
+    let first_start = first_week_start(year, start_of_week);
+    let days = date_week_start.signed_duration_since(first_start).num_days();
+    let week = (days / 7 + 1) as u32;
+    (year, week)
+}
+
+fn week_start(date: NaiveDate, start_of_week: Weekday) -> NaiveDate {
+    let date_idx = weekday_index(date.weekday());
+    let start_idx = weekday_index(start_of_week);
+    let delta = (7 + date_idx - start_idx) % 7;
+    date - chrono::Duration::days(delta as i64)
+}
+
+fn first_week_start(year: i32, start_of_week: Weekday) -> NaiveDate {
+    let mut d = NaiveDate::from_ymd_opt(year, 1, 1).unwrap();
+    while d.weekday() != start_of_week {
+        d = d + chrono::Duration::days(1);
+    }
+    d
+}
+
+fn weekday_index(day: Weekday) -> i32 {
+    match day {
+        Weekday::Mon => 0,
+        Weekday::Tue => 1,
+        Weekday::Wed => 2,
+        Weekday::Thu => 3,
+        Weekday::Fri => 4,
+        Weekday::Sat => 5,
+        Weekday::Sun => 6,
     }
 }
 
