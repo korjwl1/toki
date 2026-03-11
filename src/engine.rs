@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Receiver;
 
 use crate::checkpoint::{find_resume_offset, process_lines_streaming};
-use crate::common::types::{FileCheckpoint, LogParser, LogParserWithTs, ModelUsageSummary, UsageEvent, UsageEventWithTs};
+use crate::common::types::{FileCheckpoint, LogParser, LogParserWithTs, ModelUsageSummary, UsageEvent};
 use chrono::{DateTime, Datelike, NaiveDateTime};
 use crate::db::Database;
 
@@ -220,8 +220,8 @@ where
     let max_threads = num_cpus::get();
     let semaphore = Arc::new(Mutex::new(max_threads));
 
-    let all_results: Arc<Mutex<Vec<Vec<UsageEventWithTs>>>> =
-        Arc::new(Mutex::new(Vec::new()));
+    let grouped: Arc<Mutex<HashMap<String, HashMap<String, ModelUsageSummary>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     std::thread::scope(|s| {
         for session in &sessions {
@@ -232,7 +232,7 @@ where
 
             for file_path in files {
                 let sem = Arc::clone(&semaphore);
-                let results = Arc::clone(&all_results);
+                let grouped = Arc::clone(&grouped);
 
                 s.spawn(move || {
                     {
@@ -246,11 +246,23 @@ where
                     }
 
                     let path_str = file_path.to_string_lossy().to_string();
-                    let result = process_file_cold_with_ts(&path_str, parser, checkpoints);
-                    if let Ok(Some((events, _last_line_len, _last_line_hash))) = result {
-                        let mut r = results.lock().unwrap();
-                        r.push(events);
-                    }
+                    let _ = process_lines_streaming(&path_str, resolve_offset(&path_str, checkpoints), |line| {
+                        if let Some(event) = parser.parse_line_with_ts(line, &path_str) {
+                            if let Some(bucket) = bucket_from_timestamp(&event.timestamp, group_by) {
+                                let mut g = grouped.lock().unwrap();
+                                let by_model = g.entry(bucket).or_insert_with(HashMap::new);
+                                let summary = by_model.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
+                                    model: event.model.clone(),
+                                    ..Default::default()
+                                });
+                                summary.input_tokens += event.input_tokens;
+                                summary.cache_creation_input_tokens += event.cache_creation_input_tokens;
+                                summary.cache_read_input_tokens += event.cache_read_input_tokens;
+                                summary.output_tokens += event.output_tokens;
+                                summary.event_count += 1;
+                            }
+                        }
+                    });
 
                     {
                         let mut count = sem.lock().unwrap();
@@ -261,29 +273,7 @@ where
         }
     });
 
-    let results = Arc::try_unwrap(all_results).unwrap().into_inner().unwrap();
-
-    let mut grouped: HashMap<String, HashMap<String, ModelUsageSummary>> = HashMap::new();
-    for batch in results {
-        for event in batch {
-            let ts = match parse_timestamp(&event.timestamp) {
-                Some(t) => t,
-                None => continue,
-            };
-            let bucket = bucket_from_datetime(ts, group_by);
-            let by_model = grouped.entry(bucket).or_insert_with(HashMap::new);
-            let summary = by_model.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
-                model: event.model.clone(),
-                ..Default::default()
-            });
-            summary.input_tokens += event.input_tokens;
-            summary.cache_creation_input_tokens += event.cache_creation_input_tokens;
-            summary.cache_read_input_tokens += event.cache_read_input_tokens;
-            summary.output_tokens += event.output_tokens;
-            summary.event_count += 1;
-        }
-    }
-
+    let grouped = Arc::try_unwrap(grouped).unwrap().into_inner().unwrap();
     if grouped.is_empty() {
         println!("[clitrace] No usage data found.");
         return Ok(());
@@ -611,31 +601,10 @@ fn process_file_cold(
 
 /// Process a single file during cold start with timestamps (incremental only).
 /// If no checkpoint exists or resume line is missing, returns None (no full rescan).
-fn process_file_cold_with_ts<P>(
-    path: &str,
-    parser: &P,
-    checkpoints: &HashMap<String, FileCheckpoint>,
-) -> Result<Option<(Vec<UsageEventWithTs>, u64, u64)>, Box<dyn std::error::Error>>
-where
-    P: LogParserWithTs + Sync,
-{
-    let offset = match checkpoints.get(path) {
+fn resolve_offset(path: &str, checkpoints: &HashMap<String, FileCheckpoint>) -> u64 {
+    match checkpoints.get(path) {
         None => 0,
-        Some(cp) => find_resume_offset(path, cp)?.unwrap_or(0),
-    };
-
-    let mut events = Vec::new();
-    let result = process_lines_streaming(path, offset, |line| {
-        if let Some(event) = parser.parse_line_with_ts(line, path) {
-            events.push(event);
-        }
-    })?;
-
-    match result {
-        Some((_bytes, last_line_len, last_line_hash)) => {
-            Ok(Some((events, last_line_len, last_line_hash)))
-        }
-        None => Ok(None),
+        Some(cp) => find_resume_offset(path, cp).ok().flatten().unwrap_or(0),
     }
 }
 
@@ -721,24 +690,34 @@ fn format_number(n: u64) -> String {
     result.chars().rev().collect()
 }
 
-fn parse_timestamp(ts: &str) -> Option<NaiveDateTime> {
-    if let Ok(dt) = DateTime::parse_from_rfc3339(ts) {
-        return Some(dt.naive_utc());
+fn bucket_from_timestamp(ts: &str, group_by: ReportGroupBy) -> Option<String> {
+    if ts.len() >= 4 {
+        match group_by {
+            ReportGroupBy::Year => return Some(ts[0..4].to_string()),
+            ReportGroupBy::Month if ts.len() >= 7 => return Some(ts[0..7].to_string()),
+            ReportGroupBy::Date if ts.len() >= 10 => return Some(ts[0..10].to_string()),
+            ReportGroupBy::Hour if ts.len() >= 13 => {
+                let hour = &ts[0..13];
+                return Some(format!("{}:00", hour));
+            }
+            _ => {}
+        }
     }
-    if let Ok(dt) = NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%SZ") {
-        return Some(dt);
-    }
-    None
-}
 
-fn bucket_from_datetime(ts: NaiveDateTime, group_by: ReportGroupBy) -> String {
-    let date = ts.date();
-    match group_by {
+    let dt = if let Ok(dt) = DateTime::parse_from_rfc3339(ts) {
+        dt.naive_utc()
+    } else {
+        NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%SZ").ok()?
+    };
+
+    let date = dt.date();
+    let bucket = match group_by {
         ReportGroupBy::Date => date.format("%Y-%m-%d").to_string(),
         ReportGroupBy::Month => date.format("%Y-%m").to_string(),
         ReportGroupBy::Year => format!("{:04}", date.year()),
-        ReportGroupBy::Hour => ts.format("%Y-%m-%d %H:00").to_string(),
-    }
+        ReportGroupBy::Hour => dt.format("%Y-%m-%dT%H:00").to_string(),
+    };
+    Some(bucket)
 }
 
 
