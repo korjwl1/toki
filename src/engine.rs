@@ -202,11 +202,18 @@ pub enum ReportGroupBy {
     Hour,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReportFilter {
+    pub since: Option<NaiveDateTime>,
+    pub until: Option<NaiveDateTime>,
+}
+
 pub fn cold_start_report_grouped<P>(
     parser: &P,
     root_dir: &str,
     group_by: ReportGroupBy,
     checkpoints: &HashMap<String, FileCheckpoint>,
+    filter: ReportFilter,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     P: LogParser + LogParserWithTs + Sync,
@@ -248,7 +255,7 @@ where
                     let path_str = file_path.to_string_lossy().to_string();
                     let _ = process_lines_streaming(&path_str, resolve_offset(&path_str, checkpoints), |line| {
                         if let Some(event) = parser.parse_line_with_ts(line, &path_str) {
-                            if let Some(bucket) = bucket_from_timestamp(&event.timestamp, group_by) {
+                            if let Some(bucket) = bucket_from_timestamp_filtered(&event.timestamp, group_by, filter) {
                                 let mut g = grouped.lock().unwrap();
                                 let by_model = g.entry(bucket).or_insert_with(HashMap::new);
                                 let summary = by_model.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
@@ -309,6 +316,88 @@ where
 
     println!("[clitrace] ═══════════════════════════════════════════");
     Ok(())
+}
+
+pub fn cold_start_report_filtered<P>(
+    parser: &P,
+    root_dir: &str,
+    checkpoints: &HashMap<String, FileCheckpoint>,
+    filter: ReportFilter,
+) -> Result<HashMap<String, ModelUsageSummary>, Box<dyn std::error::Error>>
+where
+    P: LogParser + LogParserWithTs + Sync,
+{
+    let sessions = parser.discover_sessions(root_dir);
+    if sessions.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let max_threads = num_cpus::get();
+    let semaphore = Arc::new(Mutex::new(max_threads));
+
+    let summaries: Arc<Mutex<HashMap<String, ModelUsageSummary>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+
+    std::thread::scope(|s| {
+        for session in &sessions {
+            let mut files: Vec<&std::path::Path> = vec![session.parent_jsonl.as_path()];
+            for sub in &session.subagent_jsonls {
+                files.push(sub.as_path());
+            }
+
+            for file_path in files {
+                let sem = Arc::clone(&semaphore);
+                let summaries = Arc::clone(&summaries);
+
+                s.spawn(move || {
+                    {
+                        let mut count = sem.lock().unwrap();
+                        while *count == 0 {
+                            drop(count);
+                            std::thread::yield_now();
+                            count = sem.lock().unwrap();
+                        }
+                        *count -= 1;
+                    }
+
+                    let path_str = file_path.to_string_lossy().to_string();
+                    let _ = process_lines_streaming(
+                        &path_str,
+                        resolve_offset(&path_str, checkpoints),
+                        |line| {
+                            if let Some(event) = parser.parse_line_with_ts(line, &path_str) {
+                                let ts = match parse_timestamp(&event.timestamp) {
+                                    Some(t) => t,
+                                    None => return,
+                                };
+                                if !filter_match(ts, filter) {
+                                    return;
+                                }
+                                let mut s = summaries.lock().unwrap();
+                                let summary = s.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
+                                    model: event.model.clone(),
+                                    ..Default::default()
+                                });
+                                summary.input_tokens += event.input_tokens;
+                                summary.cache_creation_input_tokens += event.cache_creation_input_tokens;
+                                summary.cache_read_input_tokens += event.cache_read_input_tokens;
+                                summary.output_tokens += event.output_tokens;
+                                summary.event_count += 1;
+                            }
+                        },
+                    );
+
+                    {
+                        let mut count = sem.lock().unwrap();
+                        *count += 1;
+                    }
+                });
+            }
+        }
+    });
+
+    let summaries = Arc::try_unwrap(summaries).unwrap().into_inner().unwrap();
+    Ok(summaries)
 }
 
 impl TrackerEngine {
@@ -608,6 +697,24 @@ fn resolve_offset(path: &str, checkpoints: &HashMap<String, FileCheckpoint>) -> 
     }
 }
 
+fn filter_active(filter: ReportFilter) -> bool {
+    filter.since.is_some() || filter.until.is_some()
+}
+
+fn filter_match(ts: NaiveDateTime, filter: ReportFilter) -> bool {
+    if let Some(since) = filter.since {
+        if ts < since {
+            return false;
+        }
+    }
+    if let Some(until) = filter.until {
+        if ts > until {
+            return false;
+        }
+    }
+    true
+}
+
 /// Print cold start summary.
 pub fn print_summary(summaries: &HashMap<String, ModelUsageSummary>) {
     if summaries.is_empty() {
@@ -704,20 +811,40 @@ fn bucket_from_timestamp(ts: &str, group_by: ReportGroupBy) -> Option<String> {
         }
     }
 
-    let dt = if let Ok(dt) = DateTime::parse_from_rfc3339(ts) {
-        dt.naive_utc()
-    } else {
-        NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%SZ").ok()?
-    };
+    let dt = parse_timestamp(ts)?;
+    Some(bucket_from_datetime(dt, group_by))
+}
 
-    let date = dt.date();
-    let bucket = match group_by {
+fn bucket_from_timestamp_filtered(
+    ts: &str,
+    group_by: ReportGroupBy,
+    filter: ReportFilter,
+) -> Option<String> {
+    if filter_active(filter) {
+        let dt = parse_timestamp(ts)?;
+        if !filter_match(dt, filter) {
+            return None;
+        }
+        return Some(bucket_from_datetime(dt, group_by));
+    }
+    bucket_from_timestamp(ts, group_by)
+}
+
+fn parse_timestamp(ts: &str) -> Option<NaiveDateTime> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(ts) {
+        return Some(dt.naive_utc());
+    }
+    NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%SZ").ok()
+}
+
+fn bucket_from_datetime(ts: NaiveDateTime, group_by: ReportGroupBy) -> String {
+    let date = ts.date();
+    match group_by {
         ReportGroupBy::Date => date.format("%Y-%m-%d").to_string(),
         ReportGroupBy::Month => date.format("%Y-%m").to_string(),
         ReportGroupBy::Year => format!("{:04}", date.year()),
-        ReportGroupBy::Hour => dt.format("%Y-%m-%dT%H:00").to_string(),
-    };
-    Some(bucket)
+        ReportGroupBy::Hour => ts.format("%Y-%m-%dT%H:00").to_string(),
+    }
 }
 
 

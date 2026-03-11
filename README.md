@@ -23,11 +23,17 @@ cargo run --release -- report --group-by hour
 cargo run --release -- report --group-by date
 cargo run --release -- report --group-by month
 cargo run --release -- report --group-by year
+cargo run --release -- report --since 20260301 --until 20260331
+cargo run --release -- report --group-by hour --since 20260301
 ```
 
 Report 옵션:
 - `--group-by`: `hour | date | month | year`
   - `hour`는 기존 체크포인트 기준 증분 스캔만 수행 (전체 스캔 없음)
+- `--since` (inclusive, UTC, `>=`): `YYYYMMDD` 또는 `YYYYMMDDhhmmss`
+  - `YYYYMMDD`는 해당 날짜의 `00:00:00` UTC로 해석
+- `--until` (inclusive, UTC, `<=`): `YYYYMMDD` 또는 `YYYYMMDDhhmmss`
+  - `YYYYMMDD`는 해당 날짜의 `23:59:59` UTC로 해석
 
 ### 환경변수 오버라이드
 
