@@ -72,6 +72,11 @@ pub trait LogParser: Send + Sync {
     fn discover_sessions(&self, root_dir: &str) -> Vec<SessionGroup>;
 }
 
+/// Optional extension for parsers that can extract timestamps.
+pub trait LogParserWithTs: Send + Sync {
+    fn parse_line_with_ts(&self, line: &str, source_file: &str) -> Option<UsageEventWithTs>;
+}
+
 /// Clitrace error types.
 #[derive(Debug)]
 pub enum ClitraceError {

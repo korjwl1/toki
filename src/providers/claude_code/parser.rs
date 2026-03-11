@@ -1,4 +1,4 @@
-use crate::common::types::{LogParser, SessionGroup, UsageEvent, UsageEventWithTs};
+use crate::common::types::{LogParser, LogParserWithTs, SessionGroup, UsageEvent, UsageEventWithTs};
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -77,7 +77,7 @@ impl ClaudeCodeParser {
         })
     }
 
-    pub fn parse_line_with_ts(&self, line: &str, source_file: &str) -> Option<UsageEventWithTs> {
+    pub fn parse_line_with_ts_inner(&self, line: &str, source_file: &str) -> Option<UsageEventWithTs> {
         let parsed = self.parse_line_common(line)?;
 
         let event_key = format!("{}:{}", parsed.message_id, parsed.timestamp);
@@ -169,6 +169,12 @@ impl LogParser for ClaudeCodeParser {
     }
 }
 
+impl LogParserWithTs for ClaudeCodeParser {
+    fn parse_line_with_ts(&self, line: &str, source_file: &str) -> Option<UsageEventWithTs> {
+        self.parse_line_with_ts_inner(line, source_file)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,7 +197,7 @@ mod tests {
     fn test_parse_assistant_line_with_ts() {
         let line = r#"{"type":"assistant","message":{"id":"msg_123","model":"claude-opus-4-6","usage":{"input_tokens":3,"cache_creation_input_tokens":5139,"cache_read_input_tokens":9631,"output_tokens":14}},"timestamp":"2026-03-08T12:00:00Z"}"#;
         let parser = ClaudeCodeParser;
-        let event = parser.parse_line_with_ts(line, "/test/file.jsonl").unwrap();
+        let event = parser.parse_line_with_ts_inner(line, "/test/file.jsonl").unwrap();
 
         assert_eq!(event.model, "claude-opus-4-6");
         assert_eq!(event.input_tokens, 3);

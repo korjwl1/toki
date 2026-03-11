@@ -26,6 +26,7 @@ num_cpus = "1"
 libc = "0.2"
 clap = { version = "4", features = ["derive"] }
 fs2 = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tikv-jemallocator = "0.6"

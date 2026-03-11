@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Receiver;
 
 use crate::checkpoint::{find_resume_offset, process_lines_streaming};
-use crate::common::types::{FileCheckpoint, LogParser, ModelUsageSummary, UsageEvent};
+use crate::common::types::{FileCheckpoint, LogParser, LogParserWithTs, ModelUsageSummary, UsageEvent, UsageEventWithTs};
+use chrono::{DateTime, Datelike, NaiveDate};
 use crate::db::Database;
 
 /// Debug level:
@@ -195,6 +196,134 @@ pub fn cold_start_report(
     let result = cold_start_collect(parser, root_dir, &empty)?;
     print_summary(&result.summaries);
     Ok(result.summaries)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ReportGroupBy {
+    Day,
+    Week,
+    Year,
+}
+
+pub fn cold_start_report_grouped<P>(
+    parser: &P,
+    root_dir: &str,
+    group_by: ReportGroupBy,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    P: LogParser + LogParserWithTs + Sync,
+{
+    let sessions = parser.discover_sessions(root_dir);
+    if sessions.is_empty() {
+        println!("[clitrace] No usage data found.");
+        return Ok(());
+    }
+
+    let max_threads = num_cpus::get();
+    let semaphore = Arc::new(Mutex::new(max_threads));
+
+    let all_results: Arc<Mutex<Vec<Vec<UsageEventWithTs>>>> =
+        Arc::new(Mutex::new(Vec::new()));
+
+    std::thread::scope(|s| {
+        for session in &sessions {
+            let mut files: Vec<&std::path::Path> = vec![session.parent_jsonl.as_path()];
+            for sub in &session.subagent_jsonls {
+                files.push(sub.as_path());
+            }
+
+            for file_path in files {
+                let sem = Arc::clone(&semaphore);
+                let results = Arc::clone(&all_results);
+
+                s.spawn(move || {
+                    {
+                        let mut count = sem.lock().unwrap();
+                        while *count == 0 {
+                            drop(count);
+                            std::thread::yield_now();
+                            count = sem.lock().unwrap();
+                        }
+                        *count -= 1;
+                    }
+
+                    let path_str = file_path.to_string_lossy().to_string();
+                    let mut events: Vec<UsageEventWithTs> = Vec::new();
+                    if let Ok(Some((_bytes, _len, _hash))) = process_lines_streaming(&path_str, 0, |line| {
+                        if let Some(event) = parser.parse_line_with_ts(line, &path_str) {
+                            events.push(event);
+                        }
+                    }) {
+                        let mut r = results.lock().unwrap();
+                        r.push(events);
+                    }
+
+                    {
+                        let mut count = sem.lock().unwrap();
+                        *count += 1;
+                    }
+                });
+            }
+        }
+    });
+
+    let results = Arc::try_unwrap(all_results).unwrap().into_inner().unwrap();
+
+    let mut grouped: HashMap<String, HashMap<String, ModelUsageSummary>> = HashMap::new();
+    for batch in results {
+        for event in batch {
+            let bucket = match parse_bucket(&event.timestamp, group_by) {
+                Some(b) => b,
+                None => continue,
+            };
+            let by_model = grouped.entry(bucket).or_insert_with(HashMap::new);
+            let summary = by_model.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
+                model: event.model.clone(),
+                ..Default::default()
+            });
+            summary.input_tokens += event.input_tokens;
+            summary.cache_creation_input_tokens += event.cache_creation_input_tokens;
+            summary.cache_read_input_tokens += event.cache_read_input_tokens;
+            summary.output_tokens += event.output_tokens;
+            summary.event_count += 1;
+        }
+    }
+
+    if grouped.is_empty() {
+        println!("[clitrace] No usage data found.");
+        return Ok(());
+    }
+
+    let mut buckets: Vec<_> = grouped.keys().cloned().collect();
+    buckets.sort();
+
+    for bucket in buckets {
+        println!("[clitrace] ═══════════════════════════════════════════");
+        println!("[clitrace] Token Usage Summary ({})", bucket);
+        if let Some(models) = grouped.get(&bucket) {
+            let mut sorted: Vec<_> = models.values().collect();
+            sorted.sort_by(|a, b| b.event_count.cmp(&a.event_count));
+
+            for s in &sorted {
+                println!("[clitrace] ───────────────────────────────────────────");
+                println!("[clitrace] Model: {}", s.model);
+                println!(
+                    "[clitrace]   Input: {:>12} | Cache Create: {:>12}",
+                    format_number(s.input_tokens),
+                    format_number(s.cache_creation_input_tokens),
+                );
+                println!(
+                    "[clitrace]   Cache Read: {:>8} | Output: {:>12}",
+                    format_number(s.cache_read_input_tokens),
+                    format_number(s.output_tokens),
+                );
+                println!("[clitrace]   Events: {}", s.event_count);
+            }
+        }
+    }
+
+    println!("[clitrace] ═══════════════════════════════════════════");
+    Ok(())
 }
 
 impl TrackerEngine {
@@ -565,6 +694,52 @@ fn format_number(n: u64) -> String {
         result.push(c);
     }
     result.chars().rev().collect()
+}
+
+fn parse_bucket(ts: &str, group_by: ReportGroupBy) -> Option<String> {
+    let date = if let Ok(dt) = DateTime::parse_from_rfc3339(ts) {
+        dt.date_naive()
+    } else {
+        NaiveDate::parse_from_str(ts, "%Y-%m-%dT%H:%M:%SZ").ok()?
+    };
+    match group_by {
+        ReportGroupBy::Day => Some(date.format("%Y-%m-%d").to_string()),
+        ReportGroupBy::Year => Some(format!("{:04}", date.year())),
+        ReportGroupBy::Week => {
+            let (iso_year, iso_week) = iso_week(date);
+            Some(format!("{:04}-W{:02}", iso_year, iso_week))
+        }
+    }
+}
+
+fn iso_week(date: NaiveDate) -> (i32, u32) {
+    let year = date.year();
+    let jan4 = NaiveDate::from_ymd_opt(year, 1, 4).unwrap();
+    let jan4_weekday = jan4.weekday().number_from_monday() as i32;
+    let week1_start = jan4 - chrono::Duration::days((jan4_weekday - 1) as i64);
+
+    let date_weekday = date.weekday().number_from_monday() as i32;
+    let date_week_start = date - chrono::Duration::days((date_weekday - 1) as i64);
+
+    if date_week_start < week1_start {
+        return iso_week(NaiveDate::from_ymd_opt(year - 1, 12, 31).unwrap());
+    }
+
+    let days = date_week_start.signed_duration_since(week1_start).num_days();
+    let mut week = (days / 7 + 1) as u32;
+    let mut iso_year = year;
+
+    if week == 53 {
+        let jan4_next = NaiveDate::from_ymd_opt(year + 1, 1, 4).unwrap();
+        let jan4_next_weekday = jan4_next.weekday().number_from_monday() as i32;
+        let week1_next_start = jan4_next - chrono::Duration::days((jan4_next_weekday - 1) as i64);
+        if date_week_start >= week1_next_start {
+            iso_year = year + 1;
+            week = 1;
+        }
+    }
+
+    (iso_year, week)
 }
 
 #[cfg(test)]
