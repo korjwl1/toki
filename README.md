@@ -31,7 +31,7 @@ cargo run --release -- report hourly --since 20260301
 
 Report 옵션:
 - 서브커맨드: `daily | weekly | monthly | yearly | hourly`
-  - `weekly`는 `--start-of-week` 사용 가능
+  - `--start-of-week`는 `weekly`에서만 사용 가능
 - `--since` (inclusive, UTC, `>=`): `YYYYMMDD` 또는 `YYYYMMDDhhmmss`
   - `YYYYMMDD`는 해당 날짜의 `00:00:00` UTC로 해석
 - `--until` (inclusive, UTC, `<=`): `YYYYMMDD` 또는 `YYYYMMDDhhmmss`
