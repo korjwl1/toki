@@ -22,7 +22,15 @@ cargo run --release -- report daily
 cargo run --release -- report weekly
 cargo run --release -- report weekly --start-of-week tue
 cargo run --release -- report yearly
+cargo run --release -- report --since 20260301 --until 20260331
+cargo run --release -- report weekly -w mon --since 20260301 --until 20260331235959
 ```
+
+Report 필터 옵션:
+- `--since` (inclusive, `>=`): `YYYYMMDD` 또는 `YYYYMMDDhhmmss`
+  - `YYYYMMDD`는 해당 날짜의 `00:00:00`으로 해석
+- `--until` (inclusive, `<=`): `YYYYMMDD` 또는 `YYYYMMDDhhmmss`
+  - `YYYYMMDD`는 해당 날짜의 `23:59:59`로 해석
 
 ### 환경변수 오버라이드
 

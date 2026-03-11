@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use clap::{Parser, Subcommand};
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use clitrace::Config;
 use fs2::FileExt;
 
@@ -35,6 +36,12 @@ enum Commands {
         /// Claude Code root directory (default: ~/.claude)
         #[arg(long)]
         claude_root: Option<String>,
+        /// Filter start time (inclusive): YYYYMMDD or YYYYMMDDhhmmss
+        #[arg(long)]
+        since: Option<String>,
+        /// Filter end time (inclusive): YYYYMMDD or YYYYMMDDhhmmss
+        #[arg(long)]
+        until: Option<String>,
         #[command(subcommand)]
         command: Option<ReportCommands>,
     },
@@ -52,6 +59,33 @@ enum ReportCommands {
     },
     /// Group summary by year.
     Yearly,
+}
+
+fn parse_range_arg(value: &str, is_until: bool) -> Result<NaiveDateTime, String> {
+    if value.len() == 8 && value.chars().all(|c| c.is_ascii_digit()) {
+        let year: i32 = value[0..4].parse().map_err(|_| "invalid year")?;
+        let month: u32 = value[4..6].parse().map_err(|_| "invalid month")?;
+        let day: u32 = value[6..8].parse().map_err(|_| "invalid day")?;
+        let date = NaiveDate::from_ymd_opt(year, month, day).ok_or("invalid date")?;
+        let time = if is_until {
+            NaiveTime::from_hms_opt(23, 59, 59).unwrap()
+        } else {
+            NaiveTime::from_hms_opt(0, 0, 0).unwrap()
+        };
+        return Ok(NaiveDateTime::new(date, time));
+    }
+    if value.len() == 14 && value.chars().all(|c| c.is_ascii_digit()) {
+        let year: i32 = value[0..4].parse().map_err(|_| "invalid year")?;
+        let month: u32 = value[4..6].parse().map_err(|_| "invalid month")?;
+        let day: u32 = value[6..8].parse().map_err(|_| "invalid day")?;
+        let hour: u32 = value[8..10].parse().map_err(|_| "invalid hour")?;
+        let min: u32 = value[10..12].parse().map_err(|_| "invalid minute")?;
+        let sec: u32 = value[12..14].parse().map_err(|_| "invalid second")?;
+        let date = NaiveDate::from_ymd_opt(year, month, day).ok_or("invalid date")?;
+        let time = NaiveTime::from_hms_opt(hour, min, sec).ok_or("invalid time")?;
+        return Ok(NaiveDateTime::new(date, time));
+    }
+    Err("invalid format (use YYYYMMDD or YYYYMMDDhhmmss)".to_string())
 }
 
 fn build_config(claude_root: Option<String>, db_path: Option<PathBuf>) -> Config {
@@ -131,12 +165,39 @@ fn main() {
             handle.stop();
             println!("[clitrace] Done.");
         }
-        Commands::Report { claude_root, command } => {
+        Commands::Report { claude_root, since, until, command } => {
             let config = build_config(claude_root, None);
             println!("[clitrace] Running report...");
             println!("[clitrace] Claude Code root: {}", config.claude_code_root);
 
             let parser = clitrace::providers::claude_code::ClaudeCodeParser;
+            let since_dt = match since.as_deref() {
+                Some(v) => match parse_range_arg(v, false) {
+                    Ok(dt) => Some(dt),
+                    Err(e) => {
+                        eprintln!("[clitrace] Invalid --since: {} ({})", v, e);
+                        std::process::exit(1);
+                    }
+                },
+                None => None,
+            };
+            let until_dt = match until.as_deref() {
+                Some(v) => match parse_range_arg(v, true) {
+                    Ok(dt) => Some(dt),
+                    Err(e) => {
+                        eprintln!("[clitrace] Invalid --until: {} ({})", v, e);
+                        std::process::exit(1);
+                    }
+                },
+                None => None,
+            };
+            if let (Some(s), Some(u)) = (since_dt, until_dt) {
+                if u < s {
+                    eprintln!("[clitrace] Invalid range: --until is earlier than --since");
+                    std::process::exit(1);
+                }
+            }
+            let filter = clitrace::engine::ReportFilter { since: since_dt, until: until_dt };
             let group_by = match command {
                 Some(ReportCommands::Daily) => Some(clitrace::engine::ReportGroupBy::Day),
                 Some(ReportCommands::Weekly { start_of_week }) => {
@@ -159,9 +220,22 @@ fn main() {
             };
 
             if let Some(group_by) = group_by {
-                if let Err(e) = clitrace::engine::cold_start_report_grouped(&parser, &config.claude_code_root, group_by) {
+                if let Err(e) = clitrace::engine::cold_start_report_grouped(
+                    &parser,
+                    &config.claude_code_root,
+                    group_by,
+                    filter,
+                ) {
                     eprintln!("[clitrace] Report failed: {}", e);
                     std::process::exit(1);
+                }
+            } else if filter.since.is_some() || filter.until.is_some() {
+                match clitrace::engine::cold_start_report_filtered(&parser, &config.claude_code_root, filter) {
+                    Ok(summaries) => clitrace::engine::print_summary(&summaries),
+                    Err(e) => {
+                        eprintln!("[clitrace] Report failed: {}", e);
+                        std::process::exit(1);
+                    }
                 }
             } else if let Err(e) = clitrace::engine::cold_start_report(&parser, &config.claude_code_root) {
                 eprintln!("[clitrace] Report failed: {}", e);
