@@ -175,49 +175,113 @@ fn is_complete_json_object(bytes: &[u8]) -> bool {
 /// (balanced `{}`), otherwise it is dropped as an incomplete write.
 /// Returns (lines, bytes_consumed).
 pub fn read_lines_from(path: &str, offset: u64) -> std::io::Result<(Vec<String>, u64)> {
-    let mut file = std::fs::File::open(path)?;
-    file.seek(SeekFrom::Start(offset))?;
+    let file = std::fs::File::open(path)?;
+    let file_size = file.metadata()?.len();
+    let remaining = file_size.saturating_sub(offset);
 
-    let mut data = Vec::new();
-    file.read_to_end(&mut data)?;
-
-    if data.is_empty() {
+    if remaining == 0 {
         return Ok((Vec::new(), 0));
     }
 
-    let mut bytes_consumed = data.len() as u64;
+    let mut reader = std::io::BufReader::new(file);
+    reader.seek(SeekFrom::Start(offset))?;
 
-    // Handle trailing segment without \n.
-    if !data.ends_with(b"\n") {
-        // Find the trailing segment (after last \n, or entire data if no \n).
-        let last_newline = data.iter().rposition(|&b| b == b'\n');
-        let trailing_start = match last_newline {
-            Some(pos) => pos + 1,
-            None => 0,
-        };
-        let trailing = &data[trailing_start..];
+    let mut lines = Vec::new();
+    let mut bytes_consumed: u64 = 0;
+    let mut trailing_line: Option<String> = None;
 
-        if is_complete_json_object(trailing) {
-            // Complete JSON without trailing \n — include it.
-            // bytes_consumed covers everything including this segment.
+    let mut line_buf = String::new();
+    loop {
+        line_buf.clear();
+        let n = reader.read_line(&mut line_buf)?;
+        if n == 0 {
+            break;
+        }
+        if line_buf.ends_with('\n') {
+            // Complete line — strip newline and keep
+            let trimmed = line_buf.trim_end_matches('\n').trim_end_matches('\r');
+            lines.push(trimmed.to_string());
+            bytes_consumed += n as u64;
         } else {
-            // Incomplete write — drop the trailing segment.
-            if let Some(pos) = last_newline {
-                data.truncate(pos + 1);
-                bytes_consumed = data.len() as u64;
-            } else {
-                return Ok((Vec::new(), 0));
-            }
+            // Trailing segment without \n — defer decision
+            trailing_line = Some(line_buf.clone());
         }
     }
 
-    let reader = std::io::BufReader::new(&data[..]);
-    let lines: Vec<String> = reader
-        .lines()
-        .filter_map(|l| l.ok())
-        .collect();
+    // Handle trailing segment without \n
+    if let Some(trailing) = trailing_line {
+        if is_complete_json_object(trailing.as_bytes()) {
+            bytes_consumed += trailing.len() as u64;
+            lines.push(trailing);
+        }
+        // else: incomplete write — drop it, bytes_consumed stays at last \n
+    }
 
     Ok((lines, bytes_consumed))
+}
+
+/// Streaming line processor: reads lines from offset and calls a closure for each line,
+/// avoiding accumulation of all lines in memory. Used for cold start.
+/// Returns (count, bytes_consumed, last_line_len, last_line_hash) or None if no lines.
+pub fn process_lines_streaming<F>(
+    path: &str,
+    offset: u64,
+    mut on_line: F,
+) -> std::io::Result<Option<(u64, u64, u64)>>
+where
+    F: FnMut(&str),
+{
+    let file = std::fs::File::open(path)?;
+    let file_size = file.metadata()?.len();
+    let remaining = file_size.saturating_sub(offset);
+
+    if remaining == 0 {
+        return Ok(None);
+    }
+
+    let mut reader = std::io::BufReader::new(file);
+    reader.seek(SeekFrom::Start(offset))?;
+
+    let mut bytes_consumed: u64 = 0;
+    let mut last_line_len: u64 = 0;
+    let mut last_line_hash: u64 = 0;
+    let mut has_lines = false;
+    let mut trailing_line: Option<String> = None;
+
+    let mut line_buf = String::new();
+    loop {
+        line_buf.clear();
+        let n = reader.read_line(&mut line_buf)?;
+        if n == 0 {
+            break;
+        }
+        if line_buf.ends_with('\n') {
+            let trimmed = line_buf.trim_end_matches('\n').trim_end_matches('\r');
+            on_line(trimmed);
+            last_line_len = trimmed.len() as u64;
+            last_line_hash = hash_line(trimmed.as_bytes());
+            bytes_consumed += n as u64;
+            has_lines = true;
+        } else {
+            trailing_line = Some(line_buf.clone());
+        }
+    }
+
+    if let Some(trailing) = trailing_line {
+        if is_complete_json_object(trailing.as_bytes()) {
+            on_line(&trailing);
+            last_line_len = trailing.len() as u64;
+            last_line_hash = hash_line(trailing.as_bytes());
+            bytes_consumed += trailing.len() as u64;
+            has_lines = true;
+        }
+    }
+
+    if has_lines {
+        Ok(Some((bytes_consumed, last_line_len, last_line_hash)))
+    } else {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]

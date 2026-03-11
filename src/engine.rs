@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
 
-use crate::checkpoint::{find_resume_offset, hash_line, read_lines_from};
+use crate::checkpoint::{find_resume_offset, hash_line, process_lines_streaming, read_lines_from};
 use crate::common::types::{FileCheckpoint, LogParser, ModelUsageSummary, UsageEvent};
 use crate::db::Database;
 
@@ -410,6 +410,7 @@ impl TrackerEngine {
 }
 
 /// Process a single file during cold start (called from scoped threads).
+/// Uses streaming line reader to avoid holding all lines in memory.
 /// Returns (events, last_line_len, last_line_hash) or None if no new data.
 fn process_file_cold(
     path: &str,
@@ -424,23 +425,19 @@ fn process_file_cold(
             .unwrap_or(0),
     };
 
-    let (lines, _bytes_read) = read_lines_from(path, offset)?;
-    if lines.is_empty() {
-        return Ok(None);
-    }
-
     let mut events = Vec::new();
-    for line in &lines {
+    let result = process_lines_streaming(path, offset, |line| {
         if let Some(event) = parser.parse_line(line, path) {
             events.push(event);
         }
+    })?;
+
+    match result {
+        Some((_bytes, last_line_len, last_line_hash)) => {
+            Ok(Some((events, last_line_len, last_line_hash)))
+        }
+        None => Ok(None),
     }
-
-    let last_line = lines.last().unwrap();
-    let last_line_len = last_line.len() as u64;
-    let last_line_hash = hash_line(last_line.as_bytes());
-
-    Ok(Some((events, last_line_len, last_line_hash)))
 }
 
 /// Print cold start summary.
