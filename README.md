@@ -56,6 +56,21 @@ Report 옵션:
   - `YYYYMMDD`는 해당 날짜의 `23:59:59` UTC로 해석
 - `--from-beginning`: `--since` 없이 전체 데이터 그룹핑 허용
 
+### 출력 형식 (`--output-format`)
+
+```bash
+# 기본값: 테이블 출력
+cargo run --release -- report weekly --from-beginning
+
+# JSON 출력
+cargo run --release -- report --output-format json weekly --from-beginning
+
+# trace에서도 사용 가능 (이벤트가 NDJSON으로 출력)
+cargo run --release -- trace --output-format json
+```
+
+`--output-format`은 글로벌 옵션으로, `report`/`trace` 앞이나 뒤 어디에나 위치할 수 있다.
+
 ### 환경변수 오버라이드
 
 ```bash
@@ -75,12 +90,13 @@ clitrace = { path = "../module/clitrace" }
 
 ```rust
 use clitrace::{Config, start};
+use clitrace::engine::OutputFormat;
 
 fn main() {
     let config = Config::new()
         .with_claude_root("/custom/path/.claude".to_string());
 
-    let handle = start(config, None).expect("Failed to start clitrace");
+    let handle = start(config, None, OutputFormat::Table).expect("Failed to start clitrace");
 
     // ... 호스트 애플리케이션 로직 ...
 
@@ -90,28 +106,75 @@ fn main() {
 
 ## 출력 예시
 
-### Cold Start (모델별 요약)
+### Table (기본)
 
 ```
-[clitrace] ═══════════════════════════════════════════
 [clitrace] Token Usage Summary
-[clitrace] ───────────────────────────────────────────
-[clitrace] Model: claude-opus-4-6
-[clitrace]   Input:        1,234 | Cache Create:       56,789
-[clitrace]   Cache Read:  98,765 | Output:              4,321
-[clitrace]   Events: 42
-[clitrace] ───────────────────────────────────────────
-[clitrace] Model: claude-haiku-4-5-20251001
-[clitrace]   Input:          567 | Cache Create:       12,345
-[clitrace]   Cache Read:  34,567 | Output:              2,100
-[clitrace]   Events: 18
-[clitrace] ═══════════════════════════════════════════
+┌───────────────────────────┬─────────┬─────────┬────────────┬──────────────┬──────────────┬────────┐
+│ Model                     ┆ Input   ┆ Output  ┆ Cache      ┆ Cache        ┆ Total        ┆ Events │
+│                           ┆         ┆         ┆ Create     ┆ Read         ┆ Tokens       ┆        │
+╞═══════════════════════════╪═════════╪═════════╪════════════╪══════════════╪══════════════╪════════╡
+│ claude-opus-4-6           ┆ 1,234   ┆ 4,321   ┆ 56,789     ┆ 98,765       ┆ 161,109      ┆ 42     │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┤
+│ claude-haiku-4-5-20251001 ┆ 567     ┆ 2,100   ┆ 12,345     ┆ 34,567       ┆ 49,579       ┆ 18     │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┤
+│ Total                     ┆ 1,801   ┆ 6,421   ┆ 69,134     ┆ 133,332      ┆ 210,688      ┆ 60     │
+└───────────────────────────┴─────────┴─────────┴────────────┴──────────────┴──────────────┴────────┘
+```
+
+### JSON (`--output-format json`)
+
+Summary:
+```json
+{
+  "type": "summary",
+  "data": [
+    {
+      "model": "claude-opus-4-6",
+      "input_tokens": 1234,
+      "output_tokens": 4321,
+      "cache_creation_input_tokens": 56789,
+      "cache_read_input_tokens": 98765,
+      "total_tokens": 161109,
+      "events": 42
+    }
+  ]
+}
+```
+
+Grouped (daily, weekly, ...):
+```json
+{
+  "type": "daily",
+  "data": [
+    {
+      "period": "2026-03-01",
+      "usage_per_models": [
+        {
+          "model": "claude-opus-4-6",
+          "input_tokens": 1234,
+          "output_tokens": 4321,
+          "cache_creation_input_tokens": 56789,
+          "cache_read_input_tokens": 98765,
+          "total_tokens": 161109,
+          "events": 42
+        }
+      ]
+    }
+  ]
+}
 ```
 
 ### Watch Mode (실시간 이벤트)
 
+Table:
 ```
 [clitrace] claude-opus-4-6 | session.jsonl | in:3 cc:5139 cr:9631 out:14
+```
+
+JSON (NDJSON, 한 줄씩):
+```json
+{"type":"event","data":{"model":"claude-opus-4-6","source":"4de9291e","input_tokens":3,"output_tokens":14,"cache_creation_input_tokens":5139,"cache_read_input_tokens":9631}}
 ```
 
 ## Architecture
@@ -347,6 +410,7 @@ module/clitrace/
 | 파일 감시 | notify 6.x | macOS FSEvents 자동 사용 |
 | 직렬화 | bincode 1.x (checkpoint), serde_json (JSONL) | 바이너리 최소 오버헤드 |
 | 해시 | xxhash-rust 0.8 (xxh3) | 체크포인트 줄 식별 (30GB/s, 비암호화) |
+| 테이블 출력 | comfy-table 7.1 | Unicode 테이블 렌더링 |
 
 ## JSONL 구조 참고
 
