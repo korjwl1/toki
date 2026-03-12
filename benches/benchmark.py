@@ -399,11 +399,17 @@ def cmd_run(args):
                     print(f"  {r.wall_time_s:7.3f}s  {r.peak_rss_mb:6.1f}MB  {status}")
 
     # Save results
-    save_results(results)
+    json_path = save_results(results)
     print_summary(results)
 
+    # Auto-generate charts
+    print("\n=== Generating Charts ===")
+    charts = generate_charts(json_path)
+    if charts:
+        print(f"\n{len(charts)} chart files saved to {RESULTS_DIR / 'charts'}/")
 
-def save_results(results: list[BenchResult]):
+
+def save_results(results: list[BenchResult]) -> Path:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -428,6 +434,7 @@ def save_results(results: list[BenchResult]):
     print(f"\nResults saved:")
     print(f"  CSV:  {csv_path}")
     print(f"  JSON: {json_path}")
+    return json_path
 
 
 def compute_averages(results: list[BenchResult]) -> list[dict]:
@@ -504,6 +511,219 @@ def print_summary(results: list[BenchResult]):
 
 
 # ---------------------------------------------------------------------------
+# Chart generation
+# ---------------------------------------------------------------------------
+
+TOOL_COLORS = {
+    "clitrace": "#2563eb",  # blue
+    "ccusage": "#f59e0b",   # amber
+}
+
+TOOL_LABELS = {
+    "clitrace": "clitrace (Rust)",
+    "ccusage": "ccusage (Node.js)",
+}
+
+
+def generate_charts(json_path: Path) -> list[Path]:
+    """Generate benchmark charts from a JSON results file. Returns list of saved image paths."""
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import matplotlib.ticker as ticker
+        from matplotlib.patches import FancyBboxPatch
+    except ImportError:
+        print("Warning: matplotlib not installed. Skipping chart generation.")
+        print("  Install with: pip3 install matplotlib")
+        return []
+
+    # ── Modern style ──
+    BG = "#ffffff"
+    PLOT_BG = "#f8f9fa"
+    GRID_COLOR = "#e9ecef"
+    TEXT_COLOR = "#212529"
+    SUBTLE_TEXT = "#6c757d"
+
+    plt.rcParams.update({
+        "font.family": "sans-serif",
+        "font.sans-serif": ["Helvetica Neue", "Arial", "DejaVu Sans"],
+        "font.size": 11,
+        "axes.titlesize": 14,
+        "axes.titleweight": 600,
+        "axes.labelsize": 11,
+        "axes.labelcolor": SUBTLE_TEXT,
+        "axes.edgecolor": "#dee2e6",
+        "axes.linewidth": 0.6,
+        "xtick.color": SUBTLE_TEXT,
+        "ytick.color": SUBTLE_TEXT,
+        "xtick.labelsize": 10,
+        "ytick.labelsize": 10,
+        "figure.facecolor": BG,
+        "axes.facecolor": PLOT_BG,
+        "grid.color": GRID_COLOR,
+        "grid.linewidth": 0.7,
+        "grid.alpha": 1.0,
+        "lines.antialiased": True,
+        "patch.antialiased": True,
+    })
+
+    with open(json_path) as f:
+        data = json.load(f)
+
+    avgs = data["averages"]
+    tools = sorted(set(a["tool"] for a in avgs))
+    scenarios = sorted(
+        set(a["scenario"] for a in avgs),
+        key=lambda s: [x[0] for x in SCENARIOS].index(s),
+    )
+
+    charts_dir = RESULTS_DIR / "charts"
+    charts_dir.mkdir(parents=True, exist_ok=True)
+    ts = json_path.stem.replace("benchmark_", "")
+    saved = []
+
+    # ── Line styles: 4 visually distinct lines ──
+    STYLES = {
+        ("clitrace", "val"):  {"color": "#2563eb", "ls": "-",  "marker": "o", "ms": 5, "lw": 2.2, "label": "clitrace"},
+        ("clitrace", "avg"):  {"color": "#2563eb", "ls": "-",  "marker": "o", "ms": 5, "lw": 2.2, "label": "clitrace avg"},
+        ("clitrace", "peak"): {"color": "#93c5fd", "ls": "--", "marker": "D", "ms": 4, "lw": 1.6, "label": "clitrace peak"},
+        ("ccusage", "val"):   {"color": "#ea580c", "ls": "-",  "marker": "s", "ms": 5, "lw": 2.2, "label": "ccusage"},
+        ("ccusage", "avg"):   {"color": "#ea580c", "ls": "-",  "marker": "s", "ms": 5, "lw": 2.2, "label": "ccusage avg"},
+        ("ccusage", "peak"):  {"color": "#fdba74", "ls": "--", "marker": "^", "ms": 4, "lw": 1.6, "label": "ccusage peak"},
+    }
+
+    def _plot(ax, x, y, tool, kind):
+        s = STYLES[(tool, kind)]
+        ax.plot(x, y, color=s["color"], linestyle=s["ls"], marker=s["marker"],
+                markersize=s["ms"], linewidth=s["lw"], label=s["label"],
+                markeredgecolor="white", markeredgewidth=0.8, zorder=3)
+
+    def _style_ax(ax, ylabel, show_xlabel=True):
+        ax.set_ylim(bottom=0)
+        ax.set_ylabel(ylabel, fontsize=11, color=SUBTLE_TEXT)
+        if show_xlabel:
+            ax.set_xlabel("Data Size (MB)", fontsize=11, color=SUBTLE_TEXT)
+        ax.grid(axis="y", zorder=0)
+        ax.grid(axis="x", visible=False)
+        for spine in ["top", "right"]:
+            ax.spines[spine].set_visible(False)
+        ax.tick_params(axis="both", length=3, width=0.6)
+
+    def _legend(ax, loc="upper right"):
+        leg = ax.legend(
+            loc=loc, fontsize=9, frameon=True, framealpha=0.92,
+            edgecolor="#dee2e6", fancybox=True, borderpad=0.6,
+            handlelength=1.8, handletextpad=0.5, labelspacing=0.35,
+        )
+        leg.get_frame().set_linewidth(0.5)
+
+    # ── Per-scenario charts: 3 columns ──
+    for scenario in scenarios:
+        fig, axes = plt.subplots(1, 3, figsize=(19, 5.5))
+        fig.suptitle(f"clitrace vs ccusage  —  {scenario} report",
+                     fontsize=17, fontweight="bold", color=TEXT_COLOR, y=0.98)
+
+        for tool in tools:
+            entries = sorted(
+                [a for a in avgs if a["tool"] == tool and a["scenario"] == scenario],
+                key=lambda a: a["data_size_mb"],
+            )
+            if not entries:
+                continue
+            x = [int(a["data_label"].replace("mb", "")) for a in entries]
+
+            _plot(axes[0], x, [a["wall_time_s"] for a in entries], tool, "val")
+            _plot(axes[1], x, [a["avg_cpu_pct"] for a in entries], tool, "avg")
+            _plot(axes[1], x, [a["peak_cpu_pct"] for a in entries], tool, "peak")
+            _plot(axes[2], x, [a["avg_rss_mb"] for a in entries], tool, "avg")
+            _plot(axes[2], x, [a["peak_rss_mb"] for a in entries], tool, "peak")
+
+        titles = ["Execution Time", "CPU Usage", "Memory"]
+        ylabels = ["Time (s)", "CPU (%)", "Memory (MB)"]
+        for i, ax in enumerate(axes):
+            ax.set_title(titles[i], fontsize=13, fontweight=600, color=TEXT_COLOR, pad=10)
+            _style_ax(ax, ylabels[i])
+            _legend(ax, loc="upper right" if i > 0 else "upper left")
+
+        fig.tight_layout(rect=[0, 0, 1, 0.94], w_pad=3.5)
+
+        for fmt in ["png", "svg"]:
+            out = charts_dir / f"benchmark_{scenario}_{ts}.{fmt}"
+            fig.savefig(str(out), dpi=220 if fmt == "png" else 150,
+                        bbox_inches="tight", facecolor=BG)
+            saved.append(out)
+        plt.close(fig)
+        print(f"  {scenario}: saved PNG + SVG")
+
+    # ── Speedup chart ──
+    SPEEDUP_COLORS = ["#2563eb", "#7c3aed", "#059669", "#ea580c", "#d946ef"]
+    fig, ax = plt.subplots(figsize=(13, 5.5))
+    color_idx = 0
+    for scenario in scenarios:
+        speedups = []
+        x_vals = []
+        cli_entries = sorted(
+            [a for a in avgs if a["tool"] == "clitrace" and a["scenario"] == scenario],
+            key=lambda a: a["data_size_mb"],
+        )
+        for entry in cli_entries:
+            cc = [a for a in avgs if a["tool"] == "ccusage"
+                  and a["data_label"] == entry["data_label"]
+                  and a["scenario"] == scenario]
+            if cc and entry["wall_time_s"] > 0:
+                speedups.append(cc[0]["wall_time_s"] / entry["wall_time_s"])
+                x_vals.append(int(entry["data_label"].replace("mb", "")))
+
+        if speedups:
+            c = SPEEDUP_COLORS[color_idx % len(SPEEDUP_COLORS)]
+            ax.plot(x_vals, speedups, marker="o", markersize=5, linewidth=2.2,
+                    label=scenario, color=c, markeredgecolor="white", markeredgewidth=0.8, zorder=3)
+            for xi, si in zip(x_vals, speedups):
+                ax.annotate(f"{si:.0f}x", (xi, si), textcoords="offset points",
+                            xytext=(0, 10), ha="center", fontsize=9, color=c, fontweight=500)
+            color_idx += 1
+
+    ax.set_title("Speedup: clitrace vs ccusage  (higher = faster)",
+                 fontsize=15, fontweight="bold", color=TEXT_COLOR, pad=12)
+    _style_ax(ax, "Speedup (x)")
+    _legend(ax, loc="upper right")
+    fig.tight_layout()
+
+    for fmt in ["png", "svg"]:
+        out = charts_dir / f"benchmark_speedup_{ts}.{fmt}"
+        fig.savefig(str(out), dpi=220 if fmt == "png" else 150,
+                    bbox_inches="tight", facecolor=BG)
+        saved.append(out)
+    plt.close(fig)
+    print(f"  speedup: saved PNG + SVG")
+
+    return saved
+
+
+def cmd_plot(args):
+    """Generate charts from an existing results JSON file."""
+    if args.file:
+        json_path = Path(args.file)
+    else:
+        # Find latest JSON result
+        if not RESULTS_DIR.exists():
+            print("Error: No results directory found. Run benchmarks first.")
+            sys.exit(1)
+        jsons = sorted(RESULTS_DIR.glob("benchmark_*.json"))
+        if not jsons:
+            print("Error: No result JSON files found.")
+            sys.exit(1)
+        json_path = jsons[-1]
+
+    print(f"\n=== Generating Charts ===")
+    print(f"Source: {json_path}")
+    charts = generate_charts(json_path)
+    if charts:
+        print(f"\n{len(charts)} chart files saved to {RESULTS_DIR / 'charts'}/")
+
+
+# ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
 
@@ -534,6 +754,8 @@ Examples:
   python3 benchmark.py run --runs 5
   python3 benchmark.py run --sizes 100,200
   python3 benchmark.py all
+  python3 benchmark.py plot
+  python3 benchmark.py plot --file results/benchmark_xxx.json
         """,
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -561,6 +783,11 @@ Examples:
     a.add_argument("--runs", type=int, default=DEFAULT_RUNS,
                    help=f"Runs per scenario (default: {DEFAULT_RUNS})")
 
+    # plot
+    p = sub.add_parser("plot", help="Generate charts from benchmark results")
+    p.add_argument("--file", default=None,
+                   help="Path to benchmark JSON file (default: latest)")
+
     args = parser.parse_args()
 
     # Apply default sizes for generate/all
@@ -573,6 +800,8 @@ Examples:
         cmd_run(args)
     elif args.command == "all":
         cmd_all(args)
+    elif args.command == "plot":
+        cmd_plot(args)
 
 
 if __name__ == "__main__":
