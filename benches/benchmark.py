@@ -594,10 +594,25 @@ def generate_charts(json_path: Path) -> list[Path]:
     }
 
     def _plot(ax, x, y, tool, kind):
+        import numpy as np
+        from scipy.interpolate import make_interp_spline
         s = STYLES[(tool, kind)]
-        ax.plot(x, y, color=s["color"], linestyle=s["ls"], marker=s["marker"],
-                markersize=s["ms"], linewidth=s["lw"], label=s["label"],
-                markeredgecolor="white", markeredgewidth=0.8, zorder=3)
+        # Smooth curve via spline interpolation (need 3+ points)
+        if len(x) >= 3:
+            x_arr = np.array(x, dtype=float)
+            y_arr = np.array(y, dtype=float)
+            x_smooth = np.linspace(x_arr.min(), x_arr.max(), 200)
+            spl = make_interp_spline(x_arr, y_arr, k=min(3, len(x) - 1))
+            y_smooth = spl(x_smooth)
+            ax.plot(x_smooth, y_smooth, color=s["color"], linestyle=s["ls"],
+                    linewidth=s["lw"], label=s["label"], zorder=2)
+            ax.plot(x, y, color=s["color"], marker=s["marker"],
+                    markersize=s["ms"], linestyle="none",
+                    markeredgecolor="white", markeredgewidth=0.8, zorder=3)
+        else:
+            ax.plot(x, y, color=s["color"], linestyle=s["ls"], marker=s["marker"],
+                    markersize=s["ms"], linewidth=s["lw"], label=s["label"],
+                    markeredgecolor="white", markeredgewidth=0.8, zorder=3)
 
     def _style_ax(ax, ylabel, show_xlabel=True):
         ax.set_ylim(bottom=0)
@@ -676,9 +691,20 @@ def generate_charts(json_path: Path) -> list[Path]:
                 x_vals.append(int(entry["data_label"].replace("mb", "")))
 
         if speedups:
+            import numpy as np
+            from scipy.interpolate import make_interp_spline
             c = SPEEDUP_COLORS[color_idx % len(SPEEDUP_COLORS)]
-            ax.plot(x_vals, speedups, marker="o", markersize=5, linewidth=2.2,
-                    label=scenario, color=c, markeredgecolor="white", markeredgewidth=0.8, zorder=3)
+            if len(x_vals) >= 3:
+                x_arr = np.array(x_vals, dtype=float)
+                y_arr = np.array(speedups, dtype=float)
+                x_sm = np.linspace(x_arr.min(), x_arr.max(), 200)
+                spl = make_interp_spline(x_arr, y_arr, k=min(3, len(x_vals) - 1))
+                ax.plot(x_sm, spl(x_sm), color=c, linewidth=2.2, label=scenario, zorder=2)
+                ax.plot(x_vals, speedups, marker="o", markersize=5, linestyle="none",
+                        color=c, markeredgecolor="white", markeredgewidth=0.8, zorder=3)
+            else:
+                ax.plot(x_vals, speedups, marker="o", markersize=5, linewidth=2.2,
+                        label=scenario, color=c, markeredgecolor="white", markeredgewidth=0.8, zorder=3)
             for xi, si in zip(x_vals, speedups):
                 ax.annotate(f"{si:.0f}x", (xi, si), textcoords="offset points",
                             xytext=(0, 10), ha="center", fontsize=9, color=c, fontweight=500)
