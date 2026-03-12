@@ -84,6 +84,8 @@ pub struct TrackerEngine {
     dirty: HashSet<String>,
     /// Output format for print functions.
     output_format: OutputFormat,
+    /// Optional session ID prefix filter for trace mode.
+    session_filter: Option<String>,
 }
 
 struct ColdStartResult {
@@ -97,8 +99,12 @@ fn cold_start_collect(
     parser: &(dyn LogParser + Sync),
     root_dir: &str,
     checkpoints: &HashMap<String, FileCheckpoint>,
+    session_filter: Option<&str>,
 ) -> Result<ColdStartResult, Box<dyn std::error::Error>> {
-    let sessions = parser.discover_sessions(root_dir);
+    let mut sessions = parser.discover_sessions(root_dir);
+    if let Some(prefix) = session_filter {
+        sessions = filter_sessions_by_id(sessions, prefix);
+    }
 
     if sessions.is_empty() {
         return Ok(ColdStartResult {
@@ -152,9 +158,10 @@ pub fn cold_start_report(
     parser: &(dyn LogParser + Sync),
     root_dir: &str,
     output_format: OutputFormat,
+    session_filter: Option<&str>,
 ) -> Result<HashMap<String, ModelUsageSummary>, Box<dyn std::error::Error>> {
     let empty = HashMap::new();
-    let result = cold_start_collect(parser, root_dir, &empty)?;
+    let result = cold_start_collect(parser, root_dir, &empty, session_filter)?;
     print_summary(&result.summaries, output_format);
     Ok(result.summaries)
 }
@@ -193,11 +200,15 @@ pub fn cold_start_report_grouped<P>(
     checkpoints: &HashMap<String, FileCheckpoint>,
     filter: ReportFilter,
     output_format: OutputFormat,
+    session_filter: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     P: LogParser + LogParserWithTs + Sync,
 {
-    let sessions = parser.discover_sessions(root_dir);
+    let mut sessions = parser.discover_sessions(root_dir);
+    if let Some(prefix) = session_filter {
+        sessions = filter_sessions_by_id(sessions, prefix);
+    }
     if sessions.is_empty() {
         println!("[clitrace] No usage data found.");
         return Ok(());
@@ -235,11 +246,15 @@ pub fn cold_start_report_filtered<P>(
     root_dir: &str,
     checkpoints: &HashMap<String, FileCheckpoint>,
     filter: ReportFilter,
+    session_filter: Option<&str>,
 ) -> Result<HashMap<String, ModelUsageSummary>, Box<dyn std::error::Error>>
 where
     P: LogParser + LogParserWithTs + Sync,
 {
-    let sessions = parser.discover_sessions(root_dir);
+    let mut sessions = parser.discover_sessions(root_dir);
+    if let Some(prefix) = session_filter {
+        sessions = filter_sessions_by_id(sessions, prefix);
+    }
     if sessions.is_empty() {
         return Ok(HashMap::new());
     }
@@ -273,6 +288,73 @@ where
     Ok(summaries.into_inner().unwrap())
 }
 
+/// Report grouped by session ID (each session shows its per-model breakdown).
+pub fn cold_start_report_by_session<P>(
+    parser: &P,
+    root_dir: &str,
+    checkpoints: &HashMap<String, FileCheckpoint>,
+    filter: ReportFilter,
+    session_filter: Option<&str>,
+    output_format: OutputFormat,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    P: LogParser + LogParserWithTs + Sync,
+{
+    let mut sessions = parser.discover_sessions(root_dir);
+    if let Some(prefix) = session_filter {
+        sessions = filter_sessions_by_id(sessions, prefix);
+    }
+    if sessions.is_empty() {
+        println!("[clitrace] No usage data found.");
+        return Ok(());
+    }
+
+    let grouped: Mutex<HashMap<String, HashMap<String, ModelUsageSummary>>> =
+        Mutex::new(HashMap::new());
+
+    let use_ts_filter = filter_active(filter);
+
+    parallel_scan(&sessions, checkpoints, |path, offset| {
+        let session_id = match extract_session_id(path) {
+            Some(id) => id,
+            None => return,
+        };
+        let mut local: HashMap<String, ModelUsageSummary> = HashMap::new();
+        let _ = process_lines_streaming(path, offset, |line| {
+            if use_ts_filter {
+                if let Some(event) = parser.parse_line_with_ts(line, path) {
+                    let ts = match parse_timestamp(&event.timestamp) {
+                        Some(t) => t,
+                        None => return,
+                    };
+                    if !filter_match(ts, filter) {
+                        return;
+                    }
+                    let summary = local.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
+                        model: event.model.clone(),
+                        ..Default::default()
+                    });
+                    summary.accumulate_with_ts(&event);
+                }
+            } else if let Some(event) = parser.parse_line(line, path) {
+                let summary = local.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
+                    model: event.model.clone(),
+                    ..Default::default()
+                });
+                summary.accumulate(&event);
+            }
+        });
+        if !local.is_empty() {
+            let mut g = grouped.lock().unwrap();
+            let session_models = g.entry(session_id).or_insert_with(HashMap::new);
+            merge_summaries(session_models, local);
+        }
+    });
+
+    print_grouped_summary(&grouped.into_inner().unwrap(), output_format, "session");
+    Ok(())
+}
+
 impl TrackerEngine {
     pub fn new(db: Database) -> Self {
         TrackerEngine {
@@ -282,11 +364,17 @@ impl TrackerEngine {
             activity: HashMap::new(),
             dirty: HashSet::new(),
             output_format: OutputFormat::Table,
+            session_filter: None,
         }
     }
 
     pub fn with_output_format(mut self, format: OutputFormat) -> Self {
         self.output_format = format;
+        self
+    }
+
+    pub fn with_session_filter(mut self, filter: Option<String>) -> Self {
+        self.session_filter = filter;
         self
     }
 
@@ -307,7 +395,7 @@ impl TrackerEngine {
         root_dir: &str,
     ) -> Result<HashMap<String, ModelUsageSummary>, Box<dyn std::error::Error>> {
         let t_cold = Instant::now();
-        let result = cold_start_collect(parser, root_dir, &self.checkpoints)?;
+        let result = cold_start_collect(parser, root_dir, &self.checkpoints, None)?;
 
         if result.session_count == 0 {
             debug_log!("cold_start — 0 sessions, 0 files ({}µs)", t_cold.elapsed().as_micros());
@@ -520,6 +608,14 @@ impl TrackerEngine {
     }
 
     fn process_and_print(&mut self, path: &str, parser: &dyn LogParser) {
+        // Skip files that don't match session filter
+        if let Some(ref prefix) = self.session_filter {
+            if let Some(sid) = extract_session_id(path) {
+                if !sid.starts_with(prefix.as_str()) {
+                    return;
+                }
+            }
+        }
         match self.process_file(path, parser) {
             Ok(events) => {
                 for event in &events {
@@ -706,10 +802,12 @@ fn print_grouped_summary(grouped: &HashMap<String, HashMap<String, ModelUsageSum
         return;
     }
 
+    let is_session = type_name == "session";
     let mut buckets: Vec<_> = grouped.keys().cloned().collect();
     buckets.sort();
 
     if format == OutputFormat::Json {
+        let json_key = if is_session { "session" } else { "period" };
         let mut data = Vec::new();
         for bucket in &buckets {
             if let Some(models) = grouped.get(bucket) {
@@ -727,7 +825,7 @@ fn print_grouped_summary(grouped: &HashMap<String, HashMap<String, ModelUsageSum
                     })
                 }).collect();
                 data.push(serde_json::json!({
-                    "period": bucket,
+                    json_key: bucket,
                     "usage_per_models": usage_per_models,
                 }));
             }
@@ -739,11 +837,12 @@ fn print_grouped_summary(grouped: &HashMap<String, HashMap<String, ModelUsageSum
         return;
     }
 
+    let header_label = if is_session { "Session" } else { "Period" };
     let mut table = Table::new();
     table.load_preset(UTF8_FULL);
     table.set_content_arrangement(ContentArrangement::Dynamic);
     table.set_header(vec![
-        Cell::new("Period").add_attribute(Attribute::Bold),
+        Cell::new(header_label).add_attribute(Attribute::Bold),
         Cell::new("Model").add_attribute(Attribute::Bold),
         Cell::new("Input").add_attribute(Attribute::Bold),
         Cell::new("Output").add_attribute(Attribute::Bold),
@@ -766,8 +865,9 @@ fn print_grouped_summary(grouped: &HashMap<String, HashMap<String, ModelUsageSum
 
             for (i, s) in sorted.iter().enumerate() {
                 let total = s.input_tokens + s.output_tokens + s.cache_creation_input_tokens + s.cache_read_input_tokens;
+                let display_key = if is_session { shorten_id(bucket).to_string() } else { bucket.clone() };
                 let period_cell = if i == 0 {
-                    Cell::new(bucket)
+                    Cell::new(&display_key)
                 } else {
                     Cell::new("")
                 };
@@ -943,6 +1043,26 @@ pub fn print_event(event: &UsageEvent, format: OutputFormat) {
         event.cache_read_input_tokens,
         event.output_tokens,
     );
+}
+
+/// Extract the full session UUID from a file path.
+///   Parent:   .../projects/<dir>/<UUID>.jsonl        → "<UUID>"
+///   Subagent: .../<UUID>/subagents/agent-<id>.jsonl  → "<UUID>" (grandparent dir name)
+pub fn extract_session_id(path: &str) -> Option<String> {
+    let parts: Vec<&str> = path.rsplit('/').collect();
+    // Subagent: parts = ["agent-xxx.jsonl", "subagents", "<UUID>", ...]
+    if parts.len() >= 3 && parts[1] == "subagents" {
+        return Some(parts[2].to_string());
+    }
+    // Parent: filename without .jsonl
+    parts.first().map(|s| s.trim_end_matches(".jsonl").to_string())
+}
+
+/// Filter sessions by session_id prefix match.
+pub fn filter_sessions_by_id(sessions: Vec<crate::common::types::SessionGroup>, prefix: &str) -> Vec<crate::common::types::SessionGroup> {
+    sessions.into_iter()
+        .filter(|s| s.session_id.starts_with(prefix))
+        .collect()
 }
 
 /// Extract a human-readable label from a source file path.

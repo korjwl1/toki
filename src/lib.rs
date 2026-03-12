@@ -57,7 +57,9 @@ pub fn start(config: Config, startup_group_by: Option<ReportGroupBy>, output_for
         db.clear_checkpoints().map_err(|e| ClitraceError::Db(e.into()))?;
     }
 
-    let mut engine = TrackerEngine::new(db).with_output_format(output_format);
+    let mut engine = TrackerEngine::new(db)
+        .with_output_format(output_format)
+        .with_session_filter(config.session_filter.clone());
     engine.load_checkpoints().map_err(|e| ClitraceError::Db(e.into()))?;
 
     let parser = ClaudeCodeParser;

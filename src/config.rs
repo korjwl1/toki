@@ -7,6 +7,7 @@ pub struct Config {
     pub claude_code_root: String,
     pub db_path: PathBuf,
     pub full_rescan: bool,
+    pub session_filter: Option<String>,
 }
 
 impl Config {
@@ -17,6 +18,7 @@ impl Config {
             claude_code_root: home.join(".claude").to_string_lossy().to_string(),
             db_path: home.join(".config").join("clitrace").join("clitrace.db"),
             full_rescan: false,
+            session_filter: None,
         }
     }
 
@@ -32,6 +34,11 @@ impl Config {
 
     pub fn with_full_rescan(mut self, enabled: bool) -> Self {
         self.full_rescan = enabled;
+        self
+    }
+
+    pub fn with_session_filter(mut self, filter: Option<String>) -> Self {
+        self.session_filter = filter;
         self
     }
 

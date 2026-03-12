@@ -39,6 +39,9 @@ enum Commands {
         /// Group startup summary by time period: hour, day, week, month, year
         #[arg(long = "startup-group-by")]
         startup_group_by: Option<String>,
+        /// Filter by session ID prefix
+        #[arg(long = "session-id")]
+        session_id: Option<String>,
     },
     /// Report mode: one-shot summary without writing checkpoints.
     Report {
@@ -51,6 +54,12 @@ enum Commands {
         /// Filter end time (inclusive, UTC): YYYYMMDD or YYYYMMDDhhmmss
         #[arg(long)]
         until: Option<String>,
+        /// Group results by session instead of time period
+        #[arg(long = "group-by-session")]
+        group_by_session: bool,
+        /// Filter by session ID prefix
+        #[arg(long = "session-id")]
+        session_id: Option<String>,
         #[command(subcommand)]
         command: Option<ReportCommands>,
     },
@@ -67,6 +76,9 @@ struct ReportFilterArgs {
     /// Allow full scan without --since (for hourly/daily/weekly)
     #[arg(long)]
     from_beginning: bool,
+    /// Filter by session ID prefix
+    #[arg(long = "session-id")]
+    session_id: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -175,10 +187,13 @@ fn main() {
     };
 
     match cli.command {
-        Commands::Trace { claude_root, db_path, full_rescan, startup_group_by } => {
+        Commands::Trace { claude_root, db_path, full_rescan, startup_group_by, session_id } => {
             let mut config = build_config(claude_root, db_path);
             if full_rescan {
                 config = config.with_full_rescan(true);
+            }
+            if session_id.is_some() {
+                config = config.with_session_filter(session_id);
             }
 
             // Parse --startup-group-by
@@ -243,12 +258,19 @@ fn main() {
             handle.stop();
             println!("[clitrace] Done.");
         }
-        Commands::Report { claude_root, since, until, command } => {
+        Commands::Report { claude_root, since, until, group_by_session, session_id, command } => {
             let config = build_config(claude_root, None);
             println!("[clitrace] Running report...");
             println!("[clitrace] Claude Code root: {}", config.claude_code_root);
 
             let parser = clitrace::providers::claude_code::ClaudeCodeParser;
+            let session_filter = session_id.as_deref();
+
+            // Validate: --group-by-session cannot be used with subcommands
+            if group_by_session && command.is_some() {
+                eprintln!("[clitrace] --group-by-session cannot be used with time-based subcommands (daily/weekly/etc.)");
+                std::process::exit(1);
+            }
 
             let command = match command {
                 Some(cmd) => cmd,
@@ -281,7 +303,21 @@ fn main() {
                         }
                     }
 
-                    if since_dt.is_some() || until_dt.is_some() {
+                    if group_by_session {
+                        let filter = clitrace::engine::ReportFilter { since: since_dt, until: until_dt };
+                        let checkpoints = std::collections::HashMap::new();
+                        if let Err(e) = clitrace::engine::cold_start_report_by_session(
+                            &parser,
+                            &config.claude_code_root,
+                            &checkpoints,
+                            filter,
+                            session_filter,
+                            output_format,
+                        ) {
+                            eprintln!("[clitrace] Report failed: {}", e);
+                            std::process::exit(1);
+                        }
+                    } else if since_dt.is_some() || until_dt.is_some() {
                         let filter = clitrace::engine::ReportFilter { since: since_dt, until: until_dt };
                         let checkpoints = std::collections::HashMap::new();
                         match clitrace::engine::cold_start_report_filtered(
@@ -289,6 +325,7 @@ fn main() {
                             &config.claude_code_root,
                             &checkpoints,
                             filter,
+                            session_filter,
                         ) {
                             Ok(summaries) => clitrace::engine::print_summary(&summaries, output_format),
                             Err(e) => {
@@ -296,7 +333,7 @@ fn main() {
                                 std::process::exit(1);
                             }
                         }
-                    } else if let Err(e) = clitrace::engine::cold_start_report(&parser, &config.claude_code_root, output_format) {
+                    } else if let Err(e) = clitrace::engine::cold_start_report(&parser, &config.claude_code_root, output_format, session_filter) {
                         eprintln!("[clitrace] Report failed: {}", e);
                         std::process::exit(1);
                     }
@@ -368,6 +405,9 @@ fn main() {
                 std::process::exit(1);
             }
 
+            // Merge session filters: subcommand --session-id takes precedence, then parent-level
+            let effective_session_filter = filter_args.session_id.as_deref().or(session_filter);
+
             let filter = clitrace::engine::ReportFilter { since: since_dt, until: until_dt };
             let checkpoints = std::collections::HashMap::new();
             if let Err(e) = clitrace::engine::cold_start_report_grouped(
@@ -377,6 +417,7 @@ fn main() {
                 &checkpoints,
                 filter,
                 output_format,
+                effective_session_filter,
             ) {
                 eprintln!("[clitrace] Report failed: {}", e);
                 std::process::exit(1);
