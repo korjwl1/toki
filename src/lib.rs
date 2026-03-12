@@ -12,7 +12,7 @@ pub use config::Config;
 use std::thread::JoinHandle;
 
 use db::Database;
-use engine::{ReportGroupBy, TrackerEngine};
+use engine::{OutputFormat, ReportGroupBy, TrackerEngine};
 use providers::claude_code::ClaudeCodeParser;
 
 /// Running clitrace instance handle.
@@ -48,7 +48,7 @@ impl Drop for Handle {
 
 /// Start clitrace: cold start scan, then enter watch mode.
 /// Returns a Handle to control the running instance.
-pub fn start(config: Config, startup_group_by: Option<ReportGroupBy>) -> Result<Handle, ClitraceError> {
+pub fn start(config: Config, startup_group_by: Option<ReportGroupBy>, output_format: OutputFormat) -> Result<Handle, ClitraceError> {
     let db = Database::open(&config.db_path).map_err(|e| ClitraceError::Db(e.into()))?;
 
     // Full rescan: clear checkpoints.
@@ -57,7 +57,7 @@ pub fn start(config: Config, startup_group_by: Option<ReportGroupBy>) -> Result<
         db.clear_checkpoints().map_err(|e| ClitraceError::Db(e.into()))?;
     }
 
-    let mut engine = TrackerEngine::new(db);
+    let mut engine = TrackerEngine::new(db).with_output_format(output_format);
     engine.load_checkpoints().map_err(|e| ClitraceError::Db(e.into()))?;
 
     let parser = ClaudeCodeParser;

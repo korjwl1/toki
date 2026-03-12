@@ -16,6 +16,9 @@ static RUNNING: std::sync::atomic::AtomicBool = AtomicBool::new(true);
 #[derive(Parser)]
 #[command(name = "clitrace", version, about = "AI CLI tool token usage tracker")]
 struct Cli {
+    /// Output format: table (default) or json
+    #[arg(long, default_value = "table", global = true)]
+    output_format: String,
     #[command(subcommand)]
     command: Commands,
 }
@@ -162,6 +165,15 @@ fn acquire_trace_lock(db_path: &PathBuf) -> std::io::Result<std::fs::File> {
 fn main() {
     let cli = Cli::parse();
 
+    let output_format = match cli.output_format.as_str() {
+        "table" => clitrace::engine::OutputFormat::Table,
+        "json" => clitrace::engine::OutputFormat::Json,
+        v => {
+            eprintln!("[clitrace] Invalid --output-format: {} (use table|json)", v);
+            std::process::exit(1);
+        }
+    };
+
     match cli.command {
         Commands::Trace { claude_root, db_path, full_rescan, startup_group_by } => {
             let mut config = build_config(claude_root, db_path);
@@ -207,7 +219,7 @@ fn main() {
             println!("[clitrace] Claude Code root: {}", config.claude_code_root);
             println!("[clitrace] Database: {}", config.db_path.display());
 
-            let handle = match clitrace::start(config, group_by) {
+            let handle = match clitrace::start(config, group_by, output_format) {
                 Ok(h) => h,
                 Err(e) => {
                     eprintln!("[clitrace] Failed to start: {}", e);
@@ -271,32 +283,20 @@ fn main() {
 
                     if since_dt.is_some() || until_dt.is_some() {
                         let filter = clitrace::engine::ReportFilter { since: since_dt, until: until_dt };
-                        let db = match clitrace::db::Database::open(&config.db_path) {
-                            Ok(db) => db,
-                            Err(e) => {
-                                eprintln!("[clitrace] Failed to open DB: {}", e);
-                                std::process::exit(1);
-                            }
-                        };
-                        let mut checkpoints = std::collections::HashMap::new();
-                        if let Ok(cps) = db.load_all_checkpoints() {
-                            for cp in cps {
-                                checkpoints.insert(cp.file_path.clone(), cp);
-                            }
-                        }
+                        let checkpoints = std::collections::HashMap::new();
                         match clitrace::engine::cold_start_report_filtered(
                             &parser,
                             &config.claude_code_root,
                             &checkpoints,
                             filter,
                         ) {
-                            Ok(summaries) => clitrace::engine::print_summary(&summaries),
+                            Ok(summaries) => clitrace::engine::print_summary(&summaries, output_format),
                             Err(e) => {
                                 eprintln!("[clitrace] Report failed: {}", e);
                                 std::process::exit(1);
                             }
                         }
-                    } else if let Err(e) = clitrace::engine::cold_start_report(&parser, &config.claude_code_root) {
+                    } else if let Err(e) = clitrace::engine::cold_start_report(&parser, &config.claude_code_root, output_format) {
                         eprintln!("[clitrace] Report failed: {}", e);
                         std::process::exit(1);
                     }
@@ -369,25 +369,14 @@ fn main() {
             }
 
             let filter = clitrace::engine::ReportFilter { since: since_dt, until: until_dt };
-            let db = match clitrace::db::Database::open(&config.db_path) {
-                Ok(db) => db,
-                Err(e) => {
-                    eprintln!("[clitrace] Failed to open DB: {}", e);
-                    std::process::exit(1);
-                }
-            };
-            let mut checkpoints = std::collections::HashMap::new();
-            if let Ok(cps) = db.load_all_checkpoints() {
-                for cp in cps {
-                    checkpoints.insert(cp.file_path.clone(), cp);
-                }
-            }
+            let checkpoints = std::collections::HashMap::new();
             if let Err(e) = clitrace::engine::cold_start_report_grouped(
                 &parser,
                 &config.claude_code_root,
                 group_by,
                 &checkpoints,
                 filter,
+                output_format,
             ) {
                 eprintln!("[clitrace] Report failed: {}", e);
                 std::process::exit(1);

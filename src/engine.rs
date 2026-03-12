@@ -3,6 +3,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
+use comfy_table::{Table, ContentArrangement, Cell, Attribute, presets::UTF8_FULL};
 
 use crate::checkpoint::{find_resume_offset, process_lines_streaming};
 use crate::common::types::{FileCheckpoint, LogParser, LogParserWithTs, ModelUsageSummary, UsageEvent};
@@ -64,6 +65,14 @@ struct FileActivity {
     last_checked: Instant,
 }
 
+/// Output format for report and trace output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputFormat {
+    #[default]
+    Table,
+    Json,
+}
+
 pub struct TrackerEngine {
     db: Database,
     checkpoints: HashMap<String, FileCheckpoint>,
@@ -73,6 +82,8 @@ pub struct TrackerEngine {
     activity: HashMap<String, FileActivity>,
     /// Paths with checkpoints updated since last flush.
     dirty: HashSet<String>,
+    /// Output format for print functions.
+    output_format: OutputFormat,
 }
 
 struct ColdStartResult {
@@ -140,10 +151,11 @@ fn cold_start_collect(
 pub fn cold_start_report(
     parser: &(dyn LogParser + Sync),
     root_dir: &str,
+    output_format: OutputFormat,
 ) -> Result<HashMap<String, ModelUsageSummary>, Box<dyn std::error::Error>> {
     let empty = HashMap::new();
     let result = cold_start_collect(parser, root_dir, &empty)?;
-    print_summary(&result.summaries);
+    print_summary(&result.summaries, output_format);
     Ok(result.summaries)
 }
 
@@ -154,6 +166,18 @@ pub enum ReportGroupBy {
     Month,
     Year,
     Hour,
+}
+
+impl ReportGroupBy {
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            ReportGroupBy::Date => "daily",
+            ReportGroupBy::Week { .. } => "weekly",
+            ReportGroupBy::Month => "monthly",
+            ReportGroupBy::Year => "yearly",
+            ReportGroupBy::Hour => "hourly",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -168,6 +192,7 @@ pub fn cold_start_report_grouped<P>(
     group_by: ReportGroupBy,
     checkpoints: &HashMap<String, FileCheckpoint>,
     filter: ReportFilter,
+    output_format: OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     P: LogParser + LogParserWithTs + Sync,
@@ -201,7 +226,7 @@ where
         }
     });
 
-    print_grouped_summary(&grouped.into_inner().unwrap());
+    print_grouped_summary(&grouped.into_inner().unwrap(), output_format, group_by.type_name());
     Ok(())
 }
 
@@ -256,7 +281,13 @@ impl TrackerEngine {
             file_sizes: HashMap::new(),
             activity: HashMap::new(),
             dirty: HashSet::new(),
+            output_format: OutputFormat::Table,
         }
+    }
+
+    pub fn with_output_format(mut self, format: OutputFormat) -> Self {
+        self.output_format = format;
+        self
     }
 
     /// Load existing checkpoints from DB into memory.
@@ -288,7 +319,7 @@ impl TrackerEngine {
         }
 
         // Print summary
-        print_summary(&result.summaries);
+        print_summary(&result.summaries, self.output_format);
 
         // Batch flush for cold start (single transaction).
         let t_flush = Instant::now();
@@ -362,7 +393,7 @@ impl TrackerEngine {
                 batch.len(), t_flush.elapsed().as_micros());
         }
 
-        print_grouped_summary(&grouped.into_inner().unwrap());
+        print_grouped_summary(&grouped.into_inner().unwrap(), self.output_format, group_by.type_name());
         debug_log!("cold_start_grouped — ({}µs)", t_cold.elapsed().as_micros());
         Ok(())
     }
@@ -492,7 +523,7 @@ impl TrackerEngine {
         match self.process_file(path, parser) {
             Ok(events) => {
                 for event in &events {
-                    print_event(event);
+                    print_event(event, self.output_format);
                 }
             }
             Err(e) => {
@@ -662,40 +693,118 @@ where
 }
 
 /// Print grouped summary (shared by report and trace grouped outputs).
-fn print_grouped_summary(grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>) {
+fn print_grouped_summary(grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>, format: OutputFormat, type_name: &str) {
     if grouped.is_empty() {
-        println!("[clitrace] No usage data found.");
+        if format == OutputFormat::Json {
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "type": type_name,
+                "data": [],
+            })).unwrap());
+        } else {
+            println!("[clitrace] No usage data found.");
+        }
         return;
     }
 
     let mut buckets: Vec<_> = grouped.keys().cloned().collect();
     buckets.sort();
 
-    for bucket in buckets {
-        println!("[clitrace] ═══════════════════════════════════════════");
-        println!("[clitrace] Token Usage Summary ({})", bucket);
-        if let Some(models) = grouped.get(&bucket) {
+    if format == OutputFormat::Json {
+        let mut data = Vec::new();
+        for bucket in &buckets {
+            if let Some(models) = grouped.get(bucket) {
+                let mut sorted: Vec<_> = models.values().collect();
+                sorted.sort_by(|a, b| b.event_count.cmp(&a.event_count));
+                let usage_per_models: Vec<_> = sorted.iter().map(|s| {
+                    serde_json::json!({
+                        "model": s.model,
+                        "input_tokens": s.input_tokens,
+                        "output_tokens": s.output_tokens,
+                        "cache_creation_input_tokens": s.cache_creation_input_tokens,
+                        "cache_read_input_tokens": s.cache_read_input_tokens,
+                        "total_tokens": s.input_tokens + s.output_tokens + s.cache_creation_input_tokens + s.cache_read_input_tokens,
+                        "events": s.event_count,
+                    })
+                }).collect();
+                data.push(serde_json::json!({
+                    "period": bucket,
+                    "usage_per_models": usage_per_models,
+                }));
+            }
+        }
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "type": type_name,
+            "data": data,
+        })).unwrap());
+        return;
+    }
+
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL);
+    table.set_content_arrangement(ContentArrangement::Dynamic);
+    table.set_header(vec![
+        Cell::new("Period").add_attribute(Attribute::Bold),
+        Cell::new("Model").add_attribute(Attribute::Bold),
+        Cell::new("Input").add_attribute(Attribute::Bold),
+        Cell::new("Output").add_attribute(Attribute::Bold),
+        Cell::new("Cache\nCreate").add_attribute(Attribute::Bold),
+        Cell::new("Cache\nRead").add_attribute(Attribute::Bold),
+        Cell::new("Total\nTokens").add_attribute(Attribute::Bold),
+        Cell::new("Events").add_attribute(Attribute::Bold),
+    ]);
+
+    let mut grand_input = 0u64;
+    let mut grand_output = 0u64;
+    let mut grand_cache_create = 0u64;
+    let mut grand_cache_read = 0u64;
+    let mut grand_events = 0u64;
+
+    for bucket in &buckets {
+        if let Some(models) = grouped.get(bucket) {
             let mut sorted: Vec<_> = models.values().collect();
             sorted.sort_by(|a, b| b.event_count.cmp(&a.event_count));
 
-            for s in &sorted {
-                println!("[clitrace] ───────────────────────────────────────────");
-                println!("[clitrace] Model: {}", s.model);
-                println!(
-                    "[clitrace]   Input: {:>12} | Cache Create: {:>12}",
-                    format_number(s.input_tokens),
-                    format_number(s.cache_creation_input_tokens),
-                );
-                println!(
-                    "[clitrace]   Cache Read: {:>8} | Output: {:>12}",
-                    format_number(s.cache_read_input_tokens),
-                    format_number(s.output_tokens),
-                );
-                println!("[clitrace]   Events: {}", s.event_count);
+            for (i, s) in sorted.iter().enumerate() {
+                let total = s.input_tokens + s.output_tokens + s.cache_creation_input_tokens + s.cache_read_input_tokens;
+                let period_cell = if i == 0 {
+                    Cell::new(bucket)
+                } else {
+                    Cell::new("")
+                };
+                table.add_row(vec![
+                    period_cell,
+                    Cell::new(&s.model),
+                    Cell::new(format_number(s.input_tokens)),
+                    Cell::new(format_number(s.output_tokens)),
+                    Cell::new(format_number(s.cache_creation_input_tokens)),
+                    Cell::new(format_number(s.cache_read_input_tokens)),
+                    Cell::new(format_number(total)),
+                    Cell::new(format_number(s.event_count)),
+                ]);
+
+                grand_input += s.input_tokens;
+                grand_output += s.output_tokens;
+                grand_cache_create += s.cache_creation_input_tokens;
+                grand_cache_read += s.cache_read_input_tokens;
+                grand_events += s.event_count;
             }
         }
     }
-    println!("[clitrace] ═══════════════════════════════════════════");
+
+    let grand_total = grand_input + grand_output + grand_cache_create + grand_cache_read;
+    table.add_row(vec![
+        Cell::new("Total").add_attribute(Attribute::Bold),
+        Cell::new(""),
+        Cell::new(format_number(grand_input)).add_attribute(Attribute::Bold),
+        Cell::new(format_number(grand_output)).add_attribute(Attribute::Bold),
+        Cell::new(format_number(grand_cache_create)).add_attribute(Attribute::Bold),
+        Cell::new(format_number(grand_cache_read)).add_attribute(Attribute::Bold),
+        Cell::new(format_number(grand_total)).add_attribute(Attribute::Bold),
+        Cell::new(format_number(grand_events)).add_attribute(Attribute::Bold),
+    ]);
+
+    println!("[clitrace] Token Usage Summary");
+    println!("{table}");
 }
 
 fn filter_active(filter: ReportFilter) -> bool {
@@ -717,38 +826,113 @@ fn filter_match(ts: NaiveDateTime, filter: ReportFilter) -> bool {
 }
 
 /// Print cold start summary.
-pub fn print_summary(summaries: &HashMap<String, ModelUsageSummary>) {
+pub fn print_summary(summaries: &HashMap<String, ModelUsageSummary>, format: OutputFormat) {
     if summaries.is_empty() {
-        println!("[clitrace] No usage data found.");
+        if format == OutputFormat::Json {
+            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+                "type": "summary",
+                "data": [],
+            })).unwrap());
+        } else {
+            println!("[clitrace] No usage data found.");
+        }
         return;
     }
-
-    println!("[clitrace] ═══════════════════════════════════════════");
-    println!("[clitrace] Token Usage Summary");
 
     let mut sorted: Vec<_> = summaries.values().collect();
     sorted.sort_by(|a, b| b.event_count.cmp(&a.event_count));
 
-    for s in &sorted {
-        println!("[clitrace] ───────────────────────────────────────────");
-        println!("[clitrace] Model: {}", s.model);
-        println!(
-            "[clitrace]   Input: {:>12} | Cache Create: {:>12}",
-            format_number(s.input_tokens),
-            format_number(s.cache_creation_input_tokens),
-        );
-        println!(
-            "[clitrace]   Cache Read: {:>8} | Output: {:>12}",
-            format_number(s.cache_read_input_tokens),
-            format_number(s.output_tokens),
-        );
-        println!("[clitrace]   Events: {}", s.event_count);
+    if format == OutputFormat::Json {
+        let data: Vec<_> = sorted.iter().map(|s| {
+            serde_json::json!({
+                "model": s.model,
+                "input_tokens": s.input_tokens,
+                "output_tokens": s.output_tokens,
+                "cache_creation_input_tokens": s.cache_creation_input_tokens,
+                "cache_read_input_tokens": s.cache_read_input_tokens,
+                "total_tokens": s.input_tokens + s.output_tokens + s.cache_creation_input_tokens + s.cache_read_input_tokens,
+                "events": s.event_count,
+            })
+        }).collect();
+        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
+            "type": "summary",
+            "data": data,
+        })).unwrap());
+        return;
     }
-    println!("[clitrace] ═══════════════════════════════════════════");
+
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL);
+    table.set_content_arrangement(ContentArrangement::Dynamic);
+    table.set_header(vec![
+        Cell::new("Model").add_attribute(Attribute::Bold),
+        Cell::new("Input").add_attribute(Attribute::Bold),
+        Cell::new("Output").add_attribute(Attribute::Bold),
+        Cell::new("Cache\nCreate").add_attribute(Attribute::Bold),
+        Cell::new("Cache\nRead").add_attribute(Attribute::Bold),
+        Cell::new("Total\nTokens").add_attribute(Attribute::Bold),
+        Cell::new("Events").add_attribute(Attribute::Bold),
+    ]);
+
+    let mut total_input = 0u64;
+    let mut total_output = 0u64;
+    let mut total_cache_create = 0u64;
+    let mut total_cache_read = 0u64;
+    let mut total_events = 0u64;
+
+    for s in &sorted {
+        let total = s.input_tokens + s.output_tokens + s.cache_creation_input_tokens + s.cache_read_input_tokens;
+        table.add_row(vec![
+            Cell::new(&s.model),
+            Cell::new(format_number(s.input_tokens)),
+            Cell::new(format_number(s.output_tokens)),
+            Cell::new(format_number(s.cache_creation_input_tokens)),
+            Cell::new(format_number(s.cache_read_input_tokens)),
+            Cell::new(format_number(total)),
+            Cell::new(format_number(s.event_count)),
+        ]);
+
+        total_input += s.input_tokens;
+        total_output += s.output_tokens;
+        total_cache_create += s.cache_creation_input_tokens;
+        total_cache_read += s.cache_read_input_tokens;
+        total_events += s.event_count;
+    }
+
+    if sorted.len() > 1 {
+        let grand_total = total_input + total_output + total_cache_create + total_cache_read;
+        table.add_row(vec![
+            Cell::new("Total").add_attribute(Attribute::Bold),
+            Cell::new(format_number(total_input)).add_attribute(Attribute::Bold),
+            Cell::new(format_number(total_output)).add_attribute(Attribute::Bold),
+            Cell::new(format_number(total_cache_create)).add_attribute(Attribute::Bold),
+            Cell::new(format_number(total_cache_read)).add_attribute(Attribute::Bold),
+            Cell::new(format_number(grand_total)).add_attribute(Attribute::Bold),
+            Cell::new(format_number(total_events)).add_attribute(Attribute::Bold),
+        ]);
+    }
+
+    println!("[clitrace] Token Usage Summary");
+    println!("{table}");
 }
 
 /// Print a single watch-mode event.
-pub fn print_event(event: &UsageEvent) {
+pub fn print_event(event: &UsageEvent, format: OutputFormat) {
+    if format == OutputFormat::Json {
+        let json = serde_json::json!({
+            "type": "event",
+            "data": {
+                "model": event.model,
+                "source": format_source_label(&event.source_file),
+                "input_tokens": event.input_tokens,
+                "output_tokens": event.output_tokens,
+                "cache_creation_input_tokens": event.cache_creation_input_tokens,
+                "cache_read_input_tokens": event.cache_read_input_tokens,
+            }
+        });
+        println!("{}", serde_json::to_string(&json).unwrap());
+        return;
+    }
     let label = format_source_label(&event.source_file);
     println!(
         "[clitrace] {} | {} | in:{} cc:{} cr:{} out:{}",
