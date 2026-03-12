@@ -57,28 +57,30 @@ pub fn find_resume_offset(path: &str, cp: &FileCheckpoint) -> std::io::Result<Op
         }
     }
 
+    let mut buf = vec![0u8; CHUNK_SIZE as usize];
+
     while cursor > 0 {
         let read_start = cursor.saturating_sub(CHUNK_SIZE);
         let read_len = (cursor - read_start) as usize;
 
-        let mut buf = vec![0u8; read_len];
+        let buf_slice = &mut buf[..read_len];
         file.seek(SeekFrom::Start(read_start))?;
-        file.read_exact(&mut buf)?;
+        file.read_exact(buf_slice)?;
 
         // Scan newlines from right to left.
-        // `line_end` tracks the boundary: content of the current line is buf[newline_pos+1..line_end].
+        // `line_end` tracks the boundary: content of the current line is buf_slice[newline_pos+1..line_end].
         // When line_end is at a \n position, resume_offset = read_start + line_end + 1.
-        let mut line_end = buf.len();
+        let mut line_end = buf_slice.len();
         let mut found_newline = false;
 
-        for i in (0..buf.len()).rev() {
-            if buf[i] != b'\n' {
+        for i in (0..buf_slice.len()).rev() {
+            if buf_slice[i] != b'\n' {
                 continue;
             }
             found_newline = true;
 
             // Content between this \n and the previous boundary.
-            let content_in_buf = &buf[i + 1..line_end];
+            let content_in_buf = &buf_slice[i + 1..line_end];
 
             if !fragment_consumed {
                 // First \n from the right: combine with carried fragment.
@@ -98,7 +100,7 @@ pub fn find_resume_offset(path: &str, cp: &FileCheckpoint) -> std::io::Result<Op
                     && content_in_buf.len() as u64 == cp.last_line_len
                 {
                     if hash_line(content_in_buf) == cp.last_line_hash {
-                        // \n terminating this line is at buf[line_end] (file pos read_start + line_end).
+                        // \n terminating this line is at buf_slice[line_end] (file pos read_start + line_end).
                         return Ok(Some(read_start + line_end as u64 + 1));
                     }
                 }
@@ -108,9 +110,9 @@ pub fn find_resume_offset(path: &str, cp: &FileCheckpoint) -> std::io::Result<Op
         }
 
         // Everything before the leftmost \n is a partial line fragment.
-        let leftover = &buf[..line_end];
+        let leftover = &buf_slice[..line_end];
         if found_newline {
-            // We know where the \n for this fragment is: buf[line_end], file pos = read_start + line_end.
+            // We know where the \n for this fragment is: buf_slice[line_end], file pos = read_start + line_end.
             fragment = leftover.to_vec();
             fragment_resume = read_start + line_end as u64 + 1;
             fragment_consumed = false;
@@ -212,7 +214,7 @@ where
             bytes_consumed += n as u64;
             has_lines = true;
         } else {
-            trailing_line = Some(line_buf.clone());
+            trailing_line = Some(std::mem::take(&mut line_buf));
         }
     }
 

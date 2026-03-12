@@ -44,14 +44,15 @@ pub struct ClaudeCodeParser;
 impl ClaudeCodeParser {
     /// Check if a filename matches UUID format (8-4-4-4-12 hex).
     fn is_uuid_filename(name: &str) -> bool {
-        let parts: Vec<&str> = name.split('-').collect();
-        if parts.len() != 5 {
-            return false;
-        }
         let expected_lens = [8, 4, 4, 4, 12];
-        parts.iter().zip(expected_lens.iter()).all(|(part, &len)| {
-            part.len() == len && part.chars().all(|c| c.is_ascii_hexdigit())
-        })
+        let mut parts = name.split('-');
+        for &len in &expected_lens {
+            match parts.next() {
+                Some(part) if part.len() == len && part.bytes().all(|b| b.is_ascii_hexdigit()) => {}
+                _ => return false,
+            }
+        }
+        parts.next().is_none()
     }
 
     fn parse_line_common<'a>(&self, line: &'a str) -> Option<ParsedLine<'a>> {

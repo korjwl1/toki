@@ -14,12 +14,13 @@ use crate::db::Database;
 ///   1 = normal debug logging (state transitions, events, timing)
 ///   2 = level 1 + verbose (size-unchanged, no-new-lines skips)
 pub fn debug_level() -> u8 {
-    std::env::var("CLITRACE_DEBUG").map_or(0, |v| {
-        match v.as_str() {
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| {
+        std::env::var("CLITRACE_DEBUG").map_or(0, |v| match v.as_str() {
             "true" | "1" => 1,
             "2" => 2,
             _ => 0,
-        }
+        })
     })
 }
 
@@ -105,16 +106,20 @@ fn cold_start_collect(
     let cp_batch: Mutex<Vec<FileCheckpoint>> = Mutex::new(Vec::new());
 
     parallel_scan(&sessions, checkpoints, |path, offset| {
+        let mut local: HashMap<String, ModelUsageSummary> = HashMap::new();
         let result = process_lines_streaming(path, offset, |line| {
             if let Some(event) = parser.parse_line(line, path) {
-                let mut s = summaries.lock().unwrap();
-                let summary = s.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
+                let summary = local.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
                     model: event.model.clone(),
                     ..Default::default()
                 });
                 summary.accumulate(&event);
             }
         });
+        if !local.is_empty() {
+            let mut s = summaries.lock().unwrap();
+            merge_summaries(&mut s, local);
+        }
         if let Ok(Some((_bytes, last_line_len, last_line_hash))) = result {
             cp_batch.lock().unwrap().push(FileCheckpoint {
                 file_path: path.to_string(),
@@ -177,11 +182,11 @@ where
         Mutex::new(HashMap::new());
 
     parallel_scan(&sessions, checkpoints, |path, offset| {
+        let mut local: HashMap<String, HashMap<String, ModelUsageSummary>> = HashMap::new();
         let _ = process_lines_streaming(path, offset, |line| {
             if let Some(event) = parser.parse_line_with_ts(line, path) {
                 if let Some(bucket) = bucket_from_timestamp_filtered(&event.timestamp, group_by, filter) {
-                    let mut g = grouped.lock().unwrap();
-                    let by_model = g.entry(bucket).or_insert_with(HashMap::new);
+                    let by_model = local.entry(bucket).or_insert_with(HashMap::new);
                     let summary = by_model.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
                         model: event.model.clone(),
                         ..Default::default()
@@ -190,6 +195,10 @@ where
                 }
             }
         });
+        if !local.is_empty() {
+            let mut g = grouped.lock().unwrap();
+            merge_grouped(&mut g, local);
+        }
     });
 
     print_grouped_summary(&grouped.into_inner().unwrap());
@@ -213,6 +222,7 @@ where
     let summaries: Mutex<HashMap<String, ModelUsageSummary>> = Mutex::new(HashMap::new());
 
     parallel_scan(&sessions, checkpoints, |path, offset| {
+        let mut local: HashMap<String, ModelUsageSummary> = HashMap::new();
         let _ = process_lines_streaming(path, offset, |line| {
             if let Some(event) = parser.parse_line_with_ts(line, path) {
                 let ts = match parse_timestamp(&event.timestamp) {
@@ -222,14 +232,17 @@ where
                 if !filter_match(ts, filter) {
                     return;
                 }
-                let mut s = summaries.lock().unwrap();
-                let summary = s.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
+                let summary = local.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
                     model: event.model.clone(),
                     ..Default::default()
                 });
                 summary.accumulate_with_ts(&event);
             }
         });
+        if !local.is_empty() {
+            let mut s = summaries.lock().unwrap();
+            merge_summaries(&mut s, local);
+        }
     });
 
     Ok(summaries.into_inner().unwrap())
@@ -311,11 +324,11 @@ impl TrackerEngine {
         let filter = ReportFilter::default();
 
         parallel_scan(&sessions, &self.checkpoints, |path, offset| {
+            let mut local: HashMap<String, HashMap<String, ModelUsageSummary>> = HashMap::new();
             let result = process_lines_streaming(path, offset, |line| {
                 if let Some(event) = parser.parse_line_with_ts(line, path) {
                     if let Some(bucket) = bucket_from_timestamp_filtered(&event.timestamp, group_by, filter) {
-                        let mut g = grouped.lock().unwrap();
-                        let by_model = g.entry(bucket).or_insert_with(HashMap::new);
+                        let by_model = local.entry(bucket).or_insert_with(HashMap::new);
                         let summary = by_model.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
                             model: event.model.clone(),
                             ..Default::default()
@@ -324,6 +337,10 @@ impl TrackerEngine {
                     }
                 }
             });
+            if !local.is_empty() {
+                let mut g = grouped.lock().unwrap();
+                merge_grouped(&mut g, local);
+            }
             if let Ok(Some((_bytes, last_line_len, last_line_hash))) = result {
                 cp_batch.lock().unwrap().push(FileCheckpoint {
                     file_path: path.to_string(),
@@ -421,13 +438,13 @@ impl TrackerEngine {
         })?;
         let read_us = t1.elapsed().as_micros();
 
-        // Update cached file size
-        if let Ok(meta) = std::fs::metadata(path) {
-            self.file_sizes.insert(path.to_string(), meta.len());
-        }
-
+        // Update cached file size from offset + bytes consumed (avoid second metadata() call)
         match result {
             None => {
+                // No lines read — update size cache from offset (file may have trailing incomplete data)
+                if let Ok(meta) = std::fs::metadata(path) {
+                    self.file_sizes.insert(path.to_string(), meta.len());
+                }
                 let act = self.activity.entry(path.to_string()).or_insert(FileActivity {
                     state,
                     last_active: now,
@@ -440,6 +457,10 @@ impl TrackerEngine {
                 return Ok(Vec::new());
             }
             Some((bytes_read, last_line_len, last_line_hash)) => {
+                // Update cached file size: offset + bytes_read = last consumed position.
+                // File may have more trailing data, so use metadata only if needed for accuracy.
+                self.file_sizes.insert(path.to_string(), offset + bytes_read);
+
                 let cp = FileCheckpoint {
                     file_path: path.to_string(),
                     last_line_len,
@@ -563,6 +584,35 @@ fn resolve_offset(path: &str, checkpoints: &HashMap<String, FileCheckpoint>) -> 
     }
 }
 
+/// Merge thread-local summaries into global map.
+fn merge_summaries(
+    global: &mut HashMap<String, ModelUsageSummary>,
+    local: HashMap<String, ModelUsageSummary>,
+) {
+    for (model, ls) in local {
+        let gs = global.entry(model.clone()).or_insert_with(|| ModelUsageSummary {
+            model,
+            ..Default::default()
+        });
+        gs.input_tokens += ls.input_tokens;
+        gs.cache_creation_input_tokens += ls.cache_creation_input_tokens;
+        gs.cache_read_input_tokens += ls.cache_read_input_tokens;
+        gs.output_tokens += ls.output_tokens;
+        gs.event_count += ls.event_count;
+    }
+}
+
+/// Merge thread-local grouped summaries into global grouped map.
+fn merge_grouped(
+    global: &mut HashMap<String, HashMap<String, ModelUsageSummary>>,
+    local: HashMap<String, HashMap<String, ModelUsageSummary>>,
+) {
+    for (bucket, local_models) in local {
+        let global_models = global.entry(bucket).or_insert_with(HashMap::new);
+        merge_summaries(global_models, local_models);
+    }
+}
+
 /// Common parallel file scan over all sessions.
 /// Resolves checkpoint offsets and runs `on_file(path, offset)` in parallel threads.
 fn parallel_scan<F>(
@@ -574,7 +624,7 @@ where
     F: Fn(&str, u64) + Sync,
 {
     let max_threads = num_cpus::get();
-    let semaphore = Mutex::new(max_threads);
+    let semaphore = (Mutex::new(max_threads), std::sync::Condvar::new());
 
     std::thread::scope(|s| {
         for session in sessions {
@@ -588,12 +638,10 @@ where
                 let on_file = &on_file;
                 s.spawn(move || {
                     {
-                        let mut count = sem.lock().unwrap();
-                        while *count == 0 {
-                            drop(count);
-                            std::thread::yield_now();
-                            count = sem.lock().unwrap();
-                        }
+                        let (lock, cvar) = sem;
+                        let mut count = cvar
+                            .wait_while(lock.lock().unwrap(), |c| *c == 0)
+                            .unwrap();
                         *count -= 1;
                     }
 
@@ -602,8 +650,10 @@ where
                     on_file(&path_str, offset);
 
                     {
-                        let mut count = sem.lock().unwrap();
+                        let (lock, cvar) = sem;
+                        let mut count = lock.lock().unwrap();
                         *count += 1;
+                        cvar.notify_one();
                     }
                 });
             }
@@ -825,11 +875,9 @@ fn week_start(date: NaiveDate, start_of_week: Weekday) -> NaiveDate {
 }
 
 fn first_week_start(year: i32, start_of_week: Weekday) -> NaiveDate {
-    let mut d = NaiveDate::from_ymd_opt(year, 1, 1).unwrap();
-    while d.weekday() != start_of_week {
-        d = d + chrono::Duration::days(1);
-    }
-    d
+    let jan1 = NaiveDate::from_ymd_opt(year, 1, 1).unwrap();
+    let delta = (weekday_index(start_of_week) - weekday_index(jan1.weekday()) + 7) % 7;
+    jan1 + chrono::Duration::days(delta as i64)
 }
 
 fn weekday_index(day: Weekday) -> i32 {
