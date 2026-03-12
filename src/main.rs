@@ -23,6 +23,9 @@ struct Cli {
     /// Timezone for bucketing and --since/--until interpretation (e.g. Asia/Seoul, US/Eastern)
     #[arg(long, short = 'z', global = true)]
     timezone: Option<String>,
+    /// Disable cost calculation (skip pricing fetch)
+    #[arg(long, global = true)]
+    no_cost: bool,
     #[command(subcommand)]
     command: Commands,
 }
@@ -276,7 +279,7 @@ fn main() {
             println!("[clitrace] Claude Code root: {}", config.claude_code_root);
             println!("[clitrace] Database: {}", config.db_path.display());
 
-            let handle = match clitrace::start(config, group_by, output_format) {
+            let handle = match clitrace::start(config, group_by, output_format, cli.no_cost) {
                 Ok(h) => h,
                 Err(e) => {
                     eprintln!("[clitrace] Failed to start: {}", e);
@@ -304,6 +307,21 @@ fn main() {
             let config = build_config(claude_root, None);
             println!("[clitrace] Running report...");
             println!("[clitrace] Claude Code root: {}", config.claude_code_root);
+
+            // Load pricing for cost display
+            let pricing = if cli.no_cost {
+                None
+            } else {
+                let db = clitrace::db::Database::open(&config.db_path).ok();
+                match db {
+                    Some(ref d) => {
+                        let p = clitrace::pricing::fetch_pricing(d);
+                        if p.is_empty() { None } else { Some(p) }
+                    }
+                    None => None,
+                }
+            };
+            let pricing_ref = pricing.as_ref();
 
             let parser = clitrace::providers::claude_code::ClaudeCodeParser;
             let session_filter = session_id.as_deref();
@@ -357,6 +375,7 @@ fn main() {
                             session_filter,
                             project_filter,
                             output_format,
+                            pricing_ref,
                         ) {
                             eprintln!("[clitrace] Report failed: {}", e);
                             std::process::exit(1);
@@ -372,13 +391,13 @@ fn main() {
                             session_filter,
                             project_filter,
                         ) {
-                            Ok(summaries) => clitrace::engine::print_summary(&summaries, output_format),
+                            Ok(summaries) => clitrace::engine::print_summary(&summaries, output_format, pricing_ref),
                             Err(e) => {
                                 eprintln!("[clitrace] Report failed: {}", e);
                                 std::process::exit(1);
                             }
                         }
-                    } else if let Err(e) = clitrace::engine::cold_start_report(&parser, &config.claude_code_root, output_format, session_filter, project_filter) {
+                    } else if let Err(e) = clitrace::engine::cold_start_report(&parser, &config.claude_code_root, output_format, session_filter, project_filter, pricing_ref) {
                         eprintln!("[clitrace] Report failed: {}", e);
                         std::process::exit(1);
                     }
@@ -465,6 +484,7 @@ fn main() {
                 output_format,
                 effective_session_filter,
                 effective_project_filter,
+                pricing_ref,
             ) {
                 eprintln!("[clitrace] Report failed: {}", e);
                 std::process::exit(1);

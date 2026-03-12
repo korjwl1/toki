@@ -4,6 +4,7 @@ pub mod db;
 pub mod engine;
 pub mod checkpoint;
 pub mod platform;
+pub mod pricing;
 pub mod providers;
 
 pub use common::types::{UsageEvent, UsageEventWithTs, ModelUsageSummary, SessionGroup, ClitraceError};
@@ -48,7 +49,7 @@ impl Drop for Handle {
 
 /// Start clitrace: cold start scan, then enter watch mode.
 /// Returns a Handle to control the running instance.
-pub fn start(config: Config, startup_group_by: Option<ReportGroupBy>, output_format: OutputFormat) -> Result<Handle, ClitraceError> {
+pub fn start(config: Config, startup_group_by: Option<ReportGroupBy>, output_format: OutputFormat, no_cost: bool) -> Result<Handle, ClitraceError> {
     let db = Database::open(&config.db_path).map_err(|e| ClitraceError::Db(e.into()))?;
 
     // Full rescan: clear checkpoints.
@@ -57,11 +58,20 @@ pub fn start(config: Config, startup_group_by: Option<ReportGroupBy>, output_for
         db.clear_checkpoints().map_err(|e| ClitraceError::Db(e.into()))?;
     }
 
+    // Fetch/load pricing
+    let pricing_table = if no_cost {
+        None
+    } else {
+        let p = pricing::fetch_pricing(&db);
+        if p.is_empty() { None } else { Some(p) }
+    };
+
     let mut engine = TrackerEngine::new(db)
         .with_output_format(output_format)
         .with_session_filter(config.session_filter.clone())
         .with_project_filter(config.project_filter.clone())
-        .with_tz(config.tz);
+        .with_tz(config.tz)
+        .with_pricing(pricing_table);
     engine.load_checkpoints().map_err(|e| ClitraceError::Db(e.into()))?;
 
     let parser = ClaudeCodeParser;

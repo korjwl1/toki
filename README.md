@@ -36,6 +36,7 @@ Trace 옵션:
 - `--timezone <IANA>` / `-z <IANA>`: 타임존 지정 (기본: UTC)
   - 예: `-z Asia/Seoul`, `-z US/Eastern`, `-z Europe/London`
   - 버킷팅(일별/시간별 등)과 `--since`/`--until` 해석에 적용
+- `--no-cost`: 비용 계산 비활성화 (가격 fetch 스킵)
 
 ### Report 모드 (one-shot)
 
@@ -62,6 +63,9 @@ cargo run --release -- report --session-id 4de9291e
 
 # 타임존 지정 (KST 기준 일별 리포트)
 cargo run --release -- -z Asia/Seoul report daily --since 20260301
+
+# 비용 표시 없이 리포트
+cargo run --release -- --no-cost report
 ```
 
 Report 옵션:
@@ -80,6 +84,20 @@ Report 옵션:
   - 예: `--project ddleague`는 `ddleague`, `ddleague-module`, `ddleague-module-clitrace` 등 모두 포함
 - `--session-id <PREFIX>`: 세션 UUID 접두사로 필터링
 - `--group-by-session`: 세션별로 그룹핑 (시간 기반 서브커맨드와 함께 사용 불가)
+
+### 비용 계산 (Cost)
+
+기본적으로 모든 출력에 모델별 추정 비용(USD)이 표시된다.
+가격 데이터는 [LiteLLM](https://github.com/BerriAI/litellm)의 커뮤니티 유지 가격표에서 가져온다.
+
+- **최초 실행**: LiteLLM JSON 다운로드 → Claude 모델만 추출 → DB에 캐시
+- **이후 실행**: HTTP ETag 조건부 요청 → 변경 없으면 304 응답 (바디 없이 ~50ms)
+- **오프라인**: 캐시된 가격 데이터로 동작, 캐시 없으면 Cost 컬럼 생략
+- **`--no-cost`**: 가격 fetch 자체를 스킵, Cost 컬럼 미표시
+- **`--full-rescan`**: 체크포인트만 초기화, 가격 캐시는 보존
+
+가격은 현재 시점 기준으로 전체 데이터에 일괄 적용된다 (시간대별 역사적 가격 추적 없음).
+API key 사용자에게는 실제 청구 금액에 가깝고, Max Plan 구독자에게는 참고용 추정치이다.
 
 ### 출력 형식 (`--output-format`)
 
@@ -121,7 +139,7 @@ fn main() {
     let config = Config::new()
         .with_claude_root("/custom/path/.claude".to_string());
 
-    let handle = start(config, None, OutputFormat::Table).expect("Failed to start clitrace");
+    let handle = start(config, None, OutputFormat::Table, false).expect("Failed to start clitrace");
 
     // ... 호스트 애플리케이션 로직 ...
 
@@ -135,16 +153,16 @@ fn main() {
 
 ```
 [clitrace] Token Usage Summary
-┌───────────────────────────┬─────────┬─────────┬────────────┬──────────────┬──────────────┬────────┐
-│ Model                     ┆ Input   ┆ Output  ┆ Cache      ┆ Cache        ┆ Total        ┆ Events │
-│                           ┆         ┆         ┆ Create     ┆ Read         ┆ Tokens       ┆        │
-╞═══════════════════════════╪═════════╪═════════╪════════════╪══════════════╪══════════════╪════════╡
-│ claude-opus-4-6           ┆ 1,234   ┆ 4,321   ┆ 56,789     ┆ 98,765       ┆ 161,109      ┆ 42     │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┤
-│ claude-haiku-4-5-20251001 ┆ 567     ┆ 2,100   ┆ 12,345     ┆ 34,567       ┆ 49,579       ┆ 18     │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┤
-│ Total                     ┆ 1,801   ┆ 6,421   ┆ 69,134     ┆ 133,332      ┆ 210,688      ┆ 60     │
-└───────────────────────────┴─────────┴─────────┴────────────┴──────────────┴──────────────┴────────┘
+┌───────────────────────────┬─────────┬─────────┬────────────┬──────────────┬──────────────┬────────┬─────────┐
+│ Model                     ┆ Input   ┆ Output  ┆ Cache      ┆ Cache        ┆ Total        ┆ Events ┆ Cost    │
+│                           ┆         ┆         ┆ Create     ┆ Read         ┆ Tokens       ┆        ┆ (USD)   │
+╞═══════════════════════════╪═════════╪═════════╪════════════╪══════════════╪══════════════╪════════╪═════════╡
+│ claude-opus-4-6           ┆ 1,234   ┆ 4,321   ┆ 56,789     ┆ 98,765       ┆ 161,109      ┆ 42     ┆ $1.21   │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┤
+│ claude-haiku-4-5-20251001 ┆ 567     ┆ 2,100   ┆ 12,345     ┆ 34,567       ┆ 49,579       ┆ 18     ┆ $0.0234 │
+├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┤
+│ Total                     ┆ 1,801   ┆ 6,421   ┆ 69,134     ┆ 133,332      ┆ 210,688      ┆ 60     ┆ $1.23   │
+└───────────────────────────┴─────────┴─────────┴────────────┴──────────────┴──────────────┴────────┴─────────┘
 ```
 
 ### JSON (`--output-format json`)
@@ -161,7 +179,8 @@ Summary:
       "cache_creation_input_tokens": 56789,
       "cache_read_input_tokens": 98765,
       "total_tokens": 161109,
-      "events": 42
+      "events": 42,
+      "cost_usd": 1.2345
     }
   ]
 }
@@ -182,7 +201,8 @@ Grouped (daily, weekly, ...):
           "cache_creation_input_tokens": 56789,
           "cache_read_input_tokens": 98765,
           "total_tokens": 161109,
-          "events": 42
+          "events": 42,
+          "cost_usd": 1.2345
         }
       ]
     }
@@ -194,12 +214,12 @@ Grouped (daily, weekly, ...):
 
 Table:
 ```
-[clitrace] claude-opus-4-6 | session.jsonl | in:3 cc:5139 cr:9631 out:14
+[clitrace] claude-opus-4-6 | session.jsonl | in:3 cc:5139 cr:9631 out:14 | $0.0112
 ```
 
 JSON (NDJSON, 한 줄씩):
 ```json
-{"type":"event","data":{"model":"claude-opus-4-6","source":"4de9291e","input_tokens":3,"output_tokens":14,"cache_creation_input_tokens":5139,"cache_read_input_tokens":9631}}
+{"type":"event","data":{"model":"claude-opus-4-6","source":"4de9291e","input_tokens":3,"output_tokens":14,"cache_creation_input_tokens":5139,"cache_read_input_tokens":9631,"cost_usd":0.0112}}
 ```
 
 ## Architecture
@@ -350,7 +370,12 @@ flowchart LR
 
     subgraph Storage["redb"]
         cp["checkpoints\nfile_path → bincode"]
-        st["settings\nkey → value"]
+        st["settings\nkey → value\n(pricing_data, pricing_etag)"]
+    end
+
+    subgraph Pricing["Pricing"]
+        litellm["LiteLLM JSON\n(GitHub)"]
+        ptable["PricingTable"]
     end
 
     jsonl1 --> filter
@@ -359,6 +384,9 @@ flowchart LR
     extract --> event["UsageEvent"]
     event --> summary["ModelUsageSummary"]
     event --> cp
+    litellm -->|"ETag caching"| st
+    st --> ptable
+    ptable -->|"cost_usd"| summary
 ```
 
 ## Data Model
@@ -408,6 +436,7 @@ module/clitrace/
 │   ├── config.rs                       # Config + 환경변수/DB 우선순위
 │   ├── db.rs                           # redb 래퍼 (checkpoints + settings)
 │   ├── engine.rs                       # TrackerEngine: cold_start + watch_loop
+│   ├── pricing.rs                     # LiteLLM 가격 fetch, ETag 캐싱, 비용 계산
 │   ├── checkpoint.rs                   # 역순 라인 스캔, xxHash3 매칭, JSON 완성도 검사
 │   ├── common/
 │   │   ├── mod.rs
@@ -426,7 +455,7 @@ module/clitrace/
 │       ├── macos/mod.rs               # macOS 기본 경로
 │       ├── windows/mod.rs             # TODO
 │       └── linux/mod.rs               # TODO
-└── tests/                             # 58+ unit tests (cargo test)
+└── tests/                             # 67+ unit tests (cargo test)
 ```
 
 ## Tech Stack
@@ -438,6 +467,7 @@ module/clitrace/
 | 파일 감시 | notify 6.x | macOS FSEvents 자동 사용 |
 | 직렬화 | bincode 1.x (checkpoint), serde_json (JSONL) | 바이너리 최소 오버헤드 |
 | 해시 | xxhash-rust 0.8 (xxh3) | 체크포인트 줄 식별 (30GB/s, 비암호화) |
+| HTTP | ureq 2.x | 동기 HTTP client, ETag 조건부 요청 |
 | 테이블 출력 | comfy-table 7.1 | Unicode 테이블 렌더링 |
 
 ## JSONL 구조 참고
