@@ -6,6 +6,7 @@ pub mod checkpoint;
 pub mod platform;
 pub mod pricing;
 pub mod providers;
+pub mod sink;
 
 pub use common::types::{UsageEvent, UsageEventWithTs, ModelUsageSummary, SessionGroup, ClitraceError};
 pub use config::Config;
@@ -13,8 +14,9 @@ pub use config::Config;
 use std::thread::JoinHandle;
 
 use db::Database;
-use engine::{OutputFormat, ReportGroupBy, TrackerEngine};
+use engine::{ReportGroupBy, TrackerEngine};
 use providers::claude_code::ClaudeCodeParser;
+use sink::Sink;
 
 /// Running clitrace instance handle.
 /// Drop triggers automatic stop().
@@ -49,7 +51,7 @@ impl Drop for Handle {
 
 /// Start clitrace: cold start scan, then enter watch mode.
 /// Returns a Handle to control the running instance.
-pub fn start(config: Config, startup_group_by: Option<ReportGroupBy>, output_format: OutputFormat, no_cost: bool) -> Result<Handle, ClitraceError> {
+pub fn start(config: Config, startup_group_by: Option<ReportGroupBy>, sink: Box<dyn Sink>, no_cost: bool) -> Result<Handle, ClitraceError> {
     let db = Database::open(&config.db_path).map_err(|e| ClitraceError::Db(e.into()))?;
 
     // Full rescan: clear checkpoints.
@@ -67,7 +69,7 @@ pub fn start(config: Config, startup_group_by: Option<ReportGroupBy>, output_for
     };
 
     let mut engine = TrackerEngine::new(db)
-        .with_output_format(output_format)
+        .with_sink(sink)
         .with_session_filter(config.session_filter.clone())
         .with_project_filter(config.project_filter.clone())
         .with_tz(config.tz)

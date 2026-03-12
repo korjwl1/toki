@@ -3,31 +3,14 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
-use comfy_table::{Table, ContentArrangement, Cell, Attribute, presets::UTF8_FULL};
 
 use crate::checkpoint::{find_resume_offset, process_lines_streaming};
 use crate::common::types::{FileCheckpoint, LogParser, LogParserWithTs, ModelUsageSummary, UsageEvent};
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, TimeZone, Weekday};
 use chrono_tz::Tz;
 use crate::db::Database;
-use crate::pricing::{PricingTable, format_cost};
-
-/// Build a JSON summary entry for a model, optionally including cost.
-fn summary_to_json(s: &ModelUsageSummary, pricing: Option<&PricingTable>) -> serde_json::Value {
-    let mut entry = serde_json::json!({
-        "model": s.model,
-        "input_tokens": s.input_tokens,
-        "output_tokens": s.output_tokens,
-        "cache_creation_input_tokens": s.cache_creation_input_tokens,
-        "cache_read_input_tokens": s.cache_read_input_tokens,
-        "total_tokens": s.input_tokens + s.output_tokens + s.cache_creation_input_tokens + s.cache_read_input_tokens,
-        "events": s.event_count,
-    });
-    if let Some(cost) = pricing.and_then(|p| p.summary_cost(s)) {
-        entry["cost_usd"] = serde_json::json!(cost);
-    }
-    entry
-}
+use crate::pricing::PricingTable;
+use crate::sink::Sink;
 
 /// Debug level:
 ///   0 = off
@@ -84,14 +67,6 @@ struct FileActivity {
     last_checked: Instant,
 }
 
-/// Output format for report and trace output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum OutputFormat {
-    #[default]
-    Table,
-    Json,
-}
-
 pub struct TrackerEngine {
     db: Database,
     checkpoints: HashMap<String, FileCheckpoint>,
@@ -101,8 +76,8 @@ pub struct TrackerEngine {
     activity: HashMap<String, FileActivity>,
     /// Paths with checkpoints updated since last flush.
     dirty: HashSet<String>,
-    /// Output format for print functions.
-    output_format: OutputFormat,
+    /// Output sink (print, UDS, HTTP, or multi).
+    sink: Box<dyn Sink>,
     /// Optional session ID prefix filter for trace mode.
     session_filter: Option<String>,
     /// Optional project name filter for trace mode.
@@ -180,14 +155,14 @@ fn cold_start_collect(
 pub fn cold_start_report(
     parser: &(dyn LogParser + Sync),
     root_dir: &str,
-    output_format: OutputFormat,
+    sink: &dyn Sink,
     session_filter: Option<&str>,
     project_filter: Option<&str>,
     pricing: Option<&PricingTable>,
 ) -> Result<HashMap<String, ModelUsageSummary>, Box<dyn std::error::Error>> {
     let empty = HashMap::new();
     let result = cold_start_collect(parser, root_dir, &empty, session_filter, project_filter)?;
-    print_summary(&result.summaries, output_format, pricing);
+    sink.emit_summary(&result.summaries, pricing);
     Ok(result.summaries)
 }
 
@@ -232,7 +207,7 @@ pub fn cold_start_report_grouped<P>(
     group_by: ReportGroupBy,
     checkpoints: &HashMap<String, FileCheckpoint>,
     filter: ReportFilter,
-    output_format: OutputFormat,
+    sink: &dyn Sink,
     session_filter: Option<&str>,
     project_filter: Option<&str>,
     pricing: Option<&PricingTable>,
@@ -242,7 +217,7 @@ where
 {
     let sessions = apply_filters(parser.discover_sessions(root_dir), session_filter, project_filter);
     if sessions.is_empty() {
-        println!("[clitrace] No usage data found.");
+        sink.emit_grouped(&HashMap::new(), group_by.type_name(), pricing);
         return Ok(());
     }
 
@@ -269,7 +244,7 @@ where
         }
     });
 
-    print_grouped_summary(&grouped.into_inner().unwrap(), output_format, group_by.type_name(), pricing);
+    sink.emit_grouped(&grouped.into_inner().unwrap(), group_by.type_name(), pricing);
     Ok(())
 }
 
@@ -326,7 +301,7 @@ pub fn cold_start_report_by_session<P>(
     filter: ReportFilter,
     session_filter: Option<&str>,
     project_filter: Option<&str>,
-    output_format: OutputFormat,
+    sink: &dyn Sink,
     pricing: Option<&PricingTable>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
@@ -334,7 +309,7 @@ where
 {
     let sessions = apply_filters(parser.discover_sessions(root_dir), session_filter, project_filter);
     if sessions.is_empty() {
-        println!("[clitrace] No usage data found.");
+        sink.emit_grouped(&HashMap::new(), "session", pricing);
         return Ok(());
     }
 
@@ -380,7 +355,7 @@ where
         }
     });
 
-    print_grouped_summary(&grouped.into_inner().unwrap(), output_format, "session", pricing);
+    sink.emit_grouped(&grouped.into_inner().unwrap(), "session", pricing);
     Ok(())
 }
 
@@ -392,7 +367,7 @@ impl TrackerEngine {
             file_sizes: HashMap::new(),
             activity: HashMap::new(),
             dirty: HashSet::new(),
-            output_format: OutputFormat::Table,
+            sink: Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)),
             session_filter: None,
             project_filter: None,
             tz: None,
@@ -400,8 +375,8 @@ impl TrackerEngine {
         }
     }
 
-    pub fn with_output_format(mut self, format: OutputFormat) -> Self {
-        self.output_format = format;
+    pub fn with_sink(mut self, sink: Box<dyn Sink>) -> Self {
+        self.sink = sink;
         self
     }
 
@@ -471,8 +446,8 @@ impl TrackerEngine {
             self.checkpoints.insert(cp.file_path.clone(), cp.clone());
         }
 
-        // Print summary
-        print_summary(&result.summaries, self.output_format, self.pricing.as_ref());
+        // Emit summary
+        self.sink.emit_summary(&result.summaries, self.pricing.as_ref());
 
         // Batch flush for cold start (single transaction).
         let t_flush = Instant::now();
@@ -497,7 +472,7 @@ impl TrackerEngine {
         let t_cold = Instant::now();
         let sessions = parser.discover_sessions(root_dir);
         if sessions.is_empty() {
-            println!("[clitrace] No usage data found.");
+            self.sink.emit_grouped(&HashMap::new(), group_by.type_name(), self.pricing.as_ref());
             debug_log!("cold_start_grouped — 0 sessions ({}µs)", t_cold.elapsed().as_micros());
             return Ok(());
         }
@@ -546,7 +521,7 @@ impl TrackerEngine {
                 batch.len(), t_flush.elapsed().as_micros());
         }
 
-        print_grouped_summary(&grouped.into_inner().unwrap(), self.output_format, group_by.type_name(), self.pricing.as_ref());
+        self.sink.emit_grouped(&grouped.into_inner().unwrap(), group_by.type_name(), self.pricing.as_ref());
         debug_log!("cold_start_grouped — ({}µs)", t_cold.elapsed().as_micros());
         Ok(())
     }
@@ -679,7 +654,7 @@ impl TrackerEngine {
         match self.process_file(path, parser) {
             Ok(events) => {
                 for event in &events {
-                    print_event(event, self.output_format, self.pricing.as_ref());
+                    self.sink.emit_event(event, self.pricing.as_ref());
                 }
             }
             Err(e) => {
@@ -848,133 +823,6 @@ where
     });
 }
 
-/// Print grouped summary (shared by report and trace grouped outputs).
-fn print_grouped_summary(grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>, format: OutputFormat, type_name: &str, pricing: Option<&PricingTable>) {
-    if grouped.is_empty() {
-        if format == OutputFormat::Json {
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "type": type_name,
-                "data": [],
-            })).unwrap());
-        } else {
-            println!("[clitrace] No usage data found.");
-        }
-        return;
-    }
-
-    let is_session = type_name == "session";
-    let show_cost = pricing.is_some_and(|p| !p.is_empty());
-    let mut buckets: Vec<_> = grouped.keys().cloned().collect();
-    buckets.sort();
-
-    if format == OutputFormat::Json {
-        let json_key = if is_session { "session" } else { "period" };
-        let mut data = Vec::new();
-        for bucket in &buckets {
-            if let Some(models) = grouped.get(bucket) {
-                let mut sorted: Vec<_> = models.values().collect();
-                sorted.sort_by(|a, b| b.event_count.cmp(&a.event_count));
-                let usage_per_models: Vec<_> = sorted.iter()
-                    .map(|s| summary_to_json(s, pricing))
-                    .collect();
-                data.push(serde_json::json!({
-                    json_key: bucket,
-                    "usage_per_models": usage_per_models,
-                }));
-            }
-        }
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "type": type_name,
-            "data": data,
-        })).unwrap());
-        return;
-    }
-
-    let header_label = if is_session { "Session" } else { "Period" };
-    let mut table = Table::new();
-    table.load_preset(UTF8_FULL);
-    table.set_content_arrangement(ContentArrangement::Dynamic);
-    let mut header = vec![
-        Cell::new(header_label).add_attribute(Attribute::Bold),
-        Cell::new("Model").add_attribute(Attribute::Bold),
-        Cell::new("Input").add_attribute(Attribute::Bold),
-        Cell::new("Output").add_attribute(Attribute::Bold),
-        Cell::new("Cache\nCreate").add_attribute(Attribute::Bold),
-        Cell::new("Cache\nRead").add_attribute(Attribute::Bold),
-        Cell::new("Total\nTokens").add_attribute(Attribute::Bold),
-        Cell::new("Events").add_attribute(Attribute::Bold),
-    ];
-    if show_cost {
-        header.push(Cell::new("Cost\n(USD)").add_attribute(Attribute::Bold));
-    }
-    table.set_header(header);
-
-    let mut grand_input = 0u64;
-    let mut grand_output = 0u64;
-    let mut grand_cache_create = 0u64;
-    let mut grand_cache_read = 0u64;
-    let mut grand_events = 0u64;
-    let mut grand_cost = 0.0f64;
-
-    for bucket in &buckets {
-        if let Some(models) = grouped.get(bucket) {
-            let mut sorted: Vec<_> = models.values().collect();
-            sorted.sort_by(|a, b| b.event_count.cmp(&a.event_count));
-
-            for (i, s) in sorted.iter().enumerate() {
-                let total = s.input_tokens + s.output_tokens + s.cache_creation_input_tokens + s.cache_read_input_tokens;
-                let cost = pricing.and_then(|p| p.summary_cost(s));
-                let display_key = if is_session { shorten_id(bucket).to_string() } else { bucket.clone() };
-                let period_cell = if i == 0 {
-                    Cell::new(&display_key)
-                } else {
-                    Cell::new("")
-                };
-                let mut row = vec![
-                    period_cell,
-                    Cell::new(&s.model),
-                    Cell::new(format_number(s.input_tokens)),
-                    Cell::new(format_number(s.output_tokens)),
-                    Cell::new(format_number(s.cache_creation_input_tokens)),
-                    Cell::new(format_number(s.cache_read_input_tokens)),
-                    Cell::new(format_number(total)),
-                    Cell::new(format_number(s.event_count)),
-                ];
-                if show_cost {
-                    row.push(Cell::new(format_cost(cost)));
-                    if let Some(c) = cost { grand_cost += c; }
-                }
-                table.add_row(row);
-
-                grand_input += s.input_tokens;
-                grand_output += s.output_tokens;
-                grand_cache_create += s.cache_creation_input_tokens;
-                grand_cache_read += s.cache_read_input_tokens;
-                grand_events += s.event_count;
-            }
-        }
-    }
-
-    let grand_total = grand_input + grand_output + grand_cache_create + grand_cache_read;
-    let mut total_row = vec![
-        Cell::new("Total").add_attribute(Attribute::Bold),
-        Cell::new(""),
-        Cell::new(format_number(grand_input)).add_attribute(Attribute::Bold),
-        Cell::new(format_number(grand_output)).add_attribute(Attribute::Bold),
-        Cell::new(format_number(grand_cache_create)).add_attribute(Attribute::Bold),
-        Cell::new(format_number(grand_cache_read)).add_attribute(Attribute::Bold),
-        Cell::new(format_number(grand_total)).add_attribute(Attribute::Bold),
-        Cell::new(format_number(grand_events)).add_attribute(Attribute::Bold),
-    ];
-    if show_cost {
-        total_row.push(Cell::new(format_cost(Some(grand_cost))).add_attribute(Attribute::Bold));
-    }
-    table.add_row(total_row);
-
-    println!("[clitrace] Token Usage Summary");
-    println!("{table}");
-}
-
 fn filter_active(filter: ReportFilter) -> bool {
     filter.since.is_some() || filter.until.is_some()
 }
@@ -991,143 +839,6 @@ fn filter_match(ts: NaiveDateTime, filter: ReportFilter) -> bool {
         }
     }
     true
-}
-
-/// Print cold start summary.
-pub fn print_summary(summaries: &HashMap<String, ModelUsageSummary>, format: OutputFormat, pricing: Option<&PricingTable>) {
-    if summaries.is_empty() {
-        if format == OutputFormat::Json {
-            println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-                "type": "summary",
-                "data": [],
-            })).unwrap());
-        } else {
-            println!("[clitrace] No usage data found.");
-        }
-        return;
-    }
-
-    let mut sorted: Vec<_> = summaries.values().collect();
-    sorted.sort_by(|a, b| b.event_count.cmp(&a.event_count));
-
-    let show_cost = pricing.is_some_and(|p| !p.is_empty());
-
-    if format == OutputFormat::Json {
-        let data: Vec<_> = sorted.iter()
-            .map(|s| summary_to_json(s, pricing))
-            .collect();
-        println!("{}", serde_json::to_string_pretty(&serde_json::json!({
-            "type": "summary",
-            "data": data,
-        })).unwrap());
-        return;
-    }
-
-    let mut table = Table::new();
-    table.load_preset(UTF8_FULL);
-    table.set_content_arrangement(ContentArrangement::Dynamic);
-    let mut header = vec![
-        Cell::new("Model").add_attribute(Attribute::Bold),
-        Cell::new("Input").add_attribute(Attribute::Bold),
-        Cell::new("Output").add_attribute(Attribute::Bold),
-        Cell::new("Cache\nCreate").add_attribute(Attribute::Bold),
-        Cell::new("Cache\nRead").add_attribute(Attribute::Bold),
-        Cell::new("Total\nTokens").add_attribute(Attribute::Bold),
-        Cell::new("Events").add_attribute(Attribute::Bold),
-    ];
-    if show_cost {
-        header.push(Cell::new("Cost\n(USD)").add_attribute(Attribute::Bold));
-    }
-    table.set_header(header);
-
-    let mut total_input = 0u64;
-    let mut total_output = 0u64;
-    let mut total_cache_create = 0u64;
-    let mut total_cache_read = 0u64;
-    let mut total_events = 0u64;
-    let mut total_cost = 0.0f64;
-
-    for s in &sorted {
-        let total = s.input_tokens + s.output_tokens + s.cache_creation_input_tokens + s.cache_read_input_tokens;
-        let cost = pricing.and_then(|p| p.summary_cost(s));
-        let mut row = vec![
-            Cell::new(&s.model),
-            Cell::new(format_number(s.input_tokens)),
-            Cell::new(format_number(s.output_tokens)),
-            Cell::new(format_number(s.cache_creation_input_tokens)),
-            Cell::new(format_number(s.cache_read_input_tokens)),
-            Cell::new(format_number(total)),
-            Cell::new(format_number(s.event_count)),
-        ];
-        if show_cost {
-            row.push(Cell::new(format_cost(cost)));
-            if let Some(c) = cost { total_cost += c; }
-        }
-        table.add_row(row);
-
-        total_input += s.input_tokens;
-        total_output += s.output_tokens;
-        total_cache_create += s.cache_creation_input_tokens;
-        total_cache_read += s.cache_read_input_tokens;
-        total_events += s.event_count;
-    }
-
-    if sorted.len() > 1 {
-        let grand_total = total_input + total_output + total_cache_create + total_cache_read;
-        let mut row = vec![
-            Cell::new("Total").add_attribute(Attribute::Bold),
-            Cell::new(format_number(total_input)).add_attribute(Attribute::Bold),
-            Cell::new(format_number(total_output)).add_attribute(Attribute::Bold),
-            Cell::new(format_number(total_cache_create)).add_attribute(Attribute::Bold),
-            Cell::new(format_number(total_cache_read)).add_attribute(Attribute::Bold),
-            Cell::new(format_number(grand_total)).add_attribute(Attribute::Bold),
-            Cell::new(format_number(total_events)).add_attribute(Attribute::Bold),
-        ];
-        if show_cost {
-            row.push(Cell::new(format_cost(Some(total_cost))).add_attribute(Attribute::Bold));
-        }
-        table.add_row(row);
-    }
-
-    println!("[clitrace] Token Usage Summary");
-    println!("{table}");
-}
-
-/// Print a single watch-mode event.
-pub fn print_event(event: &UsageEvent, format: OutputFormat, pricing: Option<&PricingTable>) {
-    let cost = pricing.and_then(|p| p.event_cost(event));
-    if format == OutputFormat::Json {
-        let mut data = serde_json::json!({
-            "model": event.model,
-            "source": format_source_label(&event.source_file),
-            "input_tokens": event.input_tokens,
-            "output_tokens": event.output_tokens,
-            "cache_creation_input_tokens": event.cache_creation_input_tokens,
-            "cache_read_input_tokens": event.cache_read_input_tokens,
-        });
-        if let Some(c) = cost {
-            data["cost_usd"] = serde_json::json!(c);
-        }
-        let json = serde_json::json!({ "type": "event", "data": data });
-        println!("{}", serde_json::to_string(&json).unwrap());
-        return;
-    }
-    let label = format_source_label(&event.source_file);
-    match cost {
-        Some(c) => println!(
-            "[clitrace] {} | {} | in:{} cc:{} cr:{} out:{} | {}",
-            event.model, label,
-            event.input_tokens, event.cache_creation_input_tokens,
-            event.cache_read_input_tokens, event.output_tokens,
-            format_cost(Some(c)),
-        ),
-        None => println!(
-            "[clitrace] {} | {} | in:{} cc:{} cr:{} out:{}",
-            event.model, label,
-            event.input_tokens, event.cache_creation_input_tokens,
-            event.cache_read_input_tokens, event.output_tokens,
-        ),
-    }
 }
 
 /// Extract the full session UUID from a file path.
@@ -1177,43 +888,6 @@ fn apply_filters(
         });
     }
     sessions
-}
-
-/// Extract a human-readable label from a source file path.
-///   Parent:   .../projects/<dir>/<UUID>.jsonl        → "<UUID short>"
-///   Subagent: .../<UUID>/subagents/agent-<id>.jsonl  → "<UUID short>/agent-<id short>"
-fn format_source_label(path: &str) -> String {
-    let parts: Vec<&str> = path.rsplit('/').collect();
-    // parts[0] = filename, parts[1] = parent dir, parts[2] = grandparent, ...
-
-    let filename = parts.first().map_or("", |s| s.trim_end_matches(".jsonl"));
-
-    // Subagent: parts = ["agent-xxx.jsonl", "subagents", "<UUID>", ...]
-    if parts.len() >= 3 && parts[1] == "subagents" {
-        let session_id = shorten_id(parts[2]);
-        let agent_id = shorten_id(filename);
-        return format!("{}/{}", session_id, agent_id);
-    }
-
-    // Parent session
-    shorten_id(filename).to_string()
-}
-
-/// Shorten a UUID or agent ID to first 8 chars.
-fn shorten_id(id: &str) -> &str {
-    if id.len() > 8 { &id[..8] } else { id }
-}
-
-fn format_number(n: u64) -> String {
-    let s = n.to_string();
-    let mut result = String::new();
-    for (i, c) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
-            result.push(',');
-        }
-        result.push(c);
-    }
-    result.chars().rev().collect()
 }
 
 fn bucket_from_timestamp(ts: &str, group_by: ReportGroupBy, tz: Option<Tz>) -> Option<String> {
@@ -1552,14 +1226,6 @@ mod tests {
         let parser = TestParser;
         let summaries = engine.cold_start(&parser, dir.path().to_str().unwrap()).unwrap();
         assert!(summaries.is_empty());
-    }
-
-    #[test]
-    fn test_format_number() {
-        assert_eq!(format_number(0), "0");
-        assert_eq!(format_number(123), "123");
-        assert_eq!(format_number(1234), "1,234");
-        assert_eq!(format_number(1234567), "1,234,567");
     }
 
     #[test]

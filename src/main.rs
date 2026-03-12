@@ -17,9 +17,12 @@ static RUNNING: std::sync::atomic::AtomicBool = AtomicBool::new(true);
 #[derive(Parser)]
 #[command(name = "clitrace", version, about = "AI CLI tool token usage tracker")]
 struct Cli {
-    /// Output format: table (default) or json
+    /// Output format for print sink: table (default) or json
     #[arg(long, default_value = "table", global = true)]
     output_format: String,
+    /// Output sink(s): print (default), uds://<path>, http://<url>
+    #[arg(long, global = true)]
+    sink: Vec<String>,
     /// Timezone for bucketing and --since/--until interpretation (e.g. Asia/Seoul, US/Eastern)
     #[arg(long, short = 'z', global = true)]
     timezone: Option<String>,
@@ -208,12 +211,18 @@ fn main() {
     let cli = Cli::parse();
 
     let output_format = match cli.output_format.as_str() {
-        "table" => clitrace::engine::OutputFormat::Table,
-        "json" => clitrace::engine::OutputFormat::Json,
+        "table" => clitrace::sink::OutputFormat::Table,
+        "json" => clitrace::sink::OutputFormat::Json,
         v => {
             eprintln!("[clitrace] Invalid --output-format: {} (use table|json)", v);
             std::process::exit(1);
         }
+    };
+
+    let sink_specs = if cli.sink.is_empty() {
+        vec!["print".to_string()]
+    } else {
+        cli.sink.clone()
     };
 
     let tz: Option<Tz> = match cli.timezone.as_deref() {
@@ -279,7 +288,8 @@ fn main() {
             println!("[clitrace] Claude Code root: {}", config.claude_code_root);
             println!("[clitrace] Database: {}", config.db_path.display());
 
-            let handle = match clitrace::start(config, group_by, output_format, cli.no_cost) {
+            let sink = clitrace::sink::create_sinks(&sink_specs, output_format);
+            let handle = match clitrace::start(config, group_by, sink, cli.no_cost) {
                 Ok(h) => h,
                 Err(e) => {
                     eprintln!("[clitrace] Failed to start: {}", e);
@@ -307,6 +317,9 @@ fn main() {
             let config = build_config(claude_root, None);
             println!("[clitrace] Running report...");
             println!("[clitrace] Claude Code root: {}", config.claude_code_root);
+
+            // Create sink for report output
+            let sink = clitrace::sink::create_sinks(&sink_specs, output_format);
 
             // Load pricing for cost display
             let pricing = if cli.no_cost {
@@ -374,7 +387,7 @@ fn main() {
                             filter,
                             session_filter,
                             project_filter,
-                            output_format,
+                            sink.as_ref(),
                             pricing_ref,
                         ) {
                             eprintln!("[clitrace] Report failed: {}", e);
@@ -391,13 +404,13 @@ fn main() {
                             session_filter,
                             project_filter,
                         ) {
-                            Ok(summaries) => clitrace::engine::print_summary(&summaries, output_format, pricing_ref),
+                            Ok(summaries) => sink.emit_summary(&summaries, pricing_ref),
                             Err(e) => {
                                 eprintln!("[clitrace] Report failed: {}", e);
                                 std::process::exit(1);
                             }
                         }
-                    } else if let Err(e) = clitrace::engine::cold_start_report(&parser, &config.claude_code_root, output_format, session_filter, project_filter, pricing_ref) {
+                    } else if let Err(e) = clitrace::engine::cold_start_report(&parser, &config.claude_code_root, sink.as_ref(), session_filter, project_filter, pricing_ref) {
                         eprintln!("[clitrace] Report failed: {}", e);
                         std::process::exit(1);
                     }
@@ -481,7 +494,7 @@ fn main() {
                 group_by,
                 &checkpoints,
                 filter,
-                output_format,
+                sink.as_ref(),
                 effective_session_filter,
                 effective_project_filter,
                 pricing_ref,

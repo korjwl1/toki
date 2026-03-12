@@ -32,7 +32,12 @@ Trace 옵션:
 
 ### 글로벌 옵션
 
-- `--output-format table|json`: 출력 형식 (기본: table)
+- `--output-format table|json`: print sink의 출력 형식 (기본: table)
+- `--sink <SPEC>`: 출력 대상 (기본: print). 복수 지정 가능
+  - `print` — 터미널 출력 (`--output-format`에 따라 table/json)
+  - `uds://<path>` — Unix Domain Socket으로 NDJSON 전송
+  - `http://<url>` — HTTP POST로 JSON 전송 (5초 timeout)
+  - print 외 sink은 자동 JSON 출력
 - `--timezone <IANA>` / `-z <IANA>`: 타임존 지정 (기본: UTC)
   - 예: `-z Asia/Seoul`, `-z US/Eastern`, `-z Europe/London`
   - 버킷팅(일별/시간별 등)과 `--since`/`--until` 해석에 적용
@@ -99,20 +104,33 @@ Report 옵션:
 가격은 현재 시점 기준으로 전체 데이터에 일괄 적용된다 (시간대별 역사적 가격 추적 없음).
 API key 사용자에게는 실제 청구 금액에 가깝고, Max Plan 구독자에게는 참고용 추정치이다.
 
-### 출력 형식 (`--output-format`)
+### 출력 형식 (`--output-format`) & Sink (`--sink`)
 
 ```bash
-# 기본값: 테이블 출력
+# 기본값: 테이블 출력 (print sink)
 cargo run --release -- report weekly --from-beginning
 
-# JSON 출력
+# JSON 출력 (print sink)
 cargo run --release -- report --output-format json weekly --from-beginning
 
 # trace에서도 사용 가능 (이벤트가 NDJSON으로 출력)
 cargo run --release -- trace --output-format json
+
+# UDS 전송 (자동 JSON)
+cargo run --release -- trace --sink uds:///tmp/clitrace.sock
+
+# HTTP 전송 (자동 JSON, 5초 timeout)
+cargo run --release -- trace --sink http://localhost:8080/v1/events
+
+# 터미널 + HTTP 동시 출력 (MultiSink)
+cargo run --release -- trace --sink print --sink http://localhost:8080/events
+
+# report에서도 sink 사용 가능
+cargo run --release -- report --sink http://localhost:8080/report
 ```
 
-`--output-format`은 글로벌 옵션으로, `report`/`trace` 앞이나 뒤 어디에나 위치할 수 있다.
+`--output-format`은 print sink에만 적용되며, UDS/HTTP sink은 항상 JSON으로 전송한다.
+`--sink`과 `--output-format`은 글로벌 옵션으로, `report`/`trace` 앞이나 뒤 어디에나 위치할 수 있다.
 
 ### 환경변수 오버라이드
 
@@ -133,13 +151,14 @@ clitrace = { path = "../module/clitrace" }
 
 ```rust
 use clitrace::{Config, start};
-use clitrace::engine::OutputFormat;
+use clitrace::sink::{PrintSink, OutputFormat};
 
 fn main() {
     let config = Config::new()
         .with_claude_root("/custom/path/.claude".to_string());
 
-    let handle = start(config, None, OutputFormat::Table, false).expect("Failed to start clitrace");
+    let sink = Box::new(PrintSink::new(OutputFormat::Table));
+    let handle = start(config, None, sink, false).expect("Failed to start clitrace");
 
     // ... 호스트 애플리케이션 로직 ...
 
@@ -300,7 +319,7 @@ flowchart LR
         end
     end
 
-    scope --> print["print_summary() / print_grouped_summary()"]
+    scope --> sink["sink.emit_summary() / sink.emit_grouped()"]
     scope --> flush2["flush_checkpoints()"]
 ```
 
@@ -387,6 +406,16 @@ flowchart LR
     litellm -->|"ETag caching"| st
     st --> ptable
     ptable -->|"cost_usd"| summary
+
+    subgraph Sink["Sink (출력)"]
+        print["PrintSink\n(table/json → stdout)"]
+        uds["UdsSink\n(NDJSON → UDS)"]
+        http["HttpSink\n(JSON POST)"]
+    end
+
+    summary --> print
+    summary --> uds
+    summary --> http
 ```
 
 ## Data Model
@@ -436,11 +465,17 @@ module/clitrace/
 │   ├── config.rs                       # Config + 환경변수/DB 우선순위
 │   ├── db.rs                           # redb 래퍼 (checkpoints + settings)
 │   ├── engine.rs                       # TrackerEngine: cold_start + watch_loop
-│   ├── pricing.rs                     # LiteLLM 가격 fetch, ETag 캐싱, 비용 계산
+│   ├── pricing.rs                      # LiteLLM 가격 fetch, ETag 캐싱, 비용 계산
 │   ├── checkpoint.rs                   # 역순 라인 스캔, xxHash3 매칭, JSON 완성도 검사
 │   ├── common/
 │   │   ├── mod.rs
 │   │   └── types.rs                    # UsageEvent, FileCheckpoint, LogParser trait
+│   ├── sink/                           # 출력 추상화 (Sink trait)
+│   │   ├── mod.rs                      # Sink trait, MultiSink, create_sinks()
+│   │   ├── json.rs                     # 공통 JSON 직렬화 (3개 sink 공유)
+│   │   ├── print.rs                    # PrintSink: table/json → stdout
+│   │   ├── uds.rs                      # UdsSink: NDJSON over Unix Domain Socket
+│   │   └── http.rs                     # HttpSink: JSON POST (5s timeout)
 │   ├── providers/
 │   │   ├── mod.rs
 │   │   ├── claude_code/
@@ -455,7 +490,7 @@ module/clitrace/
 │       ├── macos/mod.rs               # macOS 기본 경로
 │       ├── windows/mod.rs             # TODO
 │       └── linux/mod.rs               # TODO
-└── tests/                             # 67+ unit tests (cargo test)
+└── tests/                             # 68+ unit tests (cargo test)
 ```
 
 ## Tech Stack
