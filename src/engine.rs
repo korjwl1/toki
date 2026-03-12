@@ -132,11 +132,11 @@ fn cold_start_collect(
             }
         });
         if !local.is_empty() {
-            let mut s = summaries.lock().unwrap();
+            let mut s = summaries.lock().unwrap_or_else(|e| e.into_inner());
             merge_summaries(&mut s, local);
         }
         if let Ok(Some((_bytes, last_line_len, last_line_hash))) = result {
-            cp_batch.lock().unwrap().push(FileCheckpoint {
+            cp_batch.lock().unwrap_or_else(|e| e.into_inner()).push(FileCheckpoint {
                 file_path: path.to_string(),
                 last_line_len,
                 last_line_hash,
@@ -145,8 +145,8 @@ fn cold_start_collect(
     });
 
     Ok(ColdStartResult {
-        summaries: summaries.into_inner().unwrap(),
-        checkpoints: cp_batch.into_inner().unwrap(),
+        summaries: summaries.into_inner().unwrap_or_else(|e| e.into_inner()),
+        checkpoints: cp_batch.into_inner().unwrap_or_else(|e| e.into_inner()),
         session_count: sessions.len(),
         total_files,
     })
@@ -239,12 +239,12 @@ where
             }
         });
         if !local.is_empty() {
-            let mut g = grouped.lock().unwrap();
+            let mut g = grouped.lock().unwrap_or_else(|e| e.into_inner());
             merge_grouped(&mut g, local);
         }
     });
 
-    sink.emit_grouped(&grouped.into_inner().unwrap(), group_by.type_name(), pricing);
+    sink.emit_grouped(&grouped.into_inner().unwrap_or_else(|e| e.into_inner()), group_by.type_name(), pricing);
     Ok(())
 }
 
@@ -285,12 +285,12 @@ where
             }
         });
         if !local.is_empty() {
-            let mut s = summaries.lock().unwrap();
+            let mut s = summaries.lock().unwrap_or_else(|e| e.into_inner());
             merge_summaries(&mut s, local);
         }
     });
 
-    Ok(summaries.into_inner().unwrap())
+    Ok(summaries.into_inner().unwrap_or_else(|e| e.into_inner()))
 }
 
 /// Report grouped by session ID (each session shows its per-model breakdown).
@@ -349,13 +349,13 @@ where
             }
         });
         if !local.is_empty() {
-            let mut g = grouped.lock().unwrap();
+            let mut g = grouped.lock().unwrap_or_else(|e| e.into_inner());
             let session_models = g.entry(session_id).or_insert_with(HashMap::new);
             merge_summaries(session_models, local);
         }
     });
 
-    sink.emit_grouped(&grouped.into_inner().unwrap(), "session", pricing);
+    sink.emit_grouped(&grouped.into_inner().unwrap_or_else(|e| e.into_inner()), "session", pricing);
     Ok(())
 }
 
@@ -497,11 +497,11 @@ impl TrackerEngine {
                 }
             });
             if !local.is_empty() {
-                let mut g = grouped.lock().unwrap();
+                let mut g = grouped.lock().unwrap_or_else(|e| e.into_inner());
                 merge_grouped(&mut g, local);
             }
             if let Ok(Some((_bytes, last_line_len, last_line_hash))) = result {
-                cp_batch.lock().unwrap().push(FileCheckpoint {
+                cp_batch.lock().unwrap_or_else(|e| e.into_inner()).push(FileCheckpoint {
                     file_path: path.to_string(),
                     last_line_len,
                     last_line_hash,
@@ -510,7 +510,7 @@ impl TrackerEngine {
         });
 
         // Save checkpoints
-        let batch = cp_batch.into_inner().unwrap();
+        let batch = cp_batch.into_inner().unwrap_or_else(|e| e.into_inner());
         if !batch.is_empty() {
             for cp in &batch {
                 self.checkpoints.insert(cp.file_path.clone(), cp.clone());
@@ -521,7 +521,7 @@ impl TrackerEngine {
                 batch.len(), t_flush.elapsed().as_micros());
         }
 
-        self.sink.emit_grouped(&grouped.into_inner().unwrap(), group_by.type_name(), self.pricing.as_ref());
+        self.sink.emit_grouped(&grouped.into_inner().unwrap_or_else(|e| e.into_inner()), group_by.type_name(), self.pricing.as_ref());
         debug_log!("cold_start_grouped — ({}µs)", t_cold.elapsed().as_micros());
         Ok(())
     }
@@ -776,7 +776,8 @@ fn merge_grouped(
 }
 
 /// Common parallel file scan over all sessions.
-/// Resolves checkpoint offsets and runs `on_file(path, offset)` in parallel threads.
+/// Resolves checkpoint offsets and runs `on_file(path, offset)` in parallel
+/// using rayon's thread pool (bounded worker threads, work stealing).
 fn parallel_scan<F>(
     sessions: &[crate::common::types::SessionGroup],
     checkpoints: &HashMap<String, FileCheckpoint>,
@@ -785,41 +786,22 @@ fn parallel_scan<F>(
 where
     F: Fn(&str, u64) + Sync,
 {
-    let max_threads = num_cpus::get();
-    let semaphore = (Mutex::new(max_threads), std::sync::Condvar::new());
+    use rayon::prelude::*;
 
-    std::thread::scope(|s| {
-        for session in sessions {
-            let mut files: Vec<&std::path::Path> = vec![session.parent_jsonl.as_path()];
+    let all_files: Vec<String> = sessions
+        .iter()
+        .flat_map(|session| {
+            let mut files = vec![session.parent_jsonl.to_string_lossy().to_string()];
             for sub in &session.subagent_jsonls {
-                files.push(sub.as_path());
+                files.push(sub.to_string_lossy().to_string());
             }
+            files
+        })
+        .collect();
 
-            for file_path in files {
-                let sem = &semaphore;
-                let on_file = &on_file;
-                s.spawn(move || {
-                    {
-                        let (lock, cvar) = sem;
-                        let mut count = cvar
-                            .wait_while(lock.lock().unwrap(), |c| *c == 0)
-                            .unwrap();
-                        *count -= 1;
-                    }
-
-                    let path_str = file_path.to_string_lossy().to_string();
-                    let offset = resolve_offset(&path_str, checkpoints);
-                    on_file(&path_str, offset);
-
-                    {
-                        let (lock, cvar) = sem;
-                        let mut count = lock.lock().unwrap();
-                        *count += 1;
-                        cvar.notify_one();
-                    }
-                });
-            }
-        }
+    all_files.par_iter().for_each(|path| {
+        let offset = resolve_offset(path, checkpoints);
+        on_file(path, offset);
     });
 }
 
@@ -1040,10 +1022,11 @@ mod tests {
                 let stem = entry.file_stem().and_then(|s| s.to_str()).unwrap_or("");
                 // Simple: treat each jsonl as its own session
                 if !stem.starts_with("agent-") {
-                    let parent_dir = entry.parent().unwrap();
+                    let Some(parent_dir) = entry.parent() else { continue };
                     let sub_dir = parent_dir.join(stem).join("subagents");
                     let subs = if sub_dir.is_dir() {
-                        glob::glob(sub_dir.join("agent-*.jsonl").to_str().unwrap())
+                        let Some(pattern) = sub_dir.join("agent-*.jsonl").to_str().map(|s| s.to_string()) else { continue };
+                        glob::glob(&pattern)
                             .into_iter()
                             .flatten()
                             .flatten()
