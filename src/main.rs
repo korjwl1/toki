@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use clap::{Args, Parser, Subcommand};
-use chrono::{NaiveDate, NaiveDateTime, NaiveTime, Weekday};
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Weekday};
+use chrono_tz::Tz;
 use clitrace::Config;
 use fs2::FileExt;
 
@@ -19,6 +20,9 @@ struct Cli {
     /// Output format: table (default) or json
     #[arg(long, default_value = "table", global = true)]
     output_format: String,
+    /// Timezone for bucketing and --since/--until interpretation (e.g. Asia/Seoul, US/Eastern)
+    #[arg(long, short = 'z', global = true)]
+    timezone: Option<String>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -42,6 +46,9 @@ enum Commands {
         /// Filter by session ID prefix
         #[arg(long = "session-id")]
         session_id: Option<String>,
+        /// Filter by project name (substring match on project directory)
+        #[arg(long)]
+        project: Option<String>,
     },
     /// Report mode: one-shot summary without writing checkpoints.
     Report {
@@ -60,6 +67,9 @@ enum Commands {
         /// Filter by session ID prefix
         #[arg(long = "session-id")]
         session_id: Option<String>,
+        /// Filter by project name (substring match on project directory)
+        #[arg(long)]
+        project: Option<String>,
         #[command(subcommand)]
         command: Option<ReportCommands>,
     },
@@ -79,6 +89,9 @@ struct ReportFilterArgs {
     /// Filter by session ID prefix
     #[arg(long = "session-id")]
     session_id: Option<String>,
+    /// Filter by project name (substring match on project directory)
+    #[arg(long)]
+    project: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -113,8 +126,11 @@ enum ReportCommands {
     },
 }
 
-fn parse_range_arg(value: &str, is_until: bool) -> Result<NaiveDateTime, String> {
-    if value.len() == 8 && value.chars().all(|c| c.is_ascii_digit()) {
+/// Parse a date/time string and return as UTC NaiveDateTime.
+/// When tz is specified, the input is interpreted as local time in that timezone and converted to UTC.
+/// When tz is None, the input is treated as UTC.
+fn parse_range_arg(value: &str, is_until: bool, tz: Option<Tz>) -> Result<NaiveDateTime, String> {
+    let naive = if value.len() == 8 && value.chars().all(|c| c.is_ascii_digit()) {
         let year: i32 = value[0..4].parse().map_err(|_| "invalid year")?;
         let month: u32 = value[4..6].parse().map_err(|_| "invalid month")?;
         let day: u32 = value[6..8].parse().map_err(|_| "invalid day")?;
@@ -124,9 +140,8 @@ fn parse_range_arg(value: &str, is_until: bool) -> Result<NaiveDateTime, String>
         } else {
             NaiveTime::from_hms_opt(0, 0, 0).unwrap()
         };
-        return Ok(NaiveDateTime::new(date, time));
-    }
-    if value.len() == 14 && value.chars().all(|c| c.is_ascii_digit()) {
+        NaiveDateTime::new(date, time)
+    } else if value.len() == 14 && value.chars().all(|c| c.is_ascii_digit()) {
         let year: i32 = value[0..4].parse().map_err(|_| "invalid year")?;
         let month: u32 = value[4..6].parse().map_err(|_| "invalid month")?;
         let day: u32 = value[6..8].parse().map_err(|_| "invalid day")?;
@@ -135,9 +150,21 @@ fn parse_range_arg(value: &str, is_until: bool) -> Result<NaiveDateTime, String>
         let sec: u32 = value[12..14].parse().map_err(|_| "invalid second")?;
         let date = NaiveDate::from_ymd_opt(year, month, day).ok_or("invalid date")?;
         let time = NaiveTime::from_hms_opt(hour, min, sec).ok_or("invalid time")?;
-        return Ok(NaiveDateTime::new(date, time));
+        NaiveDateTime::new(date, time)
+    } else {
+        return Err("invalid format (use YYYYMMDD or YYYYMMDDhhmmss)".to_string());
+    };
+
+    // Convert local time to UTC when timezone is specified
+    match tz {
+        Some(tz) => {
+            let local = tz.from_local_datetime(&naive)
+                .single()
+                .ok_or("ambiguous or invalid local time for timezone")?;
+            Ok(local.naive_utc())
+        }
+        None => Ok(naive),
     }
-    Err("invalid format (use YYYYMMDD or YYYYMMDDhhmmss)".to_string())
 }
 
 fn build_config(claude_root: Option<String>, db_path: Option<PathBuf>) -> Config {
@@ -186,8 +213,19 @@ fn main() {
         }
     };
 
+    let tz: Option<Tz> = match cli.timezone.as_deref() {
+        Some(name) => match name.parse::<Tz>() {
+            Ok(tz) => Some(tz),
+            Err(_) => {
+                eprintln!("[clitrace] Invalid --timezone: {} (use IANA name like Asia/Seoul, US/Eastern)", name);
+                std::process::exit(1);
+            }
+        },
+        None => None,
+    };
+
     match cli.command {
-        Commands::Trace { claude_root, db_path, full_rescan, startup_group_by, session_id } => {
+        Commands::Trace { claude_root, db_path, full_rescan, startup_group_by, session_id, project } => {
             let mut config = build_config(claude_root, db_path);
             if full_rescan {
                 config = config.with_full_rescan(true);
@@ -195,6 +233,10 @@ fn main() {
             if session_id.is_some() {
                 config = config.with_session_filter(session_id);
             }
+            if project.is_some() {
+                config = config.with_project_filter(project);
+            }
+            config = config.with_tz(tz);
 
             // Parse --startup-group-by
             let group_by = match startup_group_by.as_deref() {
@@ -258,13 +300,14 @@ fn main() {
             handle.stop();
             println!("[clitrace] Done.");
         }
-        Commands::Report { claude_root, since, until, group_by_session, session_id, command } => {
+        Commands::Report { claude_root, since, until, group_by_session, session_id, project, command } => {
             let config = build_config(claude_root, None);
             println!("[clitrace] Running report...");
             println!("[clitrace] Claude Code root: {}", config.claude_code_root);
 
             let parser = clitrace::providers::claude_code::ClaudeCodeParser;
             let session_filter = session_id.as_deref();
+            let project_filter = project.as_deref();
 
             // Validate: --group-by-session cannot be used with subcommands
             if group_by_session && command.is_some() {
@@ -277,7 +320,7 @@ fn main() {
                 None => {
                     // No subcommand: total report (with optional since/until filter)
                     let since_dt = match since.as_deref() {
-                        Some(v) => match parse_range_arg(v, false) {
+                        Some(v) => match parse_range_arg(v, false, tz) {
                             Ok(dt) => Some(dt),
                             Err(e) => {
                                 eprintln!("[clitrace] Invalid --since: {} ({})", v, e);
@@ -287,7 +330,7 @@ fn main() {
                         None => None,
                     };
                     let until_dt = match until.as_deref() {
-                        Some(v) => match parse_range_arg(v, true) {
+                        Some(v) => match parse_range_arg(v, true, tz) {
                             Ok(dt) => Some(dt),
                             Err(e) => {
                                 eprintln!("[clitrace] Invalid --until: {} ({})", v, e);
@@ -304,7 +347,7 @@ fn main() {
                     }
 
                     if group_by_session {
-                        let filter = clitrace::engine::ReportFilter { since: since_dt, until: until_dt };
+                        let filter = clitrace::engine::ReportFilter { since: since_dt, until: until_dt, tz };
                         let checkpoints = std::collections::HashMap::new();
                         if let Err(e) = clitrace::engine::cold_start_report_by_session(
                             &parser,
@@ -312,13 +355,14 @@ fn main() {
                             &checkpoints,
                             filter,
                             session_filter,
+                            project_filter,
                             output_format,
                         ) {
                             eprintln!("[clitrace] Report failed: {}", e);
                             std::process::exit(1);
                         }
                     } else if since_dt.is_some() || until_dt.is_some() {
-                        let filter = clitrace::engine::ReportFilter { since: since_dt, until: until_dt };
+                        let filter = clitrace::engine::ReportFilter { since: since_dt, until: until_dt, tz };
                         let checkpoints = std::collections::HashMap::new();
                         match clitrace::engine::cold_start_report_filtered(
                             &parser,
@@ -326,6 +370,7 @@ fn main() {
                             &checkpoints,
                             filter,
                             session_filter,
+                            project_filter,
                         ) {
                             Ok(summaries) => clitrace::engine::print_summary(&summaries, output_format),
                             Err(e) => {
@@ -333,7 +378,7 @@ fn main() {
                                 std::process::exit(1);
                             }
                         }
-                    } else if let Err(e) = clitrace::engine::cold_start_report(&parser, &config.claude_code_root, output_format, session_filter) {
+                    } else if let Err(e) = clitrace::engine::cold_start_report(&parser, &config.claude_code_root, output_format, session_filter, project_filter) {
                         eprintln!("[clitrace] Report failed: {}", e);
                         std::process::exit(1);
                     }
@@ -367,7 +412,7 @@ fn main() {
 
             // Parse filter values
             let since_dt = match filter_args.since.as_deref() {
-                Some(v) => match parse_range_arg(v, false) {
+                Some(v) => match parse_range_arg(v, false, tz) {
                     Ok(dt) => Some(dt),
                     Err(e) => {
                         eprintln!("[clitrace] Invalid --since: {} ({})", v, e);
@@ -377,7 +422,7 @@ fn main() {
                 None => None,
             };
             let until_dt = match filter_args.until.as_deref() {
-                Some(v) => match parse_range_arg(v, true) {
+                Some(v) => match parse_range_arg(v, true, tz) {
                     Ok(dt) => Some(dt),
                     Err(e) => {
                         eprintln!("[clitrace] Invalid --until: {} ({})", v, e);
@@ -407,8 +452,9 @@ fn main() {
 
             // Merge session filters: subcommand --session-id takes precedence, then parent-level
             let effective_session_filter = filter_args.session_id.as_deref().or(session_filter);
+            let effective_project_filter = filter_args.project.as_deref().or(project_filter);
 
-            let filter = clitrace::engine::ReportFilter { since: since_dt, until: until_dt };
+            let filter = clitrace::engine::ReportFilter { since: since_dt, until: until_dt, tz };
             let checkpoints = std::collections::HashMap::new();
             if let Err(e) = clitrace::engine::cold_start_report_grouped(
                 &parser,
@@ -418,6 +464,7 @@ fn main() {
                 filter,
                 output_format,
                 effective_session_filter,
+                effective_project_filter,
             ) {
                 eprintln!("[clitrace] Report failed: {}", e);
                 std::process::exit(1);

@@ -7,7 +7,8 @@ use comfy_table::{Table, ContentArrangement, Cell, Attribute, presets::UTF8_FULL
 
 use crate::checkpoint::{find_resume_offset, process_lines_streaming};
 use crate::common::types::{FileCheckpoint, LogParser, LogParserWithTs, ModelUsageSummary, UsageEvent};
-use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, Weekday};
+use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, TimeZone, Weekday};
+use chrono_tz::Tz;
 use crate::db::Database;
 
 /// Debug level:
@@ -86,6 +87,10 @@ pub struct TrackerEngine {
     output_format: OutputFormat,
     /// Optional session ID prefix filter for trace mode.
     session_filter: Option<String>,
+    /// Optional project name filter for trace mode.
+    project_filter: Option<String>,
+    /// Optional timezone for bucketing in startup grouping.
+    tz: Option<Tz>,
 }
 
 struct ColdStartResult {
@@ -100,11 +105,9 @@ fn cold_start_collect(
     root_dir: &str,
     checkpoints: &HashMap<String, FileCheckpoint>,
     session_filter: Option<&str>,
+    project_filter: Option<&str>,
 ) -> Result<ColdStartResult, Box<dyn std::error::Error>> {
-    let mut sessions = parser.discover_sessions(root_dir);
-    if let Some(prefix) = session_filter {
-        sessions = filter_sessions_by_id(sessions, prefix);
-    }
+    let sessions = apply_filters(parser.discover_sessions(root_dir), session_filter, project_filter);
 
     if sessions.is_empty() {
         return Ok(ColdStartResult {
@@ -159,9 +162,10 @@ pub fn cold_start_report(
     root_dir: &str,
     output_format: OutputFormat,
     session_filter: Option<&str>,
+    project_filter: Option<&str>,
 ) -> Result<HashMap<String, ModelUsageSummary>, Box<dyn std::error::Error>> {
     let empty = HashMap::new();
-    let result = cold_start_collect(parser, root_dir, &empty, session_filter)?;
+    let result = cold_start_collect(parser, root_dir, &empty, session_filter, project_filter)?;
     print_summary(&result.summaries, output_format);
     Ok(result.summaries)
 }
@@ -187,10 +191,18 @@ impl ReportGroupBy {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct ReportFilter {
     pub since: Option<NaiveDateTime>,
     pub until: Option<NaiveDateTime>,
+    /// Timezone for bucketing and display. None = UTC.
+    pub tz: Option<Tz>,
+}
+
+impl Default for ReportFilter {
+    fn default() -> Self {
+        ReportFilter { since: None, until: None, tz: None }
+    }
 }
 
 pub fn cold_start_report_grouped<P>(
@@ -201,14 +213,12 @@ pub fn cold_start_report_grouped<P>(
     filter: ReportFilter,
     output_format: OutputFormat,
     session_filter: Option<&str>,
+    project_filter: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     P: LogParser + LogParserWithTs + Sync,
 {
-    let mut sessions = parser.discover_sessions(root_dir);
-    if let Some(prefix) = session_filter {
-        sessions = filter_sessions_by_id(sessions, prefix);
-    }
+    let sessions = apply_filters(parser.discover_sessions(root_dir), session_filter, project_filter);
     if sessions.is_empty() {
         println!("[clitrace] No usage data found.");
         return Ok(());
@@ -247,14 +257,12 @@ pub fn cold_start_report_filtered<P>(
     checkpoints: &HashMap<String, FileCheckpoint>,
     filter: ReportFilter,
     session_filter: Option<&str>,
+    project_filter: Option<&str>,
 ) -> Result<HashMap<String, ModelUsageSummary>, Box<dyn std::error::Error>>
 where
     P: LogParser + LogParserWithTs + Sync,
 {
-    let mut sessions = parser.discover_sessions(root_dir);
-    if let Some(prefix) = session_filter {
-        sessions = filter_sessions_by_id(sessions, prefix);
-    }
+    let sessions = apply_filters(parser.discover_sessions(root_dir), session_filter, project_filter);
     if sessions.is_empty() {
         return Ok(HashMap::new());
     }
@@ -295,15 +303,13 @@ pub fn cold_start_report_by_session<P>(
     checkpoints: &HashMap<String, FileCheckpoint>,
     filter: ReportFilter,
     session_filter: Option<&str>,
+    project_filter: Option<&str>,
     output_format: OutputFormat,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     P: LogParser + LogParserWithTs + Sync,
 {
-    let mut sessions = parser.discover_sessions(root_dir);
-    if let Some(prefix) = session_filter {
-        sessions = filter_sessions_by_id(sessions, prefix);
-    }
+    let sessions = apply_filters(parser.discover_sessions(root_dir), session_filter, project_filter);
     if sessions.is_empty() {
         println!("[clitrace] No usage data found.");
         return Ok(());
@@ -365,6 +371,8 @@ impl TrackerEngine {
             dirty: HashSet::new(),
             output_format: OutputFormat::Table,
             session_filter: None,
+            project_filter: None,
+            tz: None,
         }
     }
 
@@ -376,6 +384,34 @@ impl TrackerEngine {
     pub fn with_session_filter(mut self, filter: Option<String>) -> Self {
         self.session_filter = filter;
         self
+    }
+
+    pub fn with_project_filter(mut self, filter: Option<String>) -> Self {
+        self.project_filter = filter;
+        self
+    }
+
+    pub fn with_tz(mut self, tz: Option<Tz>) -> Self {
+        self.tz = tz;
+        self
+    }
+
+    /// Check if a file path matches the configured session and project filters.
+    fn matches_filters(&self, path: &str) -> bool {
+        if let Some(ref prefix) = self.session_filter {
+            if let Some(sid) = extract_session_id(path) {
+                if !sid.starts_with(prefix.as_str()) {
+                    return false;
+                }
+            }
+        }
+        if let Some(ref project) = self.project_filter {
+            match extract_project_name(path) {
+                Some(name) if name.contains(project.as_str()) => {}
+                _ => return false,
+            }
+        }
+        true
     }
 
     /// Load existing checkpoints from DB into memory.
@@ -395,7 +431,7 @@ impl TrackerEngine {
         root_dir: &str,
     ) -> Result<HashMap<String, ModelUsageSummary>, Box<dyn std::error::Error>> {
         let t_cold = Instant::now();
-        let result = cold_start_collect(parser, root_dir, &self.checkpoints, None)?;
+        let result = cold_start_collect(parser, root_dir, &self.checkpoints, None, self.project_filter.as_deref())?;
 
         if result.session_count == 0 {
             debug_log!("cold_start — 0 sessions, 0 files ({}µs)", t_cold.elapsed().as_micros());
@@ -440,7 +476,7 @@ impl TrackerEngine {
         let grouped: Mutex<HashMap<String, HashMap<String, ModelUsageSummary>>> =
             Mutex::new(HashMap::new());
         let cp_batch: Mutex<Vec<FileCheckpoint>> = Mutex::new(Vec::new());
-        let filter = ReportFilter::default();
+        let filter = ReportFilter { tz: self.tz, ..Default::default() };
 
         parallel_scan(&sessions, &self.checkpoints, |path, offset| {
             let mut local: HashMap<String, HashMap<String, ModelUsageSummary>> = HashMap::new();
@@ -608,13 +644,8 @@ impl TrackerEngine {
     }
 
     fn process_and_print(&mut self, path: &str, parser: &dyn LogParser) {
-        // Skip files that don't match session filter
-        if let Some(ref prefix) = self.session_filter {
-            if let Some(sid) = extract_session_id(path) {
-                if !sid.starts_with(prefix.as_str()) {
-                    return;
-                }
-            }
+        if !self.matches_filters(path) {
+            return;
         }
         match self.process_file(path, parser) {
             Ok(events) => {
@@ -1065,6 +1096,35 @@ pub fn filter_sessions_by_id(sessions: Vec<crate::common::types::SessionGroup>, 
         .collect()
 }
 
+/// Extract project directory name from a file path (zero-alloc, returns &str slice).
+///   .../projects/<PROJECT_DIR>/<UUID>.jsonl → "<PROJECT_DIR>"
+///   .../projects/<PROJECT_DIR>/<UUID>/subagents/agent-<id>.jsonl → "<PROJECT_DIR>"
+pub fn extract_project_name(path: &str) -> Option<&str> {
+    let marker = "/projects/";
+    let start = path.find(marker)? + marker.len();
+    let rest = &path[start..];
+    let end = rest.find('/').unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+/// Apply session and project filters to a list of sessions.
+fn apply_filters(
+    mut sessions: Vec<crate::common::types::SessionGroup>,
+    session_filter: Option<&str>,
+    project_filter: Option<&str>,
+) -> Vec<crate::common::types::SessionGroup> {
+    if let Some(prefix) = session_filter {
+        sessions = filter_sessions_by_id(sessions, prefix);
+    }
+    if let Some(project) = project_filter {
+        sessions.retain(|s| {
+            let path_str = s.parent_jsonl.to_string_lossy();
+            matches!(extract_project_name(&path_str), Some(name) if name.contains(project))
+        });
+    }
+    sessions
+}
+
 /// Extract a human-readable label from a source file path.
 ///   Parent:   .../projects/<dir>/<UUID>.jsonl        → "<UUID short>"
 ///   Subagent: .../<UUID>/subagents/agent-<id>.jsonl  → "<UUID short>/agent-<id short>"
@@ -1102,8 +1162,9 @@ fn format_number(n: u64) -> String {
     result.chars().rev().collect()
 }
 
-fn bucket_from_timestamp(ts: &str, group_by: ReportGroupBy) -> Option<String> {
-    if ts.len() >= 4 {
+fn bucket_from_timestamp(ts: &str, group_by: ReportGroupBy, tz: Option<Tz>) -> Option<String> {
+    // Fast path: string slicing only valid for UTC (no timezone conversion needed)
+    if tz.is_none() && ts.len() >= 4 {
         match group_by {
             ReportGroupBy::Year => return Some(ts[0..4].to_string()),
             ReportGroupBy::Month if ts.len() >= 7 => return Some(ts[0..7].to_string()),
@@ -1117,7 +1178,7 @@ fn bucket_from_timestamp(ts: &str, group_by: ReportGroupBy) -> Option<String> {
         }
     }
 
-    let dt = parse_timestamp(ts)?;
+    let dt = parse_timestamp_with_tz(ts, tz)?;
     Some(bucket_from_datetime(dt, group_by))
 }
 
@@ -1127,13 +1188,14 @@ fn bucket_from_timestamp_filtered(
     filter: ReportFilter,
 ) -> Option<String> {
     if filter_active(filter) {
-        let dt = parse_timestamp(ts)?;
-        if !filter_match(dt, filter) {
+        let utc = parse_timestamp(ts)?;
+        if !filter_match(utc, filter) {
             return None;
         }
-        return Some(bucket_from_datetime(dt, group_by));
+        let local = apply_tz(utc, filter.tz);
+        return Some(bucket_from_datetime(local, group_by));
     }
-    bucket_from_timestamp(ts, group_by)
+    bucket_from_timestamp(ts, group_by, filter.tz)
 }
 
 fn parse_timestamp(ts: &str) -> Option<NaiveDateTime> {
@@ -1141,6 +1203,20 @@ fn parse_timestamp(ts: &str) -> Option<NaiveDateTime> {
         return Some(dt.naive_utc());
     }
     NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%SZ").ok()
+}
+
+/// Parse timestamp and convert to target timezone (or UTC if None).
+fn parse_timestamp_with_tz(ts: &str, tz: Option<Tz>) -> Option<NaiveDateTime> {
+    let utc = parse_timestamp(ts)?;
+    Some(apply_tz(utc, tz))
+}
+
+/// Convert UTC NaiveDateTime to target timezone. Noop if tz is None.
+fn apply_tz(utc: NaiveDateTime, tz: Option<Tz>) -> NaiveDateTime {
+    match tz {
+        Some(tz) => chrono::Utc.from_utc_datetime(&utc).with_timezone(&tz).naive_local(),
+        None => utc,
+    }
 }
 
 fn bucket_from_datetime(ts: NaiveDateTime, group_by: ReportGroupBy) -> String {

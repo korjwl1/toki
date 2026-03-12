@@ -27,6 +27,15 @@ Trace 옵션:
 - `--startup-group-by hour|day|week|month|year`: cold start 시 시간 단위 그룹핑 요약
   - `hour`는 기존 체크포인트가 있어야 사용 가능 (증분 데이터만 출력)
   - `hour`는 `--full-rescan`과 함께 사용 불가
+- `--session-id <PREFIX>`: 세션 UUID 접두사로 필터링
+- `--project <NAME>`: 프로젝트 디렉토리 이름으로 필터링 (서브스트링 매치)
+
+### 글로벌 옵션
+
+- `--output-format table|json`: 출력 형식 (기본: table)
+- `--timezone <IANA>` / `-z <IANA>`: 타임존 지정 (기본: UTC)
+  - 예: `-z Asia/Seoul`, `-z US/Eastern`, `-z Europe/London`
+  - 버킷팅(일별/시간별 등)과 `--since`/`--until` 해석에 적용
 
 ### Report 모드 (one-shot)
 
@@ -42,6 +51,17 @@ cargo run --release -- report daily --from-beginning
 cargo run --release -- report weekly --since 20260301 --start-of-week tue
 cargo run --release -- report hourly --since 20260301
 cargo run --release -- report hourly --from-beginning
+
+# 프로젝트별 필터링
+cargo run --release -- report --project clitrace
+cargo run --release -- report --project ddleague daily --since 20260301
+
+# 세션별 그룹핑/필터링
+cargo run --release -- report --group-by-session
+cargo run --release -- report --session-id 4de9291e
+
+# 타임존 지정 (KST 기준 일별 리포트)
+cargo run --release -- -z Asia/Seoul report daily --since 20260301
 ```
 
 Report 옵션:
@@ -55,6 +75,11 @@ Report 옵션:
 - `--until` (inclusive, UTC, `<=`): `YYYYMMDD` 또는 `YYYYMMDDhhmmss`
   - `YYYYMMDD`는 해당 날짜의 `23:59:59` UTC로 해석
 - `--from-beginning`: `--since` 없이 전체 데이터 그룹핑 허용
+- `--project <NAME>`: 프로젝트 디렉토리 이름으로 필터링 (서브스트링 매치)
+  - 예: `--project clitrace`는 `clitrace`가 포함된 프로젝트만 조회
+  - 예: `--project ddleague`는 `ddleague`, `ddleague-module`, `ddleague-module-clitrace` 등 모두 포함
+- `--session-id <PREFIX>`: 세션 UUID 접두사로 필터링
+- `--group-by-session`: 세션별로 그룹핑 (시간 기반 서브커맨드와 함께 사용 불가)
 
 ### 출력 형식 (`--output-format`)
 
@@ -365,6 +390,9 @@ flowchart LR
 | `claude_code_root` | String | `~/.claude` | 루트 디렉토리 |
 | `db_path` | PathBuf | `~/.config/clitrace/clitrace.db` | DB 파일 경로 |
 | `full_rescan` | bool | false | 시작 시 체크포인트 초기화 |
+| `session_filter` | Option\<String\> | None | 세션 UUID 접두사 필터 |
+| `project_filter` | Option\<String\> | None | 프로젝트 이름 서브스트링 필터 |
+| `tz` | Option\<Tz\> | None | 타임존 (IANA 이름, 버킷팅/필터에 적용) |
 
 설정 우선순위: **환경변수** > **DB settings 테이블** > **기본값**
 

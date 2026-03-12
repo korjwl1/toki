@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use chrono_tz::Tz;
 use crate::db::Database;
 
 #[derive(Debug, Clone)]
@@ -8,6 +9,8 @@ pub struct Config {
     pub db_path: PathBuf,
     pub full_rescan: bool,
     pub session_filter: Option<String>,
+    pub project_filter: Option<String>,
+    pub tz: Option<Tz>,
 }
 
 impl Config {
@@ -19,6 +22,8 @@ impl Config {
             db_path: home.join(".config").join("clitrace").join("clitrace.db"),
             full_rescan: false,
             session_filter: None,
+            project_filter: None,
+            tz: None,
         }
     }
 
@@ -39,6 +44,16 @@ impl Config {
 
     pub fn with_session_filter(mut self, filter: Option<String>) -> Self {
         self.session_filter = filter;
+        self
+    }
+
+    pub fn with_project_filter(mut self, filter: Option<String>) -> Self {
+        self.project_filter = filter;
+        self
+    }
+
+    pub fn with_tz(mut self, tz: Option<Tz>) -> Self {
+        self.tz = tz;
         self
     }
 
