@@ -152,11 +152,11 @@ pub fn run_settings(db_path: &Path) {
 
     // Assemble form with section panels
     let form = LinearLayout::vertical()
-        .child(Panel::new(PaddedView::new(Margins::lrtb(1, 1, 0, 0), paths_section)).title("Paths"))
+        .child(Panel::new(PaddedView::new(Margins::lrtb(1, 1, 1, 0), paths_section)).title("Paths"))
         .child(DummyView.fixed_height(1))
-        .child(Panel::new(PaddedView::new(Margins::lrtb(1, 1, 0, 0), display_section)).title("Display"))
+        .child(Panel::new(PaddedView::new(Margins::lrtb(1, 1, 1, 0), display_section)).title("Display"))
         .child(DummyView.fixed_height(1))
-        .child(Panel::new(PaddedView::new(Margins::lrtb(1, 1, 0, 0), data_section)).title("Data"));
+        .child(Panel::new(PaddedView::new(Margins::lrtb(1, 1, 1, 0), data_section)).title("Data"));
 
     let padded = PaddedView::lrtb(1, 1, 0, 0, form);
 
