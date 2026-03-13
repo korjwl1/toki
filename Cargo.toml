@@ -3,6 +3,9 @@ name = "toki"
 version = "0.1.0"
 edition = "2021"
 description = "AI CLI tool token usage tracker module"
+license = "FSL-1.1-Apache-2.0"
+repository = "https://github.com/korjwl1/ddleague-clitrace"
+homepage = "https://github.com/korjwl1/ddleague-clitrace"
 
 [lib]
 name = "toki"
