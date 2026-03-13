@@ -27,13 +27,33 @@ pub struct RetentionStats {
 
 pub fn run_retention(db: &Database, policy: &RetentionPolicy) -> Result<RetentionStats, fjall::Error> {
     let t = Instant::now();
+
+    // 0 = disabled
+    if policy.event_retention_days == 0 && policy.rollup_retention_days == 0 {
+        return Ok(RetentionStats {
+            events_deleted: 0,
+            rollups_deleted: 0,
+            sessions_deleted: 0,
+            projects_deleted: 0,
+            elapsed: t.elapsed(),
+        });
+    }
+
     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
 
-    let event_cutoff = now_ms - (policy.event_retention_days as i64) * 86_400_000;
-    let rollup_cutoff = now_ms - (policy.rollup_retention_days as i64) * 86_400_000;
+    let events_deleted = if policy.event_retention_days > 0 {
+        let cutoff = now_ms - (policy.event_retention_days as i64) * 86_400_000;
+        db.delete_events_before(cutoff)?
+    } else {
+        0
+    };
 
-    let events_deleted = db.delete_events_before(event_cutoff)?;
-    let rollups_deleted = db.delete_rollups_before(rollup_cutoff)?;
+    let rollups_deleted = if policy.rollup_retention_days > 0 {
+        let cutoff = now_ms - (policy.rollup_retention_days as i64) * 86_400_000;
+        db.delete_rollups_before(cutoff)?
+    } else {
+        0
+    };
 
     // Index cleanup is skipped: session/project indices have keys like
     // {prefix}\0{ts}{msg_id}, so a full scan would be O(n) over all entries.

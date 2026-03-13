@@ -113,14 +113,37 @@ clitrace --no-cost report
 | `--group-by-session` | 세션별 그룹핑 (시간 서브커맨드와 동시 사용 불가) |
 | `--start-of-week mon\|tue\|...\|sun` | `weekly`에서만 사용 |
 
+## Settings
+
+`settings`는 cursive TUI로 설정 페이지를 연다. 설정은 DB에 저장되며, CLI 인자로도 개별 오버라이드 가능.
+
+```bash
+clitrace settings
+clitrace settings --db-path /custom/clitrace.fjall
+```
+
+| 설정 항목 | 설명 | 기본값 |
+|-----------|------|--------|
+| Claude Code Root | Claude Code 루트 디렉토리 | `~/.claude` |
+| Daemon Socket | 데몬 UDS 소켓 경로 | `~/.config/clitrace/daemon.sock` |
+| Timezone | IANA 타임존 (빈값=UTC) | (없음) |
+| Output Format | 기본 출력 형식 | `table` |
+| Start of Week | 주간 리포트 시작 요일 | `mon` |
+| No Cost | 비용 계산 비활성화 | `false` |
+| Retention Days | 이벤트 보존 기간 (0=무제한) | `0` |
+| Rollup Retention Days | Rollup 보존 기간 (0=무제한) | `0` |
+
+설정 우선순위: **CLI 인자 > DB settings > 기본값** (환경변수 미사용)
+
 ## Global Options
 
 | 옵션 | 설명 |
 |------|------|
-| `--output-format table\|json` | print sink 출력 형식 (기본: table) |
+| `--output-format table\|json` | 출력 형식 오버라이드 (DB 설정보다 우선) |
 | `--sink <SPEC>` | 출력 대상, 복수 지정 가능 |
-| `--timezone <IANA>` / `-z` | 타임존 (기본: UTC) |
-| `--no-cost` | 비용 계산 비활성화 |
+| `--timezone <IANA>` / `-z` | 타임존 오버라이드 |
+| `--no-cost` | 비용 계산 비활성화 오버라이드 |
+| `--db-path <PATH>` | DB 경로 (기본: `~/.config/clitrace/clitrace.fjall`) |
 
 ### Sink 종류
 
@@ -149,12 +172,9 @@ clitrace trace --sink print --sink http://localhost:8080/events
 
 | 변수 | 설명 | 기본값 |
 |------|------|--------|
-| `CLITRACE_CLAUDE_ROOT` | Claude Code 루트 디렉토리 | `~/.claude` |
-| `CLITRACE_DB_PATH` | DB 디렉토리 경로 | `~/.config/clitrace/clitrace.fjall` |
 | `CLITRACE_DEBUG` | 디버그 로그 (1=normal, 2=verbose) | 0 |
-| `CLITRACE_RETENTION_DAYS` | 이벤트 보존 기간 (일) | 90 |
-| `CLITRACE_ROLLUP_RETENTION_DAYS` | Rollup 보존 기간 (일) | 365 |
-| `CLITRACE_DAEMON_SOCK` | 데몬 UDS 소켓 경로 | `~/.config/clitrace/daemon.sock` |
+
+> 모든 설정은 `clitrace settings` TUI 또는 CLI `--db-path` 인자로 관리한다. 환경변수는 디버그 로그에만 사용.
 
 ## Project Structure
 
@@ -179,6 +199,7 @@ clitrace trace --sink print --sink http://localhost:8080/events
     ├── retention.rs                       # 데이터 보존 정책 (자동 삭제)
     ├── checkpoint.rs                      # 역순 라인 스캔, xxHash3 매칭
     ├── pricing.rs                         # LiteLLM 가격 fetch, ETag 캐싱
+    ├── settings.rs                        # cursive TUI 설정 페이지
     ├── common/
     │   └── types.rs                       # 공통 타입, trait 정의
     ├── daemon/                            # 데몬 서버 컴포넌트

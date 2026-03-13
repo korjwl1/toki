@@ -30,6 +30,7 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 chrono-tz = "0.10"
 comfy-table = ">=7.1, <7.2"
 ureq = "2"
+cursive = { version = "0.21", default-features = false, features = ["crossterm-backend"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tikv-jemallocator = "0.6"

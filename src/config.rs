@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use chrono::Weekday;
 use chrono_tz::Tz;
 use crate::db::Database;
 
@@ -14,6 +15,9 @@ pub struct Config {
     pub retention_days: u32,
     pub rollup_retention_days: u32,
     pub daemon_sock: PathBuf,
+    pub no_cost: bool,
+    pub output_format: String,
+    pub start_of_week: Weekday,
 }
 
 impl Config {
@@ -27,19 +31,13 @@ impl Config {
             session_filter: None,
             project_filter: None,
             tz: None,
-            retention_days: std::env::var("CLITRACE_RETENTION_DAYS")
-                .ok().and_then(|v| v.parse().ok()).unwrap_or(90),
-            rollup_retention_days: std::env::var("CLITRACE_ROLLUP_RETENTION_DAYS")
-                .ok().and_then(|v| v.parse().ok()).unwrap_or(365),
-            daemon_sock: std::env::var("CLITRACE_DAEMON_SOCK")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| crate::daemon::default_sock_path()),
+            retention_days: 0,
+            rollup_retention_days: 0,
+            daemon_sock: crate::daemon::default_sock_path(),
+            no_cost: false,
+            output_format: "table".to_string(),
+            start_of_week: Weekday::Mon,
         }
-    }
-
-    pub fn with_claude_root(mut self, root: String) -> Self {
-        self.claude_code_root = root;
-        self
     }
 
     pub fn with_db_path(mut self, path: PathBuf) -> Self {
@@ -68,13 +66,49 @@ impl Config {
     }
 
     /// Load overrides from DB settings table.
-    /// Priority: env var > DB > default (env already applied before this call).
+    /// Priority: CLI arg > DB setting > default.
     pub fn load_from_db(&mut self, db: &Database) {
-        if std::env::var("CLITRACE_CLAUDE_ROOT").is_err() {
-            if let Ok(Some(root)) = db.get_setting("claude_code_root") {
-                self.claude_code_root = root;
+        if let Ok(Some(v)) = db.get_setting("claude_code_root") {
+            self.claude_code_root = v;
+        }
+        if let Ok(Some(v)) = db.get_setting("retention_days") {
+            if let Ok(n) = v.parse::<u32>() { self.retention_days = n; }
+        }
+        if let Ok(Some(v)) = db.get_setting("rollup_retention_days") {
+            if let Ok(n) = v.parse::<u32>() { self.rollup_retention_days = n; }
+        }
+        if let Ok(Some(v)) = db.get_setting("daemon_sock") {
+            self.daemon_sock = PathBuf::from(v);
+        }
+        if let Ok(Some(v)) = db.get_setting("timezone") {
+            if !v.is_empty() {
+                if let Ok(tz) = v.parse::<Tz>() {
+                    self.tz = Some(tz);
+                }
             }
         }
+        if let Ok(Some(v)) = db.get_setting("no_cost") {
+            self.no_cost = v == "true";
+        }
+        if let Ok(Some(v)) = db.get_setting("output_format") {
+            if v == "table" || v == "json" {
+                self.output_format = v;
+            }
+        }
+        if let Ok(Some(v)) = db.get_setting("start_of_week") {
+            if let Some(w) = parse_weekday(&v) {
+                self.start_of_week = w;
+            }
+        }
+    }
+}
+
+fn parse_weekday(s: &str) -> Option<Weekday> {
+    match s {
+        "mon" => Some(Weekday::Mon), "tue" => Some(Weekday::Tue),
+        "wed" => Some(Weekday::Wed), "thu" => Some(Weekday::Thu),
+        "fri" => Some(Weekday::Fri), "sat" => Some(Weekday::Sat),
+        "sun" => Some(Weekday::Sun), _ => None,
     }
 }
 
@@ -93,16 +127,19 @@ mod tests {
         let config = Config::new();
         assert!(config.claude_code_root.ends_with(".claude"));
         assert!(config.db_path.ends_with("clitrace.fjall"));
+        assert_eq!(config.retention_days, 0);
+        assert_eq!(config.rollup_retention_days, 0);
+        assert!(!config.no_cost);
+        assert_eq!(config.output_format, "table");
+        assert_eq!(config.start_of_week, Weekday::Mon);
     }
 
     #[test]
     fn test_config_builder() {
         let config = Config::new()
-            .with_claude_root("/custom/root".to_string())
             .with_db_path("/custom/db.fjall".into())
             .with_full_rescan(true);
 
-        assert_eq!(config.claude_code_root, "/custom/root");
         assert_eq!(config.db_path, PathBuf::from("/custom/db.fjall"));
         assert!(config.full_rescan);
     }
@@ -115,32 +152,18 @@ mod tests {
         let db = Database::open(&db_path).unwrap();
 
         db.set_setting("claude_code_root", "/from/db").unwrap();
-        // Remove env var to allow DB override
-        std::env::remove_var("CLITRACE_CLAUDE_ROOT");
+        db.set_setting("retention_days", "30").unwrap();
+        db.set_setting("no_cost", "true").unwrap();
+        db.set_setting("output_format", "json").unwrap();
+        db.set_setting("start_of_week", "fri").unwrap();
 
         let mut config = Config::new();
         config.load_from_db(&db);
 
         assert_eq!(config.claude_code_root, "/from/db");
-    }
-
-    #[test]
-    fn test_config_env_overrides_db() {
-        let _guard = env_lock().lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("test.db");
-        let db = Database::open(&db_path).unwrap();
-
-        db.set_setting("claude_code_root", "/from/db").unwrap();
-
-        std::env::set_var("CLITRACE_CLAUDE_ROOT", "/from/env");
-
-        let mut config = Config::new()
-            .with_claude_root("/from/env".to_string());
-        config.load_from_db(&db);
-
-        assert_eq!(config.claude_code_root, "/from/env");
-
-        std::env::remove_var("CLITRACE_CLAUDE_ROOT");
+        assert_eq!(config.retention_days, 30);
+        assert!(config.no_cost);
+        assert_eq!(config.output_format, "json");
+        assert_eq!(config.start_of_week, Weekday::Fri);
     }
 }

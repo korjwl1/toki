@@ -277,13 +277,14 @@ process_file_with_ts(path)
 
 ## Retention Policy
 
-Writer thread가 데이터 보존 정책을 자동 실행한다:
+Writer thread가 데이터 보존 정책을 자동 실행한다 (기본 비활성화, `clitrace settings`에서 설정):
 
-| 대상 | 기본 보존 기간 | 환경변수 |
-|------|----------------|----------|
-| events | 90일 | `CLITRACE_RETENTION_DAYS` |
-| rollups | 365일 | `CLITRACE_ROLLUP_RETENTION_DAYS` |
+| 대상 | 기본 보존 기간 | DB key |
+|------|----------------|--------|
+| events | 0 (무제한) | `retention_days` |
+| rollups | 0 (무제한) | `rollup_retention_days` |
 
+- 0 = 비활성화 (삭제하지 않음)
 - 시작 시 1회 + 이후 24시간 간격으로 실행
 - 1000개 키 단위로 batch 삭제 (대량 삭제 시 write stall 방지)
 - 인덱스(idx_sessions, idx_projects)는 삭제 생략
@@ -372,16 +373,22 @@ JSONL 파일을 직접 스캔하는 fallback 경로가 있다.
 설정 값은 다음 우선순위로 결정된다:
 
 ```
-CLI 인자 > 환경변수 > DB settings > 기본값
+CLI 인자 > DB settings (clitrace settings) > 기본값
 ```
 
-| 설정 | CLI | 환경변수 | DB key | 기본값 |
-|------|-----|----------|--------|--------|
-| Claude root | `--claude-root` | `CLITRACE_CLAUDE_ROOT` | `claude_code_root` | `~/.claude` |
-| DB path | `--db-path` | `CLITRACE_DB_PATH` | - | `~/.config/clitrace/clitrace.fjall` |
-| Daemon sock | `--sock` | `CLITRACE_DAEMON_SOCK` | - | `~/.config/clitrace/daemon.sock` |
-| Retention | - | `CLITRACE_RETENTION_DAYS` | - | 90 |
-| Rollup retention | - | `CLITRACE_ROLLUP_RETENTION_DAYS` | - | 365 |
+환경변수는 사용하지 않는다 (`CLITRACE_DEBUG` 제외).
+
+| 설정 | CLI 오버라이드 | DB key | 기본값 |
+|------|---------------|--------|--------|
+| Claude root | - | `claude_code_root` | `~/.claude` |
+| DB path | `--db-path` | - | `~/.config/clitrace/clitrace.fjall` |
+| Daemon sock | `--sock` | `daemon_sock` | `~/.config/clitrace/daemon.sock` |
+| Timezone | `-z` | `timezone` | (UTC) |
+| Output format | `--output-format` | `output_format` | `table` |
+| Start of week | `--start-of-week` | `start_of_week` | `mon` |
+| No cost | `--no-cost` | `no_cost` | `false` |
+| Retention | - | `retention_days` | `0` (disabled) |
+| Rollup retention | - | `rollup_retention_days` | `0` (disabled) |
 
 ## Backpressure
 

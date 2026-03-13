@@ -19,18 +19,21 @@ static RUNNING: AtomicBool = AtomicBool::new(true);
 #[derive(Parser)]
 #[command(name = "clitrace", version, about = "AI CLI tool token usage tracker")]
 struct Cli {
-    /// Output format for print sink: table (default) or json
-    #[arg(long, default_value = "table", global = true)]
-    output_format: String,
+    /// Output format override: table or json (overrides DB setting)
+    #[arg(long, global = true)]
+    output_format: Option<String>,
     /// Output sink(s): print (default), uds://<path>, http://<url>
     #[arg(long, global = true)]
     sink: Vec<String>,
-    /// Timezone for bucketing and --since/--until interpretation (e.g. Asia/Seoul, US/Eastern)
+    /// Timezone override (e.g. Asia/Seoul, US/Eastern)
     #[arg(long, short = 'z', global = true)]
     timezone: Option<String>,
-    /// Disable cost calculation (skip pricing fetch)
+    /// Disable cost calculation (overrides DB setting)
     #[arg(long, global = true)]
     no_cost: bool,
+    /// Database path (default: ~/.config/clitrace/clitrace.fjall)
+    #[arg(long, global = true)]
+    db_path: Option<PathBuf>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -44,15 +47,12 @@ enum Commands {
     },
     /// Connect to running daemon and stream real-time events
     Trace {
-        /// Daemon socket path (default: ~/.config/clitrace/daemon.sock)
+        /// Daemon socket path override
         #[arg(long)]
         sock: Option<String>,
     },
     /// Report mode: one-shot summary from TSDB or JSONL
     Report {
-        /// Claude Code root directory (default: ~/.claude)
-        #[arg(long)]
-        claude_root: Option<String>,
         /// Filter start time (inclusive): YYYYMMDD or YYYYMMDDhhmmss
         #[arg(long)]
         since: Option<String>,
@@ -71,22 +71,18 @@ enum Commands {
         #[command(subcommand)]
         command: Option<ReportCommands>,
     },
+    /// Open settings TUI
+    Settings,
 }
 
 #[derive(Subcommand)]
 enum DaemonCommands {
     /// Start the daemon (foreground). Watches files and writes to TSDB.
     Start {
-        /// Claude Code root directory (default: ~/.claude)
-        #[arg(long)]
-        claude_root: Option<String>,
-        /// DB path (default: ~/.config/clitrace/clitrace.fjall)
-        #[arg(long)]
-        db_path: Option<PathBuf>,
         /// Clear checkpoints and perform full rescan on startup
         #[arg(long)]
         full_rescan: bool,
-        /// Daemon socket path (default: ~/.config/clitrace/daemon.sock)
+        /// Daemon socket path override
         #[arg(long)]
         sock: Option<String>,
         /// Group startup summary by time period: hour, day, week, month, year
@@ -101,13 +97,13 @@ enum DaemonCommands {
     },
     /// Stop a running daemon
     Stop {
-        /// Daemon socket path
+        /// Daemon socket path override
         #[arg(long)]
         sock: Option<String>,
     },
     /// Check daemon status
     Status {
-        /// Daemon socket path
+        /// Daemon socket path override
         #[arg(long)]
         sock: Option<String>,
     },
@@ -195,21 +191,29 @@ fn parse_range_arg(value: &str, is_until: bool, tz: Option<Tz>) -> Result<NaiveD
     }
 }
 
-fn build_config(claude_root: Option<String>, db_path: Option<PathBuf>) -> Config {
+/// Build Config from defaults + DB settings + CLI overrides.
+fn build_config(db_path: Option<PathBuf>, cli_tz: Option<Tz>, cli_no_cost: bool, cli_output_format: Option<&str>) -> Config {
     let mut config = Config::new();
 
-    if let Ok(root) = std::env::var("CLITRACE_CLAUDE_ROOT") {
-        config = config.with_claude_root(root);
-    }
-    if let Ok(path) = std::env::var("CLITRACE_DB_PATH") {
-        config = config.with_db_path(path.into());
-    }
-
-    if let Some(root) = claude_root {
-        config = config.with_claude_root(root);
-    }
+    // CLI --db-path override
     if let Some(path) = db_path {
         config = config.with_db_path(path);
+    }
+
+    // Load settings from DB (if DB exists)
+    if let Ok(db) = clitrace::db::Database::open(&config.db_path) {
+        config.load_from_db(&db);
+    }
+
+    // CLI overrides take precedence over DB settings
+    if let Some(tz) = cli_tz {
+        config = config.with_tz(Some(tz));
+    }
+    if cli_no_cost {
+        config.no_cost = true;
+    }
+    if let Some(fmt) = cli_output_format {
+        config.output_format = fmt.to_string();
     }
 
     config
@@ -229,32 +233,18 @@ fn acquire_trace_lock(db_path: &PathBuf) -> std::io::Result<std::fs::File> {
     Ok(file)
 }
 
-fn resolve_sock_path(sock_arg: Option<String>) -> PathBuf {
-    sock_arg
-        .map(PathBuf::from)
-        .or_else(|| std::env::var("CLITRACE_DAEMON_SOCK").ok().map(PathBuf::from))
-        .unwrap_or_else(clitrace::daemon::default_sock_path)
+fn resolve_output_format(config: &Config) -> clitrace::sink::OutputFormat {
+    match config.output_format.as_str() {
+        "json" => clitrace::sink::OutputFormat::Json,
+        _ => clitrace::sink::OutputFormat::Table,
+    }
 }
 
 fn main() {
     let cli = Cli::parse();
 
-    let output_format = match cli.output_format.as_str() {
-        "table" => clitrace::sink::OutputFormat::Table,
-        "json" => clitrace::sink::OutputFormat::Json,
-        v => {
-            eprintln!("[clitrace] Invalid --output-format: {} (use table|json)", v);
-            std::process::exit(1);
-        }
-    };
-
-    let sink_specs = if cli.sink.is_empty() {
-        vec!["print".to_string()]
-    } else {
-        cli.sink.clone()
-    };
-
-    let tz: Option<Tz> = match cli.timezone.as_deref() {
+    // Parse CLI timezone
+    let cli_tz: Option<Tz> = match cli.timezone.as_deref() {
         Some(name) => match name.parse::<Tz>() {
             Ok(tz) => Some(tz),
             Err(_) => {
@@ -265,22 +255,55 @@ fn main() {
         None => None,
     };
 
+    // Validate CLI --output-format if provided
+    let cli_output_format = cli.output_format.as_deref();
+    if let Some(fmt) = cli_output_format {
+        if fmt != "table" && fmt != "json" {
+            eprintln!("[clitrace] Invalid --output-format: {} (use table|json)", fmt);
+            std::process::exit(1);
+        }
+    }
+
     match cli.command {
-        Commands::Daemon { command } => handle_daemon(command, tz, cli.no_cost),
-        Commands::Trace { sock } => handle_trace(sock, &sink_specs, output_format),
-        Commands::Report { claude_root, since, until, group_by_session, session_id, project, command } => {
-            handle_report(claude_root, since, until, group_by_session, session_id, project, command,
-                          &sink_specs, output_format, tz, cli.no_cost);
+        Commands::Settings => {
+            let config = Config::new();
+            let db_path = cli.db_path.unwrap_or(config.db_path);
+            clitrace::settings::run_settings(&db_path);
+        }
+        Commands::Daemon { command } => {
+            let config = build_config(cli.db_path, cli_tz, cli.no_cost, cli_output_format);
+            handle_daemon(command, &config);
+        }
+        Commands::Trace { sock } => {
+            let config = build_config(cli.db_path, cli_tz, cli.no_cost, cli_output_format);
+            let output_format = resolve_output_format(&config);
+            let sink_specs = if cli.sink.is_empty() {
+                vec!["print".to_string()]
+            } else {
+                cli.sink.clone()
+            };
+            handle_trace(sock, &config, &sink_specs, output_format);
+        }
+        Commands::Report { since, until, group_by_session, session_id, project, command } => {
+            let config = build_config(cli.db_path, cli_tz, cli.no_cost, cli_output_format);
+            let output_format = resolve_output_format(&config);
+            let sink_specs = if cli.sink.is_empty() {
+                vec!["print".to_string()]
+            } else {
+                cli.sink.clone()
+            };
+            handle_report(since, until, group_by_session, session_id, project, command,
+                          &config, &sink_specs, output_format);
         }
     }
 }
 
 // ── Daemon ──────────────────────────────────────────────
 
-fn handle_daemon(command: DaemonCommands, tz: Option<Tz>, no_cost: bool) {
+fn handle_daemon(command: DaemonCommands, config: &Config) {
     match command {
-        DaemonCommands::Start { claude_root, db_path, full_rescan, sock, startup_group_by, session_id, project } => {
-            let mut config = build_config(claude_root, db_path);
+        DaemonCommands::Start { full_rescan, sock, startup_group_by, session_id, project } => {
+            let mut config = config.clone();
             if full_rescan {
                 config = config.with_full_rescan(true);
             }
@@ -290,15 +313,19 @@ fn handle_daemon(command: DaemonCommands, tz: Option<Tz>, no_cost: bool) {
             if project.is_some() {
                 config = config.with_project_filter(project);
             }
-            config = config.with_tz(tz);
 
-            let sock_path = resolve_sock_path(sock);
+            // CLI --sock overrides DB setting
+            if let Some(s) = sock {
+                config.daemon_sock = PathBuf::from(s);
+            }
+
+            let sock_path = config.daemon_sock.clone();
 
             // Parse --startup-group-by
             let group_by = match startup_group_by.as_deref() {
                 Some("hour") => Some(clitrace::engine::ReportGroupBy::Hour),
                 Some("day") => Some(clitrace::engine::ReportGroupBy::Date),
-                Some("week") => Some(clitrace::engine::ReportGroupBy::Week { start_of_week: Weekday::Mon }),
+                Some("week") => Some(clitrace::engine::ReportGroupBy::Week { start_of_week: config.start_of_week }),
                 Some("month") => Some(clitrace::engine::ReportGroupBy::Month),
                 Some("year") => Some(clitrace::engine::ReportGroupBy::Year),
                 Some(v) => {
@@ -343,7 +370,7 @@ fn handle_daemon(command: DaemonCommands, tz: Option<Tz>, no_cost: bool) {
             eprintln!("[clitrace:daemon] Socket: {}", sock_path.display());
 
             // Start engine with BroadcastSink
-            let handle = match clitrace::start(config, group_by, Box::new(broadcast.clone()), no_cost) {
+            let handle = match clitrace::start(config, group_by, Box::new(broadcast.clone())) {
                 Ok(h) => h,
                 Err(e) => {
                     eprintln!("[clitrace:daemon] Failed to start: {}", e);
@@ -396,7 +423,7 @@ fn handle_daemon(command: DaemonCommands, tz: Option<Tz>, no_cost: bool) {
         }
 
         DaemonCommands::Stop { sock } => {
-            let sock_path = resolve_sock_path(sock);
+            let sock_path = sock.map(PathBuf::from).unwrap_or_else(|| config.daemon_sock.clone());
             let pidfile = clitrace::daemon::default_pidfile_path();
 
             match clitrace::daemon::stop_daemon(&pidfile, &sock_path) {
@@ -410,7 +437,7 @@ fn handle_daemon(command: DaemonCommands, tz: Option<Tz>, no_cost: bool) {
         }
 
         DaemonCommands::Status { sock } => {
-            let sock_path = resolve_sock_path(sock);
+            let sock_path = sock.map(PathBuf::from).unwrap_or_else(|| config.daemon_sock.clone());
             let pidfile = clitrace::daemon::default_pidfile_path();
 
             match clitrace::daemon::daemon_status(&pidfile) {
@@ -428,8 +455,8 @@ fn handle_daemon(command: DaemonCommands, tz: Option<Tz>, no_cost: bool) {
 
 // ── Trace (client) ──────────────────────────────────────
 
-fn handle_trace(sock: Option<String>, sink_specs: &[String], output_format: clitrace::sink::OutputFormat) {
-    let sock_path = resolve_sock_path(sock);
+fn handle_trace(sock: Option<String>, config: &Config, sink_specs: &[String], output_format: clitrace::sink::OutputFormat) {
+    let sock_path = sock.map(PathBuf::from).unwrap_or_else(|| config.daemon_sock.clone());
 
     let stream = match UnixStream::connect(&sock_path) {
         Ok(s) => s,
@@ -475,16 +502,13 @@ fn handle_trace(sock: Option<String>, sink_specs: &[String], output_format: clit
         match v["type"].as_str() {
             Some("event") => {
                 if let Ok(event) = serde_json::from_value::<clitrace::UsageEvent>(v["data"].clone()) {
-                    // Cost is already included in the JSON data, extract if present
                     sink.emit_event(&event, None);
                 }
             }
             Some("summary") => {
-                // Summary data — print raw JSON for now
                 println!("{}", line);
             }
             _ => {
-                // Unknown type — pass through
                 println!("{}", line);
             }
         }
@@ -496,19 +520,16 @@ fn handle_trace(sock: Option<String>, sink_specs: &[String], output_format: clit
 // ── Report ──────────────────────────────────────────────
 
 fn handle_report(
-    claude_root: Option<String>,
     since: Option<String>,
     until: Option<String>,
     group_by_session: bool,
     session_id: Option<String>,
     project: Option<String>,
     command: Option<ReportCommands>,
+    config: &Config,
     sink_specs: &[String],
     output_format: clitrace::sink::OutputFormat,
-    tz: Option<Tz>,
-    no_cost: bool,
 ) {
-    let config = build_config(claude_root, None);
     println!("[clitrace] Running report...");
     println!("[clitrace] Claude Code root: {}", config.claude_code_root);
 
@@ -516,7 +537,7 @@ fn handle_report(
 
     let db = clitrace::db::Database::open(&config.db_path).ok();
 
-    let pricing = if no_cost {
+    let pricing = if config.no_cost {
         None
     } else {
         match db {
@@ -534,6 +555,7 @@ fn handle_report(
     let parser = clitrace::providers::claude_code::ClaudeCodeParser;
     let session_filter = session_id.as_deref();
     let project_filter = project.as_deref();
+    let tz = config.tz;
 
     if group_by_session && command.is_some() {
         eprintln!("[clitrace] --group-by-session cannot be used with time-based subcommands");
@@ -580,11 +602,11 @@ fn handle_report(
                     Ok(summaries) => sink.emit_summary(&summaries, pricing_ref),
                     Err(e) => {
                         eprintln!("[clitrace] TSDB query failed: {}, falling back to JSONL scan", e);
-                        fallback_total_report(&parser, &config, filter, session_filter, project_filter, sink.as_ref(), pricing_ref);
+                        fallback_total_report(&parser, config, filter, session_filter, project_filter, sink.as_ref(), pricing_ref);
                     }
                 }
             } else {
-                fallback_total_report(&parser, &config, filter, session_filter, project_filter, sink.as_ref(), pricing_ref);
+                fallback_total_report(&parser, config, filter, session_filter, project_filter, sink.as_ref(), pricing_ref);
             }
             return;
         }
@@ -594,7 +616,9 @@ fn handle_report(
         ReportCommands::Hourly { filter } => (filter.clone(), clitrace::engine::ReportGroupBy::Hour),
         ReportCommands::Daily { filter } => (filter.clone(), clitrace::engine::ReportGroupBy::Date),
         ReportCommands::Weekly { start_of_week, filter } => {
-            let start = parse_weekday(start_of_week.as_deref().unwrap_or("mon"));
+            let start = start_of_week.as_deref()
+                .map(|s| parse_weekday(s))
+                .unwrap_or(config.start_of_week);
             (filter.clone(), clitrace::engine::ReportGroupBy::Week { start_of_week: start })
         }
         ReportCommands::Monthly { filter } => (filter.clone(), clitrace::engine::ReportGroupBy::Month),

@@ -9,6 +9,7 @@ pub mod pricing;
 pub mod providers;
 pub mod query;
 pub mod retention;
+pub mod settings;
 pub mod sink;
 pub mod writer;
 
@@ -69,7 +70,7 @@ impl Drop for Handle {
 
 /// Start clitrace: cold start scan, then enter watch mode.
 /// Returns a Handle to control the running instance.
-pub fn start(config: Config, startup_group_by: Option<ReportGroupBy>, sink: Box<dyn Sink>, no_cost: bool) -> Result<Handle, ClitraceError> {
+pub fn start(config: Config, startup_group_by: Option<ReportGroupBy>, sink: Box<dyn Sink>) -> Result<Handle, ClitraceError> {
     // 1. Open DB and load checkpoints before spawning writer thread
     let db = Database::open(&config.db_path).map_err(|e| ClitraceError::Db(e.into()))?;
 
@@ -80,7 +81,7 @@ pub fn start(config: Config, startup_group_by: Option<ReportGroupBy>, sink: Box<
     }
 
     // Fetch/load pricing
-    let pricing_table = if no_cost {
+    let pricing_table = if config.no_cost {
         None
     } else {
         let p = pricing::fetch_pricing(&db);
