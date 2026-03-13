@@ -70,7 +70,7 @@ pub fn run_settings(db_path: &Path) {
         // Output format
         .child(field_label("Output Format"))
         .child({
-            let mut sv = SelectView::new();
+            let mut sv = SelectView::new().popup();
             sv.add_item("table", "table".to_string());
             sv.add_item("json", "json".to_string());
             let idx = if state.output_format == "json" { 1 } else { 0 };
@@ -82,7 +82,7 @@ pub fn run_settings(db_path: &Path) {
         .child(field_label("Start of Week"))
         .child({
             let days = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
-            let mut sv = SelectView::new();
+            let mut sv = SelectView::new().popup();
             for d in &days {
                 sv.add_item(*d, d.to_string());
             }
