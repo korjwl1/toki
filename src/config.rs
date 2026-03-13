@@ -13,6 +13,7 @@ pub struct Config {
     pub tz: Option<Tz>,
     pub retention_days: u32,
     pub rollup_retention_days: u32,
+    pub daemon_sock: PathBuf,
 }
 
 impl Config {
@@ -30,6 +31,9 @@ impl Config {
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(90),
             rollup_retention_days: std::env::var("CLITRACE_ROLLUP_RETENTION_DAYS")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(365),
+            daemon_sock: std::env::var("CLITRACE_DAEMON_SOCK")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| crate::daemon::default_sock_path()),
         }
     }
 

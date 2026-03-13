@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender};
 
 use crate::checkpoint::{find_resume_offset, process_lines_streaming};
-use crate::common::types::{FileCheckpoint, LogParser, LogParserWithTs, ModelUsageSummary, TokenFields, UsageEvent};
+use crate::common::types::{FileCheckpoint, LogParser, LogParserWithTs, ModelUsageSummary, TokenFields};
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, TimeZone, Weekday};
 use chrono_tz::Tz;
 use crate::pricing::PricingTable;
@@ -90,9 +90,6 @@ pub struct TrackerEngine {
 
 struct ColdStartResult {
     summaries: HashMap<String, ModelUsageSummary>,
-    checkpoints: Vec<FileCheckpoint>,
-    session_count: usize,
-    total_files: usize,
 }
 
 fn cold_start_collect(
@@ -107,22 +104,14 @@ fn cold_start_collect(
     if sessions.is_empty() {
         return Ok(ColdStartResult {
             summaries: HashMap::new(),
-            checkpoints: Vec::new(),
-            session_count: 0,
-            total_files: 0,
         });
     }
 
-    let total_files: usize = sessions.iter()
-        .map(|s| 1 + s.subagent_jsonls.len())
-        .sum();
-
     let summaries: Mutex<HashMap<String, ModelUsageSummary>> = Mutex::new(HashMap::new());
-    let cp_batch: Mutex<Vec<FileCheckpoint>> = Mutex::new(Vec::new());
 
     parallel_scan(&sessions, checkpoints, |path, offset| {
         let mut local: HashMap<String, ModelUsageSummary> = HashMap::new();
-        let result = process_lines_streaming(path, offset, |line| {
+        process_lines_streaming(path, offset, |line| {
             if let Some(event) = parser.parse_line(line, path) {
                 let summary = local.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
                     model: event.model.clone(),
@@ -130,25 +119,15 @@ fn cold_start_collect(
                 });
                 summary.accumulate(&event);
             }
-        });
+        }).ok();
         if !local.is_empty() {
             let mut s = summaries.lock().unwrap_or_else(|e| e.into_inner());
             merge_summaries(&mut s, local);
-        }
-        if let Ok(Some((_bytes, last_line_len, last_line_hash))) = result {
-            cp_batch.lock().unwrap_or_else(|e| e.into_inner()).push(FileCheckpoint {
-                file_path: path.to_string(),
-                last_line_len,
-                last_line_hash,
-            });
         }
     });
 
     Ok(ColdStartResult {
         summaries: summaries.into_inner().unwrap_or_else(|e| e.into_inner()),
-        checkpoints: cp_batch.into_inner().unwrap_or_else(|e| e.into_inner()),
-        session_count: sessions.len(),
-        total_files,
     })
 }
 
@@ -1073,7 +1052,7 @@ fn weekday_index(day: Weekday) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::types::SessionGroup;
+    use crate::common::types::{SessionGroup, UsageEvent};
     use std::io::Write;
 
     struct TestParser;
@@ -1418,7 +1397,7 @@ mod tests {
         let db_us = start.elapsed().as_micros() / iterations as u128;
 
         // Bench full process_file (cold start + incremental)
-        let db2 = crate::db::Database::open(&dir.path().join("bench2.db")).unwrap();
+        let _db2 = crate::db::Database::open(&dir.path().join("bench2.db")).unwrap();
         let (db_tx2, _db_rx2) = crossbeam_channel::bounded::<DbOp>(1024);
         let mut engine = TrackerEngine::new(db_tx2, HashMap::new());
         let parser = TestParser;

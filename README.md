@@ -1,31 +1,49 @@
 # clitrace
 
 AI CLI 도구(Claude Code 등)의 JSONL 세션 로그를 실시간 감시하여 모델별 토큰 사용량을 추적하는 Rust 도구.
-내장 TSDB에 이벤트와 시간별 rollup을 저장하고, 실시간 trace와 one-shot report를 모두 지원한다.
+내장 TSDB에 이벤트와 시간별 rollup을 저장하고, 데몬/클라이언트 구조로 실시간 trace와 one-shot report를 모두 지원한다.
+
+## Architecture
+
+Docker처럼 데몬/클라이언트 구조로 동작한다:
+
+```
+clitrace daemon start   # 항상 실행 (= dockerd)
+clitrace trace          # 실시간 스트림 클라이언트 (= docker logs -f)
+clitrace report         # TSDB 조회 클라이언트 (= docker ps)
+```
+
+- **daemon**: 파일 감시 + TSDB 저장. 항상 실행되어야 하며, trace 클라이언트가 없을 때는 Sink 오버헤드 0.
+- **trace**: 데몬에 UDS로 연결하여 실시간 이벤트 스트림 수신. print/uds/http 모든 sink 지원.
+- **report**: TSDB에서 직접 조회. 데몬과 독립적으로 동작.
 
 ## Quick Start
 
 ```bash
-# 데몬 실행: cold start → watch mode 진입
+# 1. 데몬 시작 (foreground, Ctrl+C으로 종료)
+cargo run --release -- daemon start
+
+# 2. 다른 터미널에서 실시간 이벤트 스트림
 cargo run --release -- trace
 
-# 리포트 조회 (TSDB에서 즉시 조회)
+# 3. 리포트 조회 (TSDB에서 즉시 조회)
 cargo run --release -- report
 cargo run --release -- report daily --since 20260301
 cargo run --release -- report monthly
 ```
 
-## Trace (Watch Mode)
+## Daemon
 
-`trace`는 데몬 프로세스로 동작한다. 시작 시 전체 세션 파일을 스캔(cold start)하여 TSDB를 구축하고,
-이후 파일 변경을 감시하며 새 이벤트를 실시간으로 수집한다.
+`daemon`은 항상 실행되는 서버 프로세스다. 시작 시 전체 세션 파일을 스캔(cold start)하여 TSDB를 구축하고, 이후 FSEvents로 파일 변경을 감시하며 새 이벤트를 실시간 수집한다.
 
 ```bash
-cargo run --release -- trace
-cargo run --release -- trace --startup-group-by day
-cargo run --release -- trace --session-id 4de9291e
-cargo run --release -- trace --project clitrace
-cargo run --release -- trace --full-rescan
+clitrace daemon start
+clitrace daemon start --startup-group-by day
+clitrace daemon start --session-id 4de9291e
+clitrace daemon start --project clitrace
+clitrace daemon start --full-rescan
+clitrace daemon stop
+clitrace daemon status
 ```
 
 | 옵션 | 설명 |
@@ -34,40 +52,55 @@ cargo run --release -- trace --full-rescan
 | `--session-id <PREFIX>` | 세션 UUID 접두사 필터 |
 | `--project <NAME>` | 프로젝트 디렉토리 서브스트링 필터 |
 | `--full-rescan` | 체크포인트 초기화 후 전체 재스캔 |
+| `--claude-root <PATH>` | Claude Code 루트 디렉토리 (기본: `~/.claude`) |
+| `--db-path <PATH>` | DB 경로 (기본: `~/.config/clitrace/clitrace.fjall`) |
+| `--sock <PATH>` | UDS 소켓 경로 (기본: `~/.config/clitrace/daemon.sock`) |
 
+- PID 파일: `~/.config/clitrace/daemon.pid`
 - 동일 DB 경로 기준 단일 인스턴스만 허용 (file lock)
-- `--startup-group-by hour`는 기존 체크포인트 필요, `--full-rescan`과 함께 사용 불가
+
+## Trace (Client)
+
+`trace`는 실행 중인 데몬에 UDS로 연결하여 실시간 이벤트를 스트림으로 수신하는 클라이언트 명령이다. 데몬에 trace 클라이언트가 연결되어 있지 않으면 Sink 처리가 완전히 비활성화되어 리소스 소모가 없다(zero overhead).
+
+```bash
+clitrace trace
+clitrace trace --sock /custom/daemon.sock
+```
+
+- 데몬이 실행 중이어야 함 (`clitrace daemon start` 먼저)
+- 복수 클라이언트 동시 연결 지원 (fan-out)
+- 모든 sink 타입 지원: `--sink print`, `--sink uds://...`, `--sink http://...`
 
 ## Report (One-Shot)
 
-`report`는 TSDB에 저장된 데이터를 즉시 조회한다. TSDB가 비어있으면 JSONL 파일을 직접 스캔한다.
+`report`는 TSDB에 저장된 데이터를 즉시 조회한다. 데몬과 독립적으로 동작하며, TSDB가 비어있으면 JSONL 파일을 직접 스캔한다.
 
 ```bash
 # 전체 요약
-cargo run --release -- report
-cargo run --release -- report --since 20260301
-cargo run --release -- report --since 20260301 --until 20260331
+clitrace report
+clitrace report --since 20260301
+clitrace report --since 20260301 --until 20260331
 
 # 시간별 그룹핑
-cargo run --release -- report daily --since 20260301
-cargo run --release -- report weekly --since 20260301 --start-of-week tue
-cargo run --release -- report monthly
-cargo run --release -- report yearly
-cargo run --release -- report hourly --from-beginning
+clitrace report daily --since 20260301
+clitrace report weekly --since 20260301 --start-of-week tue
+clitrace report monthly
+clitrace report yearly
+clitrace report hourly --from-beginning
 
 # 세션별 그룹핑
-cargo run --release -- report --group-by-session
-cargo run --release -- report --session-id 4de9291e
+clitrace report --group-by-session
 
-# 프로젝트 필터
-cargo run --release -- report --project clitrace
-cargo run --release -- report --project ddleague daily --since 20260301
+# 프로젝트/세션 필터
+clitrace report --project clitrace
+clitrace report --session-id 4de9291e
 
 # 타임존 지정
-cargo run --release -- -z Asia/Seoul report daily --since 20260301
+clitrace -z Asia/Seoul report daily --since 20260301
 
 # 비용 표시 없이
-cargo run --release -- --no-cost report
+clitrace --no-cost report
 ```
 
 | 옵션 | 설명 |
@@ -79,9 +112,6 @@ cargo run --release -- --no-cost report
 | `--from-beginning` | `--since` 없이 전체 그룹핑 허용 |
 | `--group-by-session` | 세션별 그룹핑 (시간 서브커맨드와 동시 사용 불가) |
 | `--start-of-week mon\|tue\|...\|sun` | `weekly`에서만 사용 |
-
-- `YYYYMMDD`는 `--since`일 때 `00:00:00`, `--until`일 때 `23:59:59`로 해석
-- `hourly`, `daily`, `weekly`는 `--since` 또는 `--from-beginning` 필수
 
 ## Global Options
 
@@ -102,7 +132,7 @@ cargo run --release -- --no-cost report
 
 ```bash
 # 터미널 + HTTP 동시 출력
-cargo run --release -- trace --sink print --sink http://localhost:8080/events
+clitrace trace --sink print --sink http://localhost:8080/events
 ```
 
 ## Cost Calculation
@@ -114,7 +144,6 @@ cargo run --release -- trace --sink print --sink http://localhost:8080/events
 - **이후 실행**: HTTP ETag 조건부 요청 → 변경 없으면 304 (바디 없이 ~50ms)
 - **오프라인**: 캐시된 데이터로 동작, 캐시 없으면 Cost 컬럼 생략
 - **`--no-cost`**: 가격 fetch 스킵
-- 현재 시점 가격을 전체 데이터에 일괄 적용 (역사적 가격 추적 없음)
 
 ## Environment Variables
 
@@ -125,74 +154,7 @@ cargo run --release -- trace --sink print --sink http://localhost:8080/events
 | `CLITRACE_DEBUG` | 디버그 로그 (1=normal, 2=verbose) | 0 |
 | `CLITRACE_RETENTION_DAYS` | 이벤트 보존 기간 (일) | 90 |
 | `CLITRACE_ROLLUP_RETENTION_DAYS` | Rollup 보존 기간 (일) | 365 |
-
-## Library Usage
-
-```toml
-[dependencies]
-clitrace = { path = "." }
-```
-
-```rust
-use clitrace::{Config, start};
-use clitrace::sink::{PrintSink, OutputFormat};
-
-fn main() {
-    let config = Config::new()
-        .with_claude_root("/custom/.claude".to_string());
-
-    let sink = Box::new(PrintSink::new(OutputFormat::Table));
-    let handle = start(config, None, sink, false).expect("Failed to start");
-
-    // ... application logic ...
-
-    handle.stop(); // 또는 drop 시 자동 종료
-}
-```
-
-## Output Examples
-
-### Table (기본)
-
-```
-[clitrace] Token Usage Summary
-┌───────────────────────────┬─────────┬─────────┬────────────┬──────────────┬──────────────┬────────┬─────────┐
-│ Model                     ┆ Input   ┆ Output  ┆ Cache      ┆ Cache        ┆ Total        ┆ Events ┆ Cost    │
-│                           ┆         ┆         ┆ Create     ┆ Read         ┆ Tokens       ┆        ┆ (USD)   │
-╞═══════════════════════════╪═════════╪═════════╪════════════╪══════════════╪══════════════╪════════╪═════════╡
-│ claude-opus-4-6           ┆ 1,234   ┆ 4,321   ┆ 56,789     ┆ 98,765       ┆ 161,109      ┆ 42     ┆ $1.21   │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┤
-│ claude-haiku-4-5-20251001 ┆ 567     ┆ 2,100   ┆ 12,345     ┆ 34,567       ┆ 49,579       ┆ 18     ┆ $0.023  │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┤
-│ Total                     ┆ 1,801   ┆ 6,421   ┆ 69,134     ┆ 133,332      ┆ 210,688      ┆ 60     ┆ $1.23   │
-└───────────────────────────┴─────────┴─────────┴────────────┴──────────────┴──────────────┴────────┴─────────┘
-```
-
-### JSON (`--output-format json`)
-
-```json
-{
-  "type": "summary",
-  "data": [
-    {
-      "model": "claude-opus-4-6",
-      "input_tokens": 1234,
-      "output_tokens": 4321,
-      "cache_creation_input_tokens": 56789,
-      "cache_read_input_tokens": 98765,
-      "total_tokens": 161109,
-      "events": 42,
-      "cost_usd": 1.2345
-    }
-  ]
-}
-```
-
-### Watch Mode (실시간)
-
-```
-[clitrace] claude-opus-4-6 | session.jsonl | in:3 cc:5139 cr:9631 out:14 | $0.0112
-```
+| `CLITRACE_DAEMON_SOCK` | 데몬 UDS 소켓 경로 | `~/.config/clitrace/daemon.sock` |
 
 ## Project Structure
 
@@ -219,6 +181,11 @@ fn main() {
     ├── pricing.rs                         # LiteLLM 가격 fetch, ETag 캐싱
     ├── common/
     │   └── types.rs                       # 공통 타입, trait 정의
+    ├── daemon/                            # 데몬 서버 컴포넌트
+    │   ├── mod.rs                         # default_sock_path, stop/status
+    │   ├── broadcast.rs                   # BroadcastSink (zero overhead fan-out)
+    │   ├── listener.rs                    # UDS accept loop
+    │   └── pidfile.rs                     # PID 파일 관리
     ├── sink/                              # 출력 추상화 (Sink trait)
     │   ├── mod.rs                         # Sink trait, MultiSink
     │   ├── json.rs                        # JSON 직렬화 (공용)
@@ -244,3 +211,4 @@ fn main() {
 | HTTP | ureq 2.x | 동기 HTTP, ETag 조건부 요청 |
 | CLI | clap 4.x | 서브커맨드, 글로벌 옵션 지원 |
 | 테이블 | comfy-table 7.1 | Unicode 테이블 렌더링 |
+| IPC | Unix Domain Socket | 데몬-클라이언트 NDJSON 스트리밍 |

@@ -2,48 +2,104 @@
 
 ## Overview
 
-clitrace는 3개 스레드 + bounded channel 아키텍처로 동작한다.
-데이터는 fjall 임베디드 DB의 7개 keyspace에 저장되며, writer thread가 DB를 단독 소유한다.
+clitrace는 데몬/클라이언트 구조로 동작한다.
+데몬은 4개 스레드(Worker, Writer, Listener, Notify)를 운용하며,
+fjall 임베디드 DB의 7개 keyspace에 데이터를 저장한다.
 
-## Thread Model
+## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│ Host Application / main.rs                              │
-│  start(config) → Handle                                 │
-│  handle.stop() → graceful shutdown                      │
-└──────────┬──────────────────────────────────────────────┘
-           │ spawns
-           ├──────────────────────────────┐
-           ▼                              ▼
-┌─────────────────────┐    ┌─────────────────────────────┐
-│ Worker Thread       │    │ Writer Thread               │
-│                     │    │                             │
-│ select! {           │    │ select! {                   │
-│   event_rx → file   │    │   op_rx → handle_op()      │
-│   stop_rx  → exit   │    │   tick(86400s) → retention  │
-│   default(30s)→poll │    │ }                           │
-│ }                   │    │                             │
-│                     │    │ Owns: Database              │
-│ db_tx.try_send()  ──┼───▶│ dict_cache: HashMap         │
-│ db_tx.send()        │    │ pending_events: Vec (≤64)   │
-└─────────────────────┘    └─────────────────────────────┘
-        ▲
-        │ event_tx.send(path)
-┌───────┴─────────────┐
-│ Notify Thread       │
-│ macOS FSEvents      │
-└─────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│ Daemon Process (clitrace daemon start)                           │
+│                                                                  │
+│ ┌─────────────────────┐    ┌─────────────────────────────┐       │
+│ │ Worker Thread       │    │ Writer Thread               │       │
+│ │                     │    │                             │       │
+│ │ select! {           │    │ select! {                   │       │
+│ │   event_rx → file   │    │   op_rx → handle_op()      │       │
+│ │   stop_rx  → exit   │    │   tick(86400s) → retention  │       │
+│ │   default(30s)→poll │    │ }                           │       │
+│ │ }                   │    │                             │       │
+│ │                     │    │ Owns: Database              │       │
+│ │ db_tx.try_send()  ──┼───▶│ dict_cache: HashMap         │       │
+│ │ db_tx.send()        │    │ pending_events: Vec (≤64)   │       │
+│ │                     │    └─────────────────────────────┘       │
+│ │ sink.emit_event() ──┼──┐                                      │
+│ └─────────────────────┘  │                                      │
+│         ▲                │  ┌─────────────────────────────┐     │
+│         │                └─▶│ BroadcastSink               │     │
+│ ┌───────┴─────────────┐    │ clients: Mutex<Vec<Client>>  │     │
+│ │ Notify Thread       │    │                             │     │
+│ │ macOS FSEvents      │    │ 0 clients = zero overhead   │     │
+│ └─────────────────────┘    └──────────────▲──────────────┘     │
+│                                           │ add_client()       │
+│                            ┌──────────────┴──────────────┐     │
+│                            │ Listener Thread             │     │
+│                            │ UnixListener.accept()       │     │
+│                            │ → BroadcastSink.add_client()│     │
+│                            └─────────────────────────────┘     │
+└──────────────────────────────────────────────────────────────────┘
+         ▲ UDS connect                    ▲ DB read-only open
+         │                                │
+┌────────┴────────┐              ┌────────┴────────┐
+│ Trace Client    │              │ Report Client   │
+│ NDJSON stream   │              │ TSDB query      │
+│ → local sinks   │              │ → sink output   │
+└─────────────────┘              └─────────────────┘
 ```
 
-### Worker Thread
+### Daemon Process
+
+데몬은 4개 스레드로 구성된다:
+
+1. **Worker Thread**: FSEvents 파일 변경 감지 → 파싱 → Sink 출력 + TSDB 저장
+2. **Writer Thread**: DB를 단독 소유. 이벤트 배치 커밋, rollup-on-write, retention
+3. **Listener Thread**: UDS accept loop. 새 클라이언트를 BroadcastSink에 등록
+4. **Notify Thread**: macOS FSEvents (notify 라이브러리 내부)
+
+### BroadcastSink (Zero Overhead)
+
+`BroadcastSink`는 `Sink` trait을 구현하며, 연결된 trace 클라이언트에 이벤트를 fan-out한다.
+
+- 클라이언트가 0개일 때: `emit_*` 메서드는 `Mutex::lock()` → `is_empty()` → return. 실질적 no-op.
+- 클라이언트가 있을 때: 이벤트를 JSON 직렬화 → 각 클라이언트에 NDJSON 줄 전송
+- 쓰기 실패한 클라이언트는 자동 제거 (`retain_mut`)
+- 1초 write timeout으로 느린 클라이언트가 engine thread를 block하지 않음
+
+### Trace Client
+
+```
+UnixStream::connect(daemon.sock)
+    → BufReader::lines()
+    → JSON parse → match type
+        "event" → UsageEvent 역직렬화 → local sink.emit_event()
+        "summary" → pass through
+```
+
+trace 클라이언트는 모든 sink 타입을 지원한다:
+- `--sink print` (기본): 터미널 table/json 출력
+- `--sink uds://...`: 다른 UDS로 중계
+- `--sink http://...`: HTTP POST로 중계
+
+### Report Client
+
+```
+Database::open(read-only)
+    → has_tsdb_data()?
+        Yes → TSDB query (~ms)
+        No  → JSONL scan fallback (~seconds)
+```
+
+Report는 데몬과 독립적으로 DB를 직접 읽어 조회한다. Writer thread 불필요.
+
+## Worker Thread
 
 - `crossbeam_channel::select!`로 FSEvents 이벤트, stop 시그널, 30초 백업 폴링을 다중화
 - 파일 변경 감지 → `process_file_with_ts()` → 파싱된 이벤트를 Sink에 출력 + `DbOp::WriteEvent`를 writer에 전송
 - watch mode에서는 `try_send` 사용 (UI 스레드 blocking 방지)
 - 5초 간격으로 dirty checkpoints를 writer에 batch flush
 
-### Writer Thread
+## Writer Thread
 
 - `Database`를 단독 소유 — Send 이슈 없음, 단일 스레드 접근
 - `DbOp` 수신 → pending에 축적 → 64개 도달 시 batch commit
@@ -51,23 +107,29 @@ clitrace는 3개 스레드 + bounded channel 아키텍처로 동작한다.
 - 일 1회 retention tick으로 오래된 데이터 자동 삭제
 - Shutdown 시 잔여 pending events flush 후 종료
 
-### Startup Sequence
+## Startup Sequence
 
 ```
 1. Database::open() + load_all_checkpoints()
 2. (db_tx, db_rx) = bounded(1024)
 3. Writer thread spawn (Database 소유권 이전)
-4. TrackerEngine::new(db_tx, checkpoints)
+4. TrackerEngine::new(db_tx, checkpoints, BroadcastSink)
 5. Cold start: 전체 세션 파일 스캔 → TSDB에 이벤트 저장
 6. Watcher + Worker thread spawn
+7. Write PID file
+8. Listener thread spawn (UDS accept loop)
+9. Wait for SIGTERM/SIGINT
 ```
 
-### Shutdown Sequence
+## Shutdown Sequence
 
 ```
-1. stop_tx.send() → Worker thread 종료 (잔여 checkpoints flush)
-2. db_tx.send(Shutdown) → Writer thread 종료 (잔여 events flush)
-3. Worker thread join → Writer thread join
+1. SIGTERM/SIGINT 수신
+2. Listener stop → listener thread join
+3. stop_tx.send() → Worker thread 종료 (잔여 checkpoints flush)
+4. db_tx.send(Shutdown) → Writer thread 종료 (잔여 events flush)
+5. Worker thread join → Writer thread join
+6. PID file 삭제 + socket 파일 삭제
 ```
 
 ## TSDB Schema
@@ -125,7 +187,7 @@ Writer thread는 64개 이벤트를 모아서 단일 `OwnedWriteBatch`로 commit
 
 ## Data Flow
 
-### Cold Start (trace 시작)
+### Cold Start (daemon start)
 
 ```
 discover_sessions()
@@ -152,13 +214,18 @@ FSEvents → event_tx → Worker thread
     → find_resume_offset() 역순 스캔
     → process_lines_streaming() 증분 읽기
     → parse_line_with_ts()
-    → sink.emit_event()              ← 실시간 출력
-    → db_tx.try_send(WriteEvent)     ← non-blocking (채널 풀 시 drop)
+    → BroadcastSink.emit_event()    ← 0 clients이면 no-op
+    → db_tx.try_send(WriteEvent)    ← non-blocking (채널 풀 시 drop)
 ```
 
-Watch mode에서는 `try_send`를 사용한다.
-Worker thread가 block되면 UI 출력이 지연되므로, 채널이 가득 차면 드롭한다.
-(실사용 시 초당 이벤트가 수 개 수준이므로 채널이 차는 경우는 거의 없다.)
+### Trace Client (실시간 스트림)
+
+```
+UnixStream::connect(daemon.sock)
+    → BufReader::lines() loop
+    → JSON parse → type 분기
+        "event" → UsageEvent 역직렬화 → local sink.emit_event()
+```
 
 ### Report (one-shot 조회)
 
@@ -297,7 +364,7 @@ Report 명령 실행
       No  → JSONL 파일 직접 스캔 (~seconds, cold_start_report 계열 함수)
 ```
 
-TSDB에 데이터가 있으면 TSDB를 사용하고, 없으면(trace를 한 번도 실행하지 않은 경우)
+TSDB에 데이터가 있으면 TSDB를 사용하고, 없으면(daemon을 한 번도 실행하지 않은 경우)
 JSONL 파일을 직접 스캔하는 fallback 경로가 있다.
 
 ## Config Priority
@@ -312,6 +379,7 @@ CLI 인자 > 환경변수 > DB settings > 기본값
 |------|-----|----------|--------|--------|
 | Claude root | `--claude-root` | `CLITRACE_CLAUDE_ROOT` | `claude_code_root` | `~/.claude` |
 | DB path | `--db-path` | `CLITRACE_DB_PATH` | - | `~/.config/clitrace/clitrace.fjall` |
+| Daemon sock | `--sock` | `CLITRACE_DAEMON_SOCK` | - | `~/.config/clitrace/daemon.sock` |
 | Retention | - | `CLITRACE_RETENTION_DAYS` | - | 90 |
 | Rollup retention | - | `CLITRACE_ROLLUP_RETENTION_DAYS` | - | 365 |
 
