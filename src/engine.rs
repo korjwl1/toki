@@ -2,15 +2,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{Receiver, Sender};
 
 use crate::checkpoint::{find_resume_offset, process_lines_streaming};
-use crate::common::types::{FileCheckpoint, LogParser, LogParserWithTs, ModelUsageSummary, UsageEvent};
+use crate::common::types::{FileCheckpoint, LogParser, LogParserWithTs, ModelUsageSummary, TokenFields, UsageEvent};
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, TimeZone, Weekday};
 use chrono_tz::Tz;
-use crate::db::Database;
 use crate::pricing::PricingTable;
 use crate::sink::Sink;
+use crate::writer::DbOp;
 
 /// Debug level:
 ///   0 = off
@@ -68,7 +68,7 @@ struct FileActivity {
 }
 
 pub struct TrackerEngine {
-    db: Database,
+    db_tx: Sender<DbOp>,
     checkpoints: HashMap<String, FileCheckpoint>,
     /// Cached file sizes for fast skip when size unchanged.
     file_sizes: HashMap<String, u64>,
@@ -360,10 +360,10 @@ where
 }
 
 impl TrackerEngine {
-    pub fn new(db: Database) -> Self {
+    pub fn new(db_tx: Sender<DbOp>, checkpoints: HashMap<String, FileCheckpoint>) -> Self {
         TrackerEngine {
-            db,
-            checkpoints: HashMap::new(),
+            db_tx,
+            checkpoints,
             file_sizes: HashMap::new(),
             activity: HashMap::new(),
             dirty: HashSet::new(),
@@ -418,44 +418,94 @@ impl TrackerEngine {
         true
     }
 
-    /// Load existing checkpoints from DB into memory.
-    pub fn load_checkpoints(&mut self) -> Result<(), redb::Error> {
-        let cps = self.db.load_all_checkpoints()?;
-        for cp in cps {
-            self.checkpoints.insert(cp.file_path.clone(), cp);
-        }
-        Ok(())
-    }
-
     /// Cold start: discover all sessions, process them in parallel,
-    /// aggregate by model, print summary, and flush checkpoints.
-    pub fn cold_start(
+    /// aggregate by model, print summary, flush checkpoints, and populate TSDB.
+    pub fn cold_start<P>(
         &mut self,
-        parser: &(dyn LogParser + Sync),
+        parser: &P,
         root_dir: &str,
-    ) -> Result<HashMap<String, ModelUsageSummary>, Box<dyn std::error::Error>> {
+    ) -> Result<HashMap<String, ModelUsageSummary>, Box<dyn std::error::Error>>
+    where
+        P: LogParser + LogParserWithTs + Sync,
+    {
         let t_cold = Instant::now();
-        let result = cold_start_collect(parser, root_dir, &self.checkpoints, None, self.project_filter.as_deref())?;
+        let sessions = apply_filters(parser.discover_sessions(root_dir), None, self.project_filter.as_deref());
 
-        if result.session_count == 0 {
+        if sessions.is_empty() {
             debug_log!("cold_start — 0 sessions, 0 files ({}µs)", t_cold.elapsed().as_micros());
             return Ok(HashMap::new());
         }
 
-        for cp in &result.checkpoints {
+        let total_files: usize = sessions.iter().map(|s| 1 + s.subagent_jsonls.len()).sum();
+        let summaries: Mutex<HashMap<String, ModelUsageSummary>> = Mutex::new(HashMap::new());
+        let cp_batch: Mutex<Vec<FileCheckpoint>> = Mutex::new(Vec::new());
+        let db_tx = &self.db_tx;
+
+        parallel_scan(&sessions, &self.checkpoints, |path, offset| {
+            let mut local: HashMap<String, ModelUsageSummary> = HashMap::new();
+            let session_id = extract_session_id(path).unwrap_or_default();
+            let result = process_lines_streaming(path, offset, |line| {
+                if let Some(event) = parser.parse_line_with_ts(line, path) {
+                    let summary = local.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
+                        model: event.model.clone(),
+                        ..Default::default()
+                    });
+                    summary.accumulate_with_ts(&event);
+
+                    // Send event to TSDB writer
+                    let ts_ms = parse_timestamp(&event.timestamp)
+                        .map(|dt| dt.and_utc().timestamp_millis())
+                        .unwrap_or(0);
+                    if ts_ms > 0 {
+                        let op = DbOp::WriteEvent {
+                            ts_ms,
+                            message_id: event.event_key.clone(),
+                            model: event.model.clone(),
+                            session_id: session_id.clone(),
+                            source_file: event.source_file.clone(),
+                            tokens: TokenFields {
+                                input_tokens: event.input_tokens,
+                                output_tokens: event.output_tokens,
+                                cache_creation_input_tokens: event.cache_creation_input_tokens,
+                                cache_read_input_tokens: event.cache_read_input_tokens,
+                            },
+                        };
+                        let _ = db_tx.send(op);
+                    }
+                }
+            });
+            if !local.is_empty() {
+                let mut s = summaries.lock().unwrap_or_else(|e| e.into_inner());
+                merge_summaries(&mut s, local);
+            }
+            if let Ok(Some((_bytes, last_line_len, last_line_hash))) = result {
+                cp_batch.lock().unwrap_or_else(|e| e.into_inner()).push(FileCheckpoint {
+                    file_path: path.to_string(),
+                    last_line_len,
+                    last_line_hash,
+                });
+            }
+        });
+
+        let result_summaries = summaries.into_inner().unwrap_or_else(|e| e.into_inner());
+        let checkpoints_batch = cp_batch.into_inner().unwrap_or_else(|e| e.into_inner());
+
+        for cp in &checkpoints_batch {
             self.checkpoints.insert(cp.file_path.clone(), cp.clone());
         }
 
         // Emit summary
-        self.sink.emit_summary(&result.summaries, self.pricing.as_ref());
+        self.sink.emit_summary(&result_summaries, self.pricing.as_ref());
 
-        // Batch flush for cold start (single transaction).
-        let t_flush = Instant::now();
-        self.db.flush_checkpoints(&result.checkpoints)?;
-        debug_log!("cold_start — {} sessions, {} files, {} checkpoints flushed (flush: {}µs, total: {}µs)",
-            result.session_count, result.total_files, result.checkpoints.len(), t_flush.elapsed().as_micros(), t_cold.elapsed().as_micros());
+        // Batch flush for cold start via writer thread.
+        let cp_count = checkpoints_batch.len();
+        if !checkpoints_batch.is_empty() {
+            let _ = self.db_tx.send(DbOp::FlushCheckpoints(checkpoints_batch));
+        }
+        debug_log!("cold_start — {} sessions, {} files, {} checkpoints flushed (total: {}µs)",
+            sessions.len(), total_files, cp_count, t_cold.elapsed().as_micros());
 
-        Ok(result.summaries)
+        Ok(result_summaries)
     }
 
     /// Cold start with time-bucket grouping (e.g. hourly/daily).
@@ -482,8 +532,11 @@ impl TrackerEngine {
         let cp_batch: Mutex<Vec<FileCheckpoint>> = Mutex::new(Vec::new());
         let filter = ReportFilter { tz: self.tz, ..Default::default() };
 
+        let db_tx = &self.db_tx;
+
         parallel_scan(&sessions, &self.checkpoints, |path, offset| {
             let mut local: HashMap<String, HashMap<String, ModelUsageSummary>> = HashMap::new();
+            let session_id = extract_session_id(path).unwrap_or_default();
             let result = process_lines_streaming(path, offset, |line| {
                 if let Some(event) = parser.parse_line_with_ts(line, path) {
                     if let Some(bucket) = bucket_from_timestamp_filtered(&event.timestamp, group_by, filter) {
@@ -493,6 +546,27 @@ impl TrackerEngine {
                             ..Default::default()
                         });
                         summary.accumulate_with_ts(&event);
+                    }
+
+                    // Send event to TSDB writer
+                    let ts_ms = parse_timestamp(&event.timestamp)
+                        .map(|dt| dt.and_utc().timestamp_millis())
+                        .unwrap_or(0);
+                    if ts_ms > 0 {
+                        let op = DbOp::WriteEvent {
+                            ts_ms,
+                            message_id: event.event_key.clone(),
+                            model: event.model.clone(),
+                            session_id: session_id.clone(),
+                            source_file: event.source_file.clone(),
+                            tokens: TokenFields {
+                                input_tokens: event.input_tokens,
+                                output_tokens: event.output_tokens,
+                                cache_creation_input_tokens: event.cache_creation_input_tokens,
+                                cache_read_input_tokens: event.cache_read_input_tokens,
+                            },
+                        };
+                        let _ = db_tx.send(op);
                     }
                 }
             });
@@ -515,10 +589,7 @@ impl TrackerEngine {
             for cp in &batch {
                 self.checkpoints.insert(cp.file_path.clone(), cp.clone());
             }
-            let t_flush = Instant::now();
-            self.db.flush_checkpoints(&batch)?;
-            debug_log!("cold_start_grouped — {} checkpoints flushed ({}µs)",
-                batch.len(), t_flush.elapsed().as_micros());
+            let _ = self.db_tx.send(DbOp::FlushCheckpoints(batch));
         }
 
         self.sink.emit_grouped(&grouped.into_inner().unwrap_or_else(|e| e.into_inner()), group_by.type_name(), self.pricing.as_ref());
@@ -528,16 +599,19 @@ impl TrackerEngine {
 
     /// Process a single file change (watch mode).
     /// Uses active/idle classification to minimize unnecessary work.
-    pub fn process_file(
+    /// Returns events with timestamps for TSDB storage.
+    pub fn process_file_with_ts<P>(
         &mut self,
         path: &str,
-        parser: &dyn LogParser,
-    ) -> Result<Vec<UsageEvent>, Box<dyn std::error::Error>> {
+        parser: &P,
+    ) -> Result<Vec<crate::common::types::UsageEventWithTs>, Box<dyn std::error::Error>>
+    where
+        P: LogParser + LogParserWithTs,
+    {
         let now = Instant::now();
 
-        // Step 1: Determine state (new file = Active, lazy Idle transition)
         let (state, cooldown) = match self.activity.get(path) {
-            None => (FileState::Active, ACTIVE_COOLDOWN), // new file
+            None => (FileState::Active, ACTIVE_COOLDOWN),
             Some(act) => {
                 let mut s = act.state;
                 if s == FileState::Active && now.duration_since(act.last_active) > IDLE_TRANSITION {
@@ -550,7 +624,6 @@ impl TrackerEngine {
             }
         };
 
-        // Step 2: Cooldown check
         if let Some(act) = self.activity.get(path) {
             if now.duration_since(act.last_checked) < cooldown {
                 return Ok(Vec::new());
@@ -559,16 +632,12 @@ impl TrackerEngine {
 
         let t_total = Instant::now();
 
-        // Step 3: stat() → size change check
         if let Ok(meta) = std::fs::metadata(path) {
             let current_size = meta.len();
             if let Some(&cached_size) = self.file_sizes.get(path) {
                 if current_size == cached_size {
-                    // Update last_checked, preserve state
                     let act = self.activity.entry(path.to_string()).or_insert(FileActivity {
-                        state,
-                        last_active: now,
-                        last_checked: now,
+                        state, last_active: now, last_checked: now,
                     });
                     act.last_checked = now;
                     act.state = state;
@@ -581,7 +650,6 @@ impl TrackerEngine {
             }
         }
 
-        // Step 4: Size changed → find_resume + streaming read/parse
         let t0 = Instant::now();
         let offset = self.determine_offset(path)?;
         let find_us = t0.elapsed().as_micros();
@@ -590,36 +658,29 @@ impl TrackerEngine {
         let mut events = Vec::new();
         let mut line_count: u64 = 0;
         let result = process_lines_streaming(path, offset, |line| {
-            if let Some(event) = parser.parse_line(line, path) {
+            if let Some(event) = parser.parse_line_with_ts(line, path) {
                 events.push(event);
             }
             line_count += 1;
         })?;
         let read_us = t1.elapsed().as_micros();
 
-        // Update cached file size from offset + bytes consumed (avoid second metadata() call)
         match result {
             None => {
-                // No lines read — update size cache from offset (file may have trailing incomplete data)
                 if let Ok(meta) = std::fs::metadata(path) {
                     self.file_sizes.insert(path.to_string(), meta.len());
                 }
                 let act = self.activity.entry(path.to_string()).or_insert(FileActivity {
-                    state,
-                    last_active: now,
-                    last_checked: now,
+                    state, last_active: now, last_checked: now,
                 });
                 act.last_checked = now;
                 act.state = state;
                 debug_log_verbose!("process_file {} — no new lines (find_resume: {}µs, read: {}µs)",
                     path, find_us, read_us);
-                return Ok(Vec::new());
+                Ok(Vec::new())
             }
             Some((bytes_read, last_line_len, last_line_hash)) => {
-                // Update cached file size: offset + bytes_read = last consumed position.
-                // File may have more trailing data, so use metadata only if needed for accuracy.
                 self.file_sizes.insert(path.to_string(), offset + bytes_read);
-
                 let cp = FileCheckpoint {
                     file_path: path.to_string(),
                     last_line_len,
@@ -627,34 +688,58 @@ impl TrackerEngine {
                 };
                 self.checkpoints.insert(path.to_string(), cp);
                 self.dirty.insert(path.to_string());
-
-                // Promote to Active if was Idle
                 if state == FileState::Idle {
                     debug_log!("promote {} → Active ({} new lines)", path, line_count);
                 }
                 self.activity.insert(path.to_string(), FileActivity {
-                    state: FileState::Active,
-                    last_active: now,
-                    last_checked: now,
+                    state: FileState::Active, last_active: now, last_checked: now,
                 });
-
                 debug_log!("process_file {} — {} lines, {} bytes, {} events, Active | find_resume: {}µs, read: {}µs, total: {}µs",
                     path, line_count, bytes_read, events.len(),
                     find_us, read_us, t_total.elapsed().as_micros());
-
                 Ok(events)
             }
         }
     }
 
-    fn process_and_print(&mut self, path: &str, parser: &dyn LogParser) {
+    fn process_and_print<P>(&mut self, path: &str, parser: &P)
+    where
+        P: LogParser + LogParserWithTs,
+    {
         if !self.matches_filters(path) {
             return;
         }
-        match self.process_file(path, parser) {
+        match self.process_file_with_ts(path, parser) {
             Ok(events) => {
-                for event in &events {
-                    self.sink.emit_event(event, self.pricing.as_ref());
+                let session_id = extract_session_id(path).unwrap_or_default();
+                for event in events {
+                    let ts_ms = parse_timestamp(&event.timestamp)
+                        .map(|dt| dt.and_utc().timestamp_millis())
+                        .unwrap_or_else(|| {
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH).unwrap()
+                                .as_millis() as i64
+                        });
+
+                    let (usage, _ts) = event.into_usage_event();
+                    self.sink.emit_event(&usage, self.pricing.as_ref());
+
+                    let op = DbOp::WriteEvent {
+                        ts_ms,
+                        message_id: usage.event_key,
+                        model: usage.model,
+                        session_id: session_id.clone(),
+                        source_file: usage.source_file,
+                        tokens: TokenFields {
+                            input_tokens: usage.input_tokens,
+                            output_tokens: usage.output_tokens,
+                            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                            cache_read_input_tokens: usage.cache_read_input_tokens,
+                        },
+                    };
+                    if self.db_tx.try_send(op).is_err() {
+                        debug_log!("writer channel full, dropping event");
+                    }
                 }
             }
             Err(e) => {
@@ -663,7 +748,7 @@ impl TrackerEngine {
         }
     }
 
-    /// Flush dirty checkpoints to DB in a single batch transaction.
+    /// Flush dirty checkpoints via writer thread.
     fn flush_dirty(&mut self) {
         if self.dirty.is_empty() {
             return;
@@ -672,13 +757,9 @@ impl TrackerEngine {
             .filter_map(|path| self.checkpoints.get(path).cloned())
             .collect();
         let count = batch.len();
-        let t = Instant::now();
-        if let Err(e) = self.db.flush_checkpoints(&batch) {
-            eprintln!("[clitrace] flush error: {}", e);
-            return;
-        }
+        let _ = self.db_tx.send(DbOp::FlushCheckpoints(batch));
         self.dirty.clear();
-        debug_log!("flush_dirty — {} checkpoints in {}µs", count, t.elapsed().as_micros());
+        debug_log!("flush_dirty — {} checkpoints sent to writer", count);
     }
 
     fn determine_offset(&self, path: &str) -> Result<u64, Box<dyn std::error::Error>> {
@@ -696,12 +777,15 @@ impl TrackerEngine {
     /// Watch loop: receive file change events, process incrementally,
     /// Watch loop: receive file change events, flush dirty checkpoints periodically.
     /// Graceful shutdown: flushes remaining dirty checkpoints before exiting.
-    pub fn watch_loop(
+    pub fn watch_loop<P>(
         &mut self,
         event_rx: Receiver<String>,
         stop_rx: Receiver<()>,
-        parser: &dyn LogParser,
-    ) {
+        parser: &P,
+    )
+    where
+        P: LogParser + LogParserWithTs,
+    {
         let flush_tick = crossbeam_channel::tick(FLUSH_INTERVAL);
 
         loop {
@@ -827,13 +911,16 @@ fn filter_match(ts: NaiveDateTime, filter: ReportFilter) -> bool {
 ///   Parent:   .../projects/<dir>/<UUID>.jsonl        → "<UUID>"
 ///   Subagent: .../<UUID>/subagents/agent-<id>.jsonl  → "<UUID>" (grandparent dir name)
 pub fn extract_session_id(path: &str) -> Option<String> {
-    let parts: Vec<&str> = path.rsplit('/').collect();
-    // Subagent: parts = ["agent-xxx.jsonl", "subagents", "<UUID>", ...]
-    if parts.len() >= 3 && parts[1] == "subagents" {
-        return Some(parts[2].to_string());
+    let mut parts = path.rsplit('/');
+    let filename = parts.next()?;
+    // Subagent: .../\<UUID>/subagents/agent-xxx.jsonl
+    if let Some(dir) = parts.next() {
+        if dir == "subagents" {
+            return parts.next().map(|s| s.to_string());
+        }
     }
     // Parent: filename without .jsonl
-    parts.first().map(|s| s.trim_end_matches(".jsonl").to_string())
+    Some(filename.trim_end_matches(".jsonl").to_string())
 }
 
 /// Filter sessions by session_id prefix match.
@@ -1045,6 +1132,28 @@ mod tests {
         }
     }
 
+    impl LogParserWithTs for TestParser {
+        fn parse_line_with_ts(&self, line: &str, source_file: &str) -> Option<crate::common::types::UsageEventWithTs> {
+            let v: serde_json::Value = serde_json::from_str(line).ok()?;
+            if v.get("type")?.as_str()? != "assistant" {
+                return None;
+            }
+            let msg = v.get("message")?;
+            let usage = msg.get("usage")?;
+            let ts = v.get("timestamp")?.as_str()?.to_string();
+            Some(crate::common::types::UsageEventWithTs {
+                event_key: format!("{}:{}", msg.get("id")?.as_str()?, &ts),
+                source_file: source_file.to_string(),
+                model: msg.get("model")?.as_str()?.to_string(),
+                input_tokens: usage.get("input_tokens")?.as_u64()?,
+                cache_creation_input_tokens: usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                cache_read_input_tokens: usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                output_tokens: usage.get("output_tokens")?.as_u64()?,
+                timestamp: ts,
+            })
+        }
+    }
+
     fn make_assistant_line(id: &str, model: &str, input: u64, cc: u64, cr: u64, output: u64) -> String {
         format!(
             r#"{{"type":"assistant","message":{{"id":"{}","model":"{}","usage":{{"input_tokens":{},"cache_creation_input_tokens":{},"cache_read_input_tokens":{},"output_tokens":{}}}}},"timestamp":"2026-03-08T12:00:00Z"}}"#,
@@ -1056,8 +1165,14 @@ mod tests {
     fn test_cold_start_single_session() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let db = Database::open(&db_path).unwrap();
-        let mut engine = TrackerEngine::new(db);
+        let db = crate::db::Database::open(&db_path).unwrap();
+        let checkpoints_loaded: HashMap<String, FileCheckpoint> = db.load_all_checkpoints()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|cp| (cp.file_path.clone(), cp))
+            .collect();
+        let (db_tx, _db_rx) = crossbeam_channel::bounded::<DbOp>(1024);
+        let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded);
 
         // Create test JSONL
         let projects_dir = dir.path().join("projects").join("test");
@@ -1086,8 +1201,14 @@ mod tests {
     fn test_cold_start_with_subagent() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let db = Database::open(&db_path).unwrap();
-        let mut engine = TrackerEngine::new(db);
+        let db = crate::db::Database::open(&db_path).unwrap();
+        let checkpoints_loaded: HashMap<String, FileCheckpoint> = db.load_all_checkpoints()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|cp| (cp.file_path.clone(), cp))
+            .collect();
+        let (db_tx, _db_rx) = crossbeam_channel::bounded::<DbOp>(1024);
+        let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded);
 
         let projects_dir = dir.path().join("projects").join("test");
         std::fs::create_dir_all(&projects_dir).unwrap();
@@ -1117,8 +1238,14 @@ mod tests {
     fn test_cold_start_multi_model() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let db = Database::open(&db_path).unwrap();
-        let mut engine = TrackerEngine::new(db);
+        let db = crate::db::Database::open(&db_path).unwrap();
+        let checkpoints_loaded: HashMap<String, FileCheckpoint> = db.load_all_checkpoints()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|cp| (cp.file_path.clone(), cp))
+            .collect();
+        let (db_tx, _db_rx) = crossbeam_channel::bounded::<DbOp>(1024);
+        let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded);
 
         let projects_dir = dir.path().join("projects").join("test");
         std::fs::create_dir_all(&projects_dir).unwrap();
@@ -1147,8 +1274,14 @@ mod tests {
     fn test_cold_start_checkpoints_saved() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let db = Database::open(&db_path).unwrap();
-        let mut engine = TrackerEngine::new(db);
+        let db = crate::db::Database::open(&db_path).unwrap();
+        let checkpoints_loaded: HashMap<String, FileCheckpoint> = db.load_all_checkpoints()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|cp| (cp.file_path.clone(), cp))
+            .collect();
+        let (db_tx, _db_rx) = crossbeam_channel::bounded::<DbOp>(1024);
+        let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded);
 
         let projects_dir = dir.path().join("projects").join("test");
         std::fs::create_dir_all(&projects_dir).unwrap();
@@ -1172,8 +1305,14 @@ mod tests {
     fn test_cold_start_incremental() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let db = Database::open(&db_path).unwrap();
-        let mut engine = TrackerEngine::new(db);
+        let db = crate::db::Database::open(&db_path).unwrap();
+        let checkpoints_loaded: HashMap<String, FileCheckpoint> = db.load_all_checkpoints()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|cp| (cp.file_path.clone(), cp))
+            .collect();
+        let (db_tx, _db_rx) = crossbeam_channel::bounded::<DbOp>(1024);
+        let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded);
 
         let projects_dir = dir.path().join("projects").join("test");
         std::fs::create_dir_all(&projects_dir).unwrap();
@@ -1203,8 +1342,14 @@ mod tests {
     fn test_cold_start_empty() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let db = Database::open(&db_path).unwrap();
-        let mut engine = TrackerEngine::new(db);
+        let db = crate::db::Database::open(&db_path).unwrap();
+        let checkpoints_loaded: HashMap<String, FileCheckpoint> = db.load_all_checkpoints()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|cp| (cp.file_path.clone(), cp))
+            .collect();
+        let (db_tx, _db_rx) = crossbeam_channel::bounded::<DbOp>(1024);
+        let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded);
 
         let parser = TestParser;
         let summaries = engine.cold_start(&parser, dir.path().to_str().unwrap()).unwrap();
@@ -1265,7 +1410,7 @@ mod tests {
 
         // Bench DB upsert
         let db_path = dir.path().join("bench.db");
-        let db = Database::open(&db_path).unwrap();
+        let db = crate::db::Database::open(&db_path).unwrap();
         let start = Instant::now();
         for _ in 0..iterations {
             db.upsert_checkpoint(&cp).unwrap();
@@ -1273,8 +1418,9 @@ mod tests {
         let db_us = start.elapsed().as_micros() / iterations as u128;
 
         // Bench full process_file (cold start + incremental)
-        let db2 = Database::open(&dir.path().join("bench2.db")).unwrap();
-        let mut engine = TrackerEngine::new(db2);
+        let db2 = crate::db::Database::open(&dir.path().join("bench2.db")).unwrap();
+        let (db_tx2, _db_rx2) = crossbeam_channel::bounded::<DbOp>(1024);
+        let mut engine = TrackerEngine::new(db_tx2, HashMap::new());
         let parser = TestParser;
 
         let start = Instant::now();
@@ -1292,7 +1438,7 @@ mod tests {
             }
         }
         let start = Instant::now();
-        let events = engine.process_file(path_str, &parser).unwrap();
+        let events = engine.process_file_with_ts(path_str, &parser).unwrap();
         let incr_us = start.elapsed().as_micros();
 
         println!("\n=== clitrace benchmark ===");

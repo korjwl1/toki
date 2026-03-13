@@ -40,7 +40,7 @@ enum Commands {
         /// Claude Code root directory (default: ~/.claude)
         #[arg(long)]
         claude_root: Option<String>,
-        /// DB path for checkpoints (default: ~/.config/clitrace/clitrace.db)
+        /// DB path for checkpoints (default: ~/.config/clitrace/clitrace.fjall)
         #[arg(long)]
         db_path: Option<PathBuf>,
         /// Clear checkpoints and perform full rescan on startup
@@ -301,7 +301,7 @@ fn main() {
 
             // Register SIGINT handler
             unsafe {
-                libc::signal(libc::SIGINT, sigint_handler as libc::sighandler_t);
+                libc::signal(libc::SIGINT, sigint_handler as *const () as libc::sighandler_t);
             }
 
             // Wait until SIGINT
@@ -321,11 +321,13 @@ fn main() {
             // Create sink for report output
             let sink = clitrace::sink::create_sinks(&sink_specs, output_format);
 
+            // Try to open DB for pricing and TSDB queries
+            let db = clitrace::db::Database::open(&config.db_path).ok();
+
             // Load pricing for cost display
             let pricing = if cli.no_cost {
                 None
             } else {
-                let db = clitrace::db::Database::open(&config.db_path).ok();
                 match db {
                     Some(ref d) => {
                         let p = clitrace::pricing::fetch_pricing(d);
@@ -335,6 +337,9 @@ fn main() {
                 }
             };
             let pricing_ref = pricing.as_ref();
+
+            // Check if TSDB has data for fast path
+            let use_tsdb = db.as_ref().map_or(false, clitrace::query::has_tsdb_data);
 
             let parser = clitrace::providers::claude_code::ClaudeCodeParser;
             let session_filter = session_id.as_deref();
@@ -377,42 +382,44 @@ fn main() {
                         }
                     }
 
+                    let filter = clitrace::engine::ReportFilter { since: since_dt, until: until_dt, tz };
+
                     if group_by_session {
-                        let filter = clitrace::engine::ReportFilter { since: since_dt, until: until_dt, tz };
-                        let checkpoints = std::collections::HashMap::new();
-                        if let Err(e) = clitrace::engine::cold_start_report_by_session(
-                            &parser,
-                            &config.claude_code_root,
-                            &checkpoints,
-                            filter,
-                            session_filter,
-                            project_filter,
-                            sink.as_ref(),
-                            pricing_ref,
-                        ) {
-                            eprintln!("[clitrace] Report failed: {}", e);
-                            std::process::exit(1);
-                        }
-                    } else if since_dt.is_some() || until_dt.is_some() {
-                        let filter = clitrace::engine::ReportFilter { since: since_dt, until: until_dt, tz };
-                        let checkpoints = std::collections::HashMap::new();
-                        match clitrace::engine::cold_start_report_filtered(
-                            &parser,
-                            &config.claude_code_root,
-                            &checkpoints,
-                            filter,
-                            session_filter,
-                            project_filter,
-                        ) {
-                            Ok(summaries) => sink.emit_summary(&summaries, pricing_ref),
-                            Err(e) => {
+                        if use_tsdb {
+                            match clitrace::query::report_by_session_from_db(db.as_ref().unwrap(), filter) {
+                                Ok(grouped) => sink.emit_grouped(&grouped, "session", pricing_ref),
+                                Err(e) => {
+                                    eprintln!("[clitrace] TSDB query failed: {}, falling back to JSONL scan", e);
+                                    let checkpoints = std::collections::HashMap::new();
+                                    if let Err(e) = clitrace::engine::cold_start_report_by_session(
+                                        &parser, &config.claude_code_root, &checkpoints, filter,
+                                        session_filter, project_filter, sink.as_ref(), pricing_ref,
+                                    ) {
+                                        eprintln!("[clitrace] Report failed: {}", e);
+                                        std::process::exit(1);
+                                    }
+                                }
+                            }
+                        } else {
+                            let checkpoints = std::collections::HashMap::new();
+                            if let Err(e) = clitrace::engine::cold_start_report_by_session(
+                                &parser, &config.claude_code_root, &checkpoints, filter,
+                                session_filter, project_filter, sink.as_ref(), pricing_ref,
+                            ) {
                                 eprintln!("[clitrace] Report failed: {}", e);
                                 std::process::exit(1);
                             }
                         }
-                    } else if let Err(e) = clitrace::engine::cold_start_report(&parser, &config.claude_code_root, sink.as_ref(), session_filter, project_filter, pricing_ref) {
-                        eprintln!("[clitrace] Report failed: {}", e);
-                        std::process::exit(1);
+                    } else if use_tsdb {
+                        match clitrace::query::report_summary_from_db(db.as_ref().unwrap(), filter) {
+                            Ok(summaries) => sink.emit_summary(&summaries, pricing_ref),
+                            Err(e) => {
+                                eprintln!("[clitrace] TSDB query failed: {}, falling back to JSONL scan", e);
+                                fallback_total_report(&parser, &config, filter, session_filter, project_filter, sink.as_ref(), pricing_ref);
+                            }
+                        }
+                    } else {
+                        fallback_total_report(&parser, &config, filter, session_filter, project_filter, sink.as_ref(), pricing_ref);
                     }
                     return;
                 }
@@ -487,22 +494,66 @@ fn main() {
             let effective_project_filter = filter_args.project.as_deref().or(project_filter);
 
             let filter = clitrace::engine::ReportFilter { since: since_dt, until: until_dt, tz };
-            let checkpoints = std::collections::HashMap::new();
-            if let Err(e) = clitrace::engine::cold_start_report_grouped(
-                &parser,
-                &config.claude_code_root,
-                group_by,
-                &checkpoints,
-                filter,
-                sink.as_ref(),
-                effective_session_filter,
-                effective_project_filter,
-                pricing_ref,
-            ) {
+
+            // Try TSDB first, fallback to JSONL
+            if use_tsdb {
+                match clitrace::query::report_grouped_from_db(db.as_ref().unwrap(), group_by, filter) {
+                    Ok(grouped) => {
+                        sink.emit_grouped(&grouped, group_by.type_name(), pricing_ref);
+                    }
+                    Err(e) => {
+                        eprintln!("[clitrace] TSDB query failed: {}, falling back to JSONL scan", e);
+                        let checkpoints = std::collections::HashMap::new();
+                        if let Err(e) = clitrace::engine::cold_start_report_grouped(
+                            &parser, &config.claude_code_root, group_by, &checkpoints, filter,
+                            sink.as_ref(), effective_session_filter, effective_project_filter, pricing_ref,
+                        ) {
+                            eprintln!("[clitrace] Report failed: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                }
+            } else {
+                let checkpoints = std::collections::HashMap::new();
+                if let Err(e) = clitrace::engine::cold_start_report_grouped(
+                    &parser, &config.claude_code_root, group_by, &checkpoints, filter,
+                    sink.as_ref(), effective_session_filter, effective_project_filter, pricing_ref,
+                ) {
+                    eprintln!("[clitrace] Report failed: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
+}
+
+/// Fallback: total report using JSONL scan (when TSDB is empty or unavailable).
+fn fallback_total_report(
+    parser: &clitrace::providers::claude_code::ClaudeCodeParser,
+    config: &clitrace::Config,
+    filter: clitrace::engine::ReportFilter,
+    session_filter: Option<&str>,
+    project_filter: Option<&str>,
+    sink: &dyn clitrace::sink::Sink,
+    pricing: Option<&clitrace::pricing::PricingTable>,
+) {
+    let checkpoints = std::collections::HashMap::new();
+    if filter.since.is_some() || filter.until.is_some() {
+        match clitrace::engine::cold_start_report_filtered(
+            parser, &config.claude_code_root, &checkpoints, filter,
+            session_filter, project_filter,
+        ) {
+            Ok(summaries) => sink.emit_summary(&summaries, pricing),
+            Err(e) => {
                 eprintln!("[clitrace] Report failed: {}", e);
                 std::process::exit(1);
             }
         }
+    } else if let Err(e) = clitrace::engine::cold_start_report(
+        parser, &config.claude_code_root, sink, session_filter, project_filter, pricing,
+    ) {
+        eprintln!("[clitrace] Report failed: {}", e);
+        std::process::exit(1);
     }
 }
 

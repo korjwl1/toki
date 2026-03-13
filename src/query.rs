@@ -1,0 +1,237 @@
+use std::collections::HashMap;
+
+use chrono::{NaiveDateTime, TimeZone, Datelike, Weekday};
+use chrono_tz::Tz;
+
+use crate::common::types::{ModelUsageSummary, GroupedSummaryMap, SummaryMap};
+use crate::db::Database;
+use crate::engine::{ReportFilter, ReportGroupBy};
+
+/// Resolve (since, until) from filter into ms timestamps.
+fn filter_range(filter: ReportFilter) -> (i64, i64) {
+    let since = filter_to_ms(filter.since).unwrap_or(0);
+    let until = filter_to_ms(filter.until).unwrap_or(i64::MAX);
+    (since, until)
+}
+
+fn accumulate_rollup(entry: &mut ModelUsageSummary, rollup: &crate::common::types::RollupValue) {
+    entry.input_tokens += rollup.input;
+    entry.output_tokens += rollup.output;
+    entry.cache_creation_input_tokens += rollup.cache_create;
+    entry.cache_read_input_tokens += rollup.cache_read;
+    entry.event_count += rollup.count;
+}
+
+/// Report total summary from TSDB rollups (streaming — no intermediate Vec).
+pub fn report_summary_from_db(
+    db: &Database,
+    filter: ReportFilter,
+) -> Result<SummaryMap, fjall::Error> {
+    let (since, until) = filter_range(filter);
+    let mut summaries: SummaryMap = HashMap::new();
+    db.for_each_rollup(since, until, |_ts, model, rollup| {
+        let entry = summaries.entry(model.clone()).or_insert_with(|| ModelUsageSummary {
+            model, ..Default::default()
+        });
+        accumulate_rollup(entry, &rollup);
+    })?;
+    Ok(summaries)
+}
+
+/// Report grouped by time bucket from TSDB rollups (streaming).
+pub fn report_grouped_from_db(
+    db: &Database,
+    group_by: ReportGroupBy,
+    filter: ReportFilter,
+) -> Result<GroupedSummaryMap, fjall::Error> {
+    let (since, until) = filter_range(filter);
+    let mut grouped: GroupedSummaryMap = HashMap::new();
+    db.for_each_rollup(since, until, |hour_ts, model, rollup| {
+        let dt = ts_to_datetime(hour_ts, filter.tz);
+        let bucket = bucket_from_datetime(dt, group_by);
+        let entry = grouped.entry(bucket).or_default()
+            .entry(model.clone()).or_insert_with(|| ModelUsageSummary {
+                model, ..Default::default()
+            });
+        accumulate_rollup(entry, &rollup);
+    })?;
+    Ok(grouped)
+}
+
+/// Report grouped by session from TSDB events (streaming).
+pub fn report_by_session_from_db(
+    db: &Database,
+    filter: ReportFilter,
+) -> Result<GroupedSummaryMap, fjall::Error> {
+    let dict = db.load_dict_reverse()?;
+    let (since, until) = filter_range(filter);
+    let mut grouped: GroupedSummaryMap = HashMap::new();
+    db.for_each_event(since, until, |_ts, event| {
+        let session = dict.get(&event.session_id).cloned().unwrap_or_else(|| format!("unknown-{}", event.session_id));
+        let model = dict.get(&event.model_id).cloned().unwrap_or_else(|| format!("unknown-{}", event.model_id));
+        let entry = grouped.entry(session).or_default()
+            .entry(model.clone()).or_insert_with(|| ModelUsageSummary {
+                model, ..Default::default()
+            });
+        entry.input_tokens += event.input_tokens;
+        entry.output_tokens += event.output_tokens;
+        entry.cache_creation_input_tokens += event.cache_creation_input_tokens;
+        entry.cache_read_input_tokens += event.cache_read_input_tokens;
+        entry.event_count += 1;
+    })?;
+    Ok(grouped)
+}
+
+/// Check if the TSDB has any data (O(1) — reads only first rollup entry).
+pub fn has_tsdb_data(db: &Database) -> bool {
+    db.has_any_rollups()
+}
+
+fn filter_to_ms(dt: Option<NaiveDateTime>) -> Option<i64> {
+    dt.map(|d| d.and_utc().timestamp_millis())
+}
+
+fn ts_to_datetime(ts_ms: i64, tz: Option<Tz>) -> NaiveDateTime {
+    let utc = chrono::DateTime::from_timestamp_millis(ts_ms)
+        .unwrap_or_default()
+        .naive_utc();
+    match tz {
+        Some(tz) => chrono::Utc.from_utc_datetime(&utc).with_timezone(&tz).naive_local(),
+        None => utc,
+    }
+}
+
+fn bucket_from_datetime(ts: NaiveDateTime, group_by: ReportGroupBy) -> String {
+    let date = ts.date();
+    match group_by {
+        ReportGroupBy::Date => date.format("%Y-%m-%d").to_string(),
+        ReportGroupBy::Week { start_of_week } => {
+            let (week_year, week) = week_bucket(date, start_of_week);
+            format!("{:04}-W{:02}", week_year, week)
+        }
+        ReportGroupBy::Month => date.format("%Y-%m").to_string(),
+        ReportGroupBy::Year => format!("{:04}", date.year()),
+        ReportGroupBy::Hour => ts.format("%Y-%m-%dT%H:00").to_string(),
+    }
+}
+
+fn week_bucket(date: chrono::NaiveDate, start_of_week: Weekday) -> (i32, u32) {
+    let date_week_start = week_start(date, start_of_week);
+    let mut year = date_week_start.year();
+    let first_start = first_week_start(year, start_of_week);
+    if date_week_start < first_start {
+        year -= 1;
+    }
+    let first_start = first_week_start(year, start_of_week);
+    let days = date_week_start.signed_duration_since(first_start).num_days();
+    let week = (days / 7 + 1) as u32;
+    (year, week)
+}
+
+fn week_start(date: chrono::NaiveDate, start_of_week: Weekday) -> chrono::NaiveDate {
+    let date_idx = weekday_index(date.weekday());
+    let start_idx = weekday_index(start_of_week);
+    let delta = (7 + date_idx - start_idx) % 7;
+    date - chrono::Duration::days(delta as i64)
+}
+
+fn first_week_start(year: i32, start_of_week: Weekday) -> chrono::NaiveDate {
+    let jan1 = chrono::NaiveDate::from_ymd_opt(year, 1, 1).unwrap();
+    let delta = (weekday_index(start_of_week) - weekday_index(jan1.weekday()) + 7) % 7;
+    jan1 + chrono::Duration::days(delta as i64)
+}
+
+fn weekday_index(day: Weekday) -> i32 {
+    match day {
+        Weekday::Mon => 0,
+        Weekday::Tue => 1,
+        Weekday::Wed => 2,
+        Weekday::Thu => 3,
+        Weekday::Fri => 4,
+        Weekday::Sat => 5,
+        Weekday::Sun => 6,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::types::{RollupValue, StoredEvent};
+
+    #[test]
+    fn test_report_summary_from_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("test.fjall")).unwrap();
+
+        let hour1 = 3_600_000i64;
+        let hour2 = 7_200_000i64;
+
+        let r1 = RollupValue { input: 100, output: 50, cache_create: 10, cache_read: 20, count: 5 };
+        let r2 = RollupValue { input: 200, output: 100, cache_create: 20, cache_read: 40, count: 10 };
+
+        let mut batch = db.batch();
+        db.upsert_rollup(&mut batch, hour1, "claude-opus-4-6", &r1);
+        db.upsert_rollup(&mut batch, hour2, "claude-opus-4-6", &r2);
+        batch.commit().unwrap();
+
+        let filter = ReportFilter::default();
+        let result = report_summary_from_db(&db, filter).unwrap();
+
+        assert_eq!(result.len(), 1);
+        let s = &result["claude-opus-4-6"];
+        assert_eq!(s.input_tokens, 300);
+        assert_eq!(s.output_tokens, 150);
+        assert_eq!(s.event_count, 15);
+    }
+
+    #[test]
+    fn test_report_grouped_from_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("test.fjall")).unwrap();
+
+        // Two different days
+        let day1 = 1709251200000i64; // 2024-03-01 00:00:00 UTC
+        let day2 = 1709337600000i64; // 2024-03-02 00:00:00 UTC
+
+        let r1 = RollupValue { input: 100, output: 50, cache_create: 0, cache_read: 0, count: 5 };
+        let r2 = RollupValue { input: 200, output: 100, cache_create: 0, cache_read: 0, count: 10 };
+
+        let mut batch = db.batch();
+        db.upsert_rollup(&mut batch, day1, "claude-opus-4-6", &r1);
+        db.upsert_rollup(&mut batch, day2, "claude-opus-4-6", &r2);
+        batch.commit().unwrap();
+
+        let filter = ReportFilter::default();
+        let result = report_grouped_from_db(&db, ReportGroupBy::Date, filter).unwrap();
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_report_by_session_from_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("test.fjall")).unwrap();
+
+        // Set up dict entries
+        let mut batch = db.batch();
+        db.dict_put(&mut batch, "claude-opus-4-6", 1);
+        db.dict_put(&mut batch, "session-abc", 2);
+        db.dict_put(&mut batch, "/path/to/file.jsonl", 3);
+        batch.commit().unwrap();
+
+        let event = StoredEvent {
+            model_id: 1, session_id: 2, source_file_id: 3,
+            input_tokens: 100, output_tokens: 50,
+            cache_creation_input_tokens: 10, cache_read_input_tokens: 20,
+        };
+        db.insert_event(1000, "msg1", &event).unwrap();
+        db.insert_event(2000, "msg2", &event).unwrap();
+
+        let filter = ReportFilter::default();
+        let result = report_by_session_from_db(&db, filter).unwrap();
+
+        assert_eq!(result.len(), 1);
+        let session = &result["session-abc"];
+        assert_eq!(session["claude-opus-4-6"].input_tokens, 200);
+        assert_eq!(session["claude-opus-4-6"].event_count, 2);
+    }
+}

@@ -11,6 +11,8 @@ pub struct Config {
     pub session_filter: Option<String>,
     pub project_filter: Option<String>,
     pub tz: Option<Tz>,
+    pub retention_days: u32,
+    pub rollup_retention_days: u32,
 }
 
 impl Config {
@@ -19,11 +21,15 @@ impl Config {
 
         Config {
             claude_code_root: home.join(".claude").to_string_lossy().to_string(),
-            db_path: home.join(".config").join("clitrace").join("clitrace.db"),
+            db_path: home.join(".config").join("clitrace").join("clitrace.fjall"),
             full_rescan: false,
             session_filter: None,
             project_filter: None,
             tz: None,
+            retention_days: std::env::var("CLITRACE_RETENTION_DAYS")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(90),
+            rollup_retention_days: std::env::var("CLITRACE_ROLLUP_RETENTION_DAYS")
+                .ok().and_then(|v| v.parse().ok()).unwrap_or(365),
         }
     }
 
@@ -82,18 +88,18 @@ mod tests {
     fn test_config_defaults() {
         let config = Config::new();
         assert!(config.claude_code_root.ends_with(".claude"));
-        assert!(config.db_path.ends_with("clitrace.db"));
+        assert!(config.db_path.ends_with("clitrace.fjall"));
     }
 
     #[test]
     fn test_config_builder() {
         let config = Config::new()
             .with_claude_root("/custom/root".to_string())
-            .with_db_path("/custom/db.redb".into())
+            .with_db_path("/custom/db.fjall".into())
             .with_full_rescan(true);
 
         assert_eq!(config.claude_code_root, "/custom/root");
-        assert_eq!(config.db_path, PathBuf::from("/custom/db.redb"));
+        assert_eq!(config.db_path, PathBuf::from("/custom/db.fjall"));
         assert!(config.full_rescan);
     }
 

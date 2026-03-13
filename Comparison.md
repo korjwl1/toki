@@ -6,7 +6,7 @@
   |------|-------------------|---------|
   | 언어 | Rust (Edition 2021) | TypeScript (Node.js/Bun) |
   | 실행 모델 | Watch mode (상주 프로세스) | Batch CLI (실행→집계→종료) |
-  | DB/상태 저장 | redb (embedded ACID DB) | 없음 (stateless) |
+  | DB/상태 저장 | fjall (embedded LSM-tree DB) | 없음 (stateless) |
   | 증분 처리 | 체크포인트 기반 resume | 없음 (매번 전체 재스캔) |
   | 중복 제거 | xxHash3-64 line hash | messageId:requestId Set |
 
@@ -22,7 +22,7 @@
   | 파싱 | 병렬 scoped threads (CPU수 제한) | 순차 stream readline |
   | JSON 파싱 | serde_json (~2-5µs/line) | JSON.parse + Valibot validation (~10-30µs/line) |
   | 집계 | HashMap accumulate O(1)/event | groupBy → aggregateByModel O(N) |
-  | 체크포인트 저장 | redb batch write ~200ms | 없음 |
+  | 체크포인트 저장 | fjall batch write ~200ms | 없음 |
   | **예상 총 소요** | **~2-6초** | **~5-15초** |
 
   ### 왜 차이가 나는가
@@ -112,8 +112,8 @@
   | 메모리 효율 | O(F) 체크포인트만 유지 | O(N) 전체 entry 메모리 적재 |
   | 바이너리 크기 | ~2-5MB (네이티브) | ~수백 KB + Node.js 런타임 |
   | 배포 용이성 | 단일 바이너리 | npm/bun install |
-  | 기능 풍부성 | 실시간 모니터링 특화 | daily/weekly/monthly/session/blocks 다양한 뷰 |
-  | 가격 계산 | 없음 | LiteLLM 연동 (online/offline) |
+  | 기능 풍부성 | 실시간 모니터링 + TSDB 기반 리포트 | daily/weekly/monthly/session/blocks 다양한 뷰 |
+  | 가격 계산 | LiteLLM 연동 (ETag 캐싱) | LiteLLM 연동 (online/offline) |
   | 확장성 | 다른 provider 인터페이스 (Gemini, Codex) | 별도 앱으로 분리 (codex, opencode 등) |
 
   ---

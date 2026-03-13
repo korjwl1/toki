@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// A single usage event extracted from a JSONL log line.
@@ -24,6 +25,23 @@ pub struct UsageEventWithTs {
     pub cache_read_input_tokens: u64,
     pub output_tokens: u64,
     pub timestamp: String,
+}
+
+impl UsageEventWithTs {
+    /// Convert to UsageEvent, consuming self to avoid cloning strings.
+    pub fn into_usage_event(self) -> (UsageEvent, String) {
+        let ts = self.timestamp;
+        let event = UsageEvent {
+            event_key: self.event_key,
+            source_file: self.source_file,
+            model: self.model,
+            input_tokens: self.input_tokens,
+            cache_creation_input_tokens: self.cache_creation_input_tokens,
+            cache_read_input_tokens: self.cache_read_input_tokens,
+            output_tokens: self.output_tokens,
+        };
+        (event, ts)
+    }
 }
 
 /// File checkpoint for incremental reading.
@@ -65,6 +83,42 @@ impl ModelUsageSummary {
     }
 }
 
+/// A stored event in the TSDB (events keyspace).
+/// Uses dictionary-compressed IDs for repeated strings (model, session, source_file).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredEvent {
+    pub model_id: u32,
+    pub session_id: u32,
+    pub source_file_id: u32,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+}
+
+/// Hourly rollup aggregation per model (rollups keyspace).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RollupValue {
+    pub input: u64,
+    pub output: u64,
+    pub cache_create: u64,
+    pub cache_read: u64,
+    pub count: u64,
+}
+
+/// Token fields for DbOp::WriteEvent.
+#[derive(Debug, Clone)]
+pub struct TokenFields {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+}
+
+/// Result from TSDB queries.
+pub type SummaryMap = HashMap<String, ModelUsageSummary>;
+pub type GroupedSummaryMap = HashMap<String, HashMap<String, ModelUsageSummary>>;
+
 /// A session group: parent JSONL + subagent JSONLs.
 #[derive(Debug, Clone)]
 pub struct SessionGroup {
@@ -88,7 +142,7 @@ pub trait LogParserWithTs: Send + Sync {
 /// Clitrace error types.
 #[derive(Debug)]
 pub enum ClitraceError {
-    Db(redb::Error),
+    Db(fjall::Error),
     Io(std::io::Error),
     Watcher(notify::Error),
 }
@@ -105,8 +159,8 @@ impl std::fmt::Display for ClitraceError {
 
 impl std::error::Error for ClitraceError {}
 
-impl From<redb::Error> for ClitraceError {
-    fn from(e: redb::Error) -> Self {
+impl From<fjall::Error> for ClitraceError {
+    fn from(e: fjall::Error) -> Self {
         ClitraceError::Db(e)
     }
 }
