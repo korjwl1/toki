@@ -2,26 +2,17 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::db::Database;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RetentionPolicy {
     pub event_retention_days: u32,
     pub rollup_retention_days: u32,
 }
 
-impl Default for RetentionPolicy {
-    fn default() -> Self {
-        RetentionPolicy {
-            event_retention_days: 90,
-            rollup_retention_days: 365,
-        }
-    }
-}
+// Default: all zeros (disabled). Derive is sufficient.
 
 pub struct RetentionStats {
     pub events_deleted: u64,
     pub rollups_deleted: u64,
-    pub sessions_deleted: u64,
-    pub projects_deleted: u64,
     pub elapsed: Duration,
 }
 
@@ -33,8 +24,6 @@ pub fn run_retention(db: &Database, policy: &RetentionPolicy) -> Result<Retentio
         return Ok(RetentionStats {
             events_deleted: 0,
             rollups_deleted: 0,
-            sessions_deleted: 0,
-            projects_deleted: 0,
             elapsed: t.elapsed(),
         });
     }
@@ -64,8 +53,6 @@ pub fn run_retention(db: &Database, policy: &RetentionPolicy) -> Result<Retentio
     Ok(RetentionStats {
         events_deleted,
         rollups_deleted,
-        sessions_deleted: 0,
-        projects_deleted: 0,
         elapsed: t.elapsed(),
     })
 }

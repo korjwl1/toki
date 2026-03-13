@@ -27,14 +27,17 @@ impl PrintSink {
 
 fn format_number(n: u64) -> String {
     let s = n.to_string();
-    let mut result = String::new();
-    for (i, c) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let commas = if len > 0 { (len - 1) / 3 } else { 0 };
+    let mut result = String::with_capacity(len + commas);
+    for (i, &b) in bytes.iter().enumerate() {
+        if i > 0 && (len - i).is_multiple_of(3) {
             result.push(',');
         }
-        result.push(c);
+        result.push(b as char);
     }
-    result.chars().rev().collect()
+    result
 }
 
 impl Sink for PrintSink {
@@ -144,7 +147,7 @@ impl Sink for PrintSink {
 
         let is_session = type_name == "session";
         let show_cost = pricing.is_some_and(|p| !p.is_empty());
-        let mut buckets: Vec<_> = grouped.keys().cloned().collect();
+        let mut buckets: Vec<&String> = grouped.keys().collect();
         buckets.sort();
 
         let header_label = if is_session { "Session" } else { "Period" };
@@ -174,14 +177,14 @@ impl Sink for PrintSink {
         let mut grand_cost = 0.0f64;
 
         for bucket in &buckets {
-            if let Some(models) = grouped.get(bucket) {
+            if let Some(models) = grouped.get(bucket.as_str()) {
                 let mut sorted: Vec<_> = models.values().collect();
                 sorted.sort_by(|a, b| b.event_count.cmp(&a.event_count));
 
                 for (i, s) in sorted.iter().enumerate() {
                     let total = s.input_tokens + s.output_tokens + s.cache_creation_input_tokens + s.cache_read_input_tokens;
                     let cost = pricing.and_then(|p| p.summary_cost(s));
-                    let display_key = if is_session { shorten_id(bucket).to_string() } else { bucket.clone() };
+                    let display_key = if is_session { shorten_id(bucket).to_string() } else { bucket.to_string() };
                     let period_cell = if i == 0 {
                         Cell::new(&display_key)
                     } else {

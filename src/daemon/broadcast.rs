@@ -19,6 +19,12 @@ pub struct BroadcastSink {
     clients: Mutex<Vec<ClientConn>>,
 }
 
+impl Default for BroadcastSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl BroadcastSink {
     pub fn new() -> Self {
         BroadcastSink {

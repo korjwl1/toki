@@ -38,11 +38,11 @@ pub(crate) fn grouped_to_json(
     let is_session = type_name == "session";
     let json_key = if is_session { "session" } else { "period" };
 
-    let mut buckets: Vec<_> = grouped.keys().cloned().collect();
+    let mut buckets: Vec<&String> = grouped.keys().collect();
     buckets.sort();
 
     let data: Vec<_> = buckets.iter().filter_map(|bucket| {
-        grouped.get(bucket).map(|models| {
+        grouped.get(bucket.as_str()).map(|models| {
             let mut sorted: Vec<_> = models.values().collect();
             sorted.sort_by(|a, b| b.event_count.cmp(&a.event_count));
             let usage: Vec<_> = sorted.iter().map(|s| summary_to_json(s, pricing)).collect();

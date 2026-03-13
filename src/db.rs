@@ -200,7 +200,7 @@ impl Database {
         let mut map = HashMap::new();
         for guard in self.dict.iter() {
             let kv = guard.into_inner()?;
-            let key = String::from_utf8_lossy(&kv.0).to_string();
+            let key = String::from_utf8_lossy(&kv.0).into_owned();
             if let Ok(id) = bincode::deserialize::<u32>(&kv.1) {
                 map.insert(id, key);
             }
@@ -213,7 +213,7 @@ impl Database {
         let mut map = HashMap::new();
         for guard in self.dict.iter() {
             let kv = guard.into_inner()?;
-            let key = String::from_utf8_lossy(&kv.0).to_string();
+            let key = String::from_utf8_lossy(&kv.0).into_owned();
             if let Ok(id) = bincode::deserialize::<u32>(&kv.1) {
                 map.insert(key, id);
             }
@@ -234,7 +234,7 @@ impl Database {
             if key.len() < 8 { continue; }
             let ts = i64::from_be_bytes(key[..8].try_into().unwrap());
             if ts > until_ms { break; }
-            let msg_id = String::from_utf8_lossy(&key[8..]).to_string();
+            let msg_id = String::from_utf8_lossy(&key[8..]).into_owned();
             if let Ok(event) = bincode::deserialize::<StoredEvent>(&kv.1) {
                 results.push((ts, msg_id, event));
             }
@@ -260,7 +260,7 @@ impl Database {
             if key.len() < 8 { continue; }
             let ts = i64::from_be_bytes(key[..8].try_into().unwrap());
             if ts > until_ms { break; }
-            let model = String::from_utf8_lossy(&key[8..]).to_string();
+            let model = String::from_utf8_lossy(&key[8..]).into_owned();
             if let Ok(rollup) = bincode::deserialize::<RollupValue>(&kv.1) {
                 f(ts, model, rollup);
             }

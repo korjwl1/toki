@@ -72,12 +72,12 @@ impl Drop for Handle {
 /// Returns a Handle to control the running instance.
 pub fn start(config: Config, startup_group_by: Option<ReportGroupBy>, sink: Box<dyn Sink>) -> Result<Handle, ClitraceError> {
     // 1. Open DB and load checkpoints before spawning writer thread
-    let db = Database::open(&config.db_path).map_err(|e| ClitraceError::Db(e.into()))?;
+    let db = Database::open(&config.db_path).map_err(ClitraceError::Db)?;
 
     // Full rescan: clear checkpoints.
     if config.full_rescan {
         eprintln!("[clitrace] Full rescan requested — clearing all checkpoints");
-        db.clear_checkpoints().map_err(|e| ClitraceError::Db(e.into()))?;
+        db.clear_checkpoints().map_err(ClitraceError::Db)?;
     }
 
     // Fetch/load pricing
@@ -90,7 +90,7 @@ pub fn start(config: Config, startup_group_by: Option<ReportGroupBy>, sink: Box<
 
     // Load checkpoints into memory
     let checkpoints: HashMap<String, common::types::FileCheckpoint> = db.load_all_checkpoints()
-        .map_err(|e| ClitraceError::Db(e.into()))?
+        .map_err(ClitraceError::Db)?
         .into_iter()
         .map(|cp| (cp.file_path.clone(), cp))
         .collect();

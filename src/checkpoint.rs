@@ -49,11 +49,10 @@ pub fn find_resume_offset(path: &str, cp: &FileCheckpoint) -> std::io::Result<Op
                 None => 0,
             };
             let trailing = &buf[trailing_start..];
-            if !trailing.is_empty() && trailing.len() as u64 == cp.last_line_len {
-                if hash_line(trailing) == cp.last_line_hash {
+            if !trailing.is_empty() && trailing.len() as u64 == cp.last_line_len
+                && hash_line(trailing) == cp.last_line_hash {
                     return Ok(Some(file_size));
                 }
-            }
         }
     }
 
@@ -89,21 +88,18 @@ pub fn find_resume_offset(path: &str, cp: &FileCheckpoint) -> std::io::Result<Op
                 fragment.clear();
                 fragment_consumed = true;
 
-                if !full_line.is_empty() && full_line.len() as u64 == cp.last_line_len {
-                    if hash_line(&full_line) == cp.last_line_hash {
+                if !full_line.is_empty() && full_line.len() as u64 == cp.last_line_len
+                    && hash_line(&full_line) == cp.last_line_hash {
                         return Ok(Some(fragment_resume));
                     }
-                }
             } else {
                 // Complete line entirely within this chunk.
                 if !content_in_buf.is_empty()
                     && content_in_buf.len() as u64 == cp.last_line_len
-                {
-                    if hash_line(content_in_buf) == cp.last_line_hash {
+                    && hash_line(content_in_buf) == cp.last_line_hash {
                         // \n terminating this line is at buf_slice[line_end] (file pos read_start + line_end).
                         return Ok(Some(read_start + line_end as u64 + 1));
                     }
-                }
             }
 
             line_end = i;
@@ -128,11 +124,10 @@ pub fn find_resume_offset(path: &str, cp: &FileCheckpoint) -> std::io::Result<Op
     }
 
     // Check the very first line of the file (no preceding \n).
-    if !fragment.is_empty() && fragment.len() as u64 == cp.last_line_len {
-        if hash_line(&fragment) == cp.last_line_hash {
+    if !fragment.is_empty() && fragment.len() as u64 == cp.last_line_len
+        && hash_line(&fragment) == cp.last_line_hash {
             return Ok(Some(fragment_resume));
         }
-    }
 
     // Line not found — compacted away entirely.
     Ok(None)

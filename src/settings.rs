@@ -149,12 +149,11 @@ fn save_settings(siv: &mut Cursive, db_path: &Path) {
     }).unwrap_or(false);
 
     // Validate timezone
-    if !timezone.is_empty() {
-        if timezone.parse::<chrono_tz::Tz>().is_err() {
+    if !timezone.is_empty()
+        && timezone.parse::<chrono_tz::Tz>().is_err() {
             siv.add_layer(Dialog::info(format!("Invalid timezone: {}", timezone)));
             return;
         }
-    }
 
     // Validate retention days
     if retention.parse::<u32>().is_err() {

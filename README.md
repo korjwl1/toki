@@ -191,7 +191,7 @@ clitrace trace --sink print --sink http://localhost:8080/events
 └── src/
     ├── lib.rs                             # Public API: start(), Handle
     ├── main.rs                            # CLI 바이너리 (clap)
-    ├── config.rs                          # Config + 환경변수/DB 우선순위
+    ├── config.rs                          # Config + DB settings 우선순위
     ├── db.rs                              # fjall 래퍼 (7 keyspaces)
     ├── engine.rs                          # TrackerEngine: cold_start + watch_loop
     ├── writer.rs                          # DB writer thread (DbOp channel)

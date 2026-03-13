@@ -167,6 +167,7 @@ impl ReportGroupBy {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[derive(Default)]
 pub struct ReportFilter {
     pub since: Option<NaiveDateTime>,
     pub until: Option<NaiveDateTime>,
@@ -174,11 +175,6 @@ pub struct ReportFilter {
     pub tz: Option<Tz>,
 }
 
-impl Default for ReportFilter {
-    fn default() -> Self {
-        ReportFilter { since: None, until: None, tz: None }
-    }
-}
 
 pub fn cold_start_report_grouped<P>(
     parser: &P,
@@ -208,7 +204,7 @@ where
         let _ = process_lines_streaming(path, offset, |line| {
             if let Some(event) = parser.parse_line_with_ts(line, path) {
                 if let Some(bucket) = bucket_from_timestamp_filtered(&event.timestamp, group_by, filter) {
-                    let by_model = local.entry(bucket).or_insert_with(HashMap::new);
+                    let by_model = local.entry(bucket).or_default();
                     let summary = by_model.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
                         model: event.model.clone(),
                         ..Default::default()
@@ -329,7 +325,7 @@ where
         });
         if !local.is_empty() {
             let mut g = grouped.lock().unwrap_or_else(|e| e.into_inner());
-            let session_models = g.entry(session_id).or_insert_with(HashMap::new);
+            let session_models = g.entry(session_id).or_default();
             merge_summaries(session_models, local);
         }
     });
@@ -519,7 +515,7 @@ impl TrackerEngine {
             let result = process_lines_streaming(path, offset, |line| {
                 if let Some(event) = parser.parse_line_with_ts(line, path) {
                     if let Some(bucket) = bucket_from_timestamp_filtered(&event.timestamp, group_by, filter) {
-                        let by_model = local.entry(bucket).or_insert_with(HashMap::new);
+                        let by_model = local.entry(bucket).or_default();
                         let summary = by_model.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
                             model: event.model.clone(),
                             ..Default::default()
@@ -589,8 +585,8 @@ impl TrackerEngine {
     {
         let now = Instant::now();
 
-        let (state, cooldown) = match self.activity.get(path) {
-            None => (FileState::Active, ACTIVE_COOLDOWN),
+        let state = match self.activity.get(path) {
+            None => FileState::Active,
             Some(act) => {
                 let mut s = act.state;
                 if s == FileState::Active && now.duration_since(act.last_active) > IDLE_TRANSITION {
@@ -599,15 +595,13 @@ impl TrackerEngine {
                         path, now.duration_since(act.last_active).as_secs());
                 }
                 let cd = if s == FileState::Active { ACTIVE_COOLDOWN } else { IDLE_COOLDOWN };
-                (s, cd)
+                // Cooldown check: skip if checked too recently
+                if now.duration_since(act.last_checked) < cd {
+                    return Ok(Vec::new());
+                }
+                s
             }
         };
-
-        if let Some(act) = self.activity.get(path) {
-            if now.duration_since(act.last_checked) < cooldown {
-                return Ok(Vec::new());
-            }
-        }
 
         let t_total = Instant::now();
 
@@ -754,7 +748,7 @@ impl TrackerEngine {
     }
 
     /// Watch loop: receive file change events, process incrementally,
-    /// Watch loop: receive file change events, flush dirty checkpoints periodically.
+    /// flush dirty checkpoints periodically.
     /// Graceful shutdown: flushes remaining dirty checkpoints before exiting.
     pub fn watch_loop<P>(
         &mut self,
@@ -819,11 +813,11 @@ fn merge_summaries(
             model,
             ..Default::default()
         });
-        gs.input_tokens += ls.input_tokens;
-        gs.cache_creation_input_tokens += ls.cache_creation_input_tokens;
-        gs.cache_read_input_tokens += ls.cache_read_input_tokens;
-        gs.output_tokens += ls.output_tokens;
-        gs.event_count += ls.event_count;
+        gs.input_tokens = gs.input_tokens.saturating_add(ls.input_tokens);
+        gs.cache_creation_input_tokens = gs.cache_creation_input_tokens.saturating_add(ls.cache_creation_input_tokens);
+        gs.cache_read_input_tokens = gs.cache_read_input_tokens.saturating_add(ls.cache_read_input_tokens);
+        gs.output_tokens = gs.output_tokens.saturating_add(ls.output_tokens);
+        gs.event_count = gs.event_count.saturating_add(ls.event_count);
     }
 }
 
@@ -833,7 +827,7 @@ fn merge_grouped(
     local: HashMap<String, HashMap<String, ModelUsageSummary>>,
 ) {
     for (bucket, local_models) in local {
-        let global_models = global.entry(bucket).or_insert_with(HashMap::new);
+        let global_models = global.entry(bucket).or_default();
         merge_summaries(global_models, local_models);
     }
 }

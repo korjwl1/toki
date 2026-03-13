@@ -219,13 +219,14 @@ fn build_config(db_path: Option<PathBuf>, cli_tz: Option<Tz>, cli_no_cost: bool,
     config
 }
 
-fn acquire_trace_lock(db_path: &PathBuf) -> std::io::Result<std::fs::File> {
+fn acquire_trace_lock(db_path: &std::path::Path) -> std::io::Result<std::fs::File> {
     let lock_path = db_path.with_extension("lock");
     if let Some(parent) = lock_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let file = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)?;
@@ -550,7 +551,7 @@ fn handle_report(
     };
     let pricing_ref = pricing.as_ref();
 
-    let use_tsdb = db.as_ref().map_or(false, clitrace::query::has_tsdb_data);
+    let use_tsdb = db.as_ref().is_some_and(clitrace::query::has_tsdb_data);
 
     let parser = clitrace::providers::claude_code::ClaudeCodeParser;
     let session_filter = session_id.as_deref();
@@ -617,7 +618,7 @@ fn handle_report(
         ReportCommands::Daily { filter } => (filter.clone(), clitrace::engine::ReportGroupBy::Date),
         ReportCommands::Weekly { start_of_week, filter } => {
             let start = start_of_week.as_deref()
-                .map(|s| parse_weekday(s))
+                .map(parse_weekday)
                 .unwrap_or(config.start_of_week);
             (filter.clone(), clitrace::engine::ReportGroupBy::Week { start_of_week: start })
         }

@@ -67,19 +67,19 @@ pub struct ModelUsageSummary {
 
 impl ModelUsageSummary {
     pub fn accumulate(&mut self, event: &UsageEvent) {
-        self.input_tokens += event.input_tokens;
-        self.cache_creation_input_tokens += event.cache_creation_input_tokens;
-        self.cache_read_input_tokens += event.cache_read_input_tokens;
-        self.output_tokens += event.output_tokens;
-        self.event_count += 1;
+        self.input_tokens = self.input_tokens.saturating_add(event.input_tokens);
+        self.cache_creation_input_tokens = self.cache_creation_input_tokens.saturating_add(event.cache_creation_input_tokens);
+        self.cache_read_input_tokens = self.cache_read_input_tokens.saturating_add(event.cache_read_input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(event.output_tokens);
+        self.event_count = self.event_count.saturating_add(1);
     }
 
     pub fn accumulate_with_ts(&mut self, event: &UsageEventWithTs) {
-        self.input_tokens += event.input_tokens;
-        self.cache_creation_input_tokens += event.cache_creation_input_tokens;
-        self.cache_read_input_tokens += event.cache_read_input_tokens;
-        self.output_tokens += event.output_tokens;
-        self.event_count += 1;
+        self.input_tokens = self.input_tokens.saturating_add(event.input_tokens);
+        self.cache_creation_input_tokens = self.cache_creation_input_tokens.saturating_add(event.cache_creation_input_tokens);
+        self.cache_read_input_tokens = self.cache_read_input_tokens.saturating_add(event.cache_read_input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(event.output_tokens);
+        self.event_count = self.event_count.saturating_add(1);
     }
 }
 
