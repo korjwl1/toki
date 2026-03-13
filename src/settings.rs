@@ -2,9 +2,12 @@ use std::path::Path;
 
 use cursive::Cursive;
 use cursive::event::Key;
+use cursive::theme::{BaseColor, BorderStyle, Color, ColorStyle, ColorType, PaletteColor, Theme};
 use cursive::traits::*;
+use cursive::utils::markup::StyledString;
+use cursive::view::Margins;
 use cursive::views::{
-    Checkbox, Dialog, EditView, LinearLayout, SelectView, TextView,
+    Checkbox, Dialog, EditView, LinearLayout, Panel, SelectView, TextView,
     DummyView, PaddedView,
 };
 
@@ -41,6 +44,78 @@ impl SettingsState {
     }
 }
 
+fn build_theme() -> Theme {
+    let mut theme = Theme::terminal_default();
+    theme.shadow = false;
+    theme.borders = BorderStyle::Simple;
+
+    // Dark background, clean foreground
+    theme.palette[PaletteColor::Background] = Color::TerminalDefault;
+    theme.palette[PaletteColor::View] = Color::TerminalDefault;
+    theme.palette[PaletteColor::Primary] = Color::Light(BaseColor::White);
+    theme.palette[PaletteColor::Secondary] = Color::Dark(BaseColor::White);
+    theme.palette[PaletteColor::Tertiary] = Color::Dark(BaseColor::White);
+
+    // Titles: cyan accent
+    theme.palette[PaletteColor::TitlePrimary] = Color::Light(BaseColor::Cyan);
+    theme.palette[PaletteColor::TitleSecondary] = Color::Dark(BaseColor::Cyan);
+
+    // Highlight: cyan bg, black text
+    theme.palette[PaletteColor::Highlight] = Color::Dark(BaseColor::Cyan);
+    theme.palette[PaletteColor::HighlightInactive] = Color::Dark(BaseColor::White);
+    theme.palette[PaletteColor::HighlightText] = Color::Dark(BaseColor::Black);
+
+    theme
+}
+
+/// Styled field label (bright)
+fn field_label(text: &str) -> TextView {
+    let mut s = StyledString::new();
+    s.append_styled(text, ColorStyle::new(
+        ColorType::Color(Color::Light(BaseColor::White)),
+        ColorType::InheritParent,
+    ));
+    TextView::new(s)
+}
+
+/// Styled hint text (dim)
+fn hint_text(text: &str) -> TextView {
+    let mut s = StyledString::new();
+    s.append_styled(text, ColorStyle::new(
+        ColorType::Color(Color::Dark(BaseColor::White)),
+        ColorType::InheritParent,
+    ));
+    TextView::new(s)
+}
+
+/// Build a labeled row: "Label:  [EditView]"
+fn labeled_edit(label: &str, value: &str, name: &str) -> LinearLayout {
+    LinearLayout::horizontal()
+        .child(field_label(&format!("{:<22}", label)))
+        .child(EditView::new().content(value).with_name(name).full_width())
+}
+
+/// Build a labeled row with popup SelectView
+fn labeled_select(label: &str, items: &[&str], current: &str, name: &str) -> LinearLayout {
+    let mut sv = SelectView::new().popup();
+    for &item in items {
+        sv.add_item(item, item.to_string());
+    }
+    let idx = items.iter().position(|&d| d == current).unwrap_or(0);
+    sv.set_selection(idx);
+
+    LinearLayout::horizontal()
+        .child(field_label(&format!("{:<22}", label)))
+        .child(sv.with_name(name))
+}
+
+/// Build a labeled row with checkbox
+fn labeled_checkbox(label: &str, checked: bool, name: &str) -> LinearLayout {
+    LinearLayout::horizontal()
+        .child(field_label(&format!("{:<22}", label)))
+        .child(Checkbox::new().with_checked(checked).with_name(name))
+}
+
 pub fn run_settings(db_path: &Path) {
     let db = match Database::open(db_path) {
         Ok(d) => d,
@@ -53,80 +128,94 @@ pub fn run_settings(db_path: &Path) {
     let state = SettingsState::load(&db);
 
     let mut siv = cursive::default();
+    siv.set_theme(build_theme());
 
-    // Build form
+    // -- Paths section --
+    let paths_section = LinearLayout::vertical()
+        .child(labeled_edit("Claude Code Root", &state.claude_code_root, "claude_code_root"))
+        .child(DummyView.fixed_height(1))
+        .child(labeled_edit("Daemon Socket", &state.daemon_sock, "daemon_sock"));
+
+    // -- Display section --
+    let display_section = LinearLayout::vertical()
+        .child(labeled_edit("Timezone", &state.timezone, "timezone"))
+        .child(hint_text("                        IANA format (e.g. Asia/Seoul), empty = UTC"))
+        .child(DummyView.fixed_height(1))
+        .child(labeled_select("Output Format", &["table", "json"], &state.output_format, "output_format"))
+        .child(DummyView.fixed_height(1))
+        .child(labeled_select("Start of Week", &["mon", "tue", "wed", "thu", "fri", "sat", "sun"], &state.start_of_week, "start_of_week"))
+        .child(DummyView.fixed_height(1))
+        .child(labeled_checkbox("Disable Cost", state.no_cost, "no_cost"));
+
+    // -- Data section --
+    let data_section = LinearLayout::vertical()
+        .child(labeled_edit("Event Retention", &state.retention_days, "retention_days"))
+        .child(hint_text("                        Days to keep events (0 = forever)"))
+        .child(DummyView.fixed_height(1))
+        .child(labeled_edit("Rollup Retention", &state.rollup_retention_days, "rollup_retention_days"))
+        .child(hint_text("                        Days to keep rollups (0 = forever)"));
+
+    // Assemble form with section panels
     let form = LinearLayout::vertical()
-        // Paths
-        .child(field_label("Claude Code Root"))
-        .child(EditView::new().content(&state.claude_code_root).with_name("claude_code_root").full_width())
-        .child(DummyView)
-        .child(field_label("Daemon Socket"))
-        .child(EditView::new().content(&state.daemon_sock).with_name("daemon_sock").full_width())
-        .child(DummyView)
-        // Timezone
-        .child(field_label("Timezone (IANA, empty=UTC)"))
-        .child(EditView::new().content(&state.timezone).with_name("timezone").full_width())
-        .child(DummyView)
-        // Output format
-        .child(field_label("Output Format"))
-        .child({
-            let mut sv = SelectView::new().popup();
-            sv.add_item("table", "table".to_string());
-            sv.add_item("json", "json".to_string());
-            let idx = if state.output_format == "json" { 1 } else { 0 };
-            sv.set_selection(idx);
-            sv.with_name("output_format")
-        })
-        .child(DummyView)
-        // Start of week
-        .child(field_label("Start of Week"))
-        .child({
-            let days = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
-            let mut sv = SelectView::new().popup();
-            for d in &days {
-                sv.add_item(*d, d.to_string());
-            }
-            let idx = days.iter().position(|&d| d == state.start_of_week).unwrap_or(0);
-            sv.set_selection(idx);
-            sv.with_name("start_of_week")
-        })
-        .child(DummyView)
-        // No cost
-        .child(
-            LinearLayout::horizontal()
-                .child(Checkbox::new().with_checked(state.no_cost).with_name("no_cost"))
-                .child(TextView::new("  Disable cost calculation"))
-        )
-        .child(DummyView)
-        // Retention
-        .child(field_label("Event Retention Days (0=disabled)"))
-        .child(EditView::new().content(&state.retention_days).with_name("retention_days").full_width())
-        .child(DummyView)
-        .child(field_label("Rollup Retention Days (0=disabled)"))
-        .child(EditView::new().content(&state.rollup_retention_days).with_name("rollup_retention_days").full_width());
+        .child(Panel::new(PaddedView::new(Margins::lrtb(1, 1, 0, 0), paths_section)).title("Paths"))
+        .child(DummyView.fixed_height(1))
+        .child(Panel::new(PaddedView::new(Margins::lrtb(1, 1, 0, 0), display_section)).title("Display"))
+        .child(DummyView.fixed_height(1))
+        .child(Panel::new(PaddedView::new(Margins::lrtb(1, 1, 0, 0), data_section)).title("Data"));
 
-    let padded = PaddedView::lrtb(2, 2, 1, 1, form);
+    let padded = PaddedView::lrtb(1, 1, 0, 0, form);
 
     let db_path_owned = db_path.to_path_buf();
 
+    // Footer hint
+    let footer = {
+        let mut s = StyledString::new();
+        s.append_styled("Tab", ColorStyle::new(
+            ColorType::Color(Color::Light(BaseColor::Cyan)),
+            ColorType::InheritParent,
+        ));
+        s.append_styled(" navigate  ", ColorStyle::new(
+            ColorType::Color(Color::Dark(BaseColor::White)),
+            ColorType::InheritParent,
+        ));
+        s.append_styled("Enter", ColorStyle::new(
+            ColorType::Color(Color::Light(BaseColor::Cyan)),
+            ColorType::InheritParent,
+        ));
+        s.append_styled(" select  ", ColorStyle::new(
+            ColorType::Color(Color::Dark(BaseColor::White)),
+            ColorType::InheritParent,
+        ));
+        s.append_styled("Esc", ColorStyle::new(
+            ColorType::Color(Color::Light(BaseColor::Cyan)),
+            ColorType::InheritParent,
+        ));
+        s.append_styled(" cancel", ColorStyle::new(
+            ColorType::Color(Color::Dark(BaseColor::White)),
+            ColorType::InheritParent,
+        ));
+        TextView::new(s)
+    };
+
+    let main_layout = LinearLayout::vertical()
+        .child(padded)
+        .child(DummyView.fixed_height(1))
+        .child(PaddedView::lrtb(2, 0, 0, 0, footer));
+
     siv.add_layer(
-        Dialog::around(padded)
-            .title("clitrace Settings")
+        Dialog::around(main_layout)
+            .title("clitrace settings")
             .button("Save", move |s| {
                 save_settings(s, &db_path_owned);
             })
             .button("Cancel", |s| s.quit())
-            .min_width(60)
+            .min_width(70)
     );
 
     // Esc to quit
     siv.add_global_callback(Key::Esc, |s| s.quit());
 
     siv.run();
-}
-
-fn field_label(text: &str) -> TextView {
-    TextView::new(text)
 }
 
 fn save_settings(siv: &mut Cursive, db_path: &Path) {
