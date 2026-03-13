@@ -482,7 +482,7 @@ fn handle_report(
     let pricing = if config.no_cost {
         None
     } else {
-        let p = toki::pricing::fetch_pricing(&db);
+        let (p, _etag) = toki::pricing::fetch_pricing(&db);
         if p.is_empty() { None } else { Some(p) }
     };
     let pricing_ref = pricing.as_ref();

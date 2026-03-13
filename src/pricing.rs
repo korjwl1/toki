@@ -116,26 +116,33 @@ struct LiteLLMEntry {
     cache_read_input_token_cost: Option<f64>,
 }
 
-/// Fetch pricing with ETag-based caching.
-/// Falls back to cached data on network errors. Returns empty table if no cache available.
-pub fn fetch_pricing(db: &Database) -> PricingTable {
-    let cached_etag = db.get_setting("pricing_etag").ok().flatten();
-    let cached_data = db.get_setting("pricing_data").ok().flatten();
+/// Result of an HTTP pricing refresh attempt.
+pub enum PricingRefreshResult {
+    /// Data unchanged (304), keep existing table.
+    NotModified,
+    /// New data fetched. Contains (table, new_etag, serialized cache JSON).
+    Updated {
+        table: PricingTable,
+        etag: Option<String>,
+        cache_json: String,
+    },
+    /// Network or parse error, keep existing table.
+    Failed,
+}
 
+/// Fetch pricing via HTTP with optional ETag for conditional request.
+/// Does NOT access DB — caller is responsible for caching.
+pub fn fetch_pricing_http(cached_etag: Option<&str>) -> PricingRefreshResult {
     let mut req = ureq::get(LITELLM_URL);
-    if let Some(ref etag) = cached_etag {
+    if let Some(etag) = cached_etag {
         req = req.set("If-None-Match", etag);
     }
 
     match req.call() {
         Ok(resp) => {
             if resp.status() == 304 {
-                if let Some(ref data) = cached_data {
-                    let prices: HashMap<String, ModelPricing> =
-                        serde_json::from_str(data).unwrap_or_default();
-                    eprintln!("[toki] Pricing: cached (not modified), {} models", prices.len());
-                    return PricingTable::new(prices);
-                }
+                eprintln!("[toki] Pricing: not modified");
+                return PricingRefreshResult::NotModified;
             }
 
             let new_etag = resp.header("ETag").map(|s| s.to_string());
@@ -143,38 +150,56 @@ pub fn fetch_pricing(db: &Database) -> PricingTable {
                 Ok(b) => b,
                 Err(e) => {
                     eprintln!("[toki] Pricing: failed to read response body: {}", e);
-                    return fallback_cached(cached_data);
+                    return PricingRefreshResult::Failed;
                 }
             };
 
             let prices = parse_litellm_json(&body);
             if prices.is_empty() {
                 eprintln!("[toki] Pricing: no Claude models found in response");
-                return fallback_cached(cached_data);
+                return PricingRefreshResult::Failed;
             }
 
-            if let Ok(json) = serde_json::to_string(&prices) {
-                let _ = db.set_setting("pricing_data", &json);
-            }
-            if let Some(etag) = new_etag {
-                let _ = db.set_setting("pricing_etag", &etag);
-            }
-
+            let cache_json = serde_json::to_string(&prices).unwrap_or_default();
             eprintln!("[toki] Pricing: updated, {} models", prices.len());
-            PricingTable::new(prices)
+            PricingRefreshResult::Updated {
+                table: PricingTable::new(prices),
+                etag: new_etag,
+                cache_json,
+            }
         }
         Err(ureq::Error::Status(304, _)) => {
-            if let Some(ref data) = cached_data {
-                let prices: HashMap<String, ModelPricing> =
-                    serde_json::from_str(data).unwrap_or_default();
-                eprintln!("[toki] Pricing: cached (not modified), {} models", prices.len());
-                return PricingTable::new(prices);
-            }
-            PricingTable::new(HashMap::new())
+            eprintln!("[toki] Pricing: not modified");
+            PricingRefreshResult::NotModified
         }
         Err(e) => {
-            eprintln!("[toki] Pricing: network error ({}), using cache", e);
-            fallback_cached(cached_data)
+            eprintln!("[toki] Pricing: network error ({})", e);
+            PricingRefreshResult::Failed
+        }
+    }
+}
+
+/// Fetch pricing with ETag-based caching (initial startup, uses DB).
+/// Falls back to cached data on network errors. Returns empty table if no cache available.
+pub fn fetch_pricing(db: &Database) -> (PricingTable, Option<String>) {
+    let cached_etag = db.get_setting("pricing_etag").ok().flatten();
+    let cached_data = db.get_setting("pricing_data").ok().flatten();
+
+    match fetch_pricing_http(cached_etag.as_deref()) {
+        PricingRefreshResult::NotModified => {
+            let table = fallback_cached(cached_data);
+            (table, cached_etag)
+        }
+        PricingRefreshResult::Updated { table, etag, cache_json } => {
+            let _ = db.set_setting("pricing_data", &cache_json);
+            if let Some(ref e) = etag {
+                let _ = db.set_setting("pricing_etag", e);
+            }
+            (table, etag)
+        }
+        PricingRefreshResult::Failed => {
+            let table = fallback_cached(cached_data);
+            (table, cached_etag)
         }
     }
 }

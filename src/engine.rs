@@ -82,6 +82,10 @@ pub struct TrackerEngine {
     tz: Option<Tz>,
     /// Pricing table for cost calculation.
     pricing: Option<PricingTable>,
+    /// Cached ETag for conditional pricing refresh.
+    pricing_etag: Option<String>,
+    /// Whether cost calculation is disabled.
+    no_cost: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -126,6 +130,8 @@ impl TrackerEngine {
             sink: Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)),
             tz: None,
             pricing: None,
+            pricing_etag: None,
+            no_cost: false,
         }
     }
 
@@ -139,8 +145,10 @@ impl TrackerEngine {
         self
     }
 
-    pub fn with_pricing(mut self, pricing: Option<PricingTable>) -> Self {
+    pub fn with_pricing(mut self, pricing: Option<PricingTable>, etag: Option<String>, no_cost: bool) -> Self {
         self.pricing = pricing;
+        self.pricing_etag = etag;
+        self.no_cost = no_cost;
         self
     }
 
@@ -196,7 +204,9 @@ impl TrackerEngine {
                                 cache_read_input_tokens: event.cache_read_input_tokens,
                             },
                         };
-                        let _ = db_tx.send(op);
+                        if db_tx.send(op).is_err() {
+                            eprintln!("[toki] Writer channel disconnected, events may be lost");
+                        }
                     }
                 }
             });
@@ -410,6 +420,28 @@ impl TrackerEngine {
     /// Watch loop: receive file change events, process incrementally,
     /// flush dirty checkpoints periodically.
     /// Graceful shutdown: flushes remaining dirty checkpoints before exiting.
+    /// Refresh pricing table via HTTP (24h periodic).
+    fn refresh_pricing(&mut self) {
+        if self.no_cost {
+            return;
+        }
+        use crate::pricing::{fetch_pricing_http, PricingRefreshResult};
+        match fetch_pricing_http(self.pricing_etag.as_deref()) {
+            PricingRefreshResult::NotModified => {}
+            PricingRefreshResult::Updated { table, etag, cache_json } => {
+                self.pricing = Some(table);
+                self.pricing_etag = etag.clone();
+                if self.db_tx.try_send(DbOp::CachePricing {
+                    etag,
+                    data: cache_json,
+                }).is_err() {
+                    eprintln!("[toki] Pricing cache persistence failed, will re-download on next refresh");
+                }
+            }
+            PricingRefreshResult::Failed => {}
+        }
+    }
+
     pub fn watch_loop<P>(
         &mut self,
         event_rx: Receiver<String>,
@@ -420,6 +452,7 @@ impl TrackerEngine {
         P: LogParser + LogParserWithTs,
     {
         let flush_tick = crossbeam_channel::tick(FLUSH_INTERVAL);
+        let pricing_tick = crossbeam_channel::tick(Duration::from_secs(86400));
 
         loop {
             crossbeam_channel::select! {
@@ -450,6 +483,9 @@ impl TrackerEngine {
                 }
                 recv(flush_tick) -> _ => {
                     self.flush_dirty();
+                }
+                recv(pricing_tick) -> _ => {
+                    self.refresh_pricing();
                 }
             }
         }
