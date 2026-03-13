@@ -44,7 +44,7 @@ impl Sink for PrintSink {
     fn emit_summary(&self, summaries: &HashMap<String, ModelUsageSummary>, pricing: Option<&PricingTable>) {
         if summaries.is_empty() {
             if self.format == OutputFormat::Json {
-                println!("{}", serde_json::to_string_pretty(&json::summaries_to_json(summaries, pricing)).unwrap());
+                println!("{}", serde_json::to_string_pretty(&json::summaries_to_json(summaries, pricing)).unwrap_or_default());
             } else {
                 println!("[toki] No usage data found.");
             }
@@ -52,7 +52,7 @@ impl Sink for PrintSink {
         }
 
         if self.format == OutputFormat::Json {
-            println!("{}", serde_json::to_string_pretty(&json::summaries_to_json(summaries, pricing)).unwrap());
+            println!("{}", serde_json::to_string_pretty(&json::summaries_to_json(summaries, pricing)).unwrap_or_default());
             return;
         }
 
@@ -133,7 +133,7 @@ impl Sink for PrintSink {
     fn emit_grouped(&self, grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>, type_name: &str, pricing: Option<&PricingTable>) {
         if grouped.is_empty() {
             if self.format == OutputFormat::Json {
-                println!("{}", serde_json::to_string_pretty(&json::grouped_to_json(grouped, type_name, pricing)).unwrap());
+                println!("{}", serde_json::to_string_pretty(&json::grouped_to_json(grouped, type_name, pricing)).unwrap_or_default());
             } else {
                 println!("[toki] No usage data found.");
             }
@@ -141,7 +141,7 @@ impl Sink for PrintSink {
         }
 
         if self.format == OutputFormat::Json {
-            println!("{}", serde_json::to_string_pretty(&json::grouped_to_json(grouped, type_name, pricing)).unwrap());
+            println!("{}", serde_json::to_string_pretty(&json::grouped_to_json(grouped, type_name, pricing)).unwrap_or_default());
             return;
         }
 
@@ -241,7 +241,7 @@ impl Sink for PrintSink {
                 "type": type_name,
                 "items": items,
             });
-            println!("{}", serde_json::to_string_pretty(&json).unwrap());
+            println!("{}", serde_json::to_string_pretty(&json).unwrap_or_default());
             return;
         }
 
@@ -267,7 +267,7 @@ impl Sink for PrintSink {
     fn emit_event(&self, event: &UsageEvent, pricing: Option<&PricingTable>) {
         if self.format == OutputFormat::Json {
             let json = json::event_to_json(event, pricing);
-            println!("{}", serde_json::to_string(&json).unwrap());
+            println!("{}", serde_json::to_string(&json).unwrap_or_default());
             return;
         }
 

@@ -90,8 +90,8 @@ Database::open(read-only)
         No  → "No data in TSDB" 에러 → 데몬 시작 안내
 ```
 
-Report는 데몬과 독립적으로 DB를 직접 읽어 조회한다. Writer thread 불필요.
-데몬이 최소 1회 이상 실행되어 TSDB에 데이터가 수집된 상태여야 한다.
+Report는 DB를 직접 읽어 조회한다. Writer thread 불필요.
+데몬이 실행 중이어야 report를 사용할 수 있다 (PID 파일로 확인).
 
 ## Worker Thread
 
@@ -115,12 +115,16 @@ Report는 데몬과 독립적으로 DB를 직접 읽어 조회한다. Writer thr
 2. (db_tx, db_rx) = bounded(1024)
 3. Writer thread spawn (Database 소유권 이전)
 4. TrackerEngine::new(db_tx, checkpoints, BroadcastSink)
-5. Cold start: 전체 세션 파일 스캔 → TSDB에 이벤트 저장
+5. Cold start: 전체 세션 파일 스캔 → TSDB에 이벤트 저장 + 요약 출력
 6. Watcher + Worker thread spawn
 7. Write PID file
 8. Listener thread spawn (UDS accept loop)
 9. Wait for SIGTERM/SIGINT
 ```
+
+데몬은 옵션 없이 `toki daemon start`로 시작한다. 소켓 경로, Claude Code root 등 설정은
+`toki settings` TUI에서 관리하며 `toki daemon restart`로 반영한다.
+DB를 처음부터 다시 구축하려면 `toki daemon reset` 후 `toki daemon start`를 사용한다.
 
 ## Shutdown Sequence
 
@@ -199,7 +203,7 @@ discover_sessions()
         → db_tx.send(WriteEvent)     ← blocking send (데이터 무손실)
         → accumulate to local HashMap
     → merge summaries
-    → sink.emit_summary() / sink.emit_grouped()
+    → sink.emit_summary()
     → db_tx.send(FlushCheckpoints)
 ```
 
@@ -231,8 +235,12 @@ UnixStream::connect(daemon.sock)
 ### Report (one-shot 조회)
 
 ```
+daemon_status(pidfile)?
+    → None: "Cannot connect to toki daemon" → exit
+    → Some: continue
+
 DB open → has_any_rollups()? (O(1) 확인)
-    → No:  에러 출력 → "Start the daemon first"
+    → No:  "No data in TSDB" (cold start 진행 중일 수 있음)
     → Yes: 쿼리 실행
 ```
 
@@ -393,7 +401,7 @@ CLI 인자 > DB settings (toki settings) > 기본값
 |------|---------------|--------|--------|
 | Claude root | - | `claude_code_root` | `~/.claude` |
 | DB path | `--db-path` | - | `~/.config/toki/toki.fjall` |
-| Daemon sock | `--sock` | `daemon_sock` | `~/.config/toki/daemon.sock` |
+| Daemon sock | - | `daemon_sock` | `~/.config/toki/daemon.sock` |
 | Timezone | `-z` | `timezone` | (UTC) |
 | Output format | `--output-format` | `output_format` | `table` |
 | Start of week | `--start-of-week` | `start_of_week` | `mon` |

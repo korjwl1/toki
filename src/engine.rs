@@ -6,7 +6,7 @@ use crossbeam_channel::{Receiver, Sender};
 
 use crate::checkpoint::{find_resume_offset, process_lines_streaming};
 use crate::common::types::{FileCheckpoint, LogParser, LogParserWithTs, ModelUsageSummary, TokenFields};
-use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, TimeZone, Weekday};
+use chrono::{DateTime, NaiveDateTime, Weekday};
 use chrono_tz::Tz;
 use crate::pricing::PricingTable;
 use crate::sink::Sink;
@@ -78,10 +78,6 @@ pub struct TrackerEngine {
     dirty: HashSet<String>,
     /// Output sink (print, UDS, HTTP, or multi).
     sink: Box<dyn Sink>,
-    /// Optional session ID prefix filter for trace mode.
-    session_filter: Option<String>,
-    /// Optional project name filter for trace mode.
-    project_filter: Option<String>,
     /// Optional timezone for bucketing in startup grouping.
     tz: Option<Tz>,
     /// Pricing table for cost calculation.
@@ -128,8 +124,6 @@ impl TrackerEngine {
             activity: HashMap::new(),
             dirty: HashSet::new(),
             sink: Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)),
-            session_filter: None,
-            project_filter: None,
             tz: None,
             pricing: None,
         }
@@ -137,16 +131,6 @@ impl TrackerEngine {
 
     pub fn with_sink(mut self, sink: Box<dyn Sink>) -> Self {
         self.sink = sink;
-        self
-    }
-
-    pub fn with_session_filter(mut self, filter: Option<String>) -> Self {
-        self.session_filter = filter;
-        self
-    }
-
-    pub fn with_project_filter(mut self, filter: Option<String>) -> Self {
-        self.project_filter = filter;
         self
     }
 
@@ -160,24 +144,6 @@ impl TrackerEngine {
         self
     }
 
-    /// Check if a file path matches the configured session and project filters.
-    fn matches_filters(&self, path: &str) -> bool {
-        if let Some(ref prefix) = self.session_filter {
-            if let Some(sid) = extract_session_id(path) {
-                if !sid.starts_with(prefix.as_str()) {
-                    return false;
-                }
-            }
-        }
-        if let Some(ref project) = self.project_filter {
-            match extract_project_name(path) {
-                Some(name) if name.contains(project.as_str()) => {}
-                _ => return false,
-            }
-        }
-        true
-    }
-
     /// Cold start: discover all sessions, process them in parallel,
     /// aggregate by model, print summary, flush checkpoints, and populate TSDB.
     pub fn cold_start<P>(
@@ -189,7 +155,7 @@ impl TrackerEngine {
         P: LogParser + LogParserWithTs + Sync,
     {
         let t_cold = Instant::now();
-        let sessions = apply_filters(parser.discover_sessions(root_dir), None, self.project_filter.as_deref());
+        let sessions = parser.discover_sessions(root_dir);
 
         if sessions.is_empty() {
             debug_log!("cold_start — 0 sessions, 0 files ({}µs)", t_cold.elapsed().as_micros());
@@ -268,95 +234,6 @@ impl TrackerEngine {
         Ok(result_summaries)
     }
 
-    /// Cold start with time-bucket grouping (e.g. hourly/daily).
-    /// Streams events into buckets, saves checkpoints, and prints grouped summary.
-    pub fn cold_start_grouped<P>(
-        &mut self,
-        parser: &P,
-        root_dir: &str,
-        group_by: ReportGroupBy,
-    ) -> Result<(), Box<dyn std::error::Error>>
-    where
-        P: LogParser + LogParserWithTs + Sync,
-    {
-        let t_cold = Instant::now();
-        let sessions = parser.discover_sessions(root_dir);
-        if sessions.is_empty() {
-            self.sink.emit_grouped(&HashMap::new(), group_by.type_name(), self.pricing.as_ref());
-            debug_log!("cold_start_grouped — 0 sessions ({}µs)", t_cold.elapsed().as_micros());
-            return Ok(());
-        }
-
-        let grouped: Mutex<HashMap<String, HashMap<String, ModelUsageSummary>>> =
-            Mutex::new(HashMap::new());
-        let cp_batch: Mutex<Vec<FileCheckpoint>> = Mutex::new(Vec::new());
-        let filter = ReportFilter { tz: self.tz, ..Default::default() };
-
-        let db_tx = &self.db_tx;
-
-        parallel_scan(&sessions, &self.checkpoints, |path, offset| {
-            let mut local: HashMap<String, HashMap<String, ModelUsageSummary>> = HashMap::new();
-            let session_id = extract_session_id(path).unwrap_or_default();
-            let result = process_lines_streaming(path, offset, |line| {
-                if let Some(event) = parser.parse_line_with_ts(line, path) {
-                    if let Some(bucket) = bucket_from_timestamp_filtered(&event.timestamp, group_by, filter) {
-                        let by_model = local.entry(bucket).or_default();
-                        let summary = by_model.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
-                            model: event.model.clone(),
-                            ..Default::default()
-                        });
-                        summary.accumulate_with_ts(&event);
-                    }
-
-                    // Send event to TSDB writer
-                    let ts_ms = parse_timestamp(&event.timestamp)
-                        .map(|dt| dt.and_utc().timestamp_millis())
-                        .unwrap_or(0);
-                    if ts_ms > 0 {
-                        let op = DbOp::WriteEvent {
-                            ts_ms,
-                            message_id: event.event_key.clone(),
-                            model: event.model.clone(),
-                            session_id: session_id.clone(),
-                            source_file: event.source_file.clone(),
-                            tokens: TokenFields {
-                                input_tokens: event.input_tokens,
-                                output_tokens: event.output_tokens,
-                                cache_creation_input_tokens: event.cache_creation_input_tokens,
-                                cache_read_input_tokens: event.cache_read_input_tokens,
-                            },
-                        };
-                        let _ = db_tx.send(op);
-                    }
-                }
-            });
-            if !local.is_empty() {
-                let mut g = grouped.lock().unwrap_or_else(|e| e.into_inner());
-                merge_grouped(&mut g, local);
-            }
-            if let Ok(Some((_bytes, last_line_len, last_line_hash))) = result {
-                cp_batch.lock().unwrap_or_else(|e| e.into_inner()).push(FileCheckpoint {
-                    file_path: path.to_string(),
-                    last_line_len,
-                    last_line_hash,
-                });
-            }
-        });
-
-        // Save checkpoints
-        let batch = cp_batch.into_inner().unwrap_or_else(|e| e.into_inner());
-        if !batch.is_empty() {
-            for cp in &batch {
-                self.checkpoints.insert(cp.file_path.clone(), cp.clone());
-            }
-            let _ = self.db_tx.send(DbOp::FlushCheckpoints(batch));
-        }
-
-        self.sink.emit_grouped(&grouped.into_inner().unwrap_or_else(|e| e.into_inner()), group_by.type_name(), self.pricing.as_ref());
-        debug_log!("cold_start_grouped — ({}µs)", t_cold.elapsed().as_micros());
-        Ok(())
-    }
-
     /// Process a single file change (watch mode).
     /// Uses active/idle classification to minimize unnecessary work.
     /// Returns events with timestamps for TSDB storage.
@@ -389,12 +266,13 @@ impl TrackerEngine {
         };
 
         let t_total = Instant::now();
+        let path_owned = path.to_string();
 
         if let Ok(meta) = std::fs::metadata(path) {
             let current_size = meta.len();
             if let Some(&cached_size) = self.file_sizes.get(path) {
                 if current_size == cached_size {
-                    let act = self.activity.entry(path.to_string()).or_insert(FileActivity {
+                    let act = self.activity.entry(path_owned).or_insert(FileActivity {
                         state, last_active: now, last_checked: now,
                     });
                     act.last_checked = now;
@@ -426,9 +304,9 @@ impl TrackerEngine {
         match result {
             None => {
                 if let Ok(meta) = std::fs::metadata(path) {
-                    self.file_sizes.insert(path.to_string(), meta.len());
+                    self.file_sizes.insert(path_owned.clone(), meta.len());
                 }
-                let act = self.activity.entry(path.to_string()).or_insert(FileActivity {
+                let act = self.activity.entry(path_owned).or_insert(FileActivity {
                     state, last_active: now, last_checked: now,
                 });
                 act.last_checked = now;
@@ -438,18 +316,18 @@ impl TrackerEngine {
                 Ok(Vec::new())
             }
             Some((bytes_read, last_line_len, last_line_hash)) => {
-                self.file_sizes.insert(path.to_string(), offset + bytes_read);
+                self.file_sizes.insert(path_owned.clone(), offset + bytes_read);
                 let cp = FileCheckpoint {
-                    file_path: path.to_string(),
+                    file_path: path_owned.clone(),
                     last_line_len,
                     last_line_hash,
                 };
-                self.checkpoints.insert(path.to_string(), cp);
-                self.dirty.insert(path.to_string());
+                self.checkpoints.insert(path_owned.clone(), cp);
+                self.dirty.insert(path_owned.clone());
                 if state == FileState::Idle {
                     debug_log!("promote {} → Active ({} new lines)", path, line_count);
                 }
-                self.activity.insert(path.to_string(), FileActivity {
+                self.activity.insert(path_owned, FileActivity {
                     state: FileState::Active, last_active: now, last_checked: now,
                 });
                 debug_log!("process_file {} — {} lines, {} bytes, {} events, Active | find_resume: {}µs, read: {}µs, total: {}µs",
@@ -464,9 +342,6 @@ impl TrackerEngine {
     where
         P: LogParser + LogParserWithTs,
     {
-        if !self.matches_filters(path) {
-            return;
-        }
         match self.process_file_with_ts(path, parser) {
             Ok(events) => {
                 let session_id = extract_session_id(path).unwrap_or_default();
@@ -606,17 +481,6 @@ fn merge_summaries(
     }
 }
 
-/// Merge thread-local grouped summaries into global grouped map.
-fn merge_grouped(
-    global: &mut HashMap<String, HashMap<String, ModelUsageSummary>>,
-    local: HashMap<String, HashMap<String, ModelUsageSummary>>,
-) {
-    for (bucket, local_models) in local {
-        let global_models = global.entry(bucket).or_default();
-        merge_summaries(global_models, local_models);
-    }
-}
-
 /// Common parallel file scan over all sessions.
 /// Resolves checkpoint offsets and runs `on_file(path, offset)` in parallel
 /// using rayon's thread pool (bounded worker threads, work stealing).
@@ -647,24 +511,6 @@ where
     });
 }
 
-fn filter_active(filter: ReportFilter) -> bool {
-    filter.since.is_some() || filter.until.is_some()
-}
-
-fn filter_match(ts: NaiveDateTime, filter: ReportFilter) -> bool {
-    if let Some(since) = filter.since {
-        if ts < since {
-            return false;
-        }
-    }
-    if let Some(until) = filter.until {
-        if ts > until {
-            return false;
-        }
-    }
-    true
-}
-
 /// Extract the full session UUID from a file path.
 ///   Parent:   .../projects/<dir>/<UUID>.jsonl        → "<UUID>"
 ///   Subagent: .../<UUID>/subagents/agent-<id>.jsonl  → "<UUID>" (grandparent dir name)
@@ -681,13 +527,6 @@ pub fn extract_session_id(path: &str) -> Option<String> {
     Some(filename.trim_end_matches(".jsonl").to_string())
 }
 
-/// Filter sessions by session_id prefix match.
-pub fn filter_sessions_by_id(sessions: Vec<crate::common::types::SessionGroup>, prefix: &str) -> Vec<crate::common::types::SessionGroup> {
-    sessions.into_iter()
-        .filter(|s| s.session_id.starts_with(prefix))
-        .collect()
-}
-
 /// Extract project directory name from a file path (zero-alloc, returns &str slice).
 ///   .../projects/<PROJECT_DIR>/<UUID>.jsonl → "<PROJECT_DIR>"
 ///   .../projects/<PROJECT_DIR>/<UUID>/subagents/agent-<id>.jsonl → "<PROJECT_DIR>"
@@ -699,134 +538,12 @@ pub fn extract_project_name(path: &str) -> Option<&str> {
     Some(&rest[..end])
 }
 
-/// Apply session and project filters to a list of sessions.
-fn apply_filters(
-    mut sessions: Vec<crate::common::types::SessionGroup>,
-    session_filter: Option<&str>,
-    project_filter: Option<&str>,
-) -> Vec<crate::common::types::SessionGroup> {
-    if let Some(prefix) = session_filter {
-        sessions = filter_sessions_by_id(sessions, prefix);
-    }
-    if let Some(project) = project_filter {
-        sessions.retain(|s| {
-            let path_str = s.parent_jsonl.to_string_lossy();
-            matches!(extract_project_name(&path_str), Some(name) if name.contains(project))
-        });
-    }
-    sessions
-}
-
-fn bucket_from_timestamp(ts: &str, group_by: ReportGroupBy, tz: Option<Tz>) -> Option<String> {
-    // Fast path: string slicing only valid for UTC (no timezone conversion needed)
-    if tz.is_none() && ts.len() >= 4 {
-        match group_by {
-            ReportGroupBy::Year => return Some(ts[0..4].to_string()),
-            ReportGroupBy::Month if ts.len() >= 7 => return Some(ts[0..7].to_string()),
-            ReportGroupBy::Date if ts.len() >= 10 => return Some(ts[0..10].to_string()),
-            ReportGroupBy::Hour if ts.len() >= 13 => {
-                let hour = &ts[0..13];
-                return Some(format!("{}:00", hour));
-            }
-            ReportGroupBy::Week { .. } => {}
-            _ => {}
-        }
-    }
-
-    let dt = parse_timestamp_with_tz(ts, tz)?;
-    Some(bucket_from_datetime(dt, group_by))
-}
-
-fn bucket_from_timestamp_filtered(
-    ts: &str,
-    group_by: ReportGroupBy,
-    filter: ReportFilter,
-) -> Option<String> {
-    if filter_active(filter) {
-        let utc = parse_timestamp(ts)?;
-        if !filter_match(utc, filter) {
-            return None;
-        }
-        let local = apply_tz(utc, filter.tz);
-        return Some(bucket_from_datetime(local, group_by));
-    }
-    bucket_from_timestamp(ts, group_by, filter.tz)
-}
-
 fn parse_timestamp(ts: &str) -> Option<NaiveDateTime> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(ts) {
         return Some(dt.naive_utc());
     }
     NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%SZ").ok()
 }
-
-/// Parse timestamp and convert to target timezone (or UTC if None).
-fn parse_timestamp_with_tz(ts: &str, tz: Option<Tz>) -> Option<NaiveDateTime> {
-    let utc = parse_timestamp(ts)?;
-    Some(apply_tz(utc, tz))
-}
-
-/// Convert UTC NaiveDateTime to target timezone. Noop if tz is None.
-fn apply_tz(utc: NaiveDateTime, tz: Option<Tz>) -> NaiveDateTime {
-    match tz {
-        Some(tz) => chrono::Utc.from_utc_datetime(&utc).with_timezone(&tz).naive_local(),
-        None => utc,
-    }
-}
-
-fn bucket_from_datetime(ts: NaiveDateTime, group_by: ReportGroupBy) -> String {
-    let date = ts.date();
-    match group_by {
-        ReportGroupBy::Date => date.format("%Y-%m-%d").to_string(),
-        ReportGroupBy::Week { start_of_week } => {
-            let (week_year, week) = week_bucket(date, start_of_week);
-            format!("{:04}-W{:02}", week_year, week)
-        }
-        ReportGroupBy::Month => date.format("%Y-%m").to_string(),
-        ReportGroupBy::Year => format!("{:04}", date.year()),
-        ReportGroupBy::Hour => ts.format("%Y-%m-%dT%H:00").to_string(),
-    }
-}
-
-fn week_bucket(date: NaiveDate, start_of_week: Weekday) -> (i32, u32) {
-    let date_week_start = week_start(date, start_of_week);
-    let mut year = date_week_start.year();
-
-    let first_start = first_week_start(year, start_of_week);
-    if date_week_start < first_start {
-        year -= 1;
-    }
-    let first_start = first_week_start(year, start_of_week);
-    let days = date_week_start.signed_duration_since(first_start).num_days();
-    let week = (days / 7 + 1) as u32;
-    (year, week)
-}
-
-fn week_start(date: NaiveDate, start_of_week: Weekday) -> NaiveDate {
-    let date_idx = weekday_index(date.weekday());
-    let start_idx = weekday_index(start_of_week);
-    let delta = (7 + date_idx - start_idx) % 7;
-    date - chrono::Duration::days(delta as i64)
-}
-
-fn first_week_start(year: i32, start_of_week: Weekday) -> NaiveDate {
-    let jan1 = NaiveDate::from_ymd_opt(year, 1, 1).unwrap();
-    let delta = (weekday_index(start_of_week) - weekday_index(jan1.weekday()) + 7) % 7;
-    jan1 + chrono::Duration::days(delta as i64)
-}
-
-fn weekday_index(day: Weekday) -> i32 {
-    match day {
-        Weekday::Mon => 0,
-        Weekday::Tue => 1,
-        Weekday::Wed => 2,
-        Weekday::Thu => 3,
-        Weekday::Fri => 4,
-        Weekday::Sat => 5,
-        Weekday::Sun => 6,
-    }
-}
-
 
 #[cfg(test)]
 mod tests {

@@ -18,14 +18,16 @@ AI CLI 도구(Claude Code 등)의 JSONL 세션 로그를 실시간 감시하여 
 Docker처럼 데몬/클라이언트 구조로 동작한다:
 
 ```
-toki daemon start   # 항상 실행 (= dockerd)
-toki trace          # 실시간 스트림 클라이언트 (= docker logs -f)
-toki report         # TSDB 조회 클라이언트 (= docker ps)
+toki daemon start     # 항상 실행 (= dockerd)
+toki daemon restart   # 설정 변경 후 재시작
+toki daemon reset     # DB 전체 삭제 + 초기화
+toki trace            # 실시간 스트림 클라이언트 (= docker logs -f)
+toki report           # TSDB 조회 클라이언트 (= docker ps)
 ```
 
 - **daemon**: 파일 감시 + TSDB 저장. 항상 실행되어야 하며, trace 클라이언트가 없을 때는 Sink 오버헤드 0.
 - **trace**: 데몬에 UDS로 연결하여 실시간 이벤트 스트림 수신. print/uds/http 모든 sink 지원.
-- **report**: TSDB에서 직접 조회. 데몬이 실행 중이어야 데이터가 존재한다.
+- **report**: TSDB에서 직접 조회. 데몬이 실행 중이어야 사용 가능하다.
 
 ## Quick Start
 
@@ -51,26 +53,17 @@ cargo run --release -- report query 'sessions{project="myapp"}'
 `daemon`은 항상 실행되는 서버 프로세스다. 시작 시 전체 세션 파일을 스캔(cold start)하여 TSDB를 구축하고, 이후 FSEvents로 파일 변경을 감시하며 새 이벤트를 실시간 수집한다.
 
 ```bash
-toki daemon start
-toki daemon start --startup-group-by day
-toki daemon start --session-id 4de9291e
-toki daemon start --project toki
-toki daemon start --full-rescan
-toki daemon stop
-toki daemon status
+toki daemon start       # 데몬 시작 (foreground)
+toki daemon stop        # 데몬 중지
+toki daemon restart     # 중지 + 재시작 (설정 변경 반영)
+toki daemon status      # 실행 상태 확인
+toki daemon reset       # DB 전체 삭제 + 초기화
 ```
 
-| 옵션 | 설명 |
-|------|------|
-| `--startup-group-by hour\|day\|week\|month\|year` | cold start 시 시간 단위 그룹핑 요약 |
-| `--session-id <PREFIX>` | 세션 UUID 접두사 필터 |
-| `--project <NAME>` | 프로젝트 디렉토리 서브스트링 필터 |
-| `--full-rescan` | 체크포인트 초기화 후 전체 재스캔 |
-| `--db-path <PATH>` | DB 경로 (기본: `~/.config/toki/toki.fjall`) |
-| `--sock <PATH>` | UDS 소켓 경로 (기본: `~/.config/toki/daemon.sock`) |
-
+- 데몬 설정(소켓 경로, Claude Code root 등)은 `toki settings`에서 관리
 - PID 파일: `~/.config/toki/daemon.pid`
 - 동일 DB 경로 기준 단일 인스턴스만 허용 (file lock)
+- DB 초기화가 필요하면 `daemon reset` 후 `daemon start`
 
 ## Trace (Client)
 
@@ -78,7 +71,6 @@ toki daemon status
 
 ```bash
 toki trace
-toki trace --sock /custom/daemon.sock
 ```
 
 - 데몬이 실행 중이어야 함 (`toki daemon start` 먼저)
@@ -87,7 +79,7 @@ toki trace --sock /custom/daemon.sock
 
 ## Report (One-Shot)
 
-`report`는 TSDB에 저장된 데이터를 즉시 조회한다. 데몬이 최소 1회 이상 실행되어 TSDB에 데이터가 수집된 상태여야 한다.
+`report`는 TSDB에 저장된 데이터를 즉시 조회한다. 데몬이 실행 중이어야 사용 가능하다 (`toki daemon start` 먼저).
 
 ```bash
 # 전체 요약

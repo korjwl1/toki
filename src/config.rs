@@ -8,9 +8,6 @@ use crate::db::Database;
 pub struct Config {
     pub claude_code_root: String,
     pub db_path: PathBuf,
-    pub full_rescan: bool,
-    pub session_filter: Option<String>,
-    pub project_filter: Option<String>,
     pub tz: Option<Tz>,
     pub retention_days: u32,
     pub rollup_retention_days: u32,
@@ -33,9 +30,6 @@ impl Config {
         Config {
             claude_code_root: home.join(".claude").to_string_lossy().to_string(),
             db_path: home.join(".config").join("toki").join("toki.fjall"),
-            full_rescan: false,
-            session_filter: None,
-            project_filter: None,
             tz: None,
             retention_days: 0,
             rollup_retention_days: 0,
@@ -48,21 +42,6 @@ impl Config {
 
     pub fn with_db_path(mut self, path: PathBuf) -> Self {
         self.db_path = path;
-        self
-    }
-
-    pub fn with_full_rescan(mut self, enabled: bool) -> Self {
-        self.full_rescan = enabled;
-        self
-    }
-
-    pub fn with_session_filter(mut self, filter: Option<String>) -> Self {
-        self.session_filter = filter;
-        self
-    }
-
-    pub fn with_project_filter(mut self, filter: Option<String>) -> Self {
-        self.project_filter = filter;
         self
     }
 
@@ -143,11 +122,9 @@ mod tests {
     #[test]
     fn test_config_builder() {
         let config = Config::new()
-            .with_db_path("/custom/db.fjall".into())
-            .with_full_rescan(true);
+            .with_db_path("/custom/db.fjall".into());
 
         assert_eq!(config.db_path, PathBuf::from("/custom/db.fjall"));
-        assert!(config.full_rescan);
     }
 
     #[test]

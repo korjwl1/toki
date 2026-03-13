@@ -46,11 +46,7 @@ enum Commands {
         command: DaemonCommands,
     },
     /// Connect to running daemon and stream real-time events
-    Trace {
-        /// Daemon socket path override
-        #[arg(long)]
-        sock: Option<String>,
-    },
+    Trace,
     /// Report mode: one-shot summary from TSDB
     Report {
         /// Filter start time (inclusive): YYYYMMDD or YYYYMMDDhhmmss
@@ -78,35 +74,15 @@ enum Commands {
 #[derive(Subcommand)]
 enum DaemonCommands {
     /// Start the daemon (foreground). Watches files and writes to TSDB.
-    Start {
-        /// Clear checkpoints and perform full rescan on startup
-        #[arg(long)]
-        full_rescan: bool,
-        /// Daemon socket path override
-        #[arg(long)]
-        sock: Option<String>,
-        /// Group startup summary by time period: hour, day, week, month, year
-        #[arg(long = "startup-group-by")]
-        startup_group_by: Option<String>,
-        /// Filter by session ID prefix
-        #[arg(long = "session-id")]
-        session_id: Option<String>,
-        /// Filter by project name (substring match)
-        #[arg(long)]
-        project: Option<String>,
-    },
+    Start,
     /// Stop a running daemon
-    Stop {
-        /// Daemon socket path override
-        #[arg(long)]
-        sock: Option<String>,
-    },
+    Stop,
+    /// Restart the daemon (stop + start). Picks up settings changes.
+    Restart,
     /// Check daemon status
-    Status {
-        /// Daemon socket path override
-        #[arg(long)]
-        sock: Option<String>,
-    },
+    Status,
+    /// Delete all data and reset the database
+    Reset,
 }
 
 #[derive(Args, Clone)]
@@ -243,7 +219,7 @@ fn main() {
             let config = build_config(cli.db_path, cli_tz, cli.no_cost, cli_output_format);
             handle_daemon(command, &config);
         }
-        Commands::Trace { sock } => {
+        Commands::Trace => {
             let config = build_config(cli.db_path, cli_tz, cli.no_cost, cli_output_format);
             let output_format = resolve_output_format(&config);
             let sink_specs = if cli.sink.is_empty() {
@@ -251,7 +227,7 @@ fn main() {
             } else {
                 cli.sink.clone()
             };
-            handle_trace(sock, &config, &sink_specs, output_format);
+            handle_trace(&config, &sink_specs, output_format);
         }
         Commands::Report { since, until, group_by_session, session_id, project, command } => {
             let config = build_config(cli.db_path, cli_tz, cli.no_cost, cli_output_format);
@@ -269,163 +245,138 @@ fn main() {
 
 // ── Daemon ──────────────────────────────────────────────
 
+fn stop_running_daemon(config: &Config) -> bool {
+    let pidfile = toki::daemon::default_pidfile_path();
+    let sock_path = &config.daemon_sock;
+    match toki::daemon::stop_daemon(&pidfile, sock_path) {
+        Ok(true) => { println!("[toki] Daemon stopped."); true }
+        Ok(false) => { println!("[toki] Daemon is not running."); false }
+        Err(e) => {
+            eprintln!("[toki] Error stopping daemon: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_daemon_foreground(config: &Config) {
+    let sock_path = config.daemon_sock.clone();
+    let pidfile = toki::daemon::default_pidfile_path();
+
+    if let Some(pid) = toki::daemon::daemon_status(&pidfile) {
+        eprintln!("[toki] Daemon already running (PID {})", pid);
+        std::process::exit(1);
+    }
+
+    let _lock = match acquire_trace_lock(&config.db_path) {
+        Ok(f) => f,
+        Err(_) => {
+            eprintln!("[toki] Another instance is already running.");
+            std::process::exit(1);
+        }
+    };
+
+    let broadcast = Arc::new(toki::daemon::BroadcastSink::new());
+
+    eprintln!("[toki:daemon] Starting...");
+    eprintln!("[toki:daemon] Claude Code root: {}", config.claude_code_root);
+    eprintln!("[toki:daemon] Database: {}", config.db_path.display());
+    eprintln!("[toki:daemon] Socket: {}", sock_path.display());
+
+    let handle = match toki::start(config.clone(), Box::new(broadcast.clone())) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("[toki:daemon] Failed to start: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    toki::daemon::write_pidfile(&pidfile);
+
+    let (listener_stop_tx, listener_stop_rx) = crossbeam_channel::bounded::<()>(1);
+    let listener_sock = sock_path.clone();
+    let listener_broadcast = broadcast.clone();
+    let listener_handle = std::thread::Builder::new()
+        .name("toki-listener".to_string())
+        .spawn(move || {
+            toki::daemon::run_listener(&listener_sock, listener_broadcast, listener_stop_rx);
+        })
+        .expect("Failed to spawn listener thread");
+
+    unsafe {
+        libc::signal(libc::SIGINT, sighandler as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, sighandler as *const () as libc::sighandler_t);
+    }
+
+    eprintln!("[toki:daemon] Running (PID {}). Send SIGTERM or use 'toki daemon stop' to stop.",
+        std::process::id());
+
+    while RUNNING.load(Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    eprintln!("\n[toki:daemon] Shutting down...");
+    let _ = listener_stop_tx.send(());
+    let _ = listener_handle.join();
+    handle.stop();
+    toki::daemon::remove_pidfile(&pidfile);
+    let _ = std::fs::remove_file(&sock_path);
+    eprintln!("[toki:daemon] Done.");
+}
+
 fn handle_daemon(command: DaemonCommands, config: &Config) {
     match command {
-        DaemonCommands::Start { full_rescan, sock, startup_group_by, session_id, project } => {
-            let mut config = config.clone();
-            if full_rescan {
-                config = config.with_full_rescan(true);
-            }
-            if session_id.is_some() {
-                config = config.with_session_filter(session_id);
-            }
-            if project.is_some() {
-                config = config.with_project_filter(project);
-            }
-
-            // CLI --sock overrides DB setting
-            if let Some(s) = sock {
-                config.daemon_sock = PathBuf::from(s);
-            }
-
-            let sock_path = config.daemon_sock.clone();
-
-            // Parse --startup-group-by
-            let group_by = match startup_group_by.as_deref() {
-                Some("hour") => Some(toki::engine::ReportGroupBy::Hour),
-                Some("day") => Some(toki::engine::ReportGroupBy::Date),
-                Some("week") => Some(toki::engine::ReportGroupBy::Week { start_of_week: config.start_of_week }),
-                Some("month") => Some(toki::engine::ReportGroupBy::Month),
-                Some("year") => Some(toki::engine::ReportGroupBy::Year),
-                Some(v) => {
-                    eprintln!("[toki] Invalid --startup-group-by: {} (use hour|day|week|month|year)", v);
-                    std::process::exit(1);
-                }
-                None => None,
-            };
-
-            if matches!(group_by, Some(toki::engine::ReportGroupBy::Hour)) {
-                if full_rescan {
-                    eprintln!("[toki] --startup-group-by hour cannot be used with --full-rescan");
-                    std::process::exit(1);
-                }
-                if !config.db_path.exists() {
-                    eprintln!("[toki] --startup-group-by hour requires existing checkpoints");
-                    std::process::exit(1);
-                }
-            }
-
-            // Check for existing daemon
-            let pidfile = toki::daemon::default_pidfile_path();
-            if let Some(pid) = toki::daemon::daemon_status(&pidfile) {
-                eprintln!("[toki] Daemon already running (PID {})", pid);
-                std::process::exit(1);
-            }
-
-            let _lock = match acquire_trace_lock(&config.db_path) {
-                Ok(f) => f,
-                Err(_) => {
-                    eprintln!("[toki] Another instance is already running.");
-                    std::process::exit(1);
-                }
-            };
-
-            // Create BroadcastSink (no clients initially = zero overhead)
-            let broadcast = Arc::new(toki::daemon::BroadcastSink::new());
-
-            eprintln!("[toki:daemon] Starting...");
-            eprintln!("[toki:daemon] Claude Code root: {}", config.claude_code_root);
-            eprintln!("[toki:daemon] Database: {}", config.db_path.display());
-            eprintln!("[toki:daemon] Socket: {}", sock_path.display());
-
-            // Start engine with BroadcastSink
-            let handle = match toki::start(config, group_by, Box::new(broadcast.clone())) {
-                Ok(h) => h,
-                Err(e) => {
-                    eprintln!("[toki:daemon] Failed to start: {}", e);
-                    std::process::exit(1);
-                }
-            };
-
-            // Write PID file
-            toki::daemon::write_pidfile(&pidfile);
-
-            // Start UDS listener in a thread
-            let (listener_stop_tx, listener_stop_rx) = crossbeam_channel::bounded::<()>(1);
-            let listener_sock = sock_path.clone();
-            let listener_broadcast = broadcast.clone();
-            let listener_handle = std::thread::Builder::new()
-                .name("toki-listener".to_string())
-                .spawn(move || {
-                    toki::daemon::run_listener(&listener_sock, listener_broadcast, listener_stop_rx);
-                })
-                .expect("Failed to spawn listener thread");
-
-            // Register signal handlers
-            unsafe {
-                libc::signal(libc::SIGINT, sighandler as *const () as libc::sighandler_t);
-                libc::signal(libc::SIGTERM, sighandler as *const () as libc::sighandler_t);
-            }
-
-            eprintln!("[toki:daemon] Running (PID {}). Send SIGTERM or use 'toki daemon stop' to stop.",
-                std::process::id());
-
-            // Wait until signal
-            while RUNNING.load(Ordering::SeqCst) {
-                std::thread::sleep(std::time::Duration::from_millis(200));
-            }
-
-            eprintln!("\n[toki:daemon] Shutting down...");
-
-            // Stop listener
-            let _ = listener_stop_tx.send(());
-            let _ = listener_handle.join();
-
-            // Stop engine + writer
-            handle.stop();
-
-            // Cleanup
-            toki::daemon::remove_pidfile(&pidfile);
-            let _ = std::fs::remove_file(&sock_path);
-
-            eprintln!("[toki:daemon] Done.");
+        DaemonCommands::Start => {
+            run_daemon_foreground(config);
         }
 
-        DaemonCommands::Stop { sock } => {
-            let sock_path = sock.map(PathBuf::from).unwrap_or_else(|| config.daemon_sock.clone());
-            let pidfile = toki::daemon::default_pidfile_path();
-
-            match toki::daemon::stop_daemon(&pidfile, &sock_path) {
-                Ok(true) => println!("[toki] Daemon stopped."),
-                Ok(false) => println!("[toki] Daemon is not running."),
-                Err(e) => {
-                    eprintln!("[toki] Error stopping daemon: {}", e);
-                    std::process::exit(1);
-                }
-            }
+        DaemonCommands::Stop => {
+            stop_running_daemon(config);
         }
 
-        DaemonCommands::Status { sock } => {
-            let sock_path = sock.map(PathBuf::from).unwrap_or_else(|| config.daemon_sock.clone());
-            let pidfile = toki::daemon::default_pidfile_path();
+        DaemonCommands::Restart => {
+            stop_running_daemon(config);
+            RUNNING.store(true, Ordering::SeqCst);
+            run_daemon_foreground(config);
+        }
 
+        DaemonCommands::Status => {
+            let pidfile = toki::daemon::default_pidfile_path();
             match toki::daemon::daemon_status(&pidfile) {
                 Some(pid) => {
                     println!("[toki] Daemon is running (PID {})", pid);
-                    println!("[toki] Socket: {}", sock_path.display());
+                    println!("[toki] Socket: {}", config.daemon_sock.display());
                 }
                 None => {
                     println!("[toki] Daemon is not running.");
                 }
             }
         }
+
+        DaemonCommands::Reset => {
+            let pidfile = toki::daemon::default_pidfile_path();
+            if toki::daemon::daemon_status(&pidfile).is_some() {
+                println!("[toki] Stopping daemon first...");
+                stop_running_daemon(config);
+            }
+
+            if config.db_path.exists() {
+                if let Err(e) = std::fs::remove_dir_all(&config.db_path) {
+                    eprintln!("[toki] Failed to delete database: {}", e);
+                    std::process::exit(1);
+                }
+                println!("[toki] Database deleted: {}", config.db_path.display());
+            } else {
+                println!("[toki] No database found at {}", config.db_path.display());
+            }
+            println!("[toki] Reset complete. Start the daemon to rebuild: toki daemon start");
+        }
     }
 }
 
 // ── Trace (client) ──────────────────────────────────────
 
-fn handle_trace(sock: Option<String>, config: &Config, sink_specs: &[String], output_format: toki::sink::OutputFormat) {
-    let sock_path = sock.map(PathBuf::from).unwrap_or_else(|| config.daemon_sock.clone());
+fn handle_trace(config: &Config, sink_specs: &[String], output_format: toki::sink::OutputFormat) {
+    let sock_path = config.daemon_sock.clone();
 
     let stream = match UnixStream::connect(&sock_path) {
         Ok(s) => s,
@@ -463,14 +414,19 @@ fn handle_trace(sock: Option<String>, config: &Config, sink_specs: &[String], ou
             continue;
         }
 
-        let v: serde_json::Value = match serde_json::from_str(&line) {
+        let mut v: serde_json::Value = match serde_json::from_str(&line) {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(e) => {
+                if std::env::var("TOKI_DEBUG").is_ok() {
+                    eprintln!("[toki] malformed JSON from daemon: {}", e);
+                }
+                continue;
+            }
         };
 
         match v["type"].as_str() {
             Some("event") => {
-                if let Ok(event) = serde_json::from_value::<toki::UsageEvent>(v["data"].clone()) {
+                if let Ok(event) = serde_json::from_value::<toki::UsageEvent>(v["data"].take()) {
                     sink.emit_event(&event, None);
                 }
             }
@@ -502,17 +458,24 @@ fn handle_report(
     let sink = toki::sink::create_sinks(sink_specs, output_format);
     let tz = config.tz;
 
+    // Require daemon to be running
+    let pidfile = toki::daemon::default_pidfile_path();
+    if toki::daemon::daemon_status(&pidfile).is_none() {
+        eprintln!("[toki] Cannot connect to toki daemon.");
+        eprintln!("[toki] Start the daemon first: toki daemon start");
+        std::process::exit(1);
+    }
+
     let db = match toki::db::Database::open(&config.db_path) {
         Ok(db) => db,
         Err(e) => {
             eprintln!("[toki] Cannot open database: {}", e);
-            eprintln!("[toki] Start the daemon first: toki daemon start");
             std::process::exit(1);
         }
     };
 
     if !toki::query::has_tsdb_data(&db) {
-        eprintln!("[toki] No data in TSDB. Start the daemon to collect data: toki daemon start");
+        eprintln!("[toki] No data in TSDB. The daemon may still be performing initial scan.");
         std::process::exit(1);
     }
 
@@ -592,7 +555,9 @@ fn handle_report(
             | toki::engine::ReportGroupBy::Week { .. }
     );
     if requires_range && !filter_args.from_beginning && since_dt.is_none() {
-        eprintln!("[toki] hourly/daily/weekly requires --since or --from-beginning");
+        eprintln!("[toki] hourly/daily/weekly requires a date range.");
+        eprintln!("[toki] Usage: toki report daily --since 20250101");
+        eprintln!("[toki]        toki report daily --from-beginning");
         std::process::exit(1);
     }
 

@@ -251,14 +251,25 @@ impl<'a> Parser<'a> {
     fn parse_quoted_string(&mut self) -> Result<String, String> {
         self.skip_ws();
         self.expect_char('"')?;
-        let start = self.pos;
+        let mut value = String::new();
         while self.pos < self.input.len() {
             let c = self.input.as_bytes()[self.pos];
+            if c == b'\\' && self.pos + 1 < self.input.len() {
+                let next = self.input.as_bytes()[self.pos + 1];
+                match next {
+                    b'"' | b'\\' => {
+                        value.push(next as char);
+                        self.pos += 2;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
             if c == b'"' {
-                let value = self.input[start..self.pos].to_string();
                 self.pos += 1; // consume closing quote
                 return Ok(value);
             }
+            value.push(c as char);
             self.pos += 1;
         }
         Err("unterminated string".into())
@@ -281,6 +292,9 @@ impl<'a> Parser<'a> {
             }
             self.expect_char('=')?;
             let value = self.parse_quoted_string()?;
+            if filters.iter().any(|f| f.key == key) {
+                return Err(format!("duplicate filter key '{}'", key));
+            }
             filters.push(LabelFilter { key, value });
 
             match self.peek() {
@@ -321,7 +335,8 @@ impl<'a> Parser<'a> {
         };
 
         self.expect_char(']')?;
-        Ok(Bucket(num * unit))
+        let secs = num.checked_mul(unit).ok_or("bucket duration too large")?;
+        Ok(Bucket(secs))
     }
 
     fn parse_group_by(&mut self) -> Result<Vec<String>, String> {
@@ -542,5 +557,23 @@ mod tests {
     #[test]
     fn test_projects_rejects_group_by() {
         assert!(parse("projects by (model)").is_err());
+    }
+
+    #[test]
+    fn test_escaped_quote_in_filter() {
+        let q = parse(r#"usage{model="test\"value"}"#).unwrap();
+        assert_eq!(q.filter_value("model"), Some("test\"value"));
+    }
+
+    #[test]
+    fn test_escaped_backslash_in_filter() {
+        let q = parse(r#"usage{project="path\\dir"}"#).unwrap();
+        assert_eq!(q.filter_value("project"), Some("path\\dir"));
+    }
+
+    #[test]
+    fn test_duplicate_filter_key() {
+        let err = parse(r#"usage{model="a", model="b"}"#).unwrap_err();
+        assert!(err.contains("duplicate filter key"));
     }
 }

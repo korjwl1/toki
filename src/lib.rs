@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::thread::JoinHandle;
 
 use db::Database;
-use engine::{ReportGroupBy, TrackerEngine};
+use engine::TrackerEngine;
 use providers::claude_code::ClaudeCodeParser;
 use retention::RetentionPolicy;
 use sink::Sink;
@@ -71,15 +71,9 @@ impl Drop for Handle {
 
 /// Start toki: cold start scan, then enter watch mode.
 /// Returns a Handle to control the running instance.
-pub fn start(config: Config, startup_group_by: Option<ReportGroupBy>, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
+pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
     // 1. Open DB and load checkpoints before spawning writer thread
     let db = Database::open(&config.db_path).map_err(TokiError::Db)?;
-
-    // Full rescan: clear checkpoints.
-    if config.full_rescan {
-        eprintln!("[toki] Full rescan requested — clearing all checkpoints");
-        db.clear_checkpoints().map_err(TokiError::Db)?;
-    }
 
     // Fetch/load pricing
     let pricing_table = if config.no_cost {
@@ -115,21 +109,15 @@ pub fn start(config: Config, startup_group_by: Option<ReportGroupBy>, sink: Box<
     // 4. Create engine with db_tx and loaded checkpoints
     let mut engine = TrackerEngine::new(db_tx.clone(), checkpoints)
         .with_sink(sink)
-        .with_session_filter(config.session_filter.clone())
-        .with_project_filter(config.project_filter.clone())
         .with_tz(config.tz)
         .with_pricing(pricing_table);
 
     let parser = ClaudeCodeParser;
     let root_dir = config.claude_code_root.clone();
 
-    // Cold start
+    // Cold start — full scan, index everything into TSDB
     println!("[toki] Running initial scan...");
-    if let Some(group_by) = startup_group_by {
-        if let Err(e) = engine.cold_start_grouped(&parser, &root_dir, group_by) {
-            eprintln!("[toki] Cold start error: {}", e);
-        }
-    } else if let Err(e) = engine.cold_start(&parser, &root_dir) {
+    if let Err(e) = engine.cold_start(&parser, &root_dir) {
         eprintln!("[toki] Cold start error: {}", e);
     }
 
