@@ -1,8 +1,8 @@
-# clitrace Architecture & Design
+# toki Architecture & Design
 
 ## Overview
 
-clitrace는 데몬/클라이언트 구조로 동작한다.
+toki는 데몬/클라이언트 구조로 동작한다.
 데몬은 4개 스레드(Worker, Writer, Listener, Notify)를 운용하며,
 fjall 임베디드 DB의 7개 keyspace에 데이터를 저장한다.
 
@@ -10,7 +10,7 @@ fjall 임베디드 DB의 7개 keyspace에 데이터를 저장한다.
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│ Daemon Process (clitrace daemon start)                           │
+│ Daemon Process (toki daemon start)                           │
 │                                                                  │
 │ ┌─────────────────────┐    ┌─────────────────────────────┐       │
 │ │ Worker Thread       │    │ Writer Thread               │       │
@@ -85,12 +85,13 @@ trace 클라이언트는 모든 sink 타입을 지원한다:
 
 ```
 Database::open(read-only)
-    → has_tsdb_data()?
-        Yes → TSDB query (~ms)
-        No  → JSONL scan fallback (~seconds)
+    → has_tsdb_data()? (O(1) 확인)
+        Yes → TSDB 쿼리 (~ms)
+        No  → "No data in TSDB" 에러 → 데몬 시작 안내
 ```
 
 Report는 데몬과 독립적으로 DB를 직접 읽어 조회한다. Writer thread 불필요.
+데몬이 최소 1회 이상 실행되어 TSDB에 데이터가 수집된 상태여야 한다.
 
 ## Worker Thread
 
@@ -231,8 +232,8 @@ UnixStream::connect(daemon.sock)
 
 ```
 DB open → has_any_rollups()? (O(1) 확인)
-    → Yes: TSDB 쿼리 (for_each_rollup 스트리밍)
-    → No:  JSONL 파일 직접 스캔 (fallback)
+    → No:  에러 출력 → "Start the daemon first"
+    → Yes: 쿼리 실행
 ```
 
 Report는 writer thread 없이 DB를 직접 읽기 전용으로 연다.
@@ -277,7 +278,7 @@ process_file_with_ts(path)
 
 ## Retention Policy
 
-Writer thread가 데이터 보존 정책을 자동 실행한다 (기본 비활성화, `clitrace settings`에서 설정):
+Writer thread가 데이터 보존 정책을 자동 실행한다 (기본 비활성화, `toki settings`에서 설정):
 
 | 대상 | 기본 보존 기간 | DB key |
 |------|----------------|--------|
@@ -344,45 +345,55 @@ pub enum DbOp {
 
 Report 명령은 DB를 읽기 전용으로 열어 직접 쿼리한다 (writer thread 불필요).
 
+### 쿼리 경로
+
+CLI 플래그(`--session-id`, `--project`, `--since`, `--until`, `--group-by-session`)는 내부적으로 `Query` 구조체로 변환되어 `execute_parsed_query`를 통해 실행된다.
+시간 그룹핑 서브커맨드(daily/weekly/monthly/yearly/hourly)는 캘린더 기반 버킷팅이 필요하므로 `report_grouped_from_db`를 통해 실행된다.
+
 | 함수 | 데이터 소스 | 용도 |
 |------|-------------|------|
-| `report_summary_from_db` | rollups | 전체 요약 |
-| `report_grouped_from_db` | rollups | 시간별 그룹핑 (daily/weekly/...) |
-| `report_by_session_from_db` | events + dict | 세션별 그룹핑 |
+| `execute_parsed_query` | events + dict 또는 rollups | PromQL 쿼리 + CLI 플래그 변환 실행 |
+| `report_grouped_from_db` | rollups 또는 events + dict | 시간별 그룹핑 (daily/weekly/...) |
 | `has_tsdb_data` | rollups (O(1)) | TSDB 데이터 존재 여부 확인 |
 
-- 스트리밍 콜백 패턴: `for_each_rollup(since, until, |ts, model, rollup| { ... })`
+### 데이터 소스 선택
+
+쿼리의 필터와 그룹핑 조건에 따라 데이터 소스가 결정된다:
+
+| 조건 | 데이터 소스 | 이유 |
+|------|-------------|------|
+| 필터/그룹 없이 전체 요약 | rollups | 빠름 (시간별 사전 집계) |
+| `session` 또는 `project` 필터 있음 | events + dict | rollup에 세션/프로젝트 정보 없음 |
+| `by (session)` 등 그룹핑 | events + dict | rollup에 세션/프로젝트 정보 없음 |
+| 시간 그룹핑만 (daily/weekly/...) | rollups | 빠름 |
+| 시간 그룹핑 + 세션/프로젝트 필터 | events + dict | 이벤트 레벨 필터링 필요 |
+| `sessions` / `projects` 리스팅 | idx_sessions/idx_projects 또는 events | 시간 필터 없으면 인덱스, 있으면 이벤트 스캔 |
+
+### 스트리밍 콜백 패턴
+
+```rust
+db.for_each_rollup(since, until, |ts, model, rollup| { ... })
+db.for_each_event(since, until, |ts, event| { ... })
+```
+
 - 중간 Vec 할당 없이 HashMap에 직접 accumulate
 - `has_tsdb_data`는 `first_key_value().is_some()`으로 O(1)
-
-### TSDB vs JSONL Fallback
-
-```
-Report 명령 실행
-  → DB open 시도
-  → has_tsdb_data()?
-      Yes → TSDB 쿼리 (~ms)
-      No  → JSONL 파일 직접 스캔 (~seconds, cold_start_report 계열 함수)
-```
-
-TSDB에 데이터가 있으면 TSDB를 사용하고, 없으면(daemon을 한 번도 실행하지 않은 경우)
-JSONL 파일을 직접 스캔하는 fallback 경로가 있다.
 
 ## Config Priority
 
 설정 값은 다음 우선순위로 결정된다:
 
 ```
-CLI 인자 > DB settings (clitrace settings) > 기본값
+CLI 인자 > DB settings (toki settings) > 기본값
 ```
 
-환경변수는 사용하지 않는다 (`CLITRACE_DEBUG` 제외).
+환경변수는 사용하지 않는다 (`TOKI_DEBUG` 제외).
 
 | 설정 | CLI 오버라이드 | DB key | 기본값 |
 |------|---------------|--------|--------|
 | Claude root | - | `claude_code_root` | `~/.claude` |
-| DB path | `--db-path` | - | `~/.config/clitrace/clitrace.fjall` |
-| Daemon sock | `--sock` | `daemon_sock` | `~/.config/clitrace/daemon.sock` |
+| DB path | `--db-path` | - | `~/.config/toki/toki.fjall` |
+| Daemon sock | `--sock` | `daemon_sock` | `~/.config/toki/daemon.sock` |
 | Timezone | `-z` | `timezone` | (UTC) |
 | Output format | `--output-format` | `output_format` | `table` |
 | Start of week | `--start-of-week` | `start_of_week` | `mon` |

@@ -66,11 +66,11 @@ impl DbWriter {
         match run_retention(&self.db, &self.retention) {
             Ok(stats) => {
                 if stats.events_deleted > 0 || stats.rollups_deleted > 0 {
-                    eprintln!("[clitrace:writer] retention cleanup: {} events, {} rollups deleted ({}ms)",
+                    eprintln!("[toki:writer] retention cleanup: {} events, {} rollups deleted ({}ms)",
                         stats.events_deleted, stats.rollups_deleted, stats.elapsed.as_millis());
                 }
             }
-            Err(e) => eprintln!("[clitrace:writer] retention error: {}", e),
+            Err(e) => eprintln!("[toki:writer] retention error: {}", e),
         }
 
         // Daily retention tick
@@ -98,11 +98,11 @@ impl DbWriter {
                     match run_retention(&self.db, &self.retention) {
                         Ok(stats) => {
                             if stats.events_deleted > 0 || stats.rollups_deleted > 0 {
-                                eprintln!("[clitrace:writer] daily retention: {} events, {} rollups deleted",
+                                eprintln!("[toki:writer] daily retention: {} events, {} rollups deleted",
                                     stats.events_deleted, stats.rollups_deleted);
                             }
                         }
-                        Err(e) => eprintln!("[clitrace:writer] retention error: {}", e),
+                        Err(e) => eprintln!("[toki:writer] retention error: {}", e),
                     }
                 }
             }
@@ -123,13 +123,13 @@ impl DbWriter {
             }
             DbOp::WriteCheckpoint(cp) => {
                 if let Err(e) = self.db.upsert_checkpoint(&cp) {
-                    eprintln!("[clitrace:writer] checkpoint error: {}", e);
+                    eprintln!("[toki:writer] checkpoint error: {}", e);
                 }
                 true
             }
             DbOp::FlushCheckpoints(cps) => {
                 if let Err(e) = self.db.flush_checkpoints(&cps) {
-                    eprintln!("[clitrace:writer] flush checkpoints error: {}", e);
+                    eprintln!("[toki:writer] flush checkpoints error: {}", e);
                 }
                 true
             }
@@ -199,11 +199,11 @@ impl DbWriter {
         }
 
         if let Err(e) = batch.commit() {
-            eprintln!("[clitrace:writer] batch commit error: {}", e);
+            eprintln!("[toki:writer] batch commit error: {}", e);
         }
 
         if crate::engine::debug_level() >= 1 {
-            eprintln!("[clitrace:writer] flushed {} events, {} rollups in {}µs",
+            eprintln!("[toki:writer] flushed {} events, {} rollups in {}µs",
                 count, rollup_updates.len(), t.elapsed().as_micros());
         }
     }

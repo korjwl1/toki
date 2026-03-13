@@ -1,15 +1,15 @@
 [package]
-name = "clitrace"
+name = "toki"
 version = "0.1.0"
 edition = "2021"
 description = "AI CLI tool token usage tracker module"
 
 [lib]
-name = "clitrace"
+name = "toki"
 path = "src/lib.rs"
 
 [[bin]]
-name = "clitrace"
+name = "toki"
 path = "src/main.rs"
 
 [dependencies]

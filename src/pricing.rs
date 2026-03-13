@@ -133,7 +133,7 @@ pub fn fetch_pricing(db: &Database) -> PricingTable {
                 if let Some(ref data) = cached_data {
                     let prices: HashMap<String, ModelPricing> =
                         serde_json::from_str(data).unwrap_or_default();
-                    eprintln!("[clitrace] Pricing: cached (not modified), {} models", prices.len());
+                    eprintln!("[toki] Pricing: cached (not modified), {} models", prices.len());
                     return PricingTable::new(prices);
                 }
             }
@@ -142,14 +142,14 @@ pub fn fetch_pricing(db: &Database) -> PricingTable {
             let body = match resp.into_string() {
                 Ok(b) => b,
                 Err(e) => {
-                    eprintln!("[clitrace] Pricing: failed to read response body: {}", e);
+                    eprintln!("[toki] Pricing: failed to read response body: {}", e);
                     return fallback_cached(cached_data);
                 }
             };
 
             let prices = parse_litellm_json(&body);
             if prices.is_empty() {
-                eprintln!("[clitrace] Pricing: no Claude models found in response");
+                eprintln!("[toki] Pricing: no Claude models found in response");
                 return fallback_cached(cached_data);
             }
 
@@ -160,20 +160,20 @@ pub fn fetch_pricing(db: &Database) -> PricingTable {
                 let _ = db.set_setting("pricing_etag", &etag);
             }
 
-            eprintln!("[clitrace] Pricing: updated, {} models", prices.len());
+            eprintln!("[toki] Pricing: updated, {} models", prices.len());
             PricingTable::new(prices)
         }
         Err(ureq::Error::Status(304, _)) => {
             if let Some(ref data) = cached_data {
                 let prices: HashMap<String, ModelPricing> =
                     serde_json::from_str(data).unwrap_or_default();
-                eprintln!("[clitrace] Pricing: cached (not modified), {} models", prices.len());
+                eprintln!("[toki] Pricing: cached (not modified), {} models", prices.len());
                 return PricingTable::new(prices);
             }
             PricingTable::new(HashMap::new())
         }
         Err(e) => {
-            eprintln!("[clitrace] Pricing: network error ({}), using cache", e);
+            eprintln!("[toki] Pricing: network error ({}), using cache", e);
             fallback_cached(cached_data)
         }
     }
@@ -190,7 +190,7 @@ fn fallback_cached(cached_data: Option<String>) -> PricingTable {
             let prices: HashMap<String, ModelPricing> =
                 serde_json::from_str(&data).unwrap_or_default();
             if !prices.is_empty() {
-                eprintln!("[clitrace] Pricing: using cached data, {} models", prices.len());
+                eprintln!("[toki] Pricing: using cached data, {} models", prices.len());
             }
             PricingTable::new(prices)
         }

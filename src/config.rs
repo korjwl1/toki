@@ -32,7 +32,7 @@ impl Config {
 
         Config {
             claude_code_root: home.join(".claude").to_string_lossy().to_string(),
-            db_path: home.join(".config").join("clitrace").join("clitrace.fjall"),
+            db_path: home.join(".config").join("toki").join("toki.fjall"),
             full_rescan: false,
             session_filter: None,
             project_filter: None,
@@ -132,7 +132,7 @@ mod tests {
     fn test_config_defaults() {
         let config = Config::new();
         assert!(config.claude_code_root.ends_with(".claude"));
-        assert!(config.db_path.ends_with("clitrace.fjall"));
+        assert!(config.db_path.ends_with("toki.fjall"));
         assert_eq!(config.retention_days, 0);
         assert_eq!(config.rollup_retention_days, 0);
         assert!(!config.no_cost);

@@ -19,7 +19,7 @@ use crate::writer::DbOp;
 pub fn debug_level() -> u8 {
     static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *LEVEL.get_or_init(|| {
-        std::env::var("CLITRACE_DEBUG").map_or(0, |v| match v.as_str() {
+        std::env::var("TOKI_DEBUG").map_or(0, |v| match v.as_str() {
             "true" | "1" => 1,
             "2" => 2,
             _ => 0,
@@ -30,7 +30,7 @@ pub fn debug_level() -> u8 {
 macro_rules! debug_log {
     ($($arg:tt)*) => {
         if debug_level() >= 1 {
-            eprintln!("[clitrace:debug] {}", format!($($arg)*));
+            eprintln!("[toki:debug] {}", format!($($arg)*));
         }
     };
 }
@@ -40,7 +40,7 @@ macro_rules! debug_log {
 macro_rules! debug_log_verbose {
     ($($arg:tt)*) => {
         if debug_level() >= 2 {
-            eprintln!("[clitrace:debug] {}", format!($($arg)*));
+            eprintln!("[toki:debug] {}", format!($($arg)*));
         }
     };
 }
@@ -88,63 +88,6 @@ pub struct TrackerEngine {
     pricing: Option<PricingTable>,
 }
 
-struct ColdStartResult {
-    summaries: HashMap<String, ModelUsageSummary>,
-}
-
-fn cold_start_collect(
-    parser: &(dyn LogParser + Sync),
-    root_dir: &str,
-    checkpoints: &HashMap<String, FileCheckpoint>,
-    session_filter: Option<&str>,
-    project_filter: Option<&str>,
-) -> Result<ColdStartResult, Box<dyn std::error::Error>> {
-    let sessions = apply_filters(parser.discover_sessions(root_dir), session_filter, project_filter);
-
-    if sessions.is_empty() {
-        return Ok(ColdStartResult {
-            summaries: HashMap::new(),
-        });
-    }
-
-    let summaries: Mutex<HashMap<String, ModelUsageSummary>> = Mutex::new(HashMap::new());
-
-    parallel_scan(&sessions, checkpoints, |path, offset| {
-        let mut local: HashMap<String, ModelUsageSummary> = HashMap::new();
-        process_lines_streaming(path, offset, |line| {
-            if let Some(event) = parser.parse_line(line, path) {
-                let summary = local.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
-                    model: event.model.clone(),
-                    ..Default::default()
-                });
-                summary.accumulate(&event);
-            }
-        }).ok();
-        if !local.is_empty() {
-            let mut s = summaries.lock().unwrap_or_else(|e| e.into_inner());
-            merge_summaries(&mut s, local);
-        }
-    });
-
-    Ok(ColdStartResult {
-        summaries: summaries.into_inner().unwrap_or_else(|e| e.into_inner()),
-    })
-}
-
-pub fn cold_start_report(
-    parser: &(dyn LogParser + Sync),
-    root_dir: &str,
-    sink: &dyn Sink,
-    session_filter: Option<&str>,
-    project_filter: Option<&str>,
-    pricing: Option<&PricingTable>,
-) -> Result<HashMap<String, ModelUsageSummary>, Box<dyn std::error::Error>> {
-    let empty = HashMap::new();
-    let result = cold_start_collect(parser, root_dir, &empty, session_filter, project_filter)?;
-    sink.emit_summary(&result.summaries, pricing);
-    Ok(result.summaries)
-}
-
 #[derive(Debug, Clone, Copy)]
 pub enum ReportGroupBy {
     Date,
@@ -175,164 +118,6 @@ pub struct ReportFilter {
     pub tz: Option<Tz>,
 }
 
-
-pub fn cold_start_report_grouped<P>(
-    parser: &P,
-    root_dir: &str,
-    group_by: ReportGroupBy,
-    checkpoints: &HashMap<String, FileCheckpoint>,
-    filter: ReportFilter,
-    sink: &dyn Sink,
-    session_filter: Option<&str>,
-    project_filter: Option<&str>,
-    pricing: Option<&PricingTable>,
-) -> Result<(), Box<dyn std::error::Error>>
-where
-    P: LogParser + LogParserWithTs + Sync,
-{
-    let sessions = apply_filters(parser.discover_sessions(root_dir), session_filter, project_filter);
-    if sessions.is_empty() {
-        sink.emit_grouped(&HashMap::new(), group_by.type_name(), pricing);
-        return Ok(());
-    }
-
-    let grouped: Mutex<HashMap<String, HashMap<String, ModelUsageSummary>>> =
-        Mutex::new(HashMap::new());
-
-    parallel_scan(&sessions, checkpoints, |path, offset| {
-        let mut local: HashMap<String, HashMap<String, ModelUsageSummary>> = HashMap::new();
-        let _ = process_lines_streaming(path, offset, |line| {
-            if let Some(event) = parser.parse_line_with_ts(line, path) {
-                if let Some(bucket) = bucket_from_timestamp_filtered(&event.timestamp, group_by, filter) {
-                    let by_model = local.entry(bucket).or_default();
-                    let summary = by_model.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
-                        model: event.model.clone(),
-                        ..Default::default()
-                    });
-                    summary.accumulate_with_ts(&event);
-                }
-            }
-        });
-        if !local.is_empty() {
-            let mut g = grouped.lock().unwrap_or_else(|e| e.into_inner());
-            merge_grouped(&mut g, local);
-        }
-    });
-
-    sink.emit_grouped(&grouped.into_inner().unwrap_or_else(|e| e.into_inner()), group_by.type_name(), pricing);
-    Ok(())
-}
-
-pub fn cold_start_report_filtered<P>(
-    parser: &P,
-    root_dir: &str,
-    checkpoints: &HashMap<String, FileCheckpoint>,
-    filter: ReportFilter,
-    session_filter: Option<&str>,
-    project_filter: Option<&str>,
-) -> Result<HashMap<String, ModelUsageSummary>, Box<dyn std::error::Error>>
-where
-    P: LogParser + LogParserWithTs + Sync,
-{
-    let sessions = apply_filters(parser.discover_sessions(root_dir), session_filter, project_filter);
-    if sessions.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let summaries: Mutex<HashMap<String, ModelUsageSummary>> = Mutex::new(HashMap::new());
-
-    parallel_scan(&sessions, checkpoints, |path, offset| {
-        let mut local: HashMap<String, ModelUsageSummary> = HashMap::new();
-        let _ = process_lines_streaming(path, offset, |line| {
-            if let Some(event) = parser.parse_line_with_ts(line, path) {
-                let ts = match parse_timestamp(&event.timestamp) {
-                    Some(t) => t,
-                    None => return,
-                };
-                if !filter_match(ts, filter) {
-                    return;
-                }
-                let summary = local.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
-                    model: event.model.clone(),
-                    ..Default::default()
-                });
-                summary.accumulate_with_ts(&event);
-            }
-        });
-        if !local.is_empty() {
-            let mut s = summaries.lock().unwrap_or_else(|e| e.into_inner());
-            merge_summaries(&mut s, local);
-        }
-    });
-
-    Ok(summaries.into_inner().unwrap_or_else(|e| e.into_inner()))
-}
-
-/// Report grouped by session ID (each session shows its per-model breakdown).
-pub fn cold_start_report_by_session<P>(
-    parser: &P,
-    root_dir: &str,
-    checkpoints: &HashMap<String, FileCheckpoint>,
-    filter: ReportFilter,
-    session_filter: Option<&str>,
-    project_filter: Option<&str>,
-    sink: &dyn Sink,
-    pricing: Option<&PricingTable>,
-) -> Result<(), Box<dyn std::error::Error>>
-where
-    P: LogParser + LogParserWithTs + Sync,
-{
-    let sessions = apply_filters(parser.discover_sessions(root_dir), session_filter, project_filter);
-    if sessions.is_empty() {
-        sink.emit_grouped(&HashMap::new(), "session", pricing);
-        return Ok(());
-    }
-
-    let grouped: Mutex<HashMap<String, HashMap<String, ModelUsageSummary>>> =
-        Mutex::new(HashMap::new());
-
-    let use_ts_filter = filter_active(filter);
-
-    parallel_scan(&sessions, checkpoints, |path, offset| {
-        let session_id = match extract_session_id(path) {
-            Some(id) => id,
-            None => return,
-        };
-        let mut local: HashMap<String, ModelUsageSummary> = HashMap::new();
-        let _ = process_lines_streaming(path, offset, |line| {
-            if use_ts_filter {
-                if let Some(event) = parser.parse_line_with_ts(line, path) {
-                    let ts = match parse_timestamp(&event.timestamp) {
-                        Some(t) => t,
-                        None => return,
-                    };
-                    if !filter_match(ts, filter) {
-                        return;
-                    }
-                    let summary = local.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
-                        model: event.model.clone(),
-                        ..Default::default()
-                    });
-                    summary.accumulate_with_ts(&event);
-                }
-            } else if let Some(event) = parser.parse_line(line, path) {
-                let summary = local.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
-                    model: event.model.clone(),
-                    ..Default::default()
-                });
-                summary.accumulate(&event);
-            }
-        });
-        if !local.is_empty() {
-            let mut g = grouped.lock().unwrap_or_else(|e| e.into_inner());
-            let session_models = g.entry(session_id).or_default();
-            merge_summaries(session_models, local);
-        }
-    });
-
-    sink.emit_grouped(&grouped.into_inner().unwrap_or_else(|e| e.into_inner()), "session", pricing);
-    Ok(())
-}
 
 impl TrackerEngine {
     pub fn new(db_tx: Sender<DbOp>, checkpoints: HashMap<String, FileCheckpoint>) -> Self {
@@ -716,7 +501,7 @@ impl TrackerEngine {
                 }
             }
             Err(e) => {
-                eprintln!("[clitrace] Error processing {}: {}", path, e);
+                eprintln!("[toki] Error processing {}: {}", path, e);
             }
         }
     }
@@ -1414,7 +1199,7 @@ mod tests {
         let events = engine.process_file_with_ts(path_str, &parser).unwrap();
         let incr_us = start.elapsed().as_micros();
 
-        println!("\n=== clitrace benchmark ===");
+        println!("\n=== toki benchmark ===");
         println!("File: {} lines, {} bytes ({} KB)", 500, file_size, file_size / 1024);
         println!();
         println!("Per-operation (avg of {} runs):", iterations);

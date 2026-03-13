@@ -19,7 +19,7 @@ pub fn run_listener(
     let listener = match UnixListener::bind(sock_path) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("[clitrace:daemon] Failed to bind {}: {}", sock_path.display(), e);
+            eprintln!("[toki:daemon] Failed to bind {}: {}", sock_path.display(), e);
             return;
         }
     };
@@ -27,7 +27,7 @@ pub fn run_listener(
     // Set non-blocking so we can check stop_rx periodically
     listener.set_nonblocking(true).ok();
 
-    eprintln!("[clitrace:daemon] Listening on {}", sock_path.display());
+    eprintln!("[toki:daemon] Listening on {}", sock_path.display());
 
     loop {
         // Check for stop signal
@@ -40,7 +40,7 @@ pub fn run_listener(
                 // Set back to blocking for the client stream
                 stream.set_nonblocking(false).ok();
                 let count = broadcast.client_count() + 1;
-                eprintln!("[clitrace:daemon] Client connected ({} total)", count);
+                eprintln!("[toki:daemon] Client connected ({} total)", count);
                 broadcast.add_client(stream);
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -48,7 +48,7 @@ pub fn run_listener(
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
             Err(e) => {
-                eprintln!("[clitrace:daemon] Accept error: {}", e);
+                eprintln!("[toki:daemon] Accept error: {}", e);
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
         }
@@ -56,5 +56,5 @@ pub fn run_listener(
 
     // Cleanup socket file on exit
     let _ = std::fs::remove_file(sock_path);
-    eprintln!("[clitrace:daemon] Listener stopped");
+    eprintln!("[toki:daemon] Listener stopped");
 }

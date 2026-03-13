@@ -76,6 +76,10 @@ impl Sink for BroadcastSink {
         let json = grouped_to_json(grouped, type_name, pricing);
         self.broadcast(&json);
     }
+
+    fn emit_list(&self, items: &[String], type_name: &str) {
+        self.broadcast(&serde_json::json!({ "type": type_name, "items": items }));
+    }
 }
 
 impl Sink for std::sync::Arc<BroadcastSink> {
@@ -89,5 +93,9 @@ impl Sink for std::sync::Arc<BroadcastSink> {
 
     fn emit_grouped(&self, grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>, type_name: &str, pricing: Option<&PricingTable>) {
         (**self).emit_grouped(grouped, type_name, pricing);
+    }
+
+    fn emit_list(&self, items: &[String], type_name: &str) {
+        (**self).emit_list(items, type_name);
     }
 }

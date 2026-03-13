@@ -46,7 +46,7 @@ impl Sink for PrintSink {
             if self.format == OutputFormat::Json {
                 println!("{}", serde_json::to_string_pretty(&json::summaries_to_json(summaries, pricing)).unwrap());
             } else {
-                println!("[clitrace] No usage data found.");
+                println!("[toki] No usage data found.");
             }
             return;
         }
@@ -126,7 +126,7 @@ impl Sink for PrintSink {
             table.add_row(row);
         }
 
-        println!("[clitrace] Token Usage Summary");
+        println!("[toki] Token Usage Summary");
         println!("{table}");
     }
 
@@ -135,7 +135,7 @@ impl Sink for PrintSink {
             if self.format == OutputFormat::Json {
                 println!("{}", serde_json::to_string_pretty(&json::grouped_to_json(grouped, type_name, pricing)).unwrap());
             } else {
-                println!("[clitrace] No usage data found.");
+                println!("[toki] No usage data found.");
             }
             return;
         }
@@ -231,7 +231,36 @@ impl Sink for PrintSink {
         }
         table.add_row(total_row);
 
-        println!("[clitrace] Token Usage Summary");
+        println!("[toki] Token Usage Summary");
+        println!("{table}");
+    }
+
+    fn emit_list(&self, items: &[String], type_name: &str) {
+        if self.format == OutputFormat::Json {
+            let json = serde_json::json!({
+                "type": type_name,
+                "items": items,
+            });
+            println!("{}", serde_json::to_string_pretty(&json).unwrap());
+            return;
+        }
+
+        if items.is_empty() {
+            println!("[toki] No {} found.", type_name);
+            return;
+        }
+
+        let col_name = if type_name == "sessions" { "Session ID" } else { "Project" };
+        let mut table = Table::new();
+        table.load_preset(UTF8_FULL);
+        table.set_content_arrangement(ContentArrangement::Dynamic);
+        table.set_header(vec![Cell::new(col_name).add_attribute(Attribute::Bold)]);
+
+        for item in items {
+            table.add_row(vec![Cell::new(item)]);
+        }
+
+        println!("[toki] {} ({})", type_name, items.len());
         println!("{table}");
     }
 
@@ -246,14 +275,14 @@ impl Sink for PrintSink {
         let label = format_source_label(&event.source_file);
         match cost {
             Some(c) => println!(
-                "[clitrace] {} | {} | in:{} cc:{} cr:{} out:{} | {}",
+                "[toki] {} | {} | in:{} cc:{} cr:{} out:{} | {}",
                 event.model, label,
                 event.input_tokens, event.cache_creation_input_tokens,
                 event.cache_read_input_tokens, event.output_tokens,
                 format_cost(Some(c)),
             ),
             None => println!(
-                "[clitrace] {} | {} | in:{} cc:{} cr:{} out:{}",
+                "[toki] {} | {} | in:{} cc:{} cr:{} out:{}",
                 event.model, label,
                 event.input_tokens, event.cache_creation_input_tokens,
                 event.cache_read_input_tokens, event.output_tokens,

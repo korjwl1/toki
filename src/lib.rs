@@ -8,12 +8,13 @@ pub mod platform;
 pub mod pricing;
 pub mod providers;
 pub mod query;
+pub mod query_parser;
 pub mod retention;
 pub mod settings;
 pub mod sink;
 pub mod writer;
 
-pub use common::types::{UsageEvent, UsageEventWithTs, ModelUsageSummary, SessionGroup, ClitraceError};
+pub use common::types::{UsageEvent, UsageEventWithTs, ModelUsageSummary, SessionGroup, TokiError};
 pub use config::Config;
 
 use std::collections::HashMap;
@@ -26,7 +27,7 @@ use retention::RetentionPolicy;
 use sink::Sink;
 use writer::{DbOp, DbWriter};
 
-/// Running clitrace instance handle.
+/// Running toki instance handle.
 /// Drop triggers automatic stop().
 pub struct Handle {
     stop_tx: Option<crossbeam_channel::Sender<()>>,
@@ -38,7 +39,7 @@ pub struct Handle {
 }
 
 impl Handle {
-    /// Gracefully stop clitrace: flush dirty checkpoints and join threads.
+    /// Gracefully stop toki: flush dirty checkpoints and join threads.
     pub fn stop(mut self) {
         self.shutdown();
     }
@@ -68,16 +69,16 @@ impl Drop for Handle {
     }
 }
 
-/// Start clitrace: cold start scan, then enter watch mode.
+/// Start toki: cold start scan, then enter watch mode.
 /// Returns a Handle to control the running instance.
-pub fn start(config: Config, startup_group_by: Option<ReportGroupBy>, sink: Box<dyn Sink>) -> Result<Handle, ClitraceError> {
+pub fn start(config: Config, startup_group_by: Option<ReportGroupBy>, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
     // 1. Open DB and load checkpoints before spawning writer thread
-    let db = Database::open(&config.db_path).map_err(ClitraceError::Db)?;
+    let db = Database::open(&config.db_path).map_err(TokiError::Db)?;
 
     // Full rescan: clear checkpoints.
     if config.full_rescan {
-        eprintln!("[clitrace] Full rescan requested — clearing all checkpoints");
-        db.clear_checkpoints().map_err(ClitraceError::Db)?;
+        eprintln!("[toki] Full rescan requested — clearing all checkpoints");
+        db.clear_checkpoints().map_err(TokiError::Db)?;
     }
 
     // Fetch/load pricing
@@ -90,7 +91,7 @@ pub fn start(config: Config, startup_group_by: Option<ReportGroupBy>, sink: Box<
 
     // Load checkpoints into memory
     let checkpoints: HashMap<String, common::types::FileCheckpoint> = db.load_all_checkpoints()
-        .map_err(ClitraceError::Db)?
+        .map_err(TokiError::Db)?
         .into_iter()
         .map(|cp| (cp.file_path.clone(), cp))
         .collect();
@@ -105,11 +106,11 @@ pub fn start(config: Config, startup_group_by: Option<ReportGroupBy>, sink: Box<
     };
     let writer = DbWriter::new(db, db_rx, retention);
     let writer_handle = std::thread::Builder::new()
-        .name("clitrace-writer".to_string())
+        .name("toki-writer".to_string())
         .spawn(move || {
             writer.run();
         })
-        .map_err(ClitraceError::Io)?;
+        .map_err(TokiError::Io)?;
 
     // 4. Create engine with db_tx and loaded checkpoints
     let mut engine = TrackerEngine::new(db_tx.clone(), checkpoints)
@@ -123,13 +124,13 @@ pub fn start(config: Config, startup_group_by: Option<ReportGroupBy>, sink: Box<
     let root_dir = config.claude_code_root.clone();
 
     // Cold start
-    println!("[clitrace] Running initial scan...");
+    println!("[toki] Running initial scan...");
     if let Some(group_by) = startup_group_by {
         if let Err(e) = engine.cold_start_grouped(&parser, &root_dir, group_by) {
-            eprintln!("[clitrace] Cold start error: {}", e);
+            eprintln!("[toki] Cold start error: {}", e);
         }
     } else if let Err(e) = engine.cold_start(&parser, &root_dir) {
-        eprintln!("[clitrace] Cold start error: {}", e);
+        eprintln!("[toki] Cold start error: {}", e);
     }
 
     // Set up file watcher
@@ -140,10 +141,10 @@ pub fn start(config: Config, startup_group_by: Option<ReportGroupBy>, sink: Box<
     let projects_dir = format!("{}/projects", root_dir);
     if std::path::Path::new(&projects_dir).exists() {
         platform::watch_directory(&mut watcher, &projects_dir)?;
-        println!("[clitrace] Watching: {}", projects_dir);
+        println!("[toki] Watching: {}", projects_dir);
     } else {
         platform::watch_directory(&mut watcher, &root_dir)?;
-        println!("[clitrace] Watching: {}", root_dir);
+        println!("[toki] Watching: {}", root_dir);
     }
 
     // Stop channel
@@ -151,7 +152,7 @@ pub fn start(config: Config, startup_group_by: Option<ReportGroupBy>, sink: Box<
 
     // Spawn worker thread
     let worker_handle = std::thread::Builder::new()
-        .name("clitrace-worker".to_string())
+        .name("toki-worker".to_string())
         .spawn(move || {
             engine.watch_loop(
                 event_rx,
@@ -159,7 +160,7 @@ pub fn start(config: Config, startup_group_by: Option<ReportGroupBy>, sink: Box<
                 &parser,
             );
         })
-        .map_err(ClitraceError::Io)?;
+        .map_err(TokiError::Io)?;
 
     Ok(Handle {
         stop_tx: Some(stop_tx),

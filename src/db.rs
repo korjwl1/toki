@@ -181,6 +181,43 @@ impl Database {
         batch.insert(&self.idx_projects, key, b"");
     }
 
+    /// List distinct session IDs from the session index.
+    /// Keys are sorted in LSM-tree, so consecutive duplicates are adjacent.
+    pub fn list_sessions(&self) -> Result<Vec<String>, fjall::Error> {
+        let mut sessions = Vec::new();
+        let mut last_prefix: Vec<u8> = Vec::new();
+        for guard in self.idx_sessions.iter() {
+            let kv = guard.into_inner()?;
+            let key = &kv.0;
+            let null_pos = key.iter().position(|&b| b == 0).unwrap_or(key.len());
+            let prefix = &key[..null_pos];
+            if prefix != last_prefix.as_slice() {
+                last_prefix.clear();
+                last_prefix.extend_from_slice(prefix);
+                sessions.push(String::from_utf8_lossy(prefix).into_owned());
+            }
+        }
+        Ok(sessions)
+    }
+
+    /// List distinct project names from the project index.
+    pub fn list_projects(&self) -> Result<Vec<String>, fjall::Error> {
+        let mut projects = Vec::new();
+        let mut last_prefix: Vec<u8> = Vec::new();
+        for guard in self.idx_projects.iter() {
+            let kv = guard.into_inner()?;
+            let key = &kv.0;
+            let null_pos = key.iter().position(|&b| b == 0).unwrap_or(key.len());
+            let prefix = &key[..null_pos];
+            if prefix != last_prefix.as_slice() {
+                last_prefix.clear();
+                last_prefix.extend_from_slice(prefix);
+                projects.push(String::from_utf8_lossy(prefix).into_owned());
+            }
+        }
+        Ok(projects)
+    }
+
     // -- Dictionary operations --
 
     pub fn dict_get(&self, key: &str) -> Result<Option<u32>, fjall::Error> {

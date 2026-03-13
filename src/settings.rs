@@ -33,7 +33,7 @@ impl SettingsState {
 
         SettingsState {
             claude_code_root: get("claude_code_root", &home.join(".claude").to_string_lossy()),
-            daemon_sock: get("daemon_sock", &home.join(".config/clitrace/daemon.sock").to_string_lossy()),
+            daemon_sock: get("daemon_sock", &home.join(".config/toki/daemon.sock").to_string_lossy()),
             timezone: get("timezone", ""),
             output_format: get("output_format", "table"),
             start_of_week: get("start_of_week", "mon"),
@@ -115,7 +115,7 @@ pub fn run_settings(db_path: &Path) {
     let db = match Database::open(db_path) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("[clitrace] Failed to open database: {}", e);
+            eprintln!("[toki] Failed to open database: {}", e);
             std::process::exit(1);
         }
     };
@@ -185,7 +185,7 @@ pub fn run_settings(db_path: &Path) {
 
     siv.add_layer(
         Dialog::around(main_layout)
-            .title("clitrace settings")
+            .title("toki settings")
             .button("Save", move |s| {
                 save_settings(s, &db_path_owned);
             })

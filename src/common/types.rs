@@ -139,40 +139,40 @@ pub trait LogParserWithTs: Send + Sync {
     fn parse_line_with_ts(&self, line: &str, source_file: &str) -> Option<UsageEventWithTs>;
 }
 
-/// Clitrace error types.
+/// Toki error types.
 #[derive(Debug)]
-pub enum ClitraceError {
+pub enum TokiError {
     Db(fjall::Error),
     Io(std::io::Error),
     Watcher(notify::Error),
 }
 
-impl std::fmt::Display for ClitraceError {
+impl std::fmt::Display for TokiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ClitraceError::Db(e) => write!(f, "database error: {}", e),
-            ClitraceError::Io(e) => write!(f, "io error: {}", e),
-            ClitraceError::Watcher(e) => write!(f, "watcher error: {}", e),
+            TokiError::Db(e) => write!(f, "database error: {}", e),
+            TokiError::Io(e) => write!(f, "io error: {}", e),
+            TokiError::Watcher(e) => write!(f, "watcher error: {}", e),
         }
     }
 }
 
-impl std::error::Error for ClitraceError {}
+impl std::error::Error for TokiError {}
 
-impl From<fjall::Error> for ClitraceError {
+impl From<fjall::Error> for TokiError {
     fn from(e: fjall::Error) -> Self {
-        ClitraceError::Db(e)
+        TokiError::Db(e)
     }
 }
 
-impl From<std::io::Error> for ClitraceError {
+impl From<std::io::Error> for TokiError {
     fn from(e: std::io::Error) -> Self {
-        ClitraceError::Io(e)
+        TokiError::Io(e)
     }
 }
 
-impl From<notify::Error> for ClitraceError {
+impl From<notify::Error> for TokiError {
     fn from(e: notify::Error) -> Self {
-        ClitraceError::Watcher(e)
+        TokiError::Watcher(e)
     }
 }

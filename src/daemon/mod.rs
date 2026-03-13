@@ -11,7 +11,7 @@ use std::path::PathBuf;
 /// Default daemon socket path.
 pub fn default_sock_path() -> PathBuf {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    home.join(".config").join("clitrace").join("daemon.sock")
+    home.join(".config").join("toki").join("daemon.sock")
 }
 
 /// Send SIGTERM to the daemon process via PID file.

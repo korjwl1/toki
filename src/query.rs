@@ -38,23 +38,61 @@ pub fn report_summary_from_db(
     Ok(summaries)
 }
 
-/// Report grouped by time bucket from TSDB rollups (streaming).
+/// Report grouped by time bucket from TSDB.
+/// Uses fast rollup scan when no session/project filters are set.
+/// Falls back to event-level scan when filtering by session or project.
 pub fn report_grouped_from_db(
     db: &Database,
     group_by: ReportGroupBy,
     filter: ReportFilter,
+    session_filter: Option<&str>,
+    project_filter: Option<&str>,
 ) -> Result<GroupedSummaryMap, fjall::Error> {
     let (since, until) = filter_range(filter);
     let mut grouped: GroupedSummaryMap = HashMap::new();
-    db.for_each_rollup(since, until, |hour_ts, model, rollup| {
-        let dt = ts_to_datetime(hour_ts, filter.tz);
-        let bucket = bucket_from_datetime(dt, group_by);
-        let entry = grouped.entry(bucket).or_default()
-            .entry(model.clone()).or_insert_with(|| ModelUsageSummary {
-                model, ..Default::default()
-            });
-        accumulate_rollup(entry, &rollup);
-    })?;
+
+    if session_filter.is_some() || project_filter.is_some() {
+        // Event-level scan for session/project filtering
+        let dict = db.load_dict_reverse()?;
+        let unknown = String::new();
+        db.for_each_event(since, until, |ts, event| {
+            let model = dict.get(&event.model_id).unwrap_or(&unknown);
+            if let Some(sf) = session_filter {
+                let session = dict.get(&event.session_id).unwrap_or(&unknown);
+                if !session.starts_with(sf) { return; }
+            }
+            if let Some(pf) = project_filter {
+                let source = dict.get(&event.source_file_id).map(|s| s.as_str()).unwrap_or("");
+                match crate::engine::extract_project_name(source) {
+                    Some(p) if p.contains(pf) => {}
+                    _ => return,
+                }
+            }
+            let dt = ts_to_datetime(ts, filter.tz);
+            let bucket = bucket_from_datetime(dt, group_by);
+            let entry = grouped.entry(bucket).or_default()
+                .entry(model.clone()).or_insert_with(|| ModelUsageSummary {
+                    model: model.clone(), ..Default::default()
+                });
+            entry.input_tokens += event.input_tokens;
+            entry.output_tokens += event.output_tokens;
+            entry.cache_creation_input_tokens += event.cache_creation_input_tokens;
+            entry.cache_read_input_tokens += event.cache_read_input_tokens;
+            entry.event_count += 1;
+        })?;
+    } else {
+        // Fast rollup-based scan
+        db.for_each_rollup(since, until, |hour_ts, model, rollup| {
+            let dt = ts_to_datetime(hour_ts, filter.tz);
+            let bucket = bucket_from_datetime(dt, group_by);
+            let entry = grouped.entry(bucket).or_default()
+                .entry(model.clone()).or_insert_with(|| ModelUsageSummary {
+                    model, ..Default::default()
+                });
+            accumulate_rollup(entry, &rollup);
+        })?;
+    }
+
     Ok(grouped)
 }
 
@@ -64,14 +102,15 @@ pub fn report_by_session_from_db(
     filter: ReportFilter,
 ) -> Result<GroupedSummaryMap, fjall::Error> {
     let dict = db.load_dict_reverse()?;
+    let unknown = String::new();
     let (since, until) = filter_range(filter);
     let mut grouped: GroupedSummaryMap = HashMap::new();
     db.for_each_event(since, until, |_ts, event| {
-        let session = dict.get(&event.session_id).cloned().unwrap_or_else(|| format!("unknown-{}", event.session_id));
-        let model = dict.get(&event.model_id).cloned().unwrap_or_else(|| format!("unknown-{}", event.model_id));
-        let entry = grouped.entry(session).or_default()
+        let session = dict.get(&event.session_id).unwrap_or(&unknown);
+        let model = dict.get(&event.model_id).unwrap_or(&unknown);
+        let entry = grouped.entry(session.clone()).or_default()
             .entry(model.clone()).or_insert_with(|| ModelUsageSummary {
-                model, ..Default::default()
+                model: model.clone(), ..Default::default()
             });
         entry.input_tokens += event.input_tokens;
         entry.output_tokens += event.output_tokens;
@@ -80,6 +119,265 @@ pub fn report_by_session_from_db(
         entry.event_count += 1;
     })?;
     Ok(grouped)
+}
+
+/// Execute a parsed PromQL-style query against the TSDB.
+pub fn execute_parsed_query(
+    db: &Database,
+    parsed: &crate::query_parser::Query,
+    tz: Option<Tz>,
+    pricing: Option<&crate::pricing::PricingTable>,
+    sink: &dyn crate::sink::Sink,
+) -> Result<(), String> {
+    use crate::query_parser::Metric;
+
+    match parsed.metric {
+        Metric::Sessions => {
+            let session_prefix = parsed.filter_value("session");
+            let project_filter = parsed.filter_value("project");
+            let has_time_or_project = parsed.since.is_some() || parsed.until.is_some() || project_filter.is_some();
+
+            let sessions = if has_time_or_project {
+                // Need event-level scan to filter by time range and/or project
+                let since_dt = parsed.since.as_deref().map(|s| parse_range_time(s, false, tz)).transpose()?;
+                let until_dt = parsed.until.as_deref().map(|s| parse_range_time(s, true, tz)).transpose()?;
+                let since_ms = since_dt.map(|d| d.and_utc().timestamp_millis()).unwrap_or(0);
+                let until_ms = until_dt.map(|d| d.and_utc().timestamp_millis()).unwrap_or(i64::MAX);
+
+                let dict = db.load_dict_reverse().map_err(|e| e.to_string())?;
+                let mut set = std::collections::HashSet::new();
+                db.for_each_event(since_ms, until_ms, |_ts, event| {
+                    let session = dict.get(&event.session_id).map(|s| s.as_str()).unwrap_or("");
+                    if let Some(prefix) = session_prefix {
+                        if !session.starts_with(prefix) { return; }
+                    }
+                    if let Some(proj) = project_filter {
+                        let source = dict.get(&event.source_file_id).map(|s| s.as_str()).unwrap_or("");
+                        match crate::engine::extract_project_name(source) {
+                            Some(p) if p.contains(proj) => {}
+                            _ => return,
+                        }
+                    }
+                    set.insert(session.to_string());
+                }).map_err(|e| e.to_string())?;
+                let mut list: Vec<String> = set.into_iter().collect();
+                list.sort();
+                list
+            } else {
+                // Fast path: index scan only
+                let mut list = db.list_sessions().map_err(|e| e.to_string())?;
+                if let Some(prefix) = session_prefix {
+                    list.retain(|s| s.starts_with(prefix));
+                }
+                list
+            };
+            sink.emit_list(&sessions, "sessions");
+        }
+        Metric::Projects => {
+            let project_filter = parsed.filter_value("project");
+            let has_time = parsed.since.is_some() || parsed.until.is_some();
+
+            let projects = if has_time {
+                // Event scan for time-filtered project list
+                let since_dt = parsed.since.as_deref().map(|s| parse_range_time(s, false, tz)).transpose()?;
+                let until_dt = parsed.until.as_deref().map(|s| parse_range_time(s, true, tz)).transpose()?;
+                let since_ms = since_dt.map(|d| d.and_utc().timestamp_millis()).unwrap_or(0);
+                let until_ms = until_dt.map(|d| d.and_utc().timestamp_millis()).unwrap_or(i64::MAX);
+
+                let dict = db.load_dict_reverse().map_err(|e| e.to_string())?;
+                let mut set = std::collections::HashSet::new();
+                db.for_each_event(since_ms, until_ms, |_ts, event| {
+                    let source = dict.get(&event.source_file_id).map(|s| s.as_str()).unwrap_or("");
+                    if let Some(p) = crate::engine::extract_project_name(source) {
+                        if let Some(substr) = project_filter {
+                            if !p.contains(substr) { return; }
+                        }
+                        set.insert(p.to_string());
+                    }
+                }).map_err(|e| e.to_string())?;
+                let mut list: Vec<String> = set.into_iter().collect();
+                list.sort();
+                list
+            } else {
+                let mut list = db.list_projects().map_err(|e| e.to_string())?;
+                if let Some(substr) = project_filter {
+                    list.retain(|p| p.contains(substr));
+                }
+                list
+            };
+            sink.emit_list(&projects, "projects");
+        }
+        Metric::Usage => {
+            let since_dt = parsed.since.as_deref().map(|s| parse_range_time(s, false, tz)).transpose()?;
+            let until_dt = parsed.until.as_deref().map(|s| parse_range_time(s, true, tz)).transpose()?;
+
+            let filter = ReportFilter { since: since_dt, until: until_dt, tz };
+            let model_filter = parsed.filter_value("model");
+            let session_filter = parsed.filter_value("session");
+
+            match (&parsed.bucket, parsed.group_by.is_empty()) {
+                (None, true) => {
+                    // Flat summary
+                    let mut summaries = report_summary_from_db(db, filter).map_err(|e| e.to_string())?;
+                    if let Some(model) = model_filter {
+                        summaries.retain(|k, _| k == model);
+                    }
+                    sink.emit_summary(&summaries, pricing);
+                }
+                _ => {
+                    // Grouped output (bucket and/or group_by)
+                    let (since, until) = filter_range(filter);
+                    let mut grouped: GroupedSummaryMap = HashMap::new();
+
+                    if session_filter.is_some() || !parsed.group_by.is_empty() {
+                        // Need event-level access for session/group_by
+                        let dict = db.load_dict_reverse().map_err(|e| e.to_string())?;
+                        let unknown = String::new();
+                        db.for_each_event(since, until, |ts, event| {
+                            let model = dict.get(&event.model_id).unwrap_or(&unknown);
+                            if let Some(mf) = model_filter {
+                                if model != mf { return; }
+                            }
+                            let session = dict.get(&event.session_id).unwrap_or(&unknown);
+                            if let Some(sf) = session_filter {
+                                if !session.starts_with(sf) { return; }
+                            }
+
+                            let bucket_key = if let Some(ref bucket) = parsed.bucket {
+                                let ts_display = ts_to_datetime(ts, tz);
+                                bucket.format_label(ts_display.and_utc().timestamp())
+                            } else {
+                                String::new()
+                            };
+
+                            let group_key = build_group_key(&parsed.group_by, model, session, &dict, &event);
+                            let key = if bucket_key.is_empty() && !group_key.is_empty() {
+                                group_key
+                            } else if !bucket_key.is_empty() && group_key.is_empty() {
+                                bucket_key
+                            } else if !bucket_key.is_empty() && !group_key.is_empty() {
+                                format!("{}|{}", bucket_key, group_key)
+                            } else {
+                                "total".to_string()
+                            };
+
+                            let entry = grouped.entry(key).or_default()
+                                .entry(model.clone()).or_insert_with(|| ModelUsageSummary {
+                                    model: model.clone(), ..Default::default()
+                                });
+                            entry.input_tokens += event.input_tokens;
+                            entry.output_tokens += event.output_tokens;
+                            entry.cache_creation_input_tokens += event.cache_creation_input_tokens;
+                            entry.cache_read_input_tokens += event.cache_read_input_tokens;
+                            entry.event_count += 1;
+                        }).map_err(|e| e.to_string())?;
+                    } else {
+                        // Rollup-based (faster, no session/group_by needed)
+                        db.for_each_rollup(since, until, |hour_ts, model, rollup| {
+                            if let Some(mf) = model_filter {
+                                if model != mf { return; }
+                            }
+                            let bucket_key = if let Some(ref bucket) = parsed.bucket {
+                                let dt = ts_to_datetime(hour_ts, tz);
+                                bucket.format_label(dt.and_utc().timestamp())
+                            } else {
+                                "total".to_string()
+                            };
+
+                            let entry = grouped.entry(bucket_key).or_default()
+                                .entry(model.clone()).or_insert_with(|| ModelUsageSummary {
+                                    model, ..Default::default()
+                                });
+                            accumulate_rollup(entry, &rollup);
+                        }).map_err(|e| e.to_string())?;
+                    }
+
+                    let type_name = if let Some(ref bucket) = parsed.bucket {
+                        format!("every {}", bucket)
+                    } else {
+                        "grouped".to_string()
+                    };
+                    sink.emit_grouped(&grouped, &type_name, pricing);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn build_group_key(
+    group_by: &[String],
+    model: &str,
+    session: &str,
+    dict: &HashMap<u32, String>,
+    event: &crate::common::types::StoredEvent,
+) -> String {
+    if group_by.is_empty() {
+        return String::new();
+    }
+
+    let resolve = |dim: &str| -> &str {
+        match dim {
+            "model" => model,
+            "session" => session,
+            "project" => {
+                let source = dict.get(&event.source_file_id).map(|s| s.as_str()).unwrap_or("");
+                crate::engine::extract_project_name(source).unwrap_or("unknown")
+            }
+            _ => "",
+        }
+    };
+
+    // Fast path: single dimension avoids Vec + join
+    if group_by.len() == 1 {
+        return resolve(&group_by[0]).to_string();
+    }
+
+    let mut result = String::new();
+    for (i, dim) in group_by.iter().enumerate() {
+        if i > 0 { result.push('|'); }
+        result.push_str(resolve(dim));
+    }
+    result
+}
+
+/// Parse a time range string (YYYYMMDD or YYYYMMDDhhmmss) into NaiveDateTime.
+/// Shared between query execution and CLI argument parsing.
+pub fn parse_range_time(value: &str, is_until: bool, tz: Option<Tz>) -> Result<NaiveDateTime, String> {
+    let naive = if value.len() == 8 && value.chars().all(|c| c.is_ascii_digit()) {
+        let year: i32 = value[0..4].parse().map_err(|_| "invalid year")?;
+        let month: u32 = value[4..6].parse().map_err(|_| "invalid month")?;
+        let day: u32 = value[6..8].parse().map_err(|_| "invalid day")?;
+        let date = chrono::NaiveDate::from_ymd_opt(year, month, day).ok_or("invalid date")?;
+        let time = if is_until {
+            chrono::NaiveTime::from_hms_opt(23, 59, 59).unwrap()
+        } else {
+            chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap()
+        };
+        NaiveDateTime::new(date, time)
+    } else if value.len() == 14 && value.chars().all(|c| c.is_ascii_digit()) {
+        let year: i32 = value[0..4].parse().map_err(|_| "invalid year")?;
+        let month: u32 = value[4..6].parse().map_err(|_| "invalid month")?;
+        let day: u32 = value[6..8].parse().map_err(|_| "invalid day")?;
+        let hour: u32 = value[8..10].parse().map_err(|_| "invalid hour")?;
+        let min: u32 = value[10..12].parse().map_err(|_| "invalid minute")?;
+        let sec: u32 = value[12..14].parse().map_err(|_| "invalid second")?;
+        let date = chrono::NaiveDate::from_ymd_opt(year, month, day).ok_or("invalid date")?;
+        let time = chrono::NaiveTime::from_hms_opt(hour, min, sec).ok_or("invalid time")?;
+        NaiveDateTime::new(date, time)
+    } else {
+        return Err("invalid format (use YYYYMMDD or YYYYMMDDhhmmss)".to_string());
+    };
+
+    match tz {
+        Some(tz) => {
+            let local = tz.from_local_datetime(&naive)
+                .single()
+                .ok_or("ambiguous or invalid local time")?;
+            Ok(local.naive_utc())
+        }
+        None => Ok(naive),
+    }
 }
 
 /// Check if the TSDB has any data (O(1) — reads only first rollup entry).
@@ -202,7 +500,7 @@ mod tests {
         batch.commit().unwrap();
 
         let filter = ReportFilter::default();
-        let result = report_grouped_from_db(&db, ReportGroupBy::Date, filter).unwrap();
+        let result = report_grouped_from_db(&db, ReportGroupBy::Date, filter, None, None).unwrap();
         assert_eq!(result.len(), 2);
     }
 
