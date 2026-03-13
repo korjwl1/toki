@@ -49,40 +49,35 @@ fn build_theme() -> Theme {
     theme.shadow = false;
     theme.borders = BorderStyle::Simple;
 
-    // Dark background, clean foreground
+    // Inherit terminal colors for everything — don't fight the user's theme
     theme.palette[PaletteColor::Background] = Color::TerminalDefault;
     theme.palette[PaletteColor::View] = Color::TerminalDefault;
-    theme.palette[PaletteColor::Primary] = Color::Light(BaseColor::White);
-    theme.palette[PaletteColor::Secondary] = Color::Dark(BaseColor::White);
-    theme.palette[PaletteColor::Tertiary] = Color::Dark(BaseColor::White);
+    theme.palette[PaletteColor::Primary] = Color::TerminalDefault;
+    theme.palette[PaletteColor::Secondary] = Color::TerminalDefault;
+    theme.palette[PaletteColor::Tertiary] = Color::TerminalDefault;
 
-    // Titles: cyan accent
+    // Only accent: titles in cyan
     theme.palette[PaletteColor::TitlePrimary] = Color::Light(BaseColor::Cyan);
     theme.palette[PaletteColor::TitleSecondary] = Color::Dark(BaseColor::Cyan);
 
-    // Highlight: cyan bg, black text
+    // Highlight: reverse video (works on any terminal theme)
     theme.palette[PaletteColor::Highlight] = Color::Dark(BaseColor::Cyan);
-    theme.palette[PaletteColor::HighlightInactive] = Color::Dark(BaseColor::White);
+    theme.palette[PaletteColor::HighlightInactive] = Color::TerminalDefault;
     theme.palette[PaletteColor::HighlightText] = Color::Dark(BaseColor::Black);
 
     theme
 }
 
-/// Styled field label (bright)
+/// Field label — uses terminal default color (bold via content)
 fn field_label(text: &str) -> TextView {
-    let mut s = StyledString::new();
-    s.append_styled(text, ColorStyle::new(
-        ColorType::Color(Color::Light(BaseColor::White)),
-        ColorType::InheritParent,
-    ));
-    TextView::new(s)
+    TextView::new(text)
 }
 
-/// Styled hint text (dim)
+/// Hint text — dimmed cyan, visible on both light and dark terminals
 fn hint_text(text: &str) -> TextView {
     let mut s = StyledString::new();
     s.append_styled(text, ColorStyle::new(
-        ColorType::Color(Color::Dark(BaseColor::White)),
+        ColorType::Color(Color::Dark(BaseColor::Cyan)),
         ColorType::InheritParent,
     ));
     TextView::new(s)
@@ -167,33 +162,19 @@ pub fn run_settings(db_path: &Path) {
 
     let db_path_owned = db_path.to_path_buf();
 
-    // Footer hint
+    // Footer hint — cyan for keys, terminal default for descriptions
+    let cyan = ColorStyle::new(
+        ColorType::Color(Color::Light(BaseColor::Cyan)),
+        ColorType::InheritParent,
+    );
     let footer = {
         let mut s = StyledString::new();
-        s.append_styled("Tab", ColorStyle::new(
-            ColorType::Color(Color::Light(BaseColor::Cyan)),
-            ColorType::InheritParent,
-        ));
-        s.append_styled(" navigate  ", ColorStyle::new(
-            ColorType::Color(Color::Dark(BaseColor::White)),
-            ColorType::InheritParent,
-        ));
-        s.append_styled("Enter", ColorStyle::new(
-            ColorType::Color(Color::Light(BaseColor::Cyan)),
-            ColorType::InheritParent,
-        ));
-        s.append_styled(" select  ", ColorStyle::new(
-            ColorType::Color(Color::Dark(BaseColor::White)),
-            ColorType::InheritParent,
-        ));
-        s.append_styled("Esc", ColorStyle::new(
-            ColorType::Color(Color::Light(BaseColor::Cyan)),
-            ColorType::InheritParent,
-        ));
-        s.append_styled(" cancel", ColorStyle::new(
-            ColorType::Color(Color::Dark(BaseColor::White)),
-            ColorType::InheritParent,
-        ));
+        s.append_styled("Tab", cyan);
+        s.append_plain(" navigate  ");
+        s.append_styled("Enter", cyan);
+        s.append_plain(" select  ");
+        s.append_styled("Esc", cyan);
+        s.append_plain(" cancel");
         TextView::new(s)
     };
 
