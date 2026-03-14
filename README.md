@@ -231,7 +231,7 @@ toki trace --sink print --sink http://localhost:8080/events
 │   └── claude-code-jsonl-format.md        # Claude Code JSONL 구조 참고
 ├── specs/
 │   └── constitution.md                    # 프로젝트 원칙 (Constitution)
-├── Comparison.md                          # ccusage 성능 비교
+├── benches/                               # 벤치마크 (benchmark.py, COMPARISON.md)
 └── src/
     ├── lib.rs                             # Public API: start(), Handle
     ├── main.rs                            # CLI 바이너리 (clap)
