@@ -74,12 +74,32 @@ enum Commands {
         #[command(subcommand)]
         command: Option<ReportCommands>,
     },
-    /// Open settings TUI
+    /// Open settings TUI, or set a value non-interactively
     Settings {
         /// Database path (default: ~/.config/toki/toki.fjall)
         #[arg(long)]
         db_path: Option<PathBuf>,
+        #[command(subcommand)]
+        command: Option<SettingsCommands>,
     },
+}
+
+#[derive(Subcommand)]
+enum SettingsCommands {
+    /// Set a configuration value (e.g. toki settings set claude_code_root /path)
+    Set {
+        /// Setting key
+        key: String,
+        /// Setting value
+        value: String,
+    },
+    /// Get a configuration value
+    Get {
+        /// Setting key
+        key: String,
+    },
+    /// List all settings
+    List,
 }
 
 #[derive(Subcommand)]
@@ -219,10 +239,23 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Settings { db_path } => {
+        Commands::Settings { db_path, command } => {
             let config = Config::new();
             let db_path = db_path.unwrap_or(config.db_path);
-            toki::settings::run_settings(&db_path);
+            match command {
+                None => {
+                    toki::settings::run_settings(&db_path);
+                }
+                Some(SettingsCommands::Set { key, value }) => {
+                    handle_settings_set(&db_path, &key, &value);
+                }
+                Some(SettingsCommands::Get { key }) => {
+                    handle_settings_get(&db_path, &key);
+                }
+                Some(SettingsCommands::List) => {
+                    handle_settings_list(&db_path);
+                }
+            }
         }
         Commands::Daemon { command } => {
             let config = build_config(None, false, None);
@@ -251,6 +284,75 @@ fn main() {
             handle_report(since, until, group_by_session, session_id, project, command,
                           &config, &sink_specs, output_format, config.no_cost);
         }
+    }
+}
+
+// ── Settings (non-interactive) ──────────────────────────
+
+const VALID_SETTINGS: &[&str] = &[
+    "claude_code_root", "daemon_sock", "timezone", "output_format",
+    "start_of_week", "no_cost", "retention_days", "rollup_retention_days",
+];
+
+fn handle_settings_set(db_path: &std::path::Path, key: &str, value: &str) {
+    if !VALID_SETTINGS.contains(&key) {
+        eprintln!("[toki] Unknown setting: {}", key);
+        eprintln!("[toki] Valid keys: {}", VALID_SETTINGS.join(", "));
+        std::process::exit(1);
+    }
+
+    let db = match toki::db::Database::open(db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("[toki] Cannot open database: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(e) = db.set_setting(key, value) {
+        eprintln!("[toki] Failed to set {}: {}", key, e);
+        std::process::exit(1);
+    }
+    println!("{} = {}", key, value);
+}
+
+fn handle_settings_get(db_path: &std::path::Path, key: &str) {
+    if !VALID_SETTINGS.contains(&key) {
+        eprintln!("[toki] Unknown setting: {}", key);
+        eprintln!("[toki] Valid keys: {}", VALID_SETTINGS.join(", "));
+        std::process::exit(1);
+    }
+
+    let db = match toki::db::Database::open(db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("[toki] Cannot open database: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    match db.get_setting(key) {
+        Ok(Some(v)) => println!("{}", v),
+        Ok(None) => println!("(not set)"),
+        Err(e) => {
+            eprintln!("[toki] Failed to get {}: {}", key, e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn handle_settings_list(db_path: &std::path::Path) {
+    let db = match toki::db::Database::open(db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("[toki] Cannot open database: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    for key in VALID_SETTINGS {
+        let value = db.get_setting(key).ok().flatten().unwrap_or_else(|| "(not set)".to_string());
+        println!("{:>24} = {}", key, value);
     }
 }
 

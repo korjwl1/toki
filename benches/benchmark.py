@@ -87,14 +87,52 @@ def collect_projects(source_root: Path):
     return projects
 
 
-def copy_project(src_dir: Path, dst_dir: Path):
-    """Copy a project dir, renaming session UUIDs to avoid collision."""
+def randomize_jsonl(src_path: Path, dst_path: Path, ts_offset_s: int):
+    """Copy a JSONL file, randomizing message IDs and shifting timestamps."""
+    import random
+
+    with open(src_path, "r") as fin, open(dst_path, "w") as fout:
+        for line in fin:
+            stripped = line.strip()
+            if not stripped:
+                fout.write(line)
+                continue
+
+            try:
+                d = json.loads(stripped)
+            except json.JSONDecodeError:
+                fout.write(line)
+                continue
+
+            # Randomize timestamp (shift by offset + small jitter)
+            if "timestamp" in d and isinstance(d["timestamp"], str):
+                try:
+                    from datetime import datetime, timedelta, timezone
+                    dt = datetime.fromisoformat(d["timestamp"].replace("Z", "+00:00"))
+                    jitter = random.randint(-3600, 3600)  # ±1h jitter
+                    dt = dt + timedelta(seconds=ts_offset_s + jitter)
+                    d["timestamp"] = dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{random.randint(0,999):03d}Z"
+                except (ValueError, OSError):
+                    pass
+
+            # Randomize message.id (unique per event)
+            if "message" in d and isinstance(d["message"], dict) and "id" in d["message"]:
+                d["message"]["id"] = f"msg_{uuid.uuid4().hex[:24]}"
+
+            fout.write(json.dumps(d, separators=(",", ":")) + "\n")
+
+
+def copy_project(src_dir: Path, dst_dir: Path, round_idx: int):
+    """Copy a project dir with randomized session IDs, message IDs, and timestamps."""
     dst_dir.mkdir(parents=True, exist_ok=True)
+
+    # Shift timestamps by round * 30 days to spread across time
+    ts_offset = round_idx * 30 * 86400
 
     for item in src_dir.iterdir():
         if item.is_file() and item.suffix == ".jsonl":
             new_uuid = str(uuid.uuid4())
-            shutil.copy2(item, dst_dir / f"{new_uuid}.jsonl")
+            randomize_jsonl(item, dst_dir / f"{new_uuid}.jsonl", ts_offset)
 
             # Copy subagent dir if it exists
             sub_dir = src_dir / item.stem / "subagents"
@@ -103,7 +141,7 @@ def copy_project(src_dir: Path, dst_dir: Path):
                 new_sub_dir.mkdir(parents=True, exist_ok=True)
                 for sub in sub_dir.iterdir():
                     if sub.is_file() and sub.suffix == ".jsonl":
-                        shutil.copy2(sub, new_sub_dir / sub.name)
+                        randomize_jsonl(sub, new_sub_dir / sub.name, ts_offset)
 
 
 def generate_data_set(projects, target_bytes: int, dest: Path):
@@ -129,7 +167,7 @@ def generate_data_set(projects, target_bytes: int, dest: Path):
                 name = f"{src_path.name}-bench{copy_round}"
                 dst = projects_dst / name
 
-            copy_project(src_path, dst)
+            copy_project(src_path, dst, copy_round)
             current += src_size
 
         copy_round += 1
@@ -147,18 +185,24 @@ def cmd_generate(args):
     sizes = parse_sizes(args.sizes)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+    force = getattr(args, "force", False)
+
     for target_mb in sizes:
         target_bytes = target_mb * 1024 * 1024
         set_dir = DATA_DIR / f"{target_mb}mb"
 
         if set_dir.exists():
-            existing = get_dir_size_bytes(set_dir)
-            existing_mb = existing / 1024 / 1024
-            if abs(existing_mb - target_mb) < target_mb * 0.15:
-                print(f"  {target_mb}MB: exists ({existing_mb:.0f} MB), skipping")
-                continue
-            print(f"  {target_mb}MB: exists but wrong size ({existing_mb:.0f} MB), regenerating")
-            shutil.rmtree(set_dir)
+            if force:
+                print(f"  {target_mb}MB: regenerating (--force)")
+                shutil.rmtree(set_dir)
+            else:
+                existing = get_dir_size_bytes(set_dir)
+                existing_mb = existing / 1024 / 1024
+                if abs(existing_mb - target_mb) < target_mb * 0.15:
+                    print(f"  {target_mb}MB: exists ({existing_mb:.0f} MB), skipping")
+                    continue
+                print(f"  {target_mb}MB: exists but wrong size ({existing_mb:.0f} MB), regenerating")
+                shutil.rmtree(set_dir)
 
         print(f"  {target_mb}MB: generating...", end="", flush=True)
         generate_data_set(projects, target_bytes, set_dir)
@@ -273,14 +317,18 @@ def run_once(cmd: list[str], env_extra: dict | None = None) -> BenchResult:
     )
 
 
-def run_daemon_cold_start(toki: str) -> BenchResult:
+def run_daemon_cold_start(toki: str, data_path: Path) -> BenchResult:
     """Start toki daemon, wait for cold start to complete, measure performance.
 
     Returns BenchResult with cold start timing. Daemon keeps running for report benchmarks.
     """
-    # Reset DB
+    # Reset DB and set claude_code_root to benchmark data path
     subprocess.run(
         [toki, "daemon", "reset"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        [toki, "settings", "set", "claude_code_root", str(data_path)],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
 
@@ -462,7 +510,7 @@ def cmd_run(args):
             tag = f"[{run_idx}/{total_runs}]"
             print(f"  {tag} toki       | {label:8s} | cold_start | run 1", end="", flush=True)
 
-            r = run_daemon_cold_start(toki)
+            r = run_daemon_cold_start(toki, data_path)
             r.data_label = label
             r.data_size_mb = size_mb
             r.run = 1
@@ -1013,6 +1061,8 @@ Architecture:
                      help="Source Claude data directory (default: ~/.claude)")
     gen.add_argument("--sizes", default=None,
                      help="Comma-separated sizes in MB (default: 100,200,...,2000)")
+    gen.add_argument("--force", action="store_true",
+                     help="Regenerate all data sets even if they exist")
 
     # run
     run = sub.add_parser("run", help="Run benchmarks")
@@ -1033,6 +1083,8 @@ Architecture:
                    help=f"Runs per scenario (default: {DEFAULT_RUNS})")
     a.add_argument("--tool", choices=["toki", "ccusage", "both"], default="both",
                    help="Which tool(s) to benchmark (default: both)")
+    a.add_argument("--force", action="store_true",
+                   help="Regenerate all data sets even if they exist")
 
     # plot
     p = sub.add_parser("plot", help="Generate charts from benchmark results")
