@@ -19,23 +19,25 @@ static RUNNING: AtomicBool = AtomicBool::new(true);
 #[derive(Parser)]
 #[command(name = "toki", version, about = "AI CLI tool token usage tracker")]
 struct Cli {
-    /// Output format override: table or json (overrides DB setting)
-    #[arg(long, global = true)]
-    output_format: Option<String>,
-    /// Output sink(s): print (default), uds://<path>, http://<url>
-    #[arg(long, global = true)]
-    sink: Vec<String>,
-    /// Timezone override (e.g. Asia/Seoul, US/Eastern)
-    #[arg(long, short = 'z', global = true)]
-    timezone: Option<String>,
-    /// Disable cost calculation (overrides DB setting)
-    #[arg(long, global = true)]
-    no_cost: bool,
-    /// Database path (default: ~/.config/toki/toki.fjall)
-    #[arg(long, global = true)]
-    db_path: Option<PathBuf>,
     #[command(subcommand)]
     command: Commands,
+}
+
+/// Options shared by trace and report commands.
+#[derive(Args, Clone)]
+struct ClientOptions {
+    /// Output format override: table or json (overrides DB setting)
+    #[arg(long)]
+    output_format: Option<String>,
+    /// Output sink(s): print (default), uds://<path>, http://<url>
+    #[arg(long)]
+    sink: Vec<String>,
+    /// Timezone override (e.g. Asia/Seoul, US/Eastern)
+    #[arg(long, short = 'z')]
+    timezone: Option<String>,
+    /// Disable cost calculation (overrides DB setting)
+    #[arg(long)]
+    no_cost: bool,
 }
 
 #[derive(Subcommand)]
@@ -46,9 +48,14 @@ enum Commands {
         command: DaemonCommands,
     },
     /// Connect to running daemon and stream real-time events
-    Trace,
+    Trace {
+        #[command(flatten)]
+        opts: ClientOptions,
+    },
     /// Report mode: one-shot summary from TSDB
     Report {
+        #[command(flatten)]
+        opts: ClientOptions,
         /// Filter start time (inclusive): YYYYMMDD or YYYYMMDDhhmmss
         #[arg(long)]
         since: Option<String>,
@@ -68,7 +75,11 @@ enum Commands {
         command: Option<ReportCommands>,
     },
     /// Open settings TUI
-    Settings,
+    Settings {
+        /// Database path (default: ~/.config/toki/toki.fjall)
+        #[arg(long)]
+        db_path: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -136,13 +147,8 @@ enum ReportCommands {
 }
 
 /// Build Config from defaults + DB settings + CLI overrides.
-fn build_config(db_path: Option<PathBuf>, cli_tz: Option<Tz>, cli_no_cost: bool, cli_output_format: Option<&str>) -> Config {
+fn build_config(cli_tz: Option<Tz>, cli_no_cost: bool, cli_output_format: Option<&str>) -> Config {
     let mut config = Config::new();
-
-    // CLI --db-path override
-    if let Some(path) = db_path {
-        config = config.with_db_path(path);
-    }
 
     // Load settings from DB (if DB exists)
     if let Ok(db) = toki::db::Database::open(&config.db_path) {
@@ -185,11 +191,9 @@ fn resolve_output_format(config: &Config) -> toki::sink::OutputFormat {
     }
 }
 
-fn main() {
-    let cli = Cli::parse();
-
-    // Parse CLI timezone
-    let cli_tz: Option<Tz> = match cli.timezone.as_deref() {
+/// Parse and validate ClientOptions into config overrides.
+fn parse_client_opts(opts: &ClientOptions) -> (Option<Tz>, bool, Option<&str>) {
+    let cli_tz: Option<Tz> = match opts.timezone.as_deref() {
         Some(name) => match name.parse::<Tz>() {
             Ok(tz) => Some(tz),
             Err(_) => {
@@ -200,8 +204,7 @@ fn main() {
         None => None,
     };
 
-    // Validate CLI --output-format if provided
-    let cli_output_format = cli.output_format.as_deref();
+    let cli_output_format = opts.output_format.as_deref();
     if let Some(fmt) = cli_output_format {
         if fmt != "table" && fmt != "json" {
             eprintln!("[toki] Invalid --output-format: {} (use table|json)", fmt);
@@ -209,33 +212,41 @@ fn main() {
         }
     }
 
+    (cli_tz, opts.no_cost, cli_output_format)
+}
+
+fn main() {
+    let cli = Cli::parse();
+
     match cli.command {
-        Commands::Settings => {
+        Commands::Settings { db_path } => {
             let config = Config::new();
-            let db_path = cli.db_path.unwrap_or(config.db_path);
+            let db_path = db_path.unwrap_or(config.db_path);
             toki::settings::run_settings(&db_path);
         }
         Commands::Daemon { command } => {
-            let config = build_config(cli.db_path, cli_tz, cli.no_cost, cli_output_format);
+            let config = build_config(None, false, None);
             handle_daemon(command, &config);
         }
-        Commands::Trace => {
-            let config = build_config(cli.db_path, cli_tz, cli.no_cost, cli_output_format);
+        Commands::Trace { opts } => {
+            let (cli_tz, cli_no_cost, cli_output_format) = parse_client_opts(&opts);
+            let config = build_config(cli_tz, cli_no_cost, cli_output_format);
             let output_format = resolve_output_format(&config);
-            let sink_specs = if cli.sink.is_empty() {
+            let sink_specs = if opts.sink.is_empty() {
                 vec!["print".to_string()]
             } else {
-                cli.sink.clone()
+                opts.sink.clone()
             };
-            handle_trace(&config, &sink_specs, output_format);
+            handle_trace(&config, &sink_specs, output_format, config.no_cost);
         }
-        Commands::Report { since, until, group_by_session, session_id, project, command } => {
-            let config = build_config(cli.db_path, cli_tz, cli.no_cost, cli_output_format);
+        Commands::Report { opts, since, until, group_by_session, session_id, project, command } => {
+            let (cli_tz, cli_no_cost, cli_output_format) = parse_client_opts(&opts);
+            let config = build_config(cli_tz, cli_no_cost, cli_output_format);
             let output_format = resolve_output_format(&config);
-            let sink_specs = if cli.sink.is_empty() {
+            let sink_specs = if opts.sink.is_empty() {
                 vec!["print".to_string()]
             } else {
-                cli.sink.clone()
+                opts.sink.clone()
             };
             handle_report(since, until, group_by_session, session_id, project, command,
                           &config, &sink_specs, output_format);
@@ -375,7 +386,7 @@ fn handle_daemon(command: DaemonCommands, config: &Config) {
 
 // ── Trace (client) ──────────────────────────────────────
 
-fn handle_trace(config: &Config, sink_specs: &[String], output_format: toki::sink::OutputFormat) {
+fn handle_trace(config: &Config, sink_specs: &[String], output_format: toki::sink::OutputFormat, no_cost: bool) {
     let sock_path = config.daemon_sock.clone();
 
     let stream = match UnixStream::connect(&sock_path) {
@@ -386,6 +397,16 @@ fn handle_trace(config: &Config, sink_specs: &[String], output_format: toki::sin
             std::process::exit(1);
         }
     };
+
+    // Load pricing client-side (ETag-based fetch, cached in DB)
+    let db = if no_cost { None } else { toki::db::Database::open(&config.db_path).ok() };
+    let mut pricing = if let Some(ref d) = db {
+        let (p, _) = toki::pricing::fetch_pricing(d);
+        if p.is_empty() { None } else { Some(p) }
+    } else {
+        None
+    };
+    let mut last_pricing_refresh = std::time::Instant::now();
 
     let sink = toki::sink::create_sinks(sink_specs, output_format);
     let reader = BufReader::new(stream);
@@ -400,6 +421,17 @@ fn handle_trace(config: &Config, sink_specs: &[String], output_format: toki::sin
     for line_result in reader.lines() {
         if !RUNNING.load(Ordering::SeqCst) {
             break;
+        }
+
+        // Periodic pricing refresh (24h)
+        if !no_cost && last_pricing_refresh.elapsed() >= std::time::Duration::from_secs(86400) {
+            if let Some(ref d) = db {
+                let (p, _) = toki::pricing::fetch_pricing(d);
+                if !p.is_empty() {
+                    pricing = Some(p);
+                }
+            }
+            last_pricing_refresh = std::time::Instant::now();
         }
 
         let line = match line_result {
@@ -427,7 +459,7 @@ fn handle_trace(config: &Config, sink_specs: &[String], output_format: toki::sin
         match v["type"].as_str() {
             Some("event") => {
                 if let Ok(event) = serde_json::from_value::<toki::UsageEvent>(v["data"].take()) {
-                    sink.emit_event(&event, None);
+                    sink.emit_event(&event, pricing.as_ref());
                 }
             }
             Some("summary") => {

@@ -75,14 +75,6 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
     // 1. Open DB and load checkpoints before spawning writer thread
     let db = Database::open(&config.db_path).map_err(TokiError::Db)?;
 
-    // Fetch/load pricing
-    let (pricing_table, pricing_etag) = if config.no_cost {
-        (None, None)
-    } else {
-        let (p, etag) = pricing::fetch_pricing(&db);
-        if p.is_empty() { (None, None) } else { (Some(p), etag) }
-    };
-
     // Load checkpoints into memory
     let checkpoints: HashMap<String, common::types::FileCheckpoint> = db.load_all_checkpoints()
         .map_err(TokiError::Db)?
@@ -107,11 +99,7 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
         .map_err(TokiError::Io)?;
 
     // 4. Create engine with db_tx and loaded checkpoints
-    let no_cost = config.no_cost;
-    let mut engine = TrackerEngine::new(db_tx.clone(), checkpoints)
-        .with_sink(sink)
-        .with_tz(config.tz)
-        .with_pricing(pricing_table, pricing_etag, no_cost);
+    let mut engine = TrackerEngine::new(db_tx.clone(), checkpoints, sink);
 
     let parser = ClaudeCodeParser;
     let root_dir = config.claude_code_root.clone();

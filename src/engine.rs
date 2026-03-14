@@ -8,7 +8,6 @@ use crate::checkpoint::{find_resume_offset, process_lines_streaming};
 use crate::common::types::{FileCheckpoint, LogParser, LogParserWithTs, ModelUsageSummary, TokenFields};
 use chrono::{DateTime, NaiveDateTime, Weekday};
 use chrono_tz::Tz;
-use crate::pricing::PricingTable;
 use crate::sink::Sink;
 use crate::writer::DbOp;
 
@@ -78,14 +77,6 @@ pub struct TrackerEngine {
     dirty: HashSet<String>,
     /// Output sink (print, UDS, HTTP, or multi).
     sink: Box<dyn Sink>,
-    /// Optional timezone for bucketing in startup grouping.
-    tz: Option<Tz>,
-    /// Pricing table for cost calculation.
-    pricing: Option<PricingTable>,
-    /// Cached ETag for conditional pricing refresh.
-    pricing_etag: Option<String>,
-    /// Whether cost calculation is disabled.
-    no_cost: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -120,37 +111,17 @@ pub struct ReportFilter {
 
 
 impl TrackerEngine {
-    pub fn new(db_tx: Sender<DbOp>, checkpoints: HashMap<String, FileCheckpoint>) -> Self {
+    pub fn new(db_tx: Sender<DbOp>, checkpoints: HashMap<String, FileCheckpoint>, sink: Box<dyn Sink>) -> Self {
         TrackerEngine {
             db_tx,
             checkpoints,
             file_sizes: HashMap::new(),
             activity: HashMap::new(),
             dirty: HashSet::new(),
-            sink: Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)),
-            tz: None,
-            pricing: None,
-            pricing_etag: None,
-            no_cost: false,
+            sink,
         }
     }
 
-    pub fn with_sink(mut self, sink: Box<dyn Sink>) -> Self {
-        self.sink = sink;
-        self
-    }
-
-    pub fn with_tz(mut self, tz: Option<Tz>) -> Self {
-        self.tz = tz;
-        self
-    }
-
-    pub fn with_pricing(mut self, pricing: Option<PricingTable>, etag: Option<String>, no_cost: bool) -> Self {
-        self.pricing = pricing;
-        self.pricing_etag = etag;
-        self.no_cost = no_cost;
-        self
-    }
 
     /// Cold start: discover all sessions, process them in parallel,
     /// aggregate by model, print summary, flush checkpoints, and populate TSDB.
@@ -230,8 +201,8 @@ impl TrackerEngine {
             self.checkpoints.insert(cp.file_path.clone(), cp.clone());
         }
 
-        // Emit summary
-        self.sink.emit_summary(&result_summaries, self.pricing.as_ref());
+        // Emit summary (no pricing — cost is calculated client-side)
+        self.sink.emit_summary(&result_summaries, None);
 
         // Batch flush for cold start via writer thread.
         let cp_count = checkpoints_batch.len();
@@ -365,7 +336,7 @@ impl TrackerEngine {
                         });
 
                     let (usage, _ts) = event.into_usage_event();
-                    self.sink.emit_event(&usage, self.pricing.as_ref());
+                    self.sink.emit_event(&usage, None);
 
                     let op = DbOp::WriteEvent {
                         ts_ms,
@@ -420,28 +391,6 @@ impl TrackerEngine {
     /// Watch loop: receive file change events, process incrementally,
     /// flush dirty checkpoints periodically.
     /// Graceful shutdown: flushes remaining dirty checkpoints before exiting.
-    /// Refresh pricing table via HTTP (24h periodic).
-    fn refresh_pricing(&mut self) {
-        if self.no_cost {
-            return;
-        }
-        use crate::pricing::{fetch_pricing_http, PricingRefreshResult};
-        match fetch_pricing_http(self.pricing_etag.as_deref()) {
-            PricingRefreshResult::NotModified => {}
-            PricingRefreshResult::Updated { table, etag, cache_json } => {
-                self.pricing = Some(table);
-                self.pricing_etag = etag.clone();
-                if self.db_tx.try_send(DbOp::CachePricing {
-                    etag,
-                    data: cache_json,
-                }).is_err() {
-                    eprintln!("[toki] Pricing cache persistence failed, will re-download on next refresh");
-                }
-            }
-            PricingRefreshResult::Failed => {}
-        }
-    }
-
     pub fn watch_loop<P>(
         &mut self,
         event_rx: Receiver<String>,
@@ -452,7 +401,6 @@ impl TrackerEngine {
         P: LogParser + LogParserWithTs,
     {
         let flush_tick = crossbeam_channel::tick(FLUSH_INTERVAL);
-        let pricing_tick = crossbeam_channel::tick(Duration::from_secs(86400));
 
         loop {
             crossbeam_channel::select! {
@@ -483,9 +431,6 @@ impl TrackerEngine {
                 }
                 recv(flush_tick) -> _ => {
                     self.flush_dirty();
-                }
-                recv(pricing_tick) -> _ => {
-                    self.refresh_pricing();
                 }
             }
         }
@@ -683,7 +628,7 @@ mod tests {
             .map(|cp| (cp.file_path.clone(), cp))
             .collect();
         let (db_tx, _db_rx) = crossbeam_channel::bounded::<DbOp>(1024);
-        let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded);
+        let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded, Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)));
 
         // Create test JSONL
         let projects_dir = dir.path().join("projects").join("test");
@@ -719,7 +664,7 @@ mod tests {
             .map(|cp| (cp.file_path.clone(), cp))
             .collect();
         let (db_tx, _db_rx) = crossbeam_channel::bounded::<DbOp>(1024);
-        let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded);
+        let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded, Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)));
 
         let projects_dir = dir.path().join("projects").join("test");
         std::fs::create_dir_all(&projects_dir).unwrap();
@@ -756,7 +701,7 @@ mod tests {
             .map(|cp| (cp.file_path.clone(), cp))
             .collect();
         let (db_tx, _db_rx) = crossbeam_channel::bounded::<DbOp>(1024);
-        let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded);
+        let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded, Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)));
 
         let projects_dir = dir.path().join("projects").join("test");
         std::fs::create_dir_all(&projects_dir).unwrap();
@@ -792,7 +737,7 @@ mod tests {
             .map(|cp| (cp.file_path.clone(), cp))
             .collect();
         let (db_tx, _db_rx) = crossbeam_channel::bounded::<DbOp>(1024);
-        let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded);
+        let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded, Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)));
 
         let projects_dir = dir.path().join("projects").join("test");
         std::fs::create_dir_all(&projects_dir).unwrap();
@@ -823,7 +768,7 @@ mod tests {
             .map(|cp| (cp.file_path.clone(), cp))
             .collect();
         let (db_tx, _db_rx) = crossbeam_channel::bounded::<DbOp>(1024);
-        let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded);
+        let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded, Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)));
 
         let projects_dir = dir.path().join("projects").join("test");
         std::fs::create_dir_all(&projects_dir).unwrap();
@@ -860,7 +805,7 @@ mod tests {
             .map(|cp| (cp.file_path.clone(), cp))
             .collect();
         let (db_tx, _db_rx) = crossbeam_channel::bounded::<DbOp>(1024);
-        let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded);
+        let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded, Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)));
 
         let parser = TestParser;
         let summaries = engine.cold_start(&parser, dir.path().to_str().unwrap()).unwrap();
@@ -931,7 +876,7 @@ mod tests {
         // Bench full process_file (cold start + incremental)
         let _db2 = crate::db::Database::open(&dir.path().join("bench2.db")).unwrap();
         let (db_tx2, _db_rx2) = crossbeam_channel::bounded::<DbOp>(1024);
-        let mut engine = TrackerEngine::new(db_tx2, HashMap::new());
+        let mut engine = TrackerEngine::new(db_tx2, HashMap::new(), Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)));
         let parser = TestParser;
 
         let start = Instant::now();

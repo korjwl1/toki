@@ -1,10 +1,11 @@
 # toki Usage Guide
 
-## Installation
+## Build from Source
 
 ```bash
 cargo build --release
 # 바이너리: target/release/toki
+# PATH에 추가하거나 직접 실행
 ```
 
 ## Commands
@@ -262,16 +263,16 @@ toki settings --db-path /custom/toki.fjall
 
 환경변수는 사용하지 않는다 (`TOKI_DEBUG` 제외).
 
-## Global Options
+## Client Options (trace / report)
 
-모든 명령에 적용되는 옵션 (DB 설정을 오버라이드):
+`trace`와 `report` 명령에서만 사용 가능한 옵션. 데몬 설정은 `toki settings`로 관리한다.
 
 ### --output-format
 
 ```bash
-toki --output-format table report          # 기본값
-toki --output-format json report
-toki --output-format json trace
+toki report --output-format table          # 기본값
+toki report --output-format json
+toki trace --output-format json
 ```
 
 `print` sink에만 적용된다. UDS/HTTP sink은 항상 JSON이다.
@@ -298,9 +299,8 @@ toki report --sink http://localhost:8080/report
 ### --timezone / -z
 
 ```bash
-toki -z Asia/Seoul report daily --since 20260301
-toki -z US/Eastern report weekly --from-beginning
-toki -z Europe/London daemon start
+toki report -z Asia/Seoul daily --since 20260301
+toki report -z US/Eastern weekly --from-beginning
 ```
 
 적용 범위:
@@ -310,8 +310,8 @@ toki -z Europe/London daemon start
 ### --no-cost
 
 ```bash
-toki --no-cost report
-toki --no-cost daemon start
+toki report --no-cost
+toki trace --no-cost
 ```
 
 가격 데이터 fetch를 스킵하고 Cost 컬럼을 표시하지 않는다.

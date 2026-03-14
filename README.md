@@ -29,23 +29,31 @@ toki report           # TSDB 조회 클라이언트 (= docker ps)
 - **trace**: 데몬에 UDS로 연결하여 실시간 이벤트 스트림 수신. print/uds/http 모든 sink 지원.
 - **report**: TSDB에서 직접 조회. 데몬이 실행 중이어야 사용 가능하다.
 
+## Build from Source
+
+```bash
+cargo build --release
+# 바이너리: target/release/toki
+# PATH에 추가하거나 직접 실행
+```
+
 ## Quick Start
 
 ```bash
 # 1. 데몬 시작 (foreground, Ctrl+C으로 종료)
-cargo run --release -- daemon start
+toki daemon start
 
 # 2. 다른 터미널에서 실시간 이벤트 스트림
-cargo run --release -- trace
+toki trace
 
 # 3. 리포트 조회 (TSDB에서 즉시 조회)
-cargo run --release -- report
-cargo run --release -- report daily --since 20260301
-cargo run --release -- report monthly
+toki report
+toki report daily --since 20260301
+toki report monthly
 
 # 4. PromQL 스타일 쿼리
-cargo run --release -- report query 'usage{model="claude-opus-4-6"}[1h] by (model)'
-cargo run --release -- report query 'sessions{project="myapp"}'
+toki report query 'usage{model="claude-opus-4-6"}[1h] by (model)'
+toki report query 'sessions{project="myapp"}'
 ```
 
 ## Daemon
@@ -168,7 +176,9 @@ toki settings --db-path /custom/toki.fjall
 
 설정 우선순위: **CLI 인자 > DB settings > 기본값** (환경변수 미사용)
 
-## Global Options
+## Client Options (trace / report)
+
+`trace`와 `report` 명령에서만 사용 가능한 옵션. 데몬에는 영향 없음 (데몬 설정은 `toki settings`로 관리).
 
 | 옵션 | 설명 |
 |------|------|
@@ -176,7 +186,6 @@ toki settings --db-path /custom/toki.fjall
 | `--sink <SPEC>` | 출력 대상, 복수 지정 가능 |
 | `--timezone <IANA>` / `-z` | 타임존 오버라이드 |
 | `--no-cost` | 비용 계산 비활성화 오버라이드 |
-| `--db-path <PATH>` | DB 경로 (기본: `~/.config/toki/toki.fjall`) |
 
 ### Sink 종류
 

@@ -400,7 +400,7 @@ CLI 인자 > DB settings (toki settings) > 기본값
 | 설정 | CLI 오버라이드 | DB key | 기본값 |
 |------|---------------|--------|--------|
 | Claude root | - | `claude_code_root` | `~/.claude` |
-| DB path | `--db-path` | - | `~/.config/toki/toki.fjall` |
+| DB path | `settings --db-path` | - | `~/.config/toki/toki.fjall` |
 | Daemon sock | - | `daemon_sock` | `~/.config/toki/daemon.sock` |
 | Timezone | `-z` | `timezone` | (UTC) |
 | Output format | `--output-format` | `output_format` | `table` |

@@ -20,10 +20,6 @@ pub enum DbOp {
     },
     WriteCheckpoint(FileCheckpoint),
     FlushCheckpoints(Vec<FileCheckpoint>),
-    CachePricing {
-        etag: Option<String>,
-        data: String,
-    },
     Shutdown,
 }
 
@@ -134,13 +130,6 @@ impl DbWriter {
             DbOp::FlushCheckpoints(cps) => {
                 if let Err(e) = self.db.flush_checkpoints(&cps) {
                     eprintln!("[toki:writer] flush checkpoints error: {}", e);
-                }
-                true
-            }
-            DbOp::CachePricing { etag, data } => {
-                let _ = self.db.set_setting("pricing_data", &data);
-                if let Some(etag) = etag {
-                    let _ = self.db.set_setting("pricing_etag", &etag);
                 }
                 true
             }
