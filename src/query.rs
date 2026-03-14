@@ -380,11 +380,6 @@ pub fn parse_range_time(value: &str, is_until: bool, tz: Option<Tz>) -> Result<N
     }
 }
 
-/// Check if the TSDB has any data (O(1) — reads only first rollup entry).
-pub fn has_tsdb_data(db: &Database) -> bool {
-    db.has_any_rollups()
-}
-
 fn filter_to_ms(dt: Option<NaiveDateTime>) -> Option<i64> {
     dt.map(|d| d.and_utc().timestamp_millis())
 }

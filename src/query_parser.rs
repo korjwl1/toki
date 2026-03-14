@@ -93,6 +93,64 @@ impl Query {
             .find(|f| f.key == key)
             .map(|f| f.value.as_str())
     }
+
+    /// Serialize back to PromQL-style query string.
+    pub fn to_query_string(&self) -> String {
+        let mut s = match self.metric {
+            Metric::Usage => "usage".to_string(),
+            Metric::Sessions => "sessions".to_string(),
+            Metric::Projects => "projects".to_string(),
+        };
+
+        // Collect all filters (including since/until)
+        let mut filters: Vec<(&str, &str)> = self.filters.iter()
+            .map(|f| (f.key.as_str(), f.value.as_str()))
+            .collect();
+        if let Some(ref since) = self.since {
+            filters.push(("since", since));
+        }
+        if let Some(ref until) = self.until {
+            filters.push(("until", until));
+        }
+        if !filters.is_empty() {
+            s.push('{');
+            for (i, (k, v)) in filters.iter().enumerate() {
+                if i > 0 { s.push_str(", "); }
+                let escaped = v.replace('\\', "\\\\").replace('"', "\\\"");
+                s.push_str(&format!("{}=\"{}\"", k, escaped));
+            }
+            s.push('}');
+        }
+
+        if let Some(ref bucket) = self.bucket {
+            s.push_str(&format!("[{}]", bucket));
+        }
+
+        if !self.group_by.is_empty() {
+            s.push_str(&format!(" by ({})", self.group_by.join(", ")));
+        }
+
+        s
+    }
+
+    /// Serialize with a ReportGroupBy converted to a bucket.
+    pub fn to_query_string_with_bucket(&self, group_by: crate::engine::ReportGroupBy) -> String {
+        let bucket_str = match group_by {
+            crate::engine::ReportGroupBy::Hour => "[1h]",
+            crate::engine::ReportGroupBy::Date => "[1d]",
+            crate::engine::ReportGroupBy::Week { .. } => "[1w]",
+            crate::engine::ReportGroupBy::Month => "[30d]",
+            crate::engine::ReportGroupBy::Year => "[365d]",
+        };
+
+        let base = self.to_query_string();
+        // Insert bucket before " by" or at end
+        if let Some(pos) = base.find(" by ") {
+            format!("{}{}{}", &base[..pos], bucket_str, &base[pos..])
+        } else {
+            format!("{}{}", base, bucket_str)
+        }
+    }
 }
 
 const VALID_FILTER_KEYS: &[&str] = &["model", "session", "project", "since", "until"];

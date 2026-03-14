@@ -249,7 +249,7 @@ fn main() {
                 opts.sink.clone()
             };
             handle_report(since, until, group_by_session, session_id, project, command,
-                          &config, &sink_specs, output_format);
+                          &config, &sink_specs, output_format, config.no_cost);
         }
     }
 }
@@ -306,10 +306,11 @@ fn run_daemon_foreground(config: &Config) {
     let (listener_stop_tx, listener_stop_rx) = crossbeam_channel::bounded::<()>(1);
     let listener_sock = sock_path.clone();
     let listener_broadcast = broadcast.clone();
+    let listener_db = handle.db().clone();
     let listener_handle = std::thread::Builder::new()
         .name("toki-listener".to_string())
         .spawn(move || {
-            toki::daemon::run_listener(&listener_sock, listener_broadcast, listener_stop_rx);
+            toki::daemon::run_listener(&listener_sock, listener_broadcast, listener_db, listener_stop_rx);
         })
         .expect("Failed to spawn listener thread");
 
@@ -398,13 +399,13 @@ fn handle_trace(config: &Config, sink_specs: &[String], output_format: toki::sin
         }
     };
 
-    // Load pricing client-side (ETag-based fetch, cached in DB)
-    let db = if no_cost { None } else { toki::db::Database::open(&config.db_path).ok() };
-    let mut pricing = if let Some(ref d) = db {
-        let (p, _) = toki::pricing::fetch_pricing(d);
-        if p.is_empty() { None } else { Some(p) }
-    } else {
+    // Load pricing client-side (ETag-based fetch, file cache)
+    let pricing_cache_path = toki::pricing::default_cache_path();
+    let mut pricing = if no_cost {
         None
+    } else {
+        let p = toki::pricing::fetch_pricing(&pricing_cache_path);
+        if p.is_empty() { None } else { Some(p) }
     };
     let mut last_pricing_refresh = std::time::Instant::now();
 
@@ -425,11 +426,9 @@ fn handle_trace(config: &Config, sink_specs: &[String], output_format: toki::sin
 
         // Periodic pricing refresh (24h)
         if !no_cost && last_pricing_refresh.elapsed() >= std::time::Duration::from_secs(86400) {
-            if let Some(ref d) = db {
-                let (p, _) = toki::pricing::fetch_pricing(d);
-                if !p.is_empty() {
-                    pricing = Some(p);
-                }
+            let p = toki::pricing::fetch_pricing(&pricing_cache_path);
+            if !p.is_empty() {
+                pricing = Some(p);
             }
             last_pricing_refresh = std::time::Instant::now();
         }
@@ -486,9 +485,11 @@ fn handle_report(
     config: &Config,
     sink_specs: &[String],
     output_format: toki::sink::OutputFormat,
+    no_cost: bool,
 ) {
     let sink = toki::sink::create_sinks(sink_specs, output_format);
     let tz = config.tz;
+    let sock_path = config.daemon_sock.clone();
 
     // Require daemon to be running
     let pidfile = toki::daemon::default_pidfile_path();
@@ -498,109 +499,169 @@ fn handle_report(
         std::process::exit(1);
     }
 
-    let db = match toki::db::Database::open(&config.db_path) {
-        Ok(db) => db,
-        Err(e) => {
-            eprintln!("[toki] Cannot open database: {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    if !toki::query::has_tsdb_data(&db) {
-        eprintln!("[toki] No data in TSDB. The daemon may still be performing initial scan.");
-        std::process::exit(1);
-    }
-
-    let pricing = if config.no_cost {
-        None
-    } else {
-        let (p, _etag) = toki::pricing::fetch_pricing(&db);
-        if p.is_empty() { None } else { Some(p) }
-    };
-    let pricing_ref = pricing.as_ref();
-
     if group_by_session && command.is_some() {
         eprintln!("[toki] --group-by-session cannot be used with time-based subcommands");
         std::process::exit(1);
     }
 
-    // Handle query subcommand
-    if let Some(ReportCommands::Query { query: ref query_str }) = command {
-        let parsed = match toki::query_parser::parse(query_str) {
-            Ok(q) => q,
-            Err(e) => {
-                eprintln!("[toki] Query parse error: {}", e);
+    // Build query string from CLI arguments
+    let query_str = if let Some(ReportCommands::Query { ref query }) = command {
+        query.clone()
+    } else {
+        let query = if let Some(cmd) = &command {
+            // Time-grouped subcommands
+            let (filter_args, group_by) = match cmd {
+                ReportCommands::Hourly { filter } => (filter.clone(), toki::engine::ReportGroupBy::Hour),
+                ReportCommands::Daily { filter } => (filter.clone(), toki::engine::ReportGroupBy::Date),
+                ReportCommands::Weekly { start_of_week, filter } => {
+                    let start = start_of_week.as_deref()
+                        .map(parse_weekday)
+                        .unwrap_or(config.start_of_week);
+                    (filter.clone(), toki::engine::ReportGroupBy::Week { start_of_week: start })
+                }
+                ReportCommands::Monthly { filter } => (filter.clone(), toki::engine::ReportGroupBy::Month),
+                ReportCommands::Yearly { filter } => (filter.clone(), toki::engine::ReportGroupBy::Year),
+                ReportCommands::Query { .. } => unreachable!(),
+            };
+
+            let eff_since = filter_args.since.or(since.clone());
+            let eff_until = filter_args.until.or(until.clone());
+            let eff_session = filter_args.session_id.or(session_id.clone());
+            let eff_project = filter_args.project.or(project.clone());
+
+            let since_dt = parse_opt_range(&eff_since, false, tz);
+            let until_dt = parse_opt_range(&eff_until, true, tz);
+            validate_range(since_dt, until_dt);
+
+            let requires_range = matches!(
+                group_by,
+                toki::engine::ReportGroupBy::Hour
+                    | toki::engine::ReportGroupBy::Date
+                    | toki::engine::ReportGroupBy::Week { .. }
+            );
+            if requires_range && !filter_args.from_beginning && since_dt.is_none() {
+                eprintln!("[toki] hourly/daily/weekly requires a date range.");
+                eprintln!("[toki] Usage: toki report daily --since 20250101");
+                eprintln!("[toki]        toki report daily --from-beginning");
                 std::process::exit(1);
             }
-        };
-        if let Err(e) = toki::query::execute_parsed_query(&db, &parsed, tz, pricing_ref, sink.as_ref()) {
-            eprintln!("[toki] Query execution error: {}", e);
-            std::process::exit(1);
-        }
-        return;
-    }
 
-    // No subcommand — build a Query from CLI flags and dispatch
-    let command = match command {
-        Some(cmd) => cmd,
-        None => {
-            let query = build_query_from_flags(
+            // Convert to PromQL-style query string
+            build_query_from_flags(
+                &eff_since, &eff_until, eff_session.as_deref(), eff_project.as_deref(),
+                &[], // group_by handled via bucket
+            ).to_query_string_with_bucket(group_by)
+        } else {
+            // No subcommand — summary or session grouping
+            build_query_from_flags(
                 &since, &until, session_id.as_deref(), project.as_deref(),
                 if group_by_session { &["session"][..] } else { &[] },
-            );
-            if let Err(e) = toki::query::execute_parsed_query(&db, &query, tz, pricing_ref, sink.as_ref()) {
-                eprintln!("[toki] Query failed: {}", e);
-                std::process::exit(1);
+            ).to_query_string()
+        };
+        query
+    };
+
+    // Send query to daemon via UDS
+    let response = send_report_query(&sock_path, &query_str, tz);
+
+    // Load pricing client-side (file cache, no DB)
+    let pricing = if no_cost {
+        None
+    } else {
+        let p = toki::pricing::fetch_pricing(&toki::pricing::default_cache_path());
+        if p.is_empty() { None } else { Some(p) }
+    };
+
+    match response {
+        Ok(data) => {
+            for item in data.as_array().unwrap_or(&vec![]) {
+                dispatch_result_to_sink(item, sink.as_ref(), pricing.as_ref());
             }
-            return;
         }
-    };
-
-    // Time-grouped subcommands (hourly/daily/weekly/monthly/yearly)
-    let (filter_args, group_by) = match &command {
-        ReportCommands::Hourly { filter } => (filter.clone(), toki::engine::ReportGroupBy::Hour),
-        ReportCommands::Daily { filter } => (filter.clone(), toki::engine::ReportGroupBy::Date),
-        ReportCommands::Weekly { start_of_week, filter } => {
-            let start = start_of_week.as_deref()
-                .map(parse_weekday)
-                .unwrap_or(config.start_of_week);
-            (filter.clone(), toki::engine::ReportGroupBy::Week { start_of_week: start })
-        }
-        ReportCommands::Monthly { filter } => (filter.clone(), toki::engine::ReportGroupBy::Month),
-        ReportCommands::Yearly { filter } => (filter.clone(), toki::engine::ReportGroupBy::Year),
-        ReportCommands::Query { .. } => unreachable!("handled above"),
-    };
-
-    // Merge top-level with subcommand (subcommand takes precedence)
-    let eff_since = filter_args.since.or(since);
-    let eff_until = filter_args.until.or(until);
-    let eff_session = filter_args.session_id.or(session_id);
-    let eff_project = filter_args.project.or(project);
-    let since_dt = parse_opt_range(&eff_since, false, tz);
-    let until_dt = parse_opt_range(&eff_until, true, tz);
-    validate_range(since_dt, until_dt);
-
-    let requires_range = matches!(
-        group_by,
-        toki::engine::ReportGroupBy::Hour
-            | toki::engine::ReportGroupBy::Date
-            | toki::engine::ReportGroupBy::Week { .. }
-    );
-    if requires_range && !filter_args.from_beginning && since_dt.is_none() {
-        eprintln!("[toki] hourly/daily/weekly requires a date range.");
-        eprintln!("[toki] Usage: toki report daily --since 20250101");
-        eprintln!("[toki]        toki report daily --from-beginning");
-        std::process::exit(1);
-    }
-
-    let filter = toki::engine::ReportFilter { since: since_dt, until: until_dt, tz };
-
-    match toki::query::report_grouped_from_db(&db, group_by, filter, eff_session.as_deref(), eff_project.as_deref()) {
-        Ok(grouped) => sink.emit_grouped(&grouped, group_by.type_name(), pricing_ref),
         Err(e) => {
-            eprintln!("[toki] Query failed: {}", e);
+            eprintln!("[toki] {}", e);
             std::process::exit(1);
         }
+    }
+}
+
+/// Send a report query to the daemon via UDS and return the response.
+fn send_report_query(
+    sock_path: &std::path::Path,
+    query: &str,
+    tz: Option<chrono_tz::Tz>,
+) -> Result<serde_json::Value, String> {
+    use std::io::{BufRead, Write};
+
+    let mut stream = UnixStream::connect(sock_path)
+        .map_err(|_| "Cannot connect to daemon. Start it first: toki daemon start".to_string())?;
+
+    // Send request
+    let request = serde_json::json!({
+        "query": query,
+        "tz": tz.map(|t| t.to_string()),
+    });
+    let line = serde_json::to_string(&request).unwrap();
+    writeln!(stream, "{}", line).map_err(|e| format!("Failed to send query: {}", e))?;
+    stream.flush().map_err(|e| format!("Failed to flush: {}", e))?;
+
+    // Read response
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(60))).ok();
+    let mut reader = std::io::BufReader::new(stream);
+    let mut response_line = String::new();
+    reader.read_line(&mut response_line)
+        .map_err(|e| format!("Failed to read response: {}", e))?;
+
+    let resp: serde_json::Value = serde_json::from_str(&response_line)
+        .map_err(|e| format!("Invalid response: {}", e))?;
+
+    if resp["ok"].as_bool() == Some(true) {
+        Ok(resp["data"].clone())
+    } else {
+        Err(resp["error"].as_str().unwrap_or("Unknown error").to_string())
+    }
+}
+
+/// Dispatch a JSON result from the daemon to the local sink for display.
+fn dispatch_result_to_sink(
+    item: &serde_json::Value,
+    sink: &dyn toki::sink::Sink,
+    pricing: Option<&toki::pricing::PricingTable>,
+) {
+    match item["type"].as_str() {
+        Some("summary") => {
+            // data is an array of model summaries → convert to HashMap
+            if let Ok(summaries_vec) = serde_json::from_value::<Vec<toki::ModelUsageSummary>>(item["data"].clone()) {
+                let summaries: std::collections::HashMap<String, toki::ModelUsageSummary> =
+                    summaries_vec.into_iter().map(|s| (s.model.clone(), s)).collect();
+                sink.emit_summary(&summaries, pricing);
+            }
+        }
+        Some(type_name) if type_name == "sessions" || type_name == "projects" => {
+            if let Some(items) = item["items"].as_array() {
+                let strings: Vec<String> = items.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect();
+                sink.emit_list(&strings, type_name);
+            }
+        }
+        Some(type_name) => {
+            // Grouped data: { data: [ { period: "...", usage_per_models: [...] } ] }
+            if let Some(data_arr) = item["data"].as_array() {
+                let mut grouped: std::collections::HashMap<String, std::collections::HashMap<String, toki::ModelUsageSummary>> =
+                    std::collections::HashMap::new();
+                for entry in data_arr {
+                    let period = entry["period"].as_str().unwrap_or("total").to_string();
+                    if let Ok(models) = serde_json::from_value::<Vec<toki::ModelUsageSummary>>(entry["usage_per_models"].clone()) {
+                        let map: std::collections::HashMap<String, toki::ModelUsageSummary> =
+                            models.into_iter().map(|s| (s.model.clone(), s)).collect();
+                        grouped.insert(period, map);
+                    }
+                }
+                sink.emit_grouped(&grouped, type_name, pricing);
+            }
+        }
+        None => {}
     }
 }
 

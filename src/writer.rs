@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 use crossbeam_channel::Receiver;
@@ -27,7 +28,7 @@ pub enum DbOp {
 const BATCH_SIZE: usize = 64;
 
 pub struct DbWriter {
-    db: Database,
+    db: Arc<Database>,
     op_rx: Receiver<DbOp>,
     dict_cache: HashMap<String, u32>,
     next_dict_id: u32,
@@ -45,7 +46,7 @@ struct PendingEvent {
 }
 
 impl DbWriter {
-    pub fn new(db: Database, op_rx: Receiver<DbOp>, retention: RetentionPolicy) -> Self {
+    pub fn new(db: Arc<Database>, op_rx: Receiver<DbOp>, retention: RetentionPolicy) -> Self {
         // Load existing dictionary into cache
         let dict_cache = db.load_dict_forward().unwrap_or_default();
         let next_dict_id = dict_cache.values().max().map_or(0, |&v| v + 1);

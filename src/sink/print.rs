@@ -58,7 +58,9 @@ impl Sink for PrintSink {
 
         let mut sorted: Vec<_> = summaries.values().collect();
         sorted.sort_by(|a, b| b.event_count.cmp(&a.event_count));
-        let show_cost = pricing.is_some_and(|p| !p.is_empty());
+        let has_pricing = pricing.is_some_and(|p| !p.is_empty());
+        let has_precalc_cost = sorted.iter().any(|s| s.cost_usd.is_some());
+        let show_cost = has_pricing || has_precalc_cost;
 
         let mut table = Table::new();
         table.load_preset(UTF8_FULL);
@@ -86,7 +88,7 @@ impl Sink for PrintSink {
 
         for s in &sorted {
             let total = s.input_tokens + s.output_tokens + s.cache_creation_input_tokens + s.cache_read_input_tokens;
-            let cost = pricing.and_then(|p| p.summary_cost(s));
+            let cost = pricing.and_then(|p| p.summary_cost(s)).or(s.cost_usd);
             let mut row = vec![
                 Cell::new(&s.model),
                 Cell::new(format_number(s.input_tokens)),
@@ -146,7 +148,9 @@ impl Sink for PrintSink {
         }
 
         let is_session = type_name == "session";
-        let show_cost = pricing.is_some_and(|p| !p.is_empty());
+        let has_pricing = pricing.is_some_and(|p| !p.is_empty());
+        let has_precalc_cost = grouped.values().any(|m| m.values().any(|s| s.cost_usd.is_some()));
+        let show_cost = has_pricing || has_precalc_cost;
         let mut buckets: Vec<&String> = grouped.keys().collect();
         buckets.sort();
 
@@ -183,7 +187,7 @@ impl Sink for PrintSink {
 
                 for (i, s) in sorted.iter().enumerate() {
                     let total = s.input_tokens + s.output_tokens + s.cache_creation_input_tokens + s.cache_read_input_tokens;
-                    let cost = pricing.and_then(|p| p.summary_cost(s));
+                    let cost = pricing.and_then(|p| p.summary_cost(s)).or(s.cost_usd);
                     let display_key = if is_session { shorten_id(bucket).to_string() } else { bucket.to_string() };
                     let period_cell = if i == 0 {
                         Cell::new(&display_key)

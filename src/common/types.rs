@@ -55,14 +55,18 @@ pub struct FileCheckpoint {
 }
 
 /// Aggregated usage per model.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ModelUsageSummary {
     pub model: String,
     pub input_tokens: u64,
     pub cache_creation_input_tokens: u64,
     pub cache_read_input_tokens: u64,
     pub output_tokens: u64,
+    #[serde(alias = "events")]
     pub event_count: u64,
+    /// Pre-calculated cost from daemon (used when pricing table is not available client-side).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
 }
 
 impl ModelUsageSummary {

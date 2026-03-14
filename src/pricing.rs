@@ -1,9 +1,9 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::common::types::{ModelUsageSummary, UsageEvent};
-use crate::db::Database;
 
 const LITELLM_URL: &str =
     "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
@@ -67,10 +67,7 @@ impl PricingTable {
 }
 
 /// Parse LiteLLM JSON and extract Claude model prices.
-/// Uses streaming key inspection to skip non-Claude entries without full deserialization.
 fn parse_litellm_json(json_str: &str) -> HashMap<String, ModelPricing> {
-    // serde_json requires full parse for a JSON object, but LiteLLMEntry is only 4 Option<f64>
-    // fields — serde skips unknown fields by default, so non-matching values are cheap.
     let raw: HashMap<String, LiteLLMEntry> = match serde_json::from_str(json_str) {
         Ok(v) => v,
         Err(_) => return HashMap::new(),
@@ -116,25 +113,47 @@ struct LiteLLMEntry {
     cache_read_input_token_cost: Option<f64>,
 }
 
-/// Result of an HTTP pricing refresh attempt.
-pub enum PricingRefreshResult {
-    /// Data unchanged (304), keep existing table.
-    NotModified,
-    /// New data fetched. Contains (table, new_etag, serialized cache JSON).
-    Updated {
-        table: PricingTable,
-        etag: Option<String>,
-        cache_json: String,
-    },
-    /// Network or parse error, keep existing table.
-    Failed,
+/// On-disk pricing cache format.
+#[derive(Serialize, Deserialize)]
+struct PricingCache {
+    etag: Option<String>,
+    prices: HashMap<String, ModelPricing>,
 }
 
-/// Fetch pricing via HTTP with optional ETag for conditional request.
-/// Does NOT access DB — caller is responsible for caching.
-pub fn fetch_pricing_http(cached_etag: Option<&str>) -> PricingRefreshResult {
+/// Default pricing cache file path.
+pub fn default_cache_path() -> PathBuf {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    home.join(".config").join("toki").join("pricing.json")
+}
+
+/// Load cached pricing from file (no network, no DB).
+fn load_cache(path: &Path) -> Option<PricingCache> {
+    let data = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+/// Save pricing cache to file (atomic write via temp + rename).
+fn save_cache(path: &Path, cache: &PricingCache) {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let tmp = path.with_extension("tmp");
+    if let Ok(data) = serde_json::to_string(cache) {
+        if std::fs::write(&tmp, &data).is_ok() {
+            std::fs::rename(&tmp, path).ok();
+        }
+    }
+}
+
+/// Fetch pricing with ETag-based caching (file-based).
+/// Does HTTP conditional request, falls back to cache on error.
+/// Returns (PricingTable, cached_etag).
+pub fn fetch_pricing(cache_path: &Path) -> PricingTable {
+    let cached = load_cache(cache_path);
+    let cached_etag = cached.as_ref().and_then(|c| c.etag.clone());
+
     let mut req = ureq::get(LITELLM_URL);
-    if let Some(etag) = cached_etag {
+    if let Some(ref etag) = cached_etag {
         req = req.set("If-None-Match", etag);
     }
 
@@ -142,7 +161,8 @@ pub fn fetch_pricing_http(cached_etag: Option<&str>) -> PricingRefreshResult {
         Ok(resp) => {
             if resp.status() == 304 {
                 eprintln!("[toki] Pricing: not modified");
-                return PricingRefreshResult::NotModified;
+                return cached.map(|c| PricingTable::new(c.prices))
+                    .unwrap_or_else(|| PricingTable::new(HashMap::new()));
             }
 
             let new_etag = resp.header("ETag").map(|s| s.to_string());
@@ -150,74 +170,51 @@ pub fn fetch_pricing_http(cached_etag: Option<&str>) -> PricingRefreshResult {
                 Ok(b) => b,
                 Err(e) => {
                     eprintln!("[toki] Pricing: failed to read response body: {}", e);
-                    return PricingRefreshResult::Failed;
+                    return fallback(cached);
                 }
             };
 
             let prices = parse_litellm_json(&body);
             if prices.is_empty() {
                 eprintln!("[toki] Pricing: no Claude models found in response");
-                return PricingRefreshResult::Failed;
+                return fallback(cached);
             }
 
-            let cache_json = serde_json::to_string(&prices).unwrap_or_default();
             eprintln!("[toki] Pricing: updated, {} models", prices.len());
-            PricingRefreshResult::Updated {
-                table: PricingTable::new(prices),
-                etag: new_etag,
-                cache_json,
-            }
+            save_cache(cache_path, &PricingCache { etag: new_etag, prices: prices.clone() });
+            PricingTable::new(prices)
         }
         Err(ureq::Error::Status(304, _)) => {
             eprintln!("[toki] Pricing: not modified");
-            PricingRefreshResult::NotModified
+            fallback(cached)
         }
         Err(e) => {
             eprintln!("[toki] Pricing: network error ({})", e);
-            PricingRefreshResult::Failed
+            fallback(cached)
         }
     }
 }
 
-/// Fetch pricing with ETag-based caching (initial startup, uses DB).
-/// Falls back to cached data on network errors. Returns empty table if no cache available.
-pub fn fetch_pricing(db: &Database) -> (PricingTable, Option<String>) {
-    let cached_etag = db.get_setting("pricing_etag").ok().flatten();
-    let cached_data = db.get_setting("pricing_data").ok().flatten();
-
-    match fetch_pricing_http(cached_etag.as_deref()) {
-        PricingRefreshResult::NotModified => {
-            let table = fallback_cached(cached_data);
-            (table, cached_etag)
-        }
-        PricingRefreshResult::Updated { table, etag, cache_json } => {
-            let _ = db.set_setting("pricing_data", &cache_json);
-            if let Some(ref e) = etag {
-                let _ = db.set_setting("pricing_etag", e);
+/// Load pricing from cache file only (no network).
+pub fn load_cached_pricing(cache_path: &Path) -> PricingTable {
+    match load_cache(cache_path) {
+        Some(cache) => {
+            if !cache.prices.is_empty() {
+                eprintln!("[toki] Pricing: using cached data, {} models", cache.prices.len());
             }
-            (table, etag)
+            PricingTable::new(cache.prices)
         }
-        PricingRefreshResult::Failed => {
-            let table = fallback_cached(cached_data);
-            (table, cached_etag)
-        }
+        None => PricingTable::new(HashMap::new()),
     }
 }
 
-/// Load pricing from DB cache only (no network).
-pub fn load_cached_pricing(db: &Database) -> PricingTable {
-    fallback_cached(db.get_setting("pricing_data").ok().flatten())
-}
-
-fn fallback_cached(cached_data: Option<String>) -> PricingTable {
-    match cached_data {
-        Some(data) => {
-            let prices: HashMap<String, ModelPricing> =
-                serde_json::from_str(&data).unwrap_or_default();
-            if !prices.is_empty() {
-                eprintln!("[toki] Pricing: using cached data, {} models", prices.len());
+fn fallback(cached: Option<PricingCache>) -> PricingTable {
+    match cached {
+        Some(cache) => {
+            if !cache.prices.is_empty() {
+                eprintln!("[toki] Pricing: using cached data, {} models", cache.prices.len());
             }
-            PricingTable::new(prices)
+            PricingTable::new(cache.prices)
         }
         None => PricingTable::new(HashMap::new()),
     }
@@ -309,6 +306,7 @@ mod tests {
             cache_creation_input_tokens: 200,
             cache_read_input_tokens: 3000,
             event_count: 5,
+            cost_usd: None,
         };
         let cost = table.summary_cost(&summary).unwrap();
         // 1000*0.000003 + 500*0.000015 + 200*0.00000375 + 3000*0.0000003 = 0.01215

@@ -18,6 +18,7 @@ pub use common::types::{UsageEvent, UsageEventWithTs, ModelUsageSummary, Session
 pub use config::Config;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use db::Database;
@@ -36,12 +37,19 @@ pub struct Handle {
     writer_handle: Option<JoinHandle<()>>,
     // Keep watcher alive — dropping it stops file watching
     _watcher: notify::RecommendedWatcher,
+    /// Shared DB handle for report queries (read-only from listener thread).
+    db: Arc<Database>,
 }
 
 impl Handle {
     /// Gracefully stop toki: flush dirty checkpoints and join threads.
     pub fn stop(mut self) {
         self.shutdown();
+    }
+
+    /// Shared DB handle for report queries.
+    pub fn db(&self) -> &Arc<Database> {
+        &self.db
     }
 
     fn shutdown(&mut self) {
@@ -73,7 +81,7 @@ impl Drop for Handle {
 /// Returns a Handle to control the running instance.
 pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
     // 1. Open DB and load checkpoints before spawning writer thread
-    let db = Database::open(&config.db_path).map_err(TokiError::Db)?;
+    let db = Arc::new(Database::open(&config.db_path).map_err(TokiError::Db)?);
 
     // Load checkpoints into memory
     let checkpoints: HashMap<String, common::types::FileCheckpoint> = db.load_all_checkpoints()
@@ -85,12 +93,12 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
     // 2. Create bounded channel for writer thread
     let (db_tx, db_rx) = crossbeam_channel::bounded::<DbOp>(1024);
 
-    // 3. Spawn writer thread (owns the Database)
+    // 3. Spawn writer thread (shares DB via Arc)
     let retention = RetentionPolicy {
         event_retention_days: config.retention_days,
         rollup_retention_days: config.rollup_retention_days,
     };
-    let writer = DbWriter::new(db, db_rx, retention);
+    let writer = DbWriter::new(db.clone(), db_rx, retention);
     let writer_handle = std::thread::Builder::new()
         .name("toki-writer".to_string())
         .spawn(move || {
@@ -145,5 +153,6 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
         worker_handle: Some(worker_handle),
         writer_handle: Some(writer_handle),
         _watcher: watcher,
+        db,
     })
 }
