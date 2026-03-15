@@ -84,14 +84,15 @@ trace 클라이언트는 모든 sink 타입을 지원한다:
 ### Report Client
 
 ```
-Database::open(read-only)
-    → has_tsdb_data()? (O(1) 확인)
-        Yes → TSDB 쿼리 (~ms)
-        No  → "No data in TSDB" 에러 → 데몬 시작 안내
+UDS connect (daemon.sock)
+    → JSON 쿼리 전송 (PromQL 스타일)
+    → daemon이 TSDB에서 실행 후 JSON 응답
+    → client가 pricing 적용 + sink 출력
 ```
 
-Report는 DB를 직접 읽어 조회한다. Writer thread 불필요.
+Report는 daemon에 UDS로 쿼리를 보내고 결과를 받는다 (fjall DB lock 때문에 직접 DB open 불가).
 데몬이 실행 중이어야 report를 사용할 수 있다 (PID 파일로 확인).
+pricing은 client가 파일 캐시(`~/.config/toki/pricing.json`)에서 로드하여 적용한다.
 
 ## Worker Thread
 

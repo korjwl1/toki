@@ -27,7 +27,7 @@ toki report           # TSDB 조회 클라이언트 (= docker ps)
 
 - **daemon**: 파일 감시 + TSDB 저장. 항상 실행되어야 하며, trace 클라이언트가 없을 때는 Sink 오버헤드 0.
 - **trace**: 데몬에 UDS로 연결하여 실시간 이벤트 스트림 수신. print/uds/http 모든 sink 지원.
-- **report**: TSDB에서 직접 조회. 데몬이 실행 중이어야 사용 가능하다.
+- **report**: 데몬에 UDS로 쿼리 전송 → TSDB 조회 결과 수신. 데몬이 실행 중이어야 사용 가능하다.
 
 ## Build from Source
 
@@ -239,7 +239,7 @@ toki trace --sink print --sink http://localhost:8080/events
 └── src/
     ├── lib.rs                             # Public API: start(), Handle
     ├── main.rs                            # CLI 바이너리 (clap)
-    ├── config.rs                          # Config + DB settings 우선순위
+    ├── config.rs                          # Config + 파일 기반 설정 (settings.json)
     ├── db.rs                              # fjall 래퍼 (7 keyspaces)
     ├── engine.rs                          # TrackerEngine: cold_start + watch_loop
     ├── writer.rs                          # DB writer thread (DbOp channel)
@@ -267,6 +267,50 @@ toki trace --sink print --sink http://localhost:8080/events
     └── platform/
         └── macos/mod.rs                   # macOS FSEvents 감시
 ```
+
+## Performance
+
+ccusage (Node.js), zzusage (Zig)와의 벤치마크 비교. 동일 데이터, `sudo purge`로 디스크 캐시 초기화 후 측정.
+
+### Cold Start (전체 파일 색인)
+
+toki는 파싱과 동시에 TSDB에 색인까지 하면서도 ccusage보다 14~21배 빠르다.
+zzusage(Zig)와는 거의 동일한 속도이지만, zzusage는 DB 저장을 하지 않는다.
+
+| 데이터 | toki | ccusage | zzusage | vs ccusage | vs zzusage |
+|--------|------|---------|---------|------------|------------|
+| 100MB | 0.11s | 2.37s | 0.12s | **21x** | 1.0x |
+| 500MB | 0.39s | 6.05s | 0.35s | **16x** | 0.9x |
+| 1GB | 0.78s | 11.07s | 0.65s | **14x** | 0.8x |
+| 2GB | 1.54s | 21.73s | 1.22s | **14x** | 0.8x |
+
+메모리 사용량:
+
+| 데이터 | toki | ccusage | zzusage |
+|--------|------|---------|---------|
+| 500MB | 83MB | 126MB | 613MB |
+| 2GB | 161MB | 126MB | 2,311MB |
+
+- toki: 파일별 스트리밍 처리, mmap zero-copy
+- ccusage: Node.js 힙 고정 (~126MB), 순차 처리 후 GC
+- zzusage: 전체 이벤트를 메모리에 적재, 데이터 크기에 비례하여 폭증
+
+### Report (색인 후 조회)
+
+toki는 daemon이 TSDB에 데이터를 유지하므로 report 시 파일을 다시 읽지 않는다.
+ccusage/zzusage는 매번 전체 파일을 처음부터 다시 읽어야 한다.
+
+| 데이터 | toki | ccusage | zzusage | vs ccusage | vs zzusage |
+|--------|------|---------|---------|------------|------------|
+| 100MB | 0.013s | 2.37s | 0.12s | **182x** | **9x** |
+| 500MB | 0.013s | 6.05s | 0.35s | **465x** | **27x** |
+| 1GB | 0.013s | 11.07s | 0.65s | **851x** | **50x** |
+| 2GB | 0.013s | 21.73s | 1.22s | **1,672x** | **94x** |
+
+toki report는 데이터 크기와 무관하게 **~13ms 고정** (UDS 쿼리 + TSDB rollup 조회).
+메모리 사용량 ~5MB, CPU 사용률 거의 0%.
+
+> 벤치마크 실행: `sudo -v && python3 benches/benchmark.py run --purge --tool all`
 
 ## Tech Stack
 
