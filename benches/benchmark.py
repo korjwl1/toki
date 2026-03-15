@@ -534,12 +534,13 @@ def cmd_run(args):
     print(f"Runs per scenario: {runs}")
 
     # Count total runs
-    n_tools = (1 if toki else 0) + (1 if ccusage else 0)
-    # toki: 1 cold start + len(SCENARIOS) reports per data set
-    # ccusage: len(SCENARIOS) per data set
-    toki_runs_per_ds = (1 + len(SCENARIOS) * runs) if toki else 0
+    # toki: cold_start × runs + len(SCENARIOS) × runs reports per data set
+    # ccusage/zzusage: len(SCENARIOS) × runs per data set
+    toki_runs_per_ds = (runs + len(SCENARIOS) * runs) if toki else 0
     cc_runs_per_ds = (len(SCENARIOS) * runs) if ccusage else 0
-    total_runs = len(data_sets) * (toki_runs_per_ds + cc_runs_per_ds)
+    zz_scenarios = sum(1 for _, _, _, zz in SCENARIOS if zz or _ == "total")
+    zz_runs_per_ds = (zz_scenarios * runs) if zzusage else 0
+    total_runs = len(data_sets) * (toki_runs_per_ds + cc_runs_per_ds + zz_runs_per_ds)
     print(f"Total benchmark runs: {total_runs}\n")
 
     # Warm-up
@@ -561,24 +562,29 @@ def cmd_run(args):
     for label, data_path, size_mb in data_sets:
         print(f"\n--- {label} ({size_mb} MB) ---")
 
-        # ── toki: Phase 1 (cold start) + Phase 2 (reports) ──
+        # ── toki: Phase 1 (cold start × runs) + Phase 2 (reports) ──
         if toki:
-            if use_purge:
-                purge_disk_cache()
-            run_idx += 1
-            tag = f"[{run_idx}/{total_runs}]"
-            print(f"  {tag} toki       | {label:8s} | cold_start | run 1", end="", flush=True)
+            for i in range(1, runs + 1):
+                if use_purge:
+                    purge_disk_cache()
+                run_idx += 1
+                tag = f"[{run_idx}/{total_runs}]"
+                print(f"  {tag} toki       | {label:8s} | cold_start | run {i}", end="", flush=True)
 
-            r = run_daemon_cold_start(toki, data_path)
-            r.data_label = label
-            r.data_size_mb = size_mb
-            r.run = 1
-            results.append(r)
+                r = run_daemon_cold_start(toki, data_path)
+                r.data_label = label
+                r.data_size_mb = size_mb
+                r.run = i
+                results.append(r)
 
-            status = "OK" if r.exit_code == 0 else f"EXIT={r.exit_code}"
-            print(f"  {r.wall_time_s:7.3f}s  {r.peak_rss_mb:6.1f}MB  DB:{r.db_size_mb:.1f}MB  {status}")
+                status = "OK" if r.exit_code == 0 else f"EXIT={r.exit_code}"
+                print(f"  {r.wall_time_s:7.3f}s  {r.peak_rss_mb:6.1f}MB  DB:{r.db_size_mb:.1f}MB  {status}")
 
-            # Phase 2: reports while daemon is running
+                # Stop daemon after each cold start run (next run needs fresh start)
+                if i < runs:
+                    stop_daemon(toki)
+
+            # Phase 2: reports while daemon is running (last cold start's daemon still up)
             for scenario_name, toki_args, _, _ in SCENARIOS:
                 for i in range(1, runs + 1):
                     run_idx += 1
