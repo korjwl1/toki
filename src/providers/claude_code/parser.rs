@@ -206,7 +206,17 @@ fn parse_digits4(b: &[u8], i: usize) -> Option<u32> {
 /// Algorithm from Howard Hinnant's date library.
 #[inline]
 fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
-    if month < 1 || month > 12 || day < 1 || day > 31 {
+    if month < 1 || month > 12 || day < 1 {
+        return None;
+    }
+    let is_leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    let max_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => if is_leap { 29 } else { 28 },
+        _ => return None,
+    };
+    if day > max_day {
         return None;
     }
     let y = if month <= 2 { year - 1 } else { year };
