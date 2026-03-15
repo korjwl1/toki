@@ -310,6 +310,7 @@ ccusage/zzusage는 매번 전체 파일을 처음부터 다시 읽어야 한다.
 toki report는 데이터 크기와 무관하게 **~13ms 고정** (UDS 쿼리 + TSDB rollup 조회).
 메모리 사용량 ~5MB, CPU 사용률 거의 0%.
 
+> 측정 환경: Apple M1 MacBook Air (8GB RAM), macOS, 절전 모드 off
 > 벤치마크 실행: `sudo -v && python3 benches/benchmark.py run --purge --tool all`
 
 ## Tech Stack
