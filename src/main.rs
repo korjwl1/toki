@@ -26,7 +26,7 @@ struct Cli {
 /// Options shared by trace and report commands.
 #[derive(Args, Clone)]
 struct ClientOptions {
-    /// Output format override: table or json (overrides DB setting)
+    /// Output format override: table or json
     #[arg(long)]
     output_format: Option<String>,
     /// Output sink(s): print (default), uds://<path>, http://<url>
@@ -35,7 +35,7 @@ struct ClientOptions {
     /// Timezone override (e.g. Asia/Seoul, US/Eastern)
     #[arg(long, short = 'z')]
     timezone: Option<String>,
-    /// Disable cost calculation (overrides DB setting)
+    /// Disable cost calculation
     #[arg(long)]
     no_cost: bool,
 }
@@ -166,16 +166,12 @@ enum ReportCommands {
     },
 }
 
-/// Build Config from defaults + DB settings + CLI overrides.
+/// Build Config from defaults + settings file + CLI overrides.
 fn build_config(cli_tz: Option<Tz>, cli_no_cost: bool, cli_output_format: Option<&str>) -> Config {
+    // Config::new() auto-loads from ~/.config/toki/settings.json
     let mut config = Config::new();
 
-    // Load settings from DB (if DB exists)
-    if let Ok(db) = toki::db::Database::open(&config.db_path) {
-        config.load_from_db(&db);
-    }
-
-    // CLI overrides take precedence over DB settings
+    // CLI overrides take precedence over settings file
     if let Some(tz) = cli_tz {
         config = config.with_tz(Some(tz));
     }
@@ -239,21 +235,40 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Settings { db_path, command } => {
-            let config = Config::new();
-            let db_path = db_path.unwrap_or(config.db_path);
+        Commands::Settings { db_path: _, command } => {
             match command {
                 None => {
-                    toki::settings::run_settings(&db_path);
+                    toki::settings::run_settings();
+                    // Check if TUI requested daemon restart
+                    if std::env::var("TOKI_RESTART_DAEMON").as_deref() == Ok("1") {
+                        let config = build_config(None, false, None);
+                        stop_running_daemon(&config);
+                        eprintln!("[toki] Starting daemon...");
+                        let toki_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("toki"));
+                        std::process::Command::new(toki_bin)
+                            .args(["daemon", "start"])
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::inherit())
+                            .spawn()
+                            .ok();
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        let pidfile = toki::daemon::default_pidfile_path();
+                        if toki::daemon::daemon_status(&pidfile).is_some() {
+                            eprintln!("[toki] Daemon restarted.");
+                        } else {
+                            eprintln!("[toki] Daemon may still be starting...");
+                        }
+                    }
                 }
                 Some(SettingsCommands::Set { key, value }) => {
-                    handle_settings_set(&db_path, &key, &value);
+                    handle_settings_set(&key, &value);
                 }
                 Some(SettingsCommands::Get { key }) => {
-                    handle_settings_get(&db_path, &key);
+                    handle_settings_get(&key);
                 }
                 Some(SettingsCommands::List) => {
-                    handle_settings_list(&db_path);
+                    handle_settings_list();
                 }
             }
         }
@@ -294,64 +309,75 @@ const VALID_SETTINGS: &[&str] = &[
     "start_of_week", "no_cost", "retention_days", "rollup_retention_days",
 ];
 
-fn handle_settings_set(db_path: &std::path::Path, key: &str, value: &str) {
+/// Settings that require daemon restart to take effect.
+const DAEMON_SETTINGS: &[&str] = &[
+    "claude_code_root", "daemon_sock", "retention_days", "rollup_retention_days",
+];
+
+fn handle_settings_set(key: &str, value: &str) {
     if !VALID_SETTINGS.contains(&key) {
         eprintln!("[toki] Unknown setting: {}", key);
         eprintln!("[toki] Valid keys: {}", VALID_SETTINGS.join(", "));
         std::process::exit(1);
     }
 
-    let db = match toki::db::Database::open(db_path) {
-        Ok(db) => db,
-        Err(e) => {
-            eprintln!("[toki] Cannot open database: {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    if let Err(e) = db.set_setting(key, value) {
+    if let Err(e) = toki::config::set_setting(key, value) {
         eprintln!("[toki] Failed to set {}: {}", key, e);
         std::process::exit(1);
     }
     println!("{} = {}", key, value);
+
+    // Prompt daemon restart for daemon-affecting settings
+    if DAEMON_SETTINGS.contains(&key) {
+        let pidfile = toki::daemon::default_pidfile_path();
+        if toki::daemon::daemon_status(&pidfile).is_some() {
+            eprintln!("[toki] This setting requires daemon restart to take effect.");
+            eprint!("[toki] Restart daemon now? [y/N]: ");
+            let mut input = String::new();
+            if std::io::stdin().read_line(&mut input).is_ok() && input.trim().eq_ignore_ascii_case("y") {
+                let config = Config::new();
+                stop_running_daemon(&config);
+                RUNNING.store(true, Ordering::SeqCst);
+                eprintln!("[toki] Starting daemon...");
+                let toki_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("toki"));
+                std::process::Command::new(toki_bin)
+                    .args(["daemon", "start"])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::inherit())
+                    .spawn()
+                    .ok();
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let pidfile = toki::daemon::default_pidfile_path();
+                if toki::daemon::daemon_status(&pidfile).is_some() {
+                    eprintln!("[toki] Daemon restarted.");
+                } else {
+                    eprintln!("[toki] Daemon may still be starting...");
+                }
+            } else {
+                eprintln!("[toki] Run `toki daemon restart` to apply.");
+            }
+        }
+    }
 }
 
-fn handle_settings_get(db_path: &std::path::Path, key: &str) {
+fn handle_settings_get(key: &str) {
     if !VALID_SETTINGS.contains(&key) {
         eprintln!("[toki] Unknown setting: {}", key);
         eprintln!("[toki] Valid keys: {}", VALID_SETTINGS.join(", "));
         std::process::exit(1);
     }
 
-    let db = match toki::db::Database::open(db_path) {
-        Ok(db) => db,
-        Err(e) => {
-            eprintln!("[toki] Cannot open database: {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    match db.get_setting(key) {
-        Ok(Some(v)) => println!("{}", v),
-        Ok(None) => println!("(not set)"),
-        Err(e) => {
-            eprintln!("[toki] Failed to get {}: {}", key, e);
-            std::process::exit(1);
-        }
+    match toki::config::get_setting(key) {
+        Some(v) => println!("{}", v),
+        None => println!("(not set)"),
     }
 }
 
-fn handle_settings_list(db_path: &std::path::Path) {
-    let db = match toki::db::Database::open(db_path) {
-        Ok(db) => db,
-        Err(e) => {
-            eprintln!("[toki] Cannot open database: {}", e);
-            std::process::exit(1);
-        }
-    };
-
+fn handle_settings_list() {
+    let settings = toki::config::list_settings();
     for key in VALID_SETTINGS {
-        let value = db.get_setting(key).ok().flatten().unwrap_or_else(|| "(not set)".to_string());
+        let value = settings.get(*key).map(|s| s.as_str()).unwrap_or("(not set)");
         println!("{:>24} = {}", key, value);
     }
 }

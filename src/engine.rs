@@ -9,7 +9,7 @@ use crate::common::types::{FileCheckpoint, LogParser, LogParserWithTs, ModelUsag
 use chrono::{DateTime, NaiveDateTime, Weekday};
 use chrono_tz::Tz;
 use crate::sink::Sink;
-use crate::writer::DbOp;
+use crate::writer::{ColdStartEvent, DbOp};
 
 /// Debug level:
 ///   0 = off
@@ -144,46 +144,56 @@ impl TrackerEngine {
         let total_files: usize = sessions.iter().map(|s| 1 + s.subagent_jsonls.len()).sum();
         let summaries: Mutex<HashMap<String, ModelUsageSummary>> = Mutex::new(HashMap::new());
         let cp_batch: Mutex<Vec<FileCheckpoint>> = Mutex::new(Vec::new());
+        let event_count: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let db_tx = &self.db_tx;
 
+        // Parallel parse + streaming bulk write:
+        // Each rayon thread collects events per file, then sends the chunk
+        // to the writer thread immediately. No global event buffer.
+        // Uses optimized cold start parser to avoid intermediate allocations.
+        let cs_parser = crate::providers::claude_code::ClaudeCodeParser;
         parallel_scan(&sessions, &self.checkpoints, |path, offset| {
             let mut local: HashMap<String, ModelUsageSummary> = HashMap::new();
-            let session_id = extract_session_id(path).unwrap_or_default();
+            let mut file_events: Vec<ColdStartEvent> = Vec::new();
+            let session_id: std::rc::Rc<str> = extract_session_id(path).unwrap_or_default().into();
+            let source_file: std::rc::Rc<str> = path.into();
             let result = process_lines_streaming(path, offset, |line| {
-                if let Some(event) = parser.parse_line_with_ts(line, path) {
-                    let summary = local.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
-                        model: event.model.clone(),
+                if let Some(parsed) = cs_parser.parse_for_cold_start(line) {
+                    // Accumulate summary
+                    let summary = local.entry(parsed.model.clone()).or_insert_with(|| ModelUsageSummary {
+                        model: parsed.model.clone(),
                         ..Default::default()
                     });
-                    summary.accumulate_with_ts(&event);
+                    summary.input_tokens += parsed.input_tokens;
+                    summary.cache_creation_input_tokens += parsed.cache_creation_input_tokens;
+                    summary.cache_read_input_tokens += parsed.cache_read_input_tokens;
+                    summary.output_tokens += parsed.output_tokens;
+                    summary.event_count += 1;
 
-                    // Send event to TSDB writer
-                    let ts_ms = parse_timestamp(&event.timestamp)
-                        .map(|dt| dt.and_utc().timestamp_millis())
-                        .unwrap_or(0);
-                    if ts_ms > 0 {
-                        let op = DbOp::WriteEvent {
-                            ts_ms,
-                            message_id: event.event_key.clone(),
-                            model: event.model.clone(),
-                            session_id: session_id.clone(),
-                            source_file: event.source_file.clone(),
-                            tokens: TokenFields {
-                                input_tokens: event.input_tokens,
-                                output_tokens: event.output_tokens,
-                                cache_creation_input_tokens: event.cache_creation_input_tokens,
-                                cache_read_input_tokens: event.cache_read_input_tokens,
-                            },
-                        };
-                        if db_tx.send(op).is_err() {
-                            eprintln!("[toki] Writer channel disconnected, events may be lost");
-                        }
-                    }
+                    // Build ColdStartEvent — reuse Rc for session_id/source_file
+                    file_events.push(ColdStartEvent {
+                        ts_ms: parsed.ts_ms,
+                        message_id: parsed.event_key,
+                        model: parsed.model,
+                        session_id: session_id.to_string(),
+                        source_file: source_file.to_string(),
+                        tokens: TokenFields {
+                            input_tokens: parsed.input_tokens,
+                            output_tokens: parsed.output_tokens,
+                            cache_creation_input_tokens: parsed.cache_creation_input_tokens,
+                            cache_read_input_tokens: parsed.cache_read_input_tokens,
+                        },
+                    });
                 }
             });
             if !local.is_empty() {
                 let mut s = summaries.lock().unwrap_or_else(|e| e.into_inner());
                 merge_summaries(&mut s, local);
+            }
+            // Stream file chunk to writer immediately (no global buffer)
+            if !file_events.is_empty() {
+                event_count.fetch_add(file_events.len(), std::sync::atomic::Ordering::Relaxed);
+                let _ = db_tx.send(DbOp::BulkWrite(file_events));
             }
             if let Ok(Some((_bytes, last_line_len, last_line_hash))) = result {
                 cp_batch.lock().unwrap_or_else(|e| e.into_inner()).push(FileCheckpoint {
@@ -194,8 +204,10 @@ impl TrackerEngine {
             }
         });
 
+        let t_parse = t_cold.elapsed();
         let result_summaries = summaries.into_inner().unwrap_or_else(|e| e.into_inner());
         let checkpoints_batch = cp_batch.into_inner().unwrap_or_else(|e| e.into_inner());
+        let total_events = event_count.load(std::sync::atomic::Ordering::Relaxed);
 
         for cp in &checkpoints_batch {
             self.checkpoints.insert(cp.file_path.clone(), cp.clone());
@@ -204,13 +216,21 @@ impl TrackerEngine {
         // Emit summary (no pricing — cost is calculated client-side)
         self.sink.emit_summary(&result_summaries, None);
 
-        // Batch flush for cold start via writer thread.
+        // Signal writer to flush accumulated rollups, then wait for completion
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        let _ = self.db_tx.send(DbOp::FlushBulkRollups(done_tx));
+        let _ = done_rx.recv();
+
+        // Flush checkpoints
         let cp_count = checkpoints_batch.len();
         if !checkpoints_batch.is_empty() {
             let _ = self.db_tx.send(DbOp::FlushCheckpoints(checkpoints_batch));
         }
-        debug_log!("cold_start — {} sessions, {} files, {} checkpoints flushed (total: {}µs)",
-            sessions.len(), total_files, cp_count, t_cold.elapsed().as_micros());
+        let t_total = t_cold.elapsed();
+        let t_db = t_total - t_parse;
+        debug_log!("cold_start — {} sessions, {} files, {} events, {} checkpoints (parse: {}µs, db_wait: {}µs, total: {}µs)",
+            sessions.len(), total_files, total_events, cp_count,
+            t_parse.as_micros(), t_db.as_micros(), t_total.as_micros());
 
         Ok(result_summaries)
     }
@@ -610,6 +630,21 @@ mod tests {
         }
     }
 
+    /// Create a db_tx + drain thread that consumes all DbOps (handles FlushBulkRollups done signal).
+    fn test_db_channel() -> (crossbeam_channel::Sender<DbOp>, std::thread::JoinHandle<()>) {
+        let (db_tx, db_rx) = crossbeam_channel::bounded::<DbOp>(1024);
+        let handle = std::thread::spawn(move || {
+            while let Ok(op) = db_rx.recv() {
+                match op {
+                    DbOp::FlushBulkRollups(done_tx) => { let _ = done_tx.send(()); }
+                    DbOp::Shutdown => break,
+                    _ => {}
+                }
+            }
+        });
+        (db_tx, handle)
+    }
+
     fn make_assistant_line(id: &str, model: &str, input: u64, cc: u64, cr: u64, output: u64) -> String {
         format!(
             r#"{{"type":"assistant","message":{{"id":"{}","model":"{}","usage":{{"input_tokens":{},"cache_creation_input_tokens":{},"cache_read_input_tokens":{},"output_tokens":{}}}}},"timestamp":"2026-03-08T12:00:00Z"}}"#,
@@ -627,7 +662,7 @@ mod tests {
             .into_iter()
             .map(|cp| (cp.file_path.clone(), cp))
             .collect();
-        let (db_tx, _db_rx) = crossbeam_channel::bounded::<DbOp>(1024);
+        let (db_tx, _drain) = test_db_channel();
         let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded, Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)));
 
         // Create test JSONL
@@ -663,7 +698,7 @@ mod tests {
             .into_iter()
             .map(|cp| (cp.file_path.clone(), cp))
             .collect();
-        let (db_tx, _db_rx) = crossbeam_channel::bounded::<DbOp>(1024);
+        let (db_tx, _drain) = test_db_channel();
         let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded, Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)));
 
         let projects_dir = dir.path().join("projects").join("test");
@@ -700,7 +735,7 @@ mod tests {
             .into_iter()
             .map(|cp| (cp.file_path.clone(), cp))
             .collect();
-        let (db_tx, _db_rx) = crossbeam_channel::bounded::<DbOp>(1024);
+        let (db_tx, _drain) = test_db_channel();
         let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded, Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)));
 
         let projects_dir = dir.path().join("projects").join("test");
@@ -736,7 +771,7 @@ mod tests {
             .into_iter()
             .map(|cp| (cp.file_path.clone(), cp))
             .collect();
-        let (db_tx, _db_rx) = crossbeam_channel::bounded::<DbOp>(1024);
+        let (db_tx, _drain) = test_db_channel();
         let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded, Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)));
 
         let projects_dir = dir.path().join("projects").join("test");
@@ -767,7 +802,7 @@ mod tests {
             .into_iter()
             .map(|cp| (cp.file_path.clone(), cp))
             .collect();
-        let (db_tx, _db_rx) = crossbeam_channel::bounded::<DbOp>(1024);
+        let (db_tx, _drain) = test_db_channel();
         let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded, Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)));
 
         let projects_dir = dir.path().join("projects").join("test");
@@ -804,7 +839,7 @@ mod tests {
             .into_iter()
             .map(|cp| (cp.file_path.clone(), cp))
             .collect();
-        let (db_tx, _db_rx) = crossbeam_channel::bounded::<DbOp>(1024);
+        let (db_tx, _drain) = test_db_channel();
         let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded, Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)));
 
         let parser = TestParser;
@@ -875,7 +910,7 @@ mod tests {
 
         // Bench full process_file (cold start + incremental)
         let _db2 = crate::db::Database::open(&dir.path().join("bench2.db")).unwrap();
-        let (db_tx2, _db_rx2) = crossbeam_channel::bounded::<DbOp>(1024);
+        let (db_tx2, _drain2) = test_db_channel();
         let mut engine = TrackerEngine::new(db_tx2, HashMap::new(), Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)));
         let parser = TestParser;
 

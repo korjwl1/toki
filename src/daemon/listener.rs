@@ -46,11 +46,11 @@ pub fn run_listener(
                 classify_and_handle(stream, &broadcast, &db);
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                std::thread::sleep(std::time::Duration::from_millis(5));
             }
             Err(e) => {
                 eprintln!("[toki:daemon] Accept error: {}", e);
-                std::thread::sleep(std::time::Duration::from_millis(100));
+                std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
     }

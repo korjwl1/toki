@@ -60,12 +60,16 @@ SCENARIOS = [
 # ---------------------------------------------------------------------------
 
 def get_dir_size_bytes(path: Path) -> int:
+    """Get actual disk usage (not pre-allocated size) using st_blocks."""
     total = 0
     for dirpath, _, filenames in os.walk(path):
         for f in filenames:
             fp = os.path.join(dirpath, f)
             if os.path.isfile(fp):
-                total += os.path.getsize(fp)
+                stat = os.stat(fp)
+                # Use st_blocks (512-byte blocks) for actual disk usage,
+                # avoiding fjall's 64MB pre-allocated WAL inflation.
+                total += stat.st_blocks * 512
     return total
 
 
@@ -332,25 +336,28 @@ def run_daemon_cold_start(toki: str, data_path: Path) -> BenchResult:
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
 
-    # Start daemon
+    # Start daemon with TOKI_DEBUG=1 to capture cold_start timing
     log_path = SCRIPT_DIR / ".daemon.log"
     log_file = open(log_path, "w")
 
-    t0 = time.perf_counter()
+    env = os.environ.copy()
+    env["TOKI_DEBUG"] = "1"
+
     proc = subprocess.Popen(
         [toki, "daemon", "start"],
         stdout=log_file, stderr=subprocess.STDOUT,
+        env=env,
     )
 
     mon = ProcessMonitor(proc.pid)
     mon.start()
 
-    # Wait for "Watching:" = cold start complete
+    # Wait for "Watching:" = daemon ready
     timeout = 600  # 10 min max
     start = time.monotonic()
     while time.monotonic() - start < timeout:
         if proc.poll() is not None:
-            break  # daemon exited unexpectedly
+            break
         try:
             with open(log_path, "r") as f:
                 content = f.read()
@@ -360,9 +367,27 @@ def run_daemon_cold_start(toki: str, data_path: Path) -> BenchResult:
             pass
         time.sleep(0.05)
 
-    elapsed = time.perf_counter() - t0
     mon.stop()
     log_file.close()
+
+    # Parse pure cold_start time from debug log (excludes daemon startup overhead)
+    elapsed = 0.0
+    try:
+        with open(log_path, "r") as f:
+            for line in f:
+                # Format: [toki:debug] cold_start — ... (123456µs)
+                if "cold_start" in line and "µs)" in line:
+                    import re
+                    m = re.search(r'\((\d+)µs\)', line)
+                    if m:
+                        elapsed = int(m.group(1)) / 1_000_000  # µs → seconds
+                    break
+    except OSError:
+        pass
+
+    # Fallback: if debug log parsing fails, use wall time
+    if elapsed == 0.0:
+        elapsed = time.monotonic() - start
 
     s = mon.stats()
     result = BenchResult(
@@ -576,9 +601,11 @@ def cmd_run(args):
 def save_results(results: list[BenchResult]) -> Path:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    tools = sorted(set(r.tool for r in results))
+    tool_tag = "_".join(tools)  # e.g. "toki", "ccusage", "ccusage_toki"
 
     # CSV
-    csv_path = RESULTS_DIR / f"benchmark_{ts}.csv"
+    csv_path = RESULTS_DIR / f"benchmark_{tool_tag}_{ts}.csv"
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(asdict(results[0]).keys()))
         writer.writeheader()
@@ -586,7 +613,7 @@ def save_results(results: list[BenchResult]) -> Path:
             writer.writerow(asdict(r))
 
     # JSON (with averages pre-computed)
-    json_path = RESULTS_DIR / f"benchmark_{ts}.json"
+    json_path = RESULTS_DIR / f"benchmark_{tool_tag}_{ts}.json"
     averages = compute_averages(results)
     with open(json_path, "w") as f:
         json.dump({

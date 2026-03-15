@@ -392,15 +392,16 @@ db.for_each_event(since, until, |ts, event| { ... })
 설정 값은 다음 우선순위로 결정된다:
 
 ```
-CLI 인자 > DB settings (toki settings) > 기본값
+CLI 인자 > 설정 파일 (~/.config/toki/settings.json) > 기본값
 ```
 
+설정 파일은 `toki settings` (TUI) 또는 `toki settings set/get/list` (CLI)로 관리한다.
 환경변수는 사용하지 않는다 (`TOKI_DEBUG` 제외).
 
-| 설정 | CLI 오버라이드 | DB key | 기본값 |
-|------|---------------|--------|--------|
+| 설정 | CLI 오버라이드 | settings key | 기본값 |
+|------|---------------|-------------|--------|
 | Claude root | - | `claude_code_root` | `~/.claude` |
-| DB path | `settings --db-path` | - | `~/.config/toki/toki.fjall` |
+| DB path | - | - | `~/.config/toki/toki.fjall` |
 | Daemon sock | - | `daemon_sock` | `~/.config/toki/daemon.sock` |
 | Timezone | `-z` | `timezone` | (UTC) |
 | Output format | `--output-format` | `output_format` | `table` |

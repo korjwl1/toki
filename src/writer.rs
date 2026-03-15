@@ -9,6 +9,16 @@ use crate::db::Database;
 use crate::engine::extract_project_name;
 use crate::retention::{RetentionPolicy, run_retention};
 
+/// Event data for cold start bulk write.
+pub struct ColdStartEvent {
+    pub ts_ms: i64,
+    pub message_id: String,
+    pub model: String,
+    pub session_id: String,
+    pub source_file: String,
+    pub tokens: TokenFields,
+}
+
 /// Operations sent to the writer thread via bounded channel.
 pub enum DbOp {
     WriteEvent {
@@ -19,6 +29,11 @@ pub enum DbOp {
         source_file: String,
         tokens: TokenFields,
     },
+    /// Bulk write chunk for cold start — events from one file.
+    /// Rollups are accumulated in memory until FlushBulkRollups.
+    BulkWrite(Vec<ColdStartEvent>),
+    /// Flush accumulated rollups from cold start bulk writes. Signals done.
+    FlushBulkRollups(crossbeam_channel::Sender<()>),
     WriteCheckpoint(FileCheckpoint),
     FlushCheckpoints(Vec<FileCheckpoint>),
     Shutdown,
@@ -34,6 +49,10 @@ pub struct DbWriter {
     next_dict_id: u32,
     pending_events: Vec<PendingEvent>,
     retention: RetentionPolicy,
+    /// Accumulated rollups during cold start bulk writes.
+    bulk_rollups: HashMap<(i64, String), RollupValue>,
+    /// Accumulated events during cold start bulk writes (flushed at BULK_BATCH_SIZE).
+    bulk_pending: Vec<ColdStartEvent>,
 }
 
 struct PendingEvent {
@@ -58,6 +77,8 @@ impl DbWriter {
             next_dict_id,
             pending_events: Vec::with_capacity(BATCH_SIZE),
             retention,
+            bulk_rollups: HashMap::new(),
+            bulk_pending: Vec::new(),
         }
     }
 
@@ -120,6 +141,15 @@ impl DbWriter {
                 if self.pending_events.len() >= BATCH_SIZE {
                     self.flush_pending();
                 }
+                true
+            }
+            DbOp::BulkWrite(events) => {
+                self.bulk_write_chunk(events);
+                true
+            }
+            DbOp::FlushBulkRollups(done_tx) => {
+                self.flush_bulk_rollups();
+                let _ = done_tx.send(());
                 true
             }
             DbOp::WriteCheckpoint(cp) => {
@@ -206,6 +236,87 @@ impl DbWriter {
         if crate::engine::debug_level() >= 1 {
             eprintln!("[toki:writer] flushed {} events, {} rollups in {}µs",
                 count, rollup_updates.len(), t.elapsed().as_micros());
+        }
+    }
+
+    /// Buffer a chunk of cold start events. Flushes to DB when buffer reaches BULK_BATCH_SIZE.
+    fn bulk_write_chunk(&mut self, mut events: Vec<ColdStartEvent>) {
+        // Accumulate rollups in memory (no DB reads)
+        for event in &events {
+            let hour_ts = event.ts_ms - (event.ts_ms % 3_600_000);
+            let rollup = self.bulk_rollups.entry((hour_ts, event.model.clone())).or_default();
+            rollup.input += event.tokens.input_tokens;
+            rollup.output += event.tokens.output_tokens;
+            rollup.cache_create += event.tokens.cache_creation_input_tokens;
+            rollup.cache_read += event.tokens.cache_read_input_tokens;
+            rollup.count += 1;
+        }
+
+        // Buffer events, flush when large enough
+        self.bulk_pending.append(&mut events);
+        if self.bulk_pending.len() >= 1024 {
+            self.flush_bulk_events();
+        }
+    }
+
+    /// Flush buffered bulk events to DB.
+    fn flush_bulk_events(&mut self) {
+        if self.bulk_pending.is_empty() {
+            return;
+        }
+
+        let events: Vec<ColdStartEvent> = self.bulk_pending.drain(..).collect();
+        let mut batch = self.db.batch();
+        for event in &events {
+            let model_id = self.resolve_dict_id(&mut batch, &event.model);
+            let session_id = self.resolve_dict_id(&mut batch, &event.session_id);
+            let source_file_id = self.resolve_dict_id(&mut batch, &event.source_file);
+
+            let stored = StoredEvent {
+                model_id,
+                session_id,
+                source_file_id,
+                input_tokens: event.tokens.input_tokens,
+                output_tokens: event.tokens.output_tokens,
+                cache_creation_input_tokens: event.tokens.cache_creation_input_tokens,
+                cache_read_input_tokens: event.tokens.cache_read_input_tokens,
+            };
+
+            self.db.insert_event_batch(&mut batch, event.ts_ms, &event.message_id, &stored);
+            self.db.insert_session_index(&mut batch, &event.session_id, event.ts_ms, &event.message_id);
+
+            if let Some(project) = extract_project_name(&event.source_file) {
+                self.db.insert_project_index(&mut batch, project, event.ts_ms, &event.message_id);
+            }
+        }
+
+        if let Err(e) = batch.commit() {
+            eprintln!("[toki:writer] bulk batch commit error: {}", e);
+        }
+    }
+
+    /// Flush remaining bulk events + accumulated rollups, then signal completion.
+    fn flush_bulk_rollups(&mut self) {
+        let t = Instant::now();
+
+        // Flush remaining buffered events
+        self.flush_bulk_events();
+
+        // Write rollups in a single batch
+        if !self.bulk_rollups.is_empty() {
+            let count = self.bulk_rollups.len();
+            let mut batch = self.db.batch();
+            for ((hour_ts, model), rollup) in &self.bulk_rollups {
+                self.db.upsert_rollup(&mut batch, *hour_ts, model, rollup);
+            }
+            if let Err(e) = batch.commit() {
+                eprintln!("[toki:writer] bulk rollup commit error: {}", e);
+            }
+            self.bulk_rollups.clear();
+
+            if crate::engine::debug_level() >= 1 {
+                eprintln!("[toki:writer] bulk flush complete: {} rollups in {}µs", count, t.elapsed().as_micros());
+            }
         }
     }
 

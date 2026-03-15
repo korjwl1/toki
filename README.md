@@ -156,12 +156,16 @@ metric{filters}[bucket] by (dimensions)
 
 ## Settings
 
-`settings`는 cursive TUI로 설정 페이지를 연다. 설정은 DB에 저장되며, CLI 인자로도 개별 오버라이드 가능.
+`settings`는 cursive TUI로 설정 페이지를 연다. 설정은 `~/.config/toki/settings.json` 파일에 저장된다.
 
 ```bash
-toki settings
-toki settings --db-path /custom/toki.fjall
+toki settings                              # TUI 열기
+toki settings set claude_code_root /path   # 개별 설정 변경
+toki settings get timezone                 # 설정 조회
+toki settings list                         # 전체 설정 출력
 ```
+
+데몬 영향 설정(`claude_code_root`, `daemon_sock`, `retention_days`, `rollup_retention_days`) 변경 시 데몬 재시작 여부를 묻는다.
 
 | 설정 항목 | 설명 | 기본값 |
 |-----------|------|--------|
@@ -174,7 +178,7 @@ toki settings --db-path /custom/toki.fjall
 | Retention Days | 이벤트 보존 기간 (0=무제한) | `0` |
 | Rollup Retention Days | Rollup 보존 기간 (0=무제한) | `0` |
 
-설정 우선순위: **CLI 인자 > DB settings > 기본값** (환경변수 미사용)
+설정 우선순위: **CLI 인자 > 설정 파일 (settings.json) > 기본값** (환경변수 미사용)
 
 ## Client Options (trace / report)
 
@@ -182,7 +186,7 @@ toki settings --db-path /custom/toki.fjall
 
 | 옵션 | 설명 |
 |------|------|
-| `--output-format table\|json` | 출력 형식 오버라이드 (DB 설정보다 우선) |
+| `--output-format table\|json` | 출력 형식 오버라이드 |
 | `--sink <SPEC>` | 출력 대상, 복수 지정 가능 |
 | `--timezone <IANA>` / `-z` | 타임존 오버라이드 |
 | `--no-cost` | 비용 계산 비활성화 오버라이드 |
@@ -205,7 +209,7 @@ toki trace --sink print --sink http://localhost:8080/events
 모든 출력에 모델별 추정 비용(USD)이 표시된다.
 가격 데이터는 [LiteLLM](https://github.com/BerriAI/litellm) 커뮤니티 가격표에서 가져온다.
 
-- **최초 실행**: LiteLLM JSON 다운로드 → Claude 모델 추출 → DB 캐시
+- **최초 실행**: LiteLLM JSON 다운로드 → Claude 모델 추출 → 파일 캐시 (`~/.config/toki/pricing.json`)
 - **이후 실행**: HTTP ETag 조건부 요청 → 변경 없으면 304 (바디 없이 ~50ms)
 - **오프라인**: 캐시된 데이터로 동작, 캐시 없으면 Cost 컬럼 생략
 - **`--no-cost`**: 가격 fetch 스킵
@@ -216,7 +220,7 @@ toki trace --sink print --sink http://localhost:8080/events
 |------|------|--------|
 | `TOKI_DEBUG` | 디버그 로그 (1=normal, 2=verbose) | 0 |
 
-> 모든 설정은 `toki settings` TUI 또는 CLI `--db-path` 인자로 관리한다. 환경변수는 디버그 로그에만 사용.
+> 모든 설정은 `toki settings` (TUI 또는 `set/get/list`)로 관리한다. 환경변수는 디버그 로그에만 사용.
 
 ## Project Structure
 

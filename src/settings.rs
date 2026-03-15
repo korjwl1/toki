@@ -1,4 +1,3 @@
-use std::path::Path;
 
 use cursive::Cursive;
 use cursive::event::Key;
@@ -10,8 +9,6 @@ use cursive::views::{
     Checkbox, Dialog, EditView, LinearLayout, Panel, SelectView, TextView,
     DummyView, PaddedView,
 };
-
-use crate::db::Database;
 
 struct SettingsState {
     claude_code_root: String,
@@ -25,9 +22,9 @@ struct SettingsState {
 }
 
 impl SettingsState {
-    fn load(db: &Database) -> Self {
+    fn load() -> Self {
         let get = |key: &str, default: &str| -> String {
-            db.get_setting(key).ok().flatten().unwrap_or_else(|| default.to_string())
+            crate::config::get_setting(key).unwrap_or_else(|| default.to_string())
         };
         let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
 
@@ -111,16 +108,8 @@ fn labeled_checkbox(label: &str, checked: bool, name: &str) -> LinearLayout {
         .child(Checkbox::new().with_checked(checked).with_name(name))
 }
 
-pub fn run_settings(db_path: &Path) {
-    let db = match Database::open(db_path) {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("[toki] Failed to open database: {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    let state = SettingsState::load(&db);
+pub fn run_settings() {
+    let state = SettingsState::load();
 
     let mut siv = cursive::default();
     siv.set_theme(build_theme());
@@ -160,7 +149,6 @@ pub fn run_settings(db_path: &Path) {
 
     let padded = PaddedView::lrtb(1, 1, 0, 0, form);
 
-    let db_path_owned = db_path.to_path_buf();
 
     // Footer hint — cyan for keys, terminal default for descriptions
     let cyan = ColorStyle::new(
@@ -187,7 +175,7 @@ pub fn run_settings(db_path: &Path) {
         Dialog::around(main_layout)
             .title("toki settings")
             .button("Save", move |s| {
-                save_settings(s, &db_path_owned);
+                save_settings(s);
             })
             .button("Cancel", |s| s.quit())
             .min_width(70)
@@ -199,7 +187,7 @@ pub fn run_settings(db_path: &Path) {
     siv.run();
 }
 
-fn save_settings(siv: &mut Cursive, db_path: &Path) {
+fn save_settings(siv: &mut Cursive) {
     let claude_root = get_edit(siv, "claude_code_root");
     let daemon_sock = get_edit(siv, "daemon_sock");
     let timezone = get_edit(siv, "timezone");
@@ -235,15 +223,6 @@ fn save_settings(siv: &mut Cursive, db_path: &Path) {
         return;
     }
 
-    // Save to DB
-    let db = match Database::open(db_path) {
-        Ok(d) => d,
-        Err(e) => {
-            siv.add_layer(Dialog::info(format!("DB error: {}", e)));
-            return;
-        }
-    };
-
     let settings = [
         ("claude_code_root", claude_root.as_str()),
         ("daemon_sock", daemon_sock.as_str()),
@@ -255,17 +234,52 @@ fn save_settings(siv: &mut Cursive, db_path: &Path) {
         ("rollup_retention_days", rollup_retention.as_str()),
     ];
 
+    // Load old values to detect daemon-affecting changes
+    let daemon_keys = ["claude_code_root", "daemon_sock", "retention_days", "rollup_retention_days"];
+    let old_values: Vec<(String, String)> = daemon_keys.iter()
+        .map(|k| (k.to_string(), crate::config::get_setting(k).unwrap_or_default()))
+        .collect();
+
+    // Save to settings file
     for (key, value) in &settings {
-        if let Err(e) = db.set_setting(key, value) {
+        if let Err(e) = crate::config::set_setting(key, value) {
             siv.add_layer(Dialog::info(format!("Failed to save {}: {}", key, e)));
             return;
         }
     }
 
-    siv.add_layer(Dialog::info("Settings saved.").button("OK", |s| {
-        s.pop_layer();
-        s.quit();
-    }));
+    // Check if any daemon-affecting setting changed
+    let daemon_changed = old_values.iter().any(|(k, old_v)| {
+        settings.iter().any(|(sk, sv)| sk == k && sv != old_v)
+    });
+
+    let pidfile = crate::daemon::default_pidfile_path();
+    let daemon_running = crate::daemon::daemon_status(&pidfile).is_some();
+
+    if daemon_changed && daemon_running {
+        siv.add_layer(
+            Dialog::text("Settings saved.\n\nDaemon-affecting settings changed.\nRestart daemon now?")
+                .title("Restart Required")
+                .button("Yes", |s| {
+                    s.quit();
+                    // Restart daemon after TUI exits
+                    // Signal via exit code or env var
+                    std::env::set_var("TOKI_RESTART_DAEMON", "1");
+                })
+                .button("No", |s| {
+                    s.pop_layer();
+                    s.add_layer(Dialog::info("Run `toki daemon restart` to apply.").button("OK", |s| {
+                        s.pop_layer();
+                        s.quit();
+                    }));
+                })
+        );
+    } else {
+        siv.add_layer(Dialog::info("Settings saved.").button("OK", |s| {
+            s.pop_layer();
+            s.quit();
+        }));
+    }
 }
 
 fn get_edit(siv: &mut Cursive, name: &str) -> String {

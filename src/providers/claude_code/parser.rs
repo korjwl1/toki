@@ -100,6 +100,49 @@ impl ClaudeCodeParser {
             timestamp: parsed.timestamp.to_string(),
         })
     }
+
+    /// Optimized cold start parser: returns (event_key, model, ts_ms, tokens) directly.
+    /// Avoids intermediate String allocations and double timestamp parsing.
+    pub fn parse_for_cold_start(&self, line: &str) -> Option<ColdStartParsed> {
+        let parsed = self.parse_line_common(line)?;
+
+        let ts_ms = parse_ts_to_ms(parsed.timestamp)?;
+        let event_key = format!("{}:{}", parsed.message_id, parsed.timestamp);
+
+        Some(ColdStartParsed {
+            event_key,
+            model: parsed.model.to_string(),
+            ts_ms,
+            input_tokens: parsed.usage.input_tokens,
+            cache_creation_input_tokens: parsed.usage.cache_creation_input_tokens,
+            cache_read_input_tokens: parsed.usage.cache_read_input_tokens,
+            output_tokens: parsed.usage.output_tokens,
+        })
+    }
+}
+
+/// Parsed data optimized for cold start (no source_file/session_id — caller provides).
+pub struct ColdStartParsed {
+    pub event_key: String,
+    pub model: String,
+    pub ts_ms: i64,
+    pub input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+/// Parse RFC3339 timestamp directly to epoch millis (avoids String → NaiveDateTime → millis roundtrip).
+fn parse_ts_to_ms(ts: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .ok()
+        .map(|dt| dt.timestamp_millis())
+        .or_else(|| {
+            chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%SZ")
+                .ok()
+                .map(|dt| dt.and_utc().timestamp_millis())
+        })
+        .filter(|&ms| ms > 0)
 }
 
 impl LogParser for ClaudeCodeParser {

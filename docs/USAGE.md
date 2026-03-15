@@ -241,25 +241,34 @@ toki report query 'projects{project="myapp"}'
 
 ## settings
 
-`toki settings`는 cursive TUI로 설정 페이지를 연다. 모든 설정은 DB에 저장된다.
+`toki settings`는 cursive TUI로 설정 페이지를 연다. 모든 설정은 `~/.config/toki/settings.json` 파일에 저장된다.
 
 ```bash
+# TUI로 설정
 toki settings
-toki settings --db-path /custom/toki.fjall
+
+# 비대화형 CLI로 설정
+toki settings set claude_code_root ~/.claude
+toki settings set timezone Asia/Seoul
+toki settings get timezone
+toki settings list
 ```
 
-| 설정 항목 | DB key | 기본값 |
-|-----------|--------|--------|
-| Claude Code Root | `claude_code_root` | `~/.claude` |
-| Daemon Socket | `daemon_sock` | `~/.config/toki/daemon.sock` |
-| Timezone | `timezone` | (빈값 = UTC) |
-| Output Format | `output_format` | `table` |
-| Start of Week | `start_of_week` | `mon` |
-| No Cost | `no_cost` | `false` |
-| Retention Days | `retention_days` | `0` (무제한) |
-| Rollup Retention Days | `rollup_retention_days` | `0` (무제한) |
+데몬 영향 설정(`claude_code_root`, `daemon_sock`, `retention_days`, `rollup_retention_days`) 변경 시
+데몬이 실행 중이면 재시작 여부를 묻는다.
 
-설정 우선순위: **CLI 인자 > DB settings > 기본값**
+| 설정 항목 | key | 기본값 | 데몬 영향 |
+|-----------|-----|--------|-----------|
+| Claude Code Root | `claude_code_root` | `~/.claude` | O |
+| Daemon Socket | `daemon_sock` | `~/.config/toki/daemon.sock` | O |
+| Timezone | `timezone` | (빈값 = UTC) | X |
+| Output Format | `output_format` | `table` | X |
+| Start of Week | `start_of_week` | `mon` | X |
+| No Cost | `no_cost` | `false` | X |
+| Retention Days | `retention_days` | `0` (무제한) | O |
+| Rollup Retention Days | `rollup_retention_days` | `0` (무제한) | O |
+
+설정 우선순위: **CLI 인자 > 설정 파일 (settings.json) > 기본값**
 
 환경변수는 사용하지 않는다 (`TOKI_DEBUG` 제외).
 
