@@ -294,6 +294,12 @@ class BenchResult:
     db_size_mb: float = 0.0
 
 
+def purge_disk_cache():
+    """Purge macOS disk cache for fair cold-cache benchmarking."""
+    subprocess.run(["sudo", "-n", "purge"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(0.5)
+
+
 def run_once(cmd: list[str], env_extra: dict | None = None) -> BenchResult:
     """Run a command and measure its performance."""
     merged_env = os.environ.copy()
@@ -498,12 +504,21 @@ def cmd_run(args):
     runs = args.runs
     sizes = parse_sizes(args.sizes)
     tool_filter = getattr(args, "tool", "both")
+    use_purge = getattr(args, "purge", False)
 
     print("=== Benchmark Setup ===")
 
     toki = find_toki() if tool_filter in ("toki", "both", "all") else None
     ccusage = find_ccusage() if tool_filter in ("ccusage", "both", "all") else None
     zzusage = find_zzusage() if tool_filter in ("zzusage", "both", "all") else None
+
+    if use_purge:
+        # Verify sudo works without password (user should run: sudo -v first)
+        r = subprocess.run(["sudo", "-n", "purge"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if r.returncode != 0:
+            print("Error: --purge requires passwordless sudo. Run 'sudo -v' first.")
+            sys.exit(1)
+        print("  purge: enabled (disk cache cleared before each run)")
 
     if not toki and not ccusage and not zzusage:
         print("Error: No tools available to benchmark.")
@@ -548,6 +563,8 @@ def cmd_run(args):
 
         # ── toki: Phase 1 (cold start) + Phase 2 (reports) ──
         if toki:
+            if use_purge:
+                purge_disk_cache()
             run_idx += 1
             tag = f"[{run_idx}/{total_runs}]"
             print(f"  {tag} toki       | {label:8s} | cold_start | run 1", end="", flush=True)
@@ -568,6 +585,8 @@ def cmd_run(args):
                     tag = f"[{run_idx}/{total_runs}]"
                     print(f"  {tag} toki       | {label:8s} | {scenario_name:8s} | run {i}", end="", flush=True)
 
+                    if use_purge:
+                        purge_disk_cache()
                     cmd = [toki, "report", "--no-cost"] + toki_args
                     r2 = run_once(cmd)
                     r2.tool = "toki"
@@ -591,6 +610,8 @@ def cmd_run(args):
                     tag = f"[{run_idx}/{total_runs}]"
                     print(f"  {tag} ccusage    | {label:8s} | {scenario_name:8s} | run {i}", end="", flush=True)
 
+                    if use_purge:
+                        purge_disk_cache()
                     cmd = list(ccusage) + ["--offline"] + cc_args
                     env_extra = {"CLAUDE_CONFIG_DIR": str(data_path)}
                     r3 = run_once(cmd, env_extra)
@@ -614,6 +635,8 @@ def cmd_run(args):
                     tag = f"[{run_idx}/{total_runs}]"
                     print(f"  {tag} zzusage    | {label:8s} | {scenario_name:8s} | run {i}", end="", flush=True)
 
+                    if use_purge:
+                        purge_disk_cache()
                     cmd = [zzusage, "--data-dir", str(data_path)] + zz_args
                     r4 = run_once(cmd)
                     r4.tool = "zzusage"
@@ -1138,6 +1161,8 @@ Architecture:
                      help="Comma-separated sizes to benchmark (default: all available)")
     run.add_argument("--tool", choices=["toki", "ccusage", "zzusage", "both", "all"], default="both",
                      help="Which tool(s) to benchmark (default: both)")
+    run.add_argument("--purge", action="store_true",
+                     help="Purge disk cache before each run (requires sudo -v first)")
 
     # all
     a = sub.add_parser("all", help="Generate data + run benchmarks")
@@ -1151,6 +1176,8 @@ Architecture:
                    help="Which tool(s) to benchmark (default: both)")
     a.add_argument("--force", action="store_true",
                    help="Regenerate all data sets even if they exist")
+    a.add_argument("--purge", action="store_true",
+                   help="Purge disk cache before each run (requires sudo -v first)")
 
     # plot
     p = sub.add_parser("plot", help="Generate charts from benchmark results")
