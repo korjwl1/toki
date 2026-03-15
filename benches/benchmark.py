@@ -379,14 +379,14 @@ def run_daemon_cold_start(toki: str, data_path: Path) -> BenchResult:
     # Parse pure cold_start time from debug log (excludes daemon startup overhead)
     elapsed = 0.0
     try:
+        import re
         with open(log_path, "r") as f:
             for line in f:
-                # Format: [toki:debug] cold_start — ... (123456µs)
-                if "cold_start" in line and "µs)" in line:
-                    import re
-                    m = re.search(r'\((\d+)µs\)', line)
+                if "cold_start" in line and "total:" in line:
+                    # Format: cold_start — ... (parse: Xµs, db_wait: Yµs, total: Zµs)
+                    m = re.search(r'total:\s*(\d+)µs', line)
                     if m:
-                        elapsed = int(m.group(1)) / 1_000_000  # µs → seconds
+                        elapsed = int(m.group(1)) / 1_000_000
                     break
     except OSError:
         pass
