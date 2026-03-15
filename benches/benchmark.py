@@ -45,13 +45,13 @@ DEFAULT_RUNS = 3
 POLL_INTERVAL_S = 0.05  # 50ms sampling
 
 # Report scenarios to benchmark (Phase 2).
-# (name, toki_args, ccusage_args)
+# (name, toki_args, ccusage_args, zzusage_args)
 SCENARIOS = [
-    ("total",   [],                              []),
-    ("daily",   ["daily", "--from-beginning"],    ["daily"]),
-    ("weekly",  ["weekly", "--from-beginning"],   ["weekly"]),
-    ("monthly", ["monthly"],                      ["monthly"]),
-    ("yearly",  ["yearly"],                       ["yearly"]),
+    ("total",   [],                              [],          []),
+    ("daily",   ["daily", "--from-beginning"],    ["daily"],   ["daily"]),
+    ("weekly",  ["weekly", "--from-beginning"],   ["weekly"],  ["weekly"]),
+    ("monthly", ["monthly"],                      ["monthly"], ["monthly"]),
+    ("yearly",  ["yearly"],                       ["yearly"],  []),
 ]
 
 
@@ -459,6 +459,22 @@ def find_ccusage() -> list[str] | None:
     return None
 
 
+def find_zzusage() -> str | None:
+    """Find zzusage binary. Returns path or None."""
+    for path in ["zzusage", "/tmp/zzusage/zig-out/bin/zzusage"]:
+        try:
+            r = subprocess.run(
+                [path, "--help"], capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0:
+                print(f"  zzusage: {path}")
+                return path
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+    print("  zzusage: not found, will skip")
+    return None
+
+
 def discover_data_sets(sizes: list[int] | None) -> list[tuple[str, Path, int]]:
     """Return [(label, path, size_mb)] for available data sets."""
     if not DATA_DIR.exists():
@@ -485,10 +501,11 @@ def cmd_run(args):
 
     print("=== Benchmark Setup ===")
 
-    toki = find_toki() if tool_filter in ("toki", "both") else None
-    ccusage = find_ccusage() if tool_filter in ("ccusage", "both") else None
+    toki = find_toki() if tool_filter in ("toki", "both", "all") else None
+    ccusage = find_ccusage() if tool_filter in ("ccusage", "both", "all") else None
+    zzusage = find_zzusage() if tool_filter in ("zzusage", "both", "all") else None
 
-    if not toki and not ccusage:
+    if not toki and not ccusage and not zzusage:
         print("Error: No tools available to benchmark.")
         sys.exit(1)
 
@@ -545,7 +562,7 @@ def cmd_run(args):
             print(f"  {r.wall_time_s:7.3f}s  {r.peak_rss_mb:6.1f}MB  DB:{r.db_size_mb:.1f}MB  {status}")
 
             # Phase 2: reports while daemon is running
-            for scenario_name, toki_args, _ in SCENARIOS:
+            for scenario_name, toki_args, _, _ in SCENARIOS:
                 for i in range(1, runs + 1):
                     run_idx += 1
                     tag = f"[{run_idx}/{total_runs}]"
@@ -568,7 +585,7 @@ def cmd_run(args):
 
         # ── ccusage: every run re-reads all files ──
         if ccusage:
-            for scenario_name, _, cc_args in SCENARIOS:
+            for scenario_name, _, cc_args, _ in SCENARIOS:
                 for i in range(1, runs + 1):
                     run_idx += 1
                     tag = f"[{run_idx}/{total_runs}]"
@@ -586,6 +603,28 @@ def cmd_run(args):
 
                     status = "OK" if r3.exit_code == 0 else f"EXIT={r3.exit_code}"
                     print(f"  {r3.wall_time_s:7.3f}s  {r3.peak_rss_mb:6.1f}MB  {status}")
+
+        # ── zzusage: every run re-reads all files (Zig) ──
+        if zzusage:
+            for scenario_name, _, _, zz_args in SCENARIOS:
+                if not zz_args and scenario_name != "total":
+                    continue  # zzusage doesn't support yearly
+                for i in range(1, runs + 1):
+                    run_idx += 1
+                    tag = f"[{run_idx}/{total_runs}]"
+                    print(f"  {tag} zzusage    | {label:8s} | {scenario_name:8s} | run {i}", end="", flush=True)
+
+                    cmd = [zzusage, "--data-dir", str(data_path)] + zz_args
+                    r4 = run_once(cmd)
+                    r4.tool = "zzusage"
+                    r4.data_label = label
+                    r4.data_size_mb = size_mb
+                    r4.scenario = scenario_name
+                    r4.run = i
+                    results.append(r4)
+
+                    status = "OK" if r4.exit_code == 0 else f"EXIT={r4.exit_code}"
+                    print(f"  {r4.wall_time_s:7.3f}s  {r4.peak_rss_mb:6.1f}MB  {status}")
 
     # Save results
     json_path = save_results(results)
@@ -1097,7 +1136,7 @@ Architecture:
                      help=f"Runs per scenario (default: {DEFAULT_RUNS})")
     run.add_argument("--sizes", default=None,
                      help="Comma-separated sizes to benchmark (default: all available)")
-    run.add_argument("--tool", choices=["toki", "ccusage", "both"], default="both",
+    run.add_argument("--tool", choices=["toki", "ccusage", "zzusage", "both", "all"], default="both",
                      help="Which tool(s) to benchmark (default: both)")
 
     # all
@@ -1108,7 +1147,7 @@ Architecture:
                    help="Comma-separated sizes in MB")
     a.add_argument("--runs", type=int, default=DEFAULT_RUNS,
                    help=f"Runs per scenario (default: {DEFAULT_RUNS})")
-    a.add_argument("--tool", choices=["toki", "ccusage", "both"], default="both",
+    a.add_argument("--tool", choices=["toki", "ccusage", "zzusage", "both", "all"], default="both",
                    help="Which tool(s) to benchmark (default: both)")
     a.add_argument("--force", action="store_true",
                    help="Regenerate all data sets even if they exist")
