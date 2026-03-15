@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
 """
-clitrace vs ccusage benchmark tool.
+toki vs ccusage benchmark tool.
 
 Generates test data sets of various sizes from real ~/.claude session data,
 then measures execution time, peak/avg CPU%, and peak/avg RSS for both tools
 across multiple report scenarios.
 
+Architecture:
+  toki uses a daemon/client model:
+    Phase 1 (cold start): daemon reset → daemon start → index all files into TSDB
+    Phase 2 (report):     daemon running → toki report (reads pre-indexed TSDB)
+  ccusage is stateless:
+    Every report re-reads all files from scratch.
+
 Usage:
     python3 benchmark.py generate [--sizes 100,200,500]
-    python3 benchmark.py run [--runs 3] [--sizes 100,200]
+    python3 benchmark.py run [--runs 3] [--sizes 100,200] [--tool toki|ccusage|both]
     python3 benchmark.py all [--runs 3]
+    python3 benchmark.py plot [--file results/benchmark_xxx.json]
 """
 
 import argparse
@@ -17,6 +25,7 @@ import csv
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -35,14 +44,14 @@ DEFAULT_SIZES_MB = [100, 200, 300, 400, 500, 1000, 1500, 2000]
 DEFAULT_RUNS = 3
 POLL_INTERVAL_S = 0.05  # 50ms sampling
 
-# Report scenarios to benchmark.
-# (name, clitrace_args, ccusage_args)
+# Report scenarios to benchmark (Phase 2).
+# (name, toki_args, ccusage_args, zzusage_args)
 SCENARIOS = [
-    ("total",   [],                              []),
-    ("daily",   ["daily", "--from-beginning"],    ["daily"]),
-    ("weekly",  ["weekly", "--from-beginning"],   ["weekly"]),
-    ("monthly", ["monthly"],                      ["monthly"]),
-    ("yearly",  ["yearly"],                       ["yearly"]),
+    ("total",   [],                              [],          []),
+    ("daily",   ["daily", "--from-beginning"],    ["daily"],   ["daily"]),
+    ("weekly",  ["weekly", "--from-beginning"],   ["weekly"],  ["weekly"]),
+    ("monthly", ["monthly"],                      ["monthly"], ["monthly"]),
+    ("yearly",  ["yearly"],                       ["yearly"],  []),
 ]
 
 
@@ -51,12 +60,16 @@ SCENARIOS = [
 # ---------------------------------------------------------------------------
 
 def get_dir_size_bytes(path: Path) -> int:
+    """Get actual disk usage (not pre-allocated size) using st_blocks."""
     total = 0
     for dirpath, _, filenames in os.walk(path):
         for f in filenames:
             fp = os.path.join(dirpath, f)
             if os.path.isfile(fp):
-                total += os.path.getsize(fp)
+                stat = os.stat(fp)
+                # Use st_blocks (512-byte blocks) for actual disk usage,
+                # avoiding fjall's 64MB pre-allocated WAL inflation.
+                total += stat.st_blocks * 512
     return total
 
 
@@ -78,14 +91,52 @@ def collect_projects(source_root: Path):
     return projects
 
 
-def copy_project(src_dir: Path, dst_dir: Path):
-    """Copy a project dir, renaming session UUIDs to avoid collision."""
+def randomize_jsonl(src_path: Path, dst_path: Path, ts_offset_s: int):
+    """Copy a JSONL file, randomizing message IDs and shifting timestamps."""
+    import random
+
+    with open(src_path, "r") as fin, open(dst_path, "w") as fout:
+        for line in fin:
+            stripped = line.strip()
+            if not stripped:
+                fout.write(line)
+                continue
+
+            try:
+                d = json.loads(stripped)
+            except json.JSONDecodeError:
+                fout.write(line)
+                continue
+
+            # Randomize timestamp (shift by offset + small jitter)
+            if "timestamp" in d and isinstance(d["timestamp"], str):
+                try:
+                    from datetime import datetime, timedelta, timezone
+                    dt = datetime.fromisoformat(d["timestamp"].replace("Z", "+00:00"))
+                    jitter = random.randint(-3600, 3600)  # ±1h jitter
+                    dt = dt + timedelta(seconds=ts_offset_s + jitter)
+                    d["timestamp"] = dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{random.randint(0,999):03d}Z"
+                except (ValueError, OSError):
+                    pass
+
+            # Randomize message.id (unique per event)
+            if "message" in d and isinstance(d["message"], dict) and "id" in d["message"]:
+                d["message"]["id"] = f"msg_{uuid.uuid4().hex[:24]}"
+
+            fout.write(json.dumps(d, separators=(",", ":")) + "\n")
+
+
+def copy_project(src_dir: Path, dst_dir: Path, round_idx: int):
+    """Copy a project dir with randomized session IDs, message IDs, and timestamps."""
     dst_dir.mkdir(parents=True, exist_ok=True)
+
+    # Shift timestamps by round * 30 days to spread across time
+    ts_offset = round_idx * 30 * 86400
 
     for item in src_dir.iterdir():
         if item.is_file() and item.suffix == ".jsonl":
             new_uuid = str(uuid.uuid4())
-            shutil.copy2(item, dst_dir / f"{new_uuid}.jsonl")
+            randomize_jsonl(item, dst_dir / f"{new_uuid}.jsonl", ts_offset)
 
             # Copy subagent dir if it exists
             sub_dir = src_dir / item.stem / "subagents"
@@ -94,7 +145,7 @@ def copy_project(src_dir: Path, dst_dir: Path):
                 new_sub_dir.mkdir(parents=True, exist_ok=True)
                 for sub in sub_dir.iterdir():
                     if sub.is_file() and sub.suffix == ".jsonl":
-                        shutil.copy2(sub, new_sub_dir / sub.name)
+                        randomize_jsonl(sub, new_sub_dir / sub.name, ts_offset)
 
 
 def generate_data_set(projects, target_bytes: int, dest: Path):
@@ -120,7 +171,7 @@ def generate_data_set(projects, target_bytes: int, dest: Path):
                 name = f"{src_path.name}-bench{copy_round}"
                 dst = projects_dst / name
 
-            copy_project(src_path, dst)
+            copy_project(src_path, dst, copy_round)
             current += src_size
 
         copy_round += 1
@@ -138,18 +189,24 @@ def cmd_generate(args):
     sizes = parse_sizes(args.sizes)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+    force = getattr(args, "force", False)
+
     for target_mb in sizes:
         target_bytes = target_mb * 1024 * 1024
         set_dir = DATA_DIR / f"{target_mb}mb"
 
         if set_dir.exists():
-            existing = get_dir_size_bytes(set_dir)
-            existing_mb = existing / 1024 / 1024
-            if abs(existing_mb - target_mb) < target_mb * 0.15:
-                print(f"  {target_mb}MB: exists ({existing_mb:.0f} MB), skipping")
-                continue
-            print(f"  {target_mb}MB: exists but wrong size ({existing_mb:.0f} MB), regenerating")
-            shutil.rmtree(set_dir)
+            if force:
+                print(f"  {target_mb}MB: regenerating (--force)")
+                shutil.rmtree(set_dir)
+            else:
+                existing = get_dir_size_bytes(set_dir)
+                existing_mb = existing / 1024 / 1024
+                if abs(existing_mb - target_mb) < target_mb * 0.15:
+                    print(f"  {target_mb}MB: exists ({existing_mb:.0f} MB), skipping")
+                    continue
+                print(f"  {target_mb}MB: exists but wrong size ({existing_mb:.0f} MB), regenerating")
+                shutil.rmtree(set_dir)
 
         print(f"  {target_mb}MB: generating...", end="", flush=True)
         generate_data_set(projects, target_bytes, set_dir)
@@ -234,6 +291,15 @@ class BenchResult:
     avg_cpu_pct: float
     samples: int
     exit_code: int
+    db_size_mb: float = 0.0
+    parse_time_s: float = 0.0
+    db_wait_s: float = 0.0
+
+
+def purge_disk_cache():
+    """Purge macOS disk cache for fair cold-cache benchmarking."""
+    subprocess.run(["sudo", "-n", "purge"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(0.5)
 
 
 def run_once(cmd: list[str], env_extra: dict | None = None) -> BenchResult:
@@ -255,7 +321,6 @@ def run_once(cmd: list[str], env_extra: dict | None = None) -> BenchResult:
     mon.stop()
 
     s = mon.stats()
-    # Placeholder fields — caller fills tool/data/scenario/run
     return BenchResult(
         tool="", data_label="", data_size_mb=0, scenario="", run=0,
         wall_time_s=round(elapsed, 4),
@@ -264,24 +329,127 @@ def run_once(cmd: list[str], env_extra: dict | None = None) -> BenchResult:
     )
 
 
-def find_clitrace() -> str:
-    print("Building clitrace (release)...")
+def run_daemon_cold_start(toki: str, data_path: Path) -> BenchResult:
+    """Start toki daemon, wait for cold start to complete, measure performance.
+
+    Returns BenchResult with cold start timing. Daemon keeps running for report benchmarks.
+    """
+    # Reset DB and set claude_code_root to benchmark data path
+    subprocess.run(
+        [toki, "daemon", "reset"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    subprocess.run(
+        [toki, "settings", "set", "claude_code_root", str(data_path)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
+    # Start daemon with TOKI_DEBUG=1 to capture cold_start timing
+    log_path = SCRIPT_DIR / ".daemon.log"
+    log_file = open(log_path, "w")
+
+    env = os.environ.copy()
+    env["TOKI_DEBUG"] = "1"
+
+    proc = subprocess.Popen(
+        [toki, "daemon", "start"],
+        stdout=log_file, stderr=subprocess.STDOUT,
+        env=env,
+    )
+
+    mon = ProcessMonitor(proc.pid)
+    mon.start()
+
+    # Wait for "Watching:" = daemon ready
+    timeout = 600  # 10 min max
+    start = time.monotonic()
+    while time.monotonic() - start < timeout:
+        if proc.poll() is not None:
+            break
+        try:
+            with open(log_path, "r") as f:
+                content = f.read()
+            if "Watching:" in content:
+                break
+        except OSError:
+            pass
+        time.sleep(0.05)
+
+    mon.stop()
+    log_file.close()
+
+    # Parse cold_start timing from debug log (excludes daemon startup overhead)
+    elapsed = 0.0
+    parse_time = 0.0
+    db_wait = 0.0
+    try:
+        import re
+        with open(log_path, "r") as f:
+            for line in f:
+                if "cold_start" in line and "total:" in line:
+                    # Format: cold_start — ... (parse: Xµs, db_wait: Yµs, total: Zµs)
+                    m_total = re.search(r'total:\s*(\d+)µs', line)
+                    m_parse = re.search(r'parse:\s*(\d+)µs', line)
+                    m_db = re.search(r'db_wait:\s*(\d+)µs', line)
+                    if m_total:
+                        elapsed = int(m_total.group(1)) / 1_000_000
+                    if m_parse:
+                        parse_time = int(m_parse.group(1)) / 1_000_000
+                    if m_db:
+                        db_wait = int(m_db.group(1)) / 1_000_000
+                    break
+    except OSError:
+        pass
+
+    # Fallback: if debug log parsing fails, use wall time
+    if elapsed == 0.0:
+        elapsed = time.monotonic() - start
+
+    s = mon.stats()
+    result = BenchResult(
+        tool="toki", data_label="", data_size_mb=0,
+        scenario="cold_start", run=0,
+        wall_time_s=round(elapsed, 4),
+        exit_code=0 if proc.poll() is None else proc.returncode,
+        parse_time_s=round(parse_time, 4),
+        db_wait_s=round(db_wait, 4),
+        **s,
+    )
+
+    # DB size (default path)
+    default_db = Path.home() / ".config" / "toki" / "toki.fjall"
+    result.db_size_mb = round(get_dir_size_bytes(default_db) / 1024 / 1024, 2) if default_db.exists() else 0.0
+
+    return result
+
+
+def stop_daemon(toki: str):
+    """Stop the running daemon."""
+    subprocess.run(
+        [toki, "daemon", "stop"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    time.sleep(0.3)
+
+
+
+def find_toki() -> str:
+    print("Building toki (release)...")
     subprocess.run(
         ["cargo", "build", "--release"],
         cwd=PROJECT_ROOT, check=True,
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
     )
-    binary = PROJECT_ROOT / "target" / "release" / "clitrace"
+    binary = PROJECT_ROOT / "target" / "release" / "toki"
     if not binary.exists():
         print(f"Error: {binary} not found")
         sys.exit(1)
-    print(f"  clitrace: {binary}")
+    print(f"  toki: {binary}")
     return str(binary)
 
 
 def find_ccusage() -> list[str] | None:
     """Find ccusage command. Returns command list or None."""
-    # Check global install first
     for name in ["ccusage"]:
         try:
             r = subprocess.run(
@@ -309,6 +477,22 @@ def find_ccusage() -> list[str] | None:
     return None
 
 
+def find_zzusage() -> str | None:
+    """Find zzusage binary. Returns path or None."""
+    for path in ["zzusage", "/tmp/zzusage/zig-out/bin/zzusage"]:
+        try:
+            r = subprocess.run(
+                [path, "--help"], capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0:
+                print(f"  zzusage: {path}")
+                return path
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+    print("  zzusage: not found, will skip")
+    return None
+
+
 def discover_data_sets(sizes: list[int] | None) -> list[tuple[str, Path, int]]:
     """Return [(label, path, size_mb)] for available data sets."""
     if not DATA_DIR.exists():
@@ -331,10 +515,26 @@ def discover_data_sets(sizes: list[int] | None) -> list[tuple[str, Path, int]]:
 def cmd_run(args):
     runs = args.runs
     sizes = parse_sizes(args.sizes)
+    tool_filter = getattr(args, "tool", "both")
+    use_purge = getattr(args, "purge", False)
 
     print("=== Benchmark Setup ===")
-    clitrace = find_clitrace()
-    ccusage = find_ccusage()
+
+    toki = find_toki() if tool_filter in ("toki", "both", "all") else None
+    ccusage = find_ccusage() if tool_filter in ("ccusage", "both", "all") else None
+    zzusage = find_zzusage() if tool_filter in ("zzusage", "both", "all") else None
+
+    if use_purge:
+        # Verify sudo works without password (user should run: sudo -v first)
+        r = subprocess.run(["sudo", "-n", "purge"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if r.returncode != 0:
+            print("Error: --purge requires passwordless sudo. Run 'sudo -v' first.")
+            sys.exit(1)
+        print("  purge: enabled (disk cache cleared before each run)")
+
+    if not toki and not ccusage and not zzusage:
+        print("Error: No tools available to benchmark.")
+        sys.exit(1)
 
     data_sets = discover_data_sets(sizes)
     if not data_sets:
@@ -342,22 +542,23 @@ def cmd_run(args):
         sys.exit(1)
 
     print(f"\nData sets: {', '.join(d[0] for d in data_sets)}")
-    print(f"Scenarios: {', '.join(s[0] for s in SCENARIOS)}")
+    print(f"Tool(s): {tool_filter}")
     print(f"Runs per scenario: {runs}")
 
-    tools = [("clitrace", clitrace, None)]
-    if ccusage:
-        tools.append(("ccusage", ccusage, None))
-
-    total_runs = len(data_sets) * len(SCENARIOS) * runs * len(tools)
+    # Count total runs
+    # toki: cold_start × runs + len(SCENARIOS) × runs reports per data set
+    # ccusage/zzusage: len(SCENARIOS) × runs per data set
+    toki_runs_per_ds = (runs + len(SCENARIOS) * runs) if toki else 0
+    cc_runs_per_ds = (len(SCENARIOS) * runs) if ccusage else 0
+    zz_scenarios = sum(1 for _, _, _, zz in SCENARIOS if zz or _ == "total")
+    zz_runs_per_ds = (zz_scenarios * runs) if zzusage else 0
+    total_runs = len(data_sets) * (toki_runs_per_ds + cc_runs_per_ds + zz_runs_per_ds)
     print(f"Total benchmark runs: {total_runs}\n")
 
-    # Warm-up: run each tool once to avoid cold-start artifacts
-    print("Warming up...")
-    first_data = data_sets[0][1]
-    warm_cmd = [clitrace, "--no-cost", "report", "--claude-root", str(first_data)]
-    subprocess.run(warm_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # Warm-up
     if ccusage:
+        print("Warming up ccusage...")
+        first_data = data_sets[0][1]
         warm_env = {"CLAUDE_CONFIG_DIR": str(first_data)}
         subprocess.run(
             ccusage + ["--offline"],
@@ -371,32 +572,100 @@ def cmd_run(args):
 
     print("=== Running Benchmarks ===")
     for label, data_path, size_mb in data_sets:
-        for scenario_name, cli_args, cc_args in SCENARIOS:
-            for tool_name, tool_cmd, _ in tools:
+        print(f"\n--- {label} ({size_mb} MB) ---")
+
+        # ── toki: Phase 1 (cold start × runs) + Phase 2 (reports) ──
+        if toki:
+            for i in range(1, runs + 1):
+                if use_purge:
+                    purge_disk_cache()
+                run_idx += 1
+                tag = f"[{run_idx}/{total_runs}]"
+                print(f"  {tag} toki       | {label:8s} | cold_start | run {i}", end="", flush=True)
+
+                r = run_daemon_cold_start(toki, data_path)
+                r.data_label = label
+                r.data_size_mb = size_mb
+                r.run = i
+                results.append(r)
+
+                status = "OK" if r.exit_code == 0 else f"EXIT={r.exit_code}"
+                print(f"  {r.wall_time_s:7.3f}s  parse:{r.parse_time_s:.3f}s  db:{r.db_wait_s:.3f}s  {r.peak_rss_mb:6.1f}MB  DB:{r.db_size_mb:.1f}MB  {status}")
+
+                # Stop daemon after each cold start run (next run needs fresh start)
+                if i < runs:
+                    stop_daemon(toki)
+
+            # Phase 2: reports while daemon is running (last cold start's daemon still up)
+            for scenario_name, toki_args, _, _ in SCENARIOS:
                 for i in range(1, runs + 1):
                     run_idx += 1
-
-                    if tool_name == "clitrace":
-                        cmd = [tool_cmd, "--no-cost", "report",
-                               "--claude-root", str(data_path)] + cli_args
-                        env_extra = None
-                    else:
-                        cmd = list(tool_cmd) + ["--offline"] + cc_args
-                        env_extra = {"CLAUDE_CONFIG_DIR": str(data_path)}
-
                     tag = f"[{run_idx}/{total_runs}]"
-                    print(f"  {tag} {tool_name:10s} | {label:8s} | {scenario_name:8s} | run {i}", end="", flush=True)
+                    print(f"  {tag} toki       | {label:8s} | {scenario_name:8s} | run {i}", end="", flush=True)
 
-                    r = run_once(cmd, env_extra)
-                    r.tool = tool_name
-                    r.data_label = label
-                    r.data_size_mb = size_mb
-                    r.scenario = scenario_name
-                    r.run = i
-                    results.append(r)
+                    if use_purge:
+                        purge_disk_cache()
+                    cmd = [toki, "report", "--no-cost"] + toki_args
+                    r2 = run_once(cmd)
+                    r2.tool = "toki"
+                    r2.data_label = label
+                    r2.data_size_mb = size_mb
+                    r2.scenario = scenario_name
+                    r2.run = i
+                    results.append(r2)
 
-                    status = "OK" if r.exit_code == 0 else f"EXIT={r.exit_code}"
-                    print(f"  {r.wall_time_s:7.3f}s  {r.peak_rss_mb:6.1f}MB  {status}")
+                    status = "OK" if r2.exit_code == 0 else f"EXIT={r2.exit_code}"
+                    print(f"  {r2.wall_time_s:7.3f}s  {r2.peak_rss_mb:6.1f}MB  {status}")
+
+            # Stop daemon
+            stop_daemon(toki)
+
+        # ── ccusage: every run re-reads all files ──
+        if ccusage:
+            for scenario_name, _, cc_args, _ in SCENARIOS:
+                for i in range(1, runs + 1):
+                    run_idx += 1
+                    tag = f"[{run_idx}/{total_runs}]"
+                    print(f"  {tag} ccusage    | {label:8s} | {scenario_name:8s} | run {i}", end="", flush=True)
+
+                    if use_purge:
+                        purge_disk_cache()
+                    cmd = list(ccusage) + ["--offline"] + cc_args
+                    env_extra = {"CLAUDE_CONFIG_DIR": str(data_path)}
+                    r3 = run_once(cmd, env_extra)
+                    r3.tool = "ccusage"
+                    r3.data_label = label
+                    r3.data_size_mb = size_mb
+                    r3.scenario = scenario_name
+                    r3.run = i
+                    results.append(r3)
+
+                    status = "OK" if r3.exit_code == 0 else f"EXIT={r3.exit_code}"
+                    print(f"  {r3.wall_time_s:7.3f}s  {r3.peak_rss_mb:6.1f}MB  {status}")
+
+        # ── zzusage: every run re-reads all files (Zig) ──
+        if zzusage:
+            for scenario_name, _, _, zz_args in SCENARIOS:
+                if not zz_args and scenario_name != "total":
+                    continue  # zzusage doesn't support yearly
+                for i in range(1, runs + 1):
+                    run_idx += 1
+                    tag = f"[{run_idx}/{total_runs}]"
+                    print(f"  {tag} zzusage    | {label:8s} | {scenario_name:8s} | run {i}", end="", flush=True)
+
+                    if use_purge:
+                        purge_disk_cache()
+                    cmd = [zzusage, "--data-dir", str(data_path)] + zz_args
+                    r4 = run_once(cmd)
+                    r4.tool = "zzusage"
+                    r4.data_label = label
+                    r4.data_size_mb = size_mb
+                    r4.scenario = scenario_name
+                    r4.run = i
+                    results.append(r4)
+
+                    status = "OK" if r4.exit_code == 0 else f"EXIT={r4.exit_code}"
+                    print(f"  {r4.wall_time_s:7.3f}s  {r4.peak_rss_mb:6.1f}MB  {status}")
 
     # Save results
     json_path = save_results(results)
@@ -412,9 +681,11 @@ def cmd_run(args):
 def save_results(results: list[BenchResult]) -> Path:
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    tools = sorted(set(r.tool for r in results))
+    tool_tag = "_".join(tools)  # e.g. "toki", "ccusage", "ccusage_toki"
 
     # CSV
-    csv_path = RESULTS_DIR / f"benchmark_{ts}.csv"
+    csv_path = RESULTS_DIR / f"benchmark_{tool_tag}_{ts}.csv"
     with open(csv_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(asdict(results[0]).keys()))
         writer.writeheader()
@@ -422,7 +693,7 @@ def save_results(results: list[BenchResult]) -> Path:
             writer.writerow(asdict(r))
 
     # JSON (with averages pre-computed)
-    json_path = RESULTS_DIR / f"benchmark_{ts}.json"
+    json_path = RESULTS_DIR / f"benchmark_{tool_tag}_{ts}.json"
     averages = compute_averages(results)
     with open(json_path, "w") as f:
         json.dump({
@@ -447,7 +718,7 @@ def compute_averages(results: list[BenchResult]) -> list[dict]:
     avgs = []
     for (tool, label, size, scenario), runs in sorted(groups.items()):
         n = len(runs)
-        avgs.append({
+        entry = {
             "tool": tool,
             "data_label": label,
             "data_size_mb": size,
@@ -458,15 +729,21 @@ def compute_averages(results: list[BenchResult]) -> list[dict]:
             "avg_rss_mb": round(sum(r.avg_rss_mb for r in runs) / n, 2),
             "peak_cpu_pct": round(max(r.peak_cpu_pct for r in runs), 1),
             "avg_cpu_pct": round(sum(r.avg_cpu_pct for r in runs) / n, 1),
-        })
+        }
+        # Include db_size_mb for cold_start entries
+        if scenario == "cold_start":
+            entry["db_size_mb"] = round(max(r.db_size_mb for r in runs), 2)
+            entry["parse_time_s"] = round(sum(r.parse_time_s for r in runs) / n, 4)
+            entry["db_wait_s"] = round(sum(r.db_wait_s for r in runs) / n, 4)
+        avgs.append(entry)
     return avgs
 
 
 def print_summary(results: list[BenchResult]):
     avgs = compute_averages(results)
     tools = sorted(set(a["tool"] for a in avgs))
-    scenarios = sorted(set(a["scenario"] for a in avgs),
-                       key=lambda s: [x[0] for x in SCENARIOS].index(s))
+    all_scenarios = ["cold_start"] + [s[0] for s in SCENARIOS]
+    scenarios = [s for s in all_scenarios if any(a["scenario"] == s for a in avgs)]
     labels = sorted(set(a["data_label"] for a in avgs),
                     key=lambda l: int(l.replace("mb", "")))
 
@@ -478,6 +755,8 @@ def print_summary(results: list[BenchResult]):
         header = f"{'Data':>8s}"
         for tool in tools:
             header += f"  {'time(s)':>8s}  {'RSS(MB)':>8s}  {'CPU%':>6s}"
+            if scenario == "cold_start" and tool == "toki":
+                header += f"  {'parse(s)':>9s}  {'db(s)':>6s}  {'DB(MB)':>7s}"
         print(header)
 
         for label in labels:
@@ -489,24 +768,43 @@ def print_summary(results: list[BenchResult]):
                 if match:
                     a = match[0]
                     row += f"  {a['wall_time_s']:8.3f}  {a['peak_rss_mb']:8.1f}  {a['avg_cpu_pct']:6.1f}"
+                    if scenario == "cold_start" and tool == "toki":
+                        row += f"  {a.get('parse_time_s', 0):9.3f}  {a.get('db_wait_s', 0):6.3f}  {a.get('db_size_mb', 0):7.1f}"
                 else:
                     row += f"  {'—':>8s}  {'—':>8s}  {'—':>6s}"
+                    if scenario == "cold_start" and tool == "toki":
+                        row += f"  {'—':>9s}  {'—':>6s}  {'—':>7s}"
             print(row)
         print()
 
-    # Speedup comparison
-    if len(tools) == 2:
-        print("--- Speedup (ccusage / clitrace) ---")
-        print(f"{'Data':>8s}  {'Scenario':>8s}  {'Speedup':>8s}")
+    # Speedup comparison (toki report vs ccusage for same scenarios)
+    if "toki" in tools and "ccusage" in tools:
+        report_scenarios = [s for s in scenarios if s != "cold_start"]
+        if report_scenarios:
+            print("--- Speedup: toki report (TSDB) vs ccusage (full scan) ---")
+            print(f"{'Data':>8s}  {'Scenario':>8s}  {'Speedup':>8s}")
+            for label in labels:
+                for scenario in report_scenarios:
+                    toki_r = [a for a in avgs if a["tool"] == "toki"
+                              and a["data_label"] == label and a["scenario"] == scenario]
+                    cc_r = [a for a in avgs if a["tool"] == "ccusage"
+                            and a["data_label"] == label and a["scenario"] == scenario]
+                    if toki_r and cc_r and toki_r[0]["wall_time_s"] > 0:
+                        speedup = cc_r[0]["wall_time_s"] / toki_r[0]["wall_time_s"]
+                        print(f"{label:>8s}  {scenario:>8s}  {speedup:8.1f}x")
+            print()
+
+        # Cold start vs ccusage total (fair 1:1)
+        print("--- Cold Start vs ccusage total (both read all files) ---")
+        print(f"{'Data':>8s}  {'toki(s)':>8s}  {'ccusage(s)':>10s}  {'Speedup':>8s}")
         for label in labels:
-            for scenario in scenarios:
-                cli = [a for a in avgs if a["tool"] == "clitrace"
-                       and a["data_label"] == label and a["scenario"] == scenario]
-                cc = [a for a in avgs if a["tool"] == "ccusage"
-                      and a["data_label"] == label and a["scenario"] == scenario]
-                if cli and cc and cli[0]["wall_time_s"] > 0:
-                    speedup = cc[0]["wall_time_s"] / cli[0]["wall_time_s"]
-                    print(f"{label:>8s}  {scenario:>8s}  {speedup:8.1f}x")
+            toki_cs = [a for a in avgs if a["tool"] == "toki"
+                       and a["data_label"] == label and a["scenario"] == "cold_start"]
+            cc_total = [a for a in avgs if a["tool"] == "ccusage"
+                        and a["data_label"] == label and a["scenario"] == "total"]
+            if toki_cs and cc_total and toki_cs[0]["wall_time_s"] > 0:
+                speedup = cc_total[0]["wall_time_s"] / toki_cs[0]["wall_time_s"]
+                print(f"{label:>8s}  {toki_cs[0]['wall_time_s']:8.3f}  {cc_total[0]['wall_time_s']:10.3f}  {speedup:8.1f}x")
         print()
 
 
@@ -515,24 +813,22 @@ def print_summary(results: list[BenchResult]):
 # ---------------------------------------------------------------------------
 
 TOOL_COLORS = {
-    "clitrace": "#2563eb",  # blue
-    "ccusage": "#f59e0b",   # amber
+    "toki": "#e74c3c",      # red
+    "ccusage": "#3498db",    # blue
 }
 
 TOOL_LABELS = {
-    "clitrace": "clitrace (Rust)",
+    "toki": "toki (Rust, TSDB)",
     "ccusage": "ccusage (Node.js)",
 }
 
 
 def generate_charts(json_path: Path) -> list[Path]:
-    """Generate benchmark charts from a JSON results file. Returns list of saved image paths."""
+    """Generate benchmark charts from a JSON results file."""
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        import matplotlib.ticker as ticker
-        from matplotlib.patches import FancyBboxPatch
     except ImportError:
         print("Warning: matplotlib not installed. Skipping chart generation.")
         print("  Install with: pip3 install matplotlib")
@@ -573,32 +869,38 @@ def generate_charts(json_path: Path) -> list[Path]:
 
     avgs = data["averages"]
     tools = sorted(set(a["tool"] for a in avgs))
-    scenarios = sorted(
-        set(a["scenario"] for a in avgs),
-        key=lambda s: [x[0] for x in SCENARIOS].index(s),
-    )
+    report_scenarios = [s[0] for s in SCENARIOS]
+    scenarios = [s for s in report_scenarios if any(a["scenario"] == s for a in avgs)]
 
     charts_dir = RESULTS_DIR / "charts"
     charts_dir.mkdir(parents=True, exist_ok=True)
     ts = json_path.stem.replace("benchmark_", "")
     saved = []
 
-    # ── Line styles: 4 visually distinct lines ──
+    has_scipy = True
+    try:
+        from scipy.interpolate import make_interp_spline
+        import numpy as np
+    except ImportError:
+        has_scipy = False
+        import numpy as np
+
+    # ── Line plot helper ──
     STYLES = {
-        ("clitrace", "val"):  {"color": "#2563eb", "ls": "-",  "marker": "o", "ms": 5, "lw": 2.2, "label": "clitrace"},
-        ("clitrace", "avg"):  {"color": "#2563eb", "ls": "-",  "marker": "o", "ms": 5, "lw": 2.2, "label": "clitrace avg"},
-        ("clitrace", "peak"): {"color": "#93c5fd", "ls": "--", "marker": "D", "ms": 4, "lw": 1.6, "label": "clitrace peak"},
-        ("ccusage", "val"):   {"color": "#ea580c", "ls": "-",  "marker": "s", "ms": 5, "lw": 2.2, "label": "ccusage"},
-        ("ccusage", "avg"):   {"color": "#ea580c", "ls": "-",  "marker": "s", "ms": 5, "lw": 2.2, "label": "ccusage avg"},
-        ("ccusage", "peak"):  {"color": "#fdba74", "ls": "--", "marker": "^", "ms": 4, "lw": 1.6, "label": "ccusage peak"},
+        ("toki", "val"):   {"color": "#e74c3c", "ls": "-",  "marker": "o", "ms": 5, "lw": 2.2, "label": "toki"},
+        ("toki", "avg"):   {"color": "#e74c3c", "ls": "-",  "marker": "o", "ms": 5, "lw": 2.2, "label": "toki avg"},
+        ("toki", "peak"):  {"color": "#f5a6a0", "ls": "--", "marker": "D", "ms": 4, "lw": 1.6, "label": "toki peak"},
+        ("ccusage", "val"):  {"color": "#3498db", "ls": "-",  "marker": "s", "ms": 5, "lw": 2.2, "label": "ccusage"},
+        ("ccusage", "avg"):  {"color": "#3498db", "ls": "-",  "marker": "s", "ms": 5, "lw": 2.2, "label": "ccusage avg"},
+        ("ccusage", "peak"): {"color": "#85c1e9", "ls": "--", "marker": "^", "ms": 4, "lw": 1.6, "label": "ccusage peak"},
+        ("zzusage", "val"):  {"color": "#2ecc71", "ls": "-",  "marker": "^", "ms": 5, "lw": 2.2, "label": "zzusage"},
+        ("zzusage", "avg"):  {"color": "#2ecc71", "ls": "-",  "marker": "^", "ms": 5, "lw": 2.2, "label": "zzusage avg"},
+        ("zzusage", "peak"): {"color": "#a9dfbf", "ls": "--", "marker": "v", "ms": 4, "lw": 1.6, "label": "zzusage peak"},
     }
 
     def _plot(ax, x, y, tool, kind):
-        import numpy as np
-        from scipy.interpolate import make_interp_spline
         s = STYLES[(tool, kind)]
-        # Smooth curve via spline interpolation (need 3+ points)
-        if len(x) >= 3:
+        if has_scipy and len(x) >= 3:
             x_arr = np.array(x, dtype=float)
             y_arr = np.array(y, dtype=float)
             x_smooth = np.linspace(x_arr.min(), x_arr.max(), 200)
@@ -633,10 +935,57 @@ def generate_charts(json_path: Path) -> list[Path]:
         )
         leg.get_frame().set_linewidth(0.5)
 
-    # ── Per-scenario charts: 3 columns ──
+    # ── Chart 1: Cold start vs ccusage total (fair comparison) ──
+    cold_starts = sorted(
+        [a for a in avgs if a["tool"] == "toki" and a["scenario"] == "cold_start"],
+        key=lambda a: a["data_size_mb"],
+    )
+    cc_totals = sorted(
+        [a for a in avgs if a["tool"] == "ccusage" and a["scenario"] == "total"],
+        key=lambda a: a["data_size_mb"],
+    )
+
+    if cold_starts or cc_totals:
+        fig, axes = plt.subplots(1, 3, figsize=(19, 5.5))
+        fig.suptitle("Phase 1: Full File Scan  —  toki cold start vs ccusage report",
+                     fontsize=17, fontweight="bold", color=TEXT_COLOR, y=0.98)
+
+        if cold_starts:
+            x = [int(a["data_label"].replace("mb", "")) for a in cold_starts]
+            _plot(axes[0], x, [a["wall_time_s"] for a in cold_starts], "toki", "val")
+            _plot(axes[1], x, [a["avg_cpu_pct"] for a in cold_starts], "toki", "avg")
+            _plot(axes[1], x, [a["peak_cpu_pct"] for a in cold_starts], "toki", "peak")
+            _plot(axes[2], x, [a["avg_rss_mb"] for a in cold_starts], "toki", "avg")
+            _plot(axes[2], x, [a["peak_rss_mb"] for a in cold_starts], "toki", "peak")
+
+        if cc_totals:
+            x = [int(a["data_label"].replace("mb", "")) for a in cc_totals]
+            _plot(axes[0], x, [a["wall_time_s"] for a in cc_totals], "ccusage", "val")
+            _plot(axes[1], x, [a["avg_cpu_pct"] for a in cc_totals], "ccusage", "avg")
+            _plot(axes[1], x, [a["peak_cpu_pct"] for a in cc_totals], "ccusage", "peak")
+            _plot(axes[2], x, [a["avg_rss_mb"] for a in cc_totals], "ccusage", "avg")
+            _plot(axes[2], x, [a["peak_rss_mb"] for a in cc_totals], "ccusage", "peak")
+
+        titles = ["Execution Time", "CPU Usage", "Memory"]
+        ylabels = ["Time (s)", "CPU (%)", "Memory (MB)"]
+        for i, ax in enumerate(axes):
+            ax.set_title(titles[i], fontsize=13, fontweight=600, color=TEXT_COLOR, pad=10)
+            _style_ax(ax, ylabels[i])
+            _legend(ax, loc="upper left")
+
+        fig.tight_layout(rect=[0, 0, 1, 0.94], w_pad=3.5)
+        for fmt in ["png", "svg"]:
+            out = charts_dir / f"benchmark_cold_start_{ts}.{fmt}"
+            fig.savefig(str(out), dpi=220 if fmt == "png" else 150,
+                        bbox_inches="tight", facecolor=BG)
+            saved.append(out)
+        plt.close(fig)
+        print(f"  cold_start: saved PNG + SVG")
+
+    # ── Per-scenario charts: toki report (TSDB) vs ccusage ──
     for scenario in scenarios:
         fig, axes = plt.subplots(1, 3, figsize=(19, 5.5))
-        fig.suptitle(f"clitrace vs ccusage  —  {scenario} report",
+        fig.suptitle(f"Phase 2: Report  —  toki (TSDB query) vs ccusage (full scan)  —  {scenario}",
                      fontsize=17, fontweight="bold", color=TEXT_COLOR, y=0.98)
 
         for tool in tools:
@@ -671,58 +1020,82 @@ def generate_charts(json_path: Path) -> list[Path]:
         plt.close(fig)
         print(f"  {scenario}: saved PNG + SVG")
 
+    # ── DB size chart ──
+    if cold_starts:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        x = [int(a["data_label"].replace("mb", "")) for a in cold_starts]
+        db_sizes = [a.get("db_size_mb", 0) for a in cold_starts]
+        ax.bar(x, db_sizes, width=max(1, (max(x) - min(x)) / len(x) * 0.6),
+               color="#e74c3c", alpha=0.85)
+        for xi, di, si in zip(x, db_sizes, x):
+            if di > 0:
+                ratio = di / si * 100
+                ax.text(xi, di * 1.02, f"{ratio:.0f}%", ha="center", fontsize=9,
+                        fontweight="bold", color=SUBTLE_TEXT)
+        ax.set_title("toki TSDB Size vs Source Data", fontsize=15,
+                     fontweight="bold", color=TEXT_COLOR, pad=12)
+        _style_ax(ax, "DB Size (MB)")
+        fig.tight_layout()
+        for fmt in ["png", "svg"]:
+            out = charts_dir / f"benchmark_db_size_{ts}.{fmt}"
+            fig.savefig(str(out), dpi=220 if fmt == "png" else 150,
+                        bbox_inches="tight", facecolor=BG)
+            saved.append(out)
+        plt.close(fig)
+        print(f"  db_size: saved PNG + SVG")
+
     # ── Speedup chart ──
-    SPEEDUP_COLORS = ["#2563eb", "#7c3aed", "#059669", "#ea580c", "#d946ef"]
-    fig, ax = plt.subplots(figsize=(13, 5.5))
-    color_idx = 0
-    for scenario in scenarios:
-        speedups = []
-        x_vals = []
-        cli_entries = sorted(
-            [a for a in avgs if a["tool"] == "clitrace" and a["scenario"] == scenario],
-            key=lambda a: a["data_size_mb"],
-        )
-        for entry in cli_entries:
-            cc = [a for a in avgs if a["tool"] == "ccusage"
-                  and a["data_label"] == entry["data_label"]
-                  and a["scenario"] == scenario]
-            if cc and entry["wall_time_s"] > 0:
-                speedups.append(cc[0]["wall_time_s"] / entry["wall_time_s"])
-                x_vals.append(int(entry["data_label"].replace("mb", "")))
+    SPEEDUP_COLORS = ["#e74c3c", "#7c3aed", "#059669", "#ea580c", "#d946ef"]
+    if "toki" in tools and "ccusage" in tools:
+        fig, ax = plt.subplots(figsize=(13, 5.5))
+        color_idx = 0
+        for scenario in scenarios:
+            speedups = []
+            x_vals = []
+            toki_entries = sorted(
+                [a for a in avgs if a["tool"] == "toki" and a["scenario"] == scenario],
+                key=lambda a: a["data_size_mb"],
+            )
+            for entry in toki_entries:
+                cc = [a for a in avgs if a["tool"] == "ccusage"
+                      and a["data_label"] == entry["data_label"]
+                      and a["scenario"] == scenario]
+                if cc and entry["wall_time_s"] > 0:
+                    speedups.append(cc[0]["wall_time_s"] / entry["wall_time_s"])
+                    x_vals.append(int(entry["data_label"].replace("mb", "")))
 
-        if speedups:
-            import numpy as np
-            from scipy.interpolate import make_interp_spline
-            c = SPEEDUP_COLORS[color_idx % len(SPEEDUP_COLORS)]
-            if len(x_vals) >= 3:
-                x_arr = np.array(x_vals, dtype=float)
-                y_arr = np.array(speedups, dtype=float)
-                x_sm = np.linspace(x_arr.min(), x_arr.max(), 200)
-                spl = make_interp_spline(x_arr, y_arr, k=min(3, len(x_vals) - 1))
-                ax.plot(x_sm, spl(x_sm), color=c, linewidth=2.2, label=scenario, zorder=2)
-                ax.plot(x_vals, speedups, marker="o", markersize=5, linestyle="none",
-                        color=c, markeredgecolor="white", markeredgewidth=0.8, zorder=3)
-            else:
-                ax.plot(x_vals, speedups, marker="o", markersize=5, linewidth=2.2,
-                        label=scenario, color=c, markeredgecolor="white", markeredgewidth=0.8, zorder=3)
-            for xi, si in zip(x_vals, speedups):
-                ax.annotate(f"{si:.0f}x", (xi, si), textcoords="offset points",
-                            xytext=(0, 10), ha="center", fontsize=9, color=c, fontweight=500)
-            color_idx += 1
+            if speedups:
+                c = SPEEDUP_COLORS[color_idx % len(SPEEDUP_COLORS)]
+                if has_scipy and len(x_vals) >= 3:
+                    x_arr = np.array(x_vals, dtype=float)
+                    y_arr = np.array(speedups, dtype=float)
+                    x_sm = np.linspace(x_arr.min(), x_arr.max(), 200)
+                    spl = make_interp_spline(x_arr, y_arr, k=min(3, len(x_vals) - 1))
+                    ax.plot(x_sm, spl(x_sm), color=c, linewidth=2.2, label=scenario, zorder=2)
+                    ax.plot(x_vals, speedups, marker="o", markersize=5, linestyle="none",
+                            color=c, markeredgecolor="white", markeredgewidth=0.8, zorder=3)
+                else:
+                    ax.plot(x_vals, speedups, marker="o", markersize=5, linewidth=2.2,
+                            label=scenario, color=c, markeredgecolor="white",
+                            markeredgewidth=0.8, zorder=3)
+                for xi, si in zip(x_vals, speedups):
+                    ax.annotate(f"{si:.0f}x", (xi, si), textcoords="offset points",
+                                xytext=(0, 10), ha="center", fontsize=9, color=c, fontweight=500)
+                color_idx += 1
 
-    ax.set_title("Speedup: clitrace vs ccusage  (higher = faster)",
-                 fontsize=15, fontweight="bold", color=TEXT_COLOR, pad=12)
-    _style_ax(ax, "Speedup (x)")
-    _legend(ax, loc="upper right")
-    fig.tight_layout()
+        ax.set_title("Speedup: toki report (TSDB) vs ccusage (full scan)  —  higher = faster",
+                     fontsize=15, fontweight="bold", color=TEXT_COLOR, pad=12)
+        _style_ax(ax, "Speedup (x)")
+        _legend(ax, loc="upper right")
+        fig.tight_layout()
 
-    for fmt in ["png", "svg"]:
-        out = charts_dir / f"benchmark_speedup_{ts}.{fmt}"
-        fig.savefig(str(out), dpi=220 if fmt == "png" else 150,
-                    bbox_inches="tight", facecolor=BG)
-        saved.append(out)
-    plt.close(fig)
-    print(f"  speedup: saved PNG + SVG")
+        for fmt in ["png", "svg"]:
+            out = charts_dir / f"benchmark_speedup_{ts}.{fmt}"
+            fig.savefig(str(out), dpi=220 if fmt == "png" else 150,
+                        bbox_inches="tight", facecolor=BG)
+            saved.append(out)
+        plt.close(fig)
+        print(f"  speedup: saved PNG + SVG")
 
     return saved
 
@@ -771,17 +1144,25 @@ def cmd_all(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="clitrace vs ccusage benchmark tool",
+        description="toki vs ccusage benchmark tool",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python3 benchmark.py generate
   python3 benchmark.py generate --sizes 100,200,500
   python3 benchmark.py run --runs 5
-  python3 benchmark.py run --sizes 100,200
+  python3 benchmark.py run --sizes 100,200 --tool toki
+  python3 benchmark.py run --tool ccusage
   python3 benchmark.py all
   python3 benchmark.py plot
   python3 benchmark.py plot --file results/benchmark_xxx.json
+
+Architecture:
+  toki (daemon/client):
+    Phase 1: daemon reset → daemon start → cold start (index all files)
+    Phase 2: toki report (TSDB query, near-instant)
+  ccusage (stateless):
+    Every report re-reads all files from scratch.
         """,
     )
     sub = parser.add_subparsers(dest="command", required=True)
@@ -792,6 +1173,8 @@ Examples:
                      help="Source Claude data directory (default: ~/.claude)")
     gen.add_argument("--sizes", default=None,
                      help="Comma-separated sizes in MB (default: 100,200,...,2000)")
+    gen.add_argument("--force", action="store_true",
+                     help="Regenerate all data sets even if they exist")
 
     # run
     run = sub.add_parser("run", help="Run benchmarks")
@@ -799,6 +1182,10 @@ Examples:
                      help=f"Runs per scenario (default: {DEFAULT_RUNS})")
     run.add_argument("--sizes", default=None,
                      help="Comma-separated sizes to benchmark (default: all available)")
+    run.add_argument("--tool", choices=["toki", "ccusage", "zzusage", "both", "all"], default="both",
+                     help="Which tool(s) to benchmark (default: both)")
+    run.add_argument("--purge", action="store_true",
+                     help="Purge disk cache before each run (requires sudo -v first)")
 
     # all
     a = sub.add_parser("all", help="Generate data + run benchmarks")
@@ -808,6 +1195,12 @@ Examples:
                    help="Comma-separated sizes in MB")
     a.add_argument("--runs", type=int, default=DEFAULT_RUNS,
                    help=f"Runs per scenario (default: {DEFAULT_RUNS})")
+    a.add_argument("--tool", choices=["toki", "ccusage", "zzusage", "both", "all"], default="both",
+                   help="Which tool(s) to benchmark (default: both)")
+    a.add_argument("--force", action="store_true",
+                   help="Regenerate all data sets even if they exist")
+    a.add_argument("--purge", action="store_true",
+                   help="Purge disk cache before each run (requires sudo -v first)")
 
     # plot
     p = sub.add_parser("plot", help="Generate charts from benchmark results")

@@ -1,2 +1,4 @@
 data/
 results/
+results_backup/
+.daemon.log

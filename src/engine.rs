@@ -2,15 +2,14 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{Receiver, Sender};
 
 use crate::checkpoint::{find_resume_offset, process_lines_streaming};
-use crate::common::types::{FileCheckpoint, LogParser, LogParserWithTs, ModelUsageSummary, UsageEvent};
-use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, TimeZone, Weekday};
+use crate::common::types::{FileCheckpoint, LogParser, LogParserWithTs, ModelUsageSummary, TokenFields};
+use chrono::{DateTime, NaiveDateTime, Weekday};
 use chrono_tz::Tz;
-use crate::db::Database;
-use crate::pricing::PricingTable;
 use crate::sink::Sink;
+use crate::writer::{ColdStartEvent, DbOp};
 
 /// Debug level:
 ///   0 = off
@@ -19,7 +18,7 @@ use crate::sink::Sink;
 pub fn debug_level() -> u8 {
     static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     *LEVEL.get_or_init(|| {
-        std::env::var("CLITRACE_DEBUG").map_or(0, |v| match v.as_str() {
+        std::env::var("TOKI_DEBUG").map_or(0, |v| match v.as_str() {
             "true" | "1" => 1,
             "2" => 2,
             _ => 0,
@@ -30,7 +29,7 @@ pub fn debug_level() -> u8 {
 macro_rules! debug_log {
     ($($arg:tt)*) => {
         if debug_level() >= 1 {
-            eprintln!("[clitrace:debug] {}", format!($($arg)*));
+            eprintln!("[toki:debug] {}", format!($($arg)*));
         }
     };
 }
@@ -40,7 +39,7 @@ macro_rules! debug_log {
 macro_rules! debug_log_verbose {
     ($($arg:tt)*) => {
         if debug_level() >= 2 {
-            eprintln!("[clitrace:debug] {}", format!($($arg)*));
+            eprintln!("[toki:debug] {}", format!($($arg)*));
         }
     };
 }
@@ -68,7 +67,7 @@ struct FileActivity {
 }
 
 pub struct TrackerEngine {
-    db: Database,
+    db_tx: Sender<DbOp>,
     checkpoints: HashMap<String, FileCheckpoint>,
     /// Cached file sizes for fast skip when size unchanged.
     file_sizes: HashMap<String, u64>,
@@ -78,92 +77,6 @@ pub struct TrackerEngine {
     dirty: HashSet<String>,
     /// Output sink (print, UDS, HTTP, or multi).
     sink: Box<dyn Sink>,
-    /// Optional session ID prefix filter for trace mode.
-    session_filter: Option<String>,
-    /// Optional project name filter for trace mode.
-    project_filter: Option<String>,
-    /// Optional timezone for bucketing in startup grouping.
-    tz: Option<Tz>,
-    /// Pricing table for cost calculation.
-    pricing: Option<PricingTable>,
-}
-
-struct ColdStartResult {
-    summaries: HashMap<String, ModelUsageSummary>,
-    checkpoints: Vec<FileCheckpoint>,
-    session_count: usize,
-    total_files: usize,
-}
-
-fn cold_start_collect(
-    parser: &(dyn LogParser + Sync),
-    root_dir: &str,
-    checkpoints: &HashMap<String, FileCheckpoint>,
-    session_filter: Option<&str>,
-    project_filter: Option<&str>,
-) -> Result<ColdStartResult, Box<dyn std::error::Error>> {
-    let sessions = apply_filters(parser.discover_sessions(root_dir), session_filter, project_filter);
-
-    if sessions.is_empty() {
-        return Ok(ColdStartResult {
-            summaries: HashMap::new(),
-            checkpoints: Vec::new(),
-            session_count: 0,
-            total_files: 0,
-        });
-    }
-
-    let total_files: usize = sessions.iter()
-        .map(|s| 1 + s.subagent_jsonls.len())
-        .sum();
-
-    let summaries: Mutex<HashMap<String, ModelUsageSummary>> = Mutex::new(HashMap::new());
-    let cp_batch: Mutex<Vec<FileCheckpoint>> = Mutex::new(Vec::new());
-
-    parallel_scan(&sessions, checkpoints, |path, offset| {
-        let mut local: HashMap<String, ModelUsageSummary> = HashMap::new();
-        let result = process_lines_streaming(path, offset, |line| {
-            if let Some(event) = parser.parse_line(line, path) {
-                let summary = local.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
-                    model: event.model.clone(),
-                    ..Default::default()
-                });
-                summary.accumulate(&event);
-            }
-        });
-        if !local.is_empty() {
-            let mut s = summaries.lock().unwrap_or_else(|e| e.into_inner());
-            merge_summaries(&mut s, local);
-        }
-        if let Ok(Some((_bytes, last_line_len, last_line_hash))) = result {
-            cp_batch.lock().unwrap_or_else(|e| e.into_inner()).push(FileCheckpoint {
-                file_path: path.to_string(),
-                last_line_len,
-                last_line_hash,
-            });
-        }
-    });
-
-    Ok(ColdStartResult {
-        summaries: summaries.into_inner().unwrap_or_else(|e| e.into_inner()),
-        checkpoints: cp_batch.into_inner().unwrap_or_else(|e| e.into_inner()),
-        session_count: sessions.len(),
-        total_files,
-    })
-}
-
-pub fn cold_start_report(
-    parser: &(dyn LogParser + Sync),
-    root_dir: &str,
-    sink: &dyn Sink,
-    session_filter: Option<&str>,
-    project_filter: Option<&str>,
-    pricing: Option<&PricingTable>,
-) -> Result<HashMap<String, ModelUsageSummary>, Box<dyn std::error::Error>> {
-    let empty = HashMap::new();
-    let result = cold_start_collect(parser, root_dir, &empty, session_filter, project_filter)?;
-    sink.emit_summary(&result.summaries, pricing);
-    Ok(result.summaries)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -188,6 +101,7 @@ impl ReportGroupBy {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[derive(Default)]
 pub struct ReportFilter {
     pub since: Option<NaiveDateTime>,
     pub until: Option<NaiveDateTime>,
@@ -195,310 +109,91 @@ pub struct ReportFilter {
     pub tz: Option<Tz>,
 }
 
-impl Default for ReportFilter {
-    fn default() -> Self {
-        ReportFilter { since: None, until: None, tz: None }
-    }
-}
-
-pub fn cold_start_report_grouped<P>(
-    parser: &P,
-    root_dir: &str,
-    group_by: ReportGroupBy,
-    checkpoints: &HashMap<String, FileCheckpoint>,
-    filter: ReportFilter,
-    sink: &dyn Sink,
-    session_filter: Option<&str>,
-    project_filter: Option<&str>,
-    pricing: Option<&PricingTable>,
-) -> Result<(), Box<dyn std::error::Error>>
-where
-    P: LogParser + LogParserWithTs + Sync,
-{
-    let sessions = apply_filters(parser.discover_sessions(root_dir), session_filter, project_filter);
-    if sessions.is_empty() {
-        sink.emit_grouped(&HashMap::new(), group_by.type_name(), pricing);
-        return Ok(());
-    }
-
-    let grouped: Mutex<HashMap<String, HashMap<String, ModelUsageSummary>>> =
-        Mutex::new(HashMap::new());
-
-    parallel_scan(&sessions, checkpoints, |path, offset| {
-        let mut local: HashMap<String, HashMap<String, ModelUsageSummary>> = HashMap::new();
-        let _ = process_lines_streaming(path, offset, |line| {
-            if let Some(event) = parser.parse_line_with_ts(line, path) {
-                if let Some(bucket) = bucket_from_timestamp_filtered(&event.timestamp, group_by, filter) {
-                    let by_model = local.entry(bucket).or_insert_with(HashMap::new);
-                    let summary = by_model.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
-                        model: event.model.clone(),
-                        ..Default::default()
-                    });
-                    summary.accumulate_with_ts(&event);
-                }
-            }
-        });
-        if !local.is_empty() {
-            let mut g = grouped.lock().unwrap_or_else(|e| e.into_inner());
-            merge_grouped(&mut g, local);
-        }
-    });
-
-    sink.emit_grouped(&grouped.into_inner().unwrap_or_else(|e| e.into_inner()), group_by.type_name(), pricing);
-    Ok(())
-}
-
-pub fn cold_start_report_filtered<P>(
-    parser: &P,
-    root_dir: &str,
-    checkpoints: &HashMap<String, FileCheckpoint>,
-    filter: ReportFilter,
-    session_filter: Option<&str>,
-    project_filter: Option<&str>,
-) -> Result<HashMap<String, ModelUsageSummary>, Box<dyn std::error::Error>>
-where
-    P: LogParser + LogParserWithTs + Sync,
-{
-    let sessions = apply_filters(parser.discover_sessions(root_dir), session_filter, project_filter);
-    if sessions.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let summaries: Mutex<HashMap<String, ModelUsageSummary>> = Mutex::new(HashMap::new());
-
-    parallel_scan(&sessions, checkpoints, |path, offset| {
-        let mut local: HashMap<String, ModelUsageSummary> = HashMap::new();
-        let _ = process_lines_streaming(path, offset, |line| {
-            if let Some(event) = parser.parse_line_with_ts(line, path) {
-                let ts = match parse_timestamp(&event.timestamp) {
-                    Some(t) => t,
-                    None => return,
-                };
-                if !filter_match(ts, filter) {
-                    return;
-                }
-                let summary = local.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
-                    model: event.model.clone(),
-                    ..Default::default()
-                });
-                summary.accumulate_with_ts(&event);
-            }
-        });
-        if !local.is_empty() {
-            let mut s = summaries.lock().unwrap_or_else(|e| e.into_inner());
-            merge_summaries(&mut s, local);
-        }
-    });
-
-    Ok(summaries.into_inner().unwrap_or_else(|e| e.into_inner()))
-}
-
-/// Report grouped by session ID (each session shows its per-model breakdown).
-pub fn cold_start_report_by_session<P>(
-    parser: &P,
-    root_dir: &str,
-    checkpoints: &HashMap<String, FileCheckpoint>,
-    filter: ReportFilter,
-    session_filter: Option<&str>,
-    project_filter: Option<&str>,
-    sink: &dyn Sink,
-    pricing: Option<&PricingTable>,
-) -> Result<(), Box<dyn std::error::Error>>
-where
-    P: LogParser + LogParserWithTs + Sync,
-{
-    let sessions = apply_filters(parser.discover_sessions(root_dir), session_filter, project_filter);
-    if sessions.is_empty() {
-        sink.emit_grouped(&HashMap::new(), "session", pricing);
-        return Ok(());
-    }
-
-    let grouped: Mutex<HashMap<String, HashMap<String, ModelUsageSummary>>> =
-        Mutex::new(HashMap::new());
-
-    let use_ts_filter = filter_active(filter);
-
-    parallel_scan(&sessions, checkpoints, |path, offset| {
-        let session_id = match extract_session_id(path) {
-            Some(id) => id,
-            None => return,
-        };
-        let mut local: HashMap<String, ModelUsageSummary> = HashMap::new();
-        let _ = process_lines_streaming(path, offset, |line| {
-            if use_ts_filter {
-                if let Some(event) = parser.parse_line_with_ts(line, path) {
-                    let ts = match parse_timestamp(&event.timestamp) {
-                        Some(t) => t,
-                        None => return,
-                    };
-                    if !filter_match(ts, filter) {
-                        return;
-                    }
-                    let summary = local.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
-                        model: event.model.clone(),
-                        ..Default::default()
-                    });
-                    summary.accumulate_with_ts(&event);
-                }
-            } else if let Some(event) = parser.parse_line(line, path) {
-                let summary = local.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
-                    model: event.model.clone(),
-                    ..Default::default()
-                });
-                summary.accumulate(&event);
-            }
-        });
-        if !local.is_empty() {
-            let mut g = grouped.lock().unwrap_or_else(|e| e.into_inner());
-            let session_models = g.entry(session_id).or_insert_with(HashMap::new);
-            merge_summaries(session_models, local);
-        }
-    });
-
-    sink.emit_grouped(&grouped.into_inner().unwrap_or_else(|e| e.into_inner()), "session", pricing);
-    Ok(())
-}
 
 impl TrackerEngine {
-    pub fn new(db: Database) -> Self {
+    pub fn new(db_tx: Sender<DbOp>, checkpoints: HashMap<String, FileCheckpoint>, sink: Box<dyn Sink>) -> Self {
         TrackerEngine {
-            db,
-            checkpoints: HashMap::new(),
+            db_tx,
+            checkpoints,
             file_sizes: HashMap::new(),
             activity: HashMap::new(),
             dirty: HashSet::new(),
-            sink: Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)),
-            session_filter: None,
-            project_filter: None,
-            tz: None,
-            pricing: None,
+            sink,
         }
     }
 
-    pub fn with_sink(mut self, sink: Box<dyn Sink>) -> Self {
-        self.sink = sink;
-        self
-    }
-
-    pub fn with_session_filter(mut self, filter: Option<String>) -> Self {
-        self.session_filter = filter;
-        self
-    }
-
-    pub fn with_project_filter(mut self, filter: Option<String>) -> Self {
-        self.project_filter = filter;
-        self
-    }
-
-    pub fn with_tz(mut self, tz: Option<Tz>) -> Self {
-        self.tz = tz;
-        self
-    }
-
-    pub fn with_pricing(mut self, pricing: Option<PricingTable>) -> Self {
-        self.pricing = pricing;
-        self
-    }
-
-    /// Check if a file path matches the configured session and project filters.
-    fn matches_filters(&self, path: &str) -> bool {
-        if let Some(ref prefix) = self.session_filter {
-            if let Some(sid) = extract_session_id(path) {
-                if !sid.starts_with(prefix.as_str()) {
-                    return false;
-                }
-            }
-        }
-        if let Some(ref project) = self.project_filter {
-            match extract_project_name(path) {
-                Some(name) if name.contains(project.as_str()) => {}
-                _ => return false,
-            }
-        }
-        true
-    }
-
-    /// Load existing checkpoints from DB into memory.
-    pub fn load_checkpoints(&mut self) -> Result<(), redb::Error> {
-        let cps = self.db.load_all_checkpoints()?;
-        for cp in cps {
-            self.checkpoints.insert(cp.file_path.clone(), cp);
-        }
-        Ok(())
-    }
 
     /// Cold start: discover all sessions, process them in parallel,
-    /// aggregate by model, print summary, and flush checkpoints.
-    pub fn cold_start(
-        &mut self,
-        parser: &(dyn LogParser + Sync),
-        root_dir: &str,
-    ) -> Result<HashMap<String, ModelUsageSummary>, Box<dyn std::error::Error>> {
-        let t_cold = Instant::now();
-        let result = cold_start_collect(parser, root_dir, &self.checkpoints, None, self.project_filter.as_deref())?;
-
-        if result.session_count == 0 {
-            debug_log!("cold_start — 0 sessions, 0 files ({}µs)", t_cold.elapsed().as_micros());
-            return Ok(HashMap::new());
-        }
-
-        for cp in &result.checkpoints {
-            self.checkpoints.insert(cp.file_path.clone(), cp.clone());
-        }
-
-        // Emit summary
-        self.sink.emit_summary(&result.summaries, self.pricing.as_ref());
-
-        // Batch flush for cold start (single transaction).
-        let t_flush = Instant::now();
-        self.db.flush_checkpoints(&result.checkpoints)?;
-        debug_log!("cold_start — {} sessions, {} files, {} checkpoints flushed (flush: {}µs, total: {}µs)",
-            result.session_count, result.total_files, result.checkpoints.len(), t_flush.elapsed().as_micros(), t_cold.elapsed().as_micros());
-
-        Ok(result.summaries)
-    }
-
-    /// Cold start with time-bucket grouping (e.g. hourly/daily).
-    /// Streams events into buckets, saves checkpoints, and prints grouped summary.
-    pub fn cold_start_grouped<P>(
+    /// aggregate by model, print summary, flush checkpoints, and populate TSDB.
+    pub fn cold_start<P>(
         &mut self,
         parser: &P,
         root_dir: &str,
-        group_by: ReportGroupBy,
-    ) -> Result<(), Box<dyn std::error::Error>>
+    ) -> Result<HashMap<String, ModelUsageSummary>, Box<dyn std::error::Error>>
     where
         P: LogParser + LogParserWithTs + Sync,
     {
         let t_cold = Instant::now();
         let sessions = parser.discover_sessions(root_dir);
+
         if sessions.is_empty() {
-            self.sink.emit_grouped(&HashMap::new(), group_by.type_name(), self.pricing.as_ref());
-            debug_log!("cold_start_grouped — 0 sessions ({}µs)", t_cold.elapsed().as_micros());
-            return Ok(());
+            debug_log!("cold_start — 0 sessions, 0 files ({}µs)", t_cold.elapsed().as_micros());
+            return Ok(HashMap::new());
         }
 
-        let grouped: Mutex<HashMap<String, HashMap<String, ModelUsageSummary>>> =
-            Mutex::new(HashMap::new());
+        let total_files: usize = sessions.iter().map(|s| 1 + s.subagent_jsonls.len()).sum();
+        let summaries: Mutex<HashMap<String, ModelUsageSummary>> = Mutex::new(HashMap::new());
         let cp_batch: Mutex<Vec<FileCheckpoint>> = Mutex::new(Vec::new());
-        let filter = ReportFilter { tz: self.tz, ..Default::default() };
+        let event_count: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let db_tx = &self.db_tx;
 
+        // Parallel parse + streaming bulk write:
+        // Each rayon thread collects events per file, then sends the chunk
+        // to the writer thread immediately. No global event buffer.
+        // Uses optimized cold start parser to avoid intermediate allocations.
+        let cs_parser = crate::providers::claude_code::ClaudeCodeParser;
         parallel_scan(&sessions, &self.checkpoints, |path, offset| {
-            let mut local: HashMap<String, HashMap<String, ModelUsageSummary>> = HashMap::new();
+            let mut local: HashMap<String, ModelUsageSummary> = HashMap::new();
+            let mut file_events: Vec<ColdStartEvent> = Vec::new();
+            let session_id: std::sync::Arc<str> = extract_session_id(path).unwrap_or_default().into();
+            let source_file: std::sync::Arc<str> = path.into();
             let result = process_lines_streaming(path, offset, |line| {
-                if let Some(event) = parser.parse_line_with_ts(line, path) {
-                    if let Some(bucket) = bucket_from_timestamp_filtered(&event.timestamp, group_by, filter) {
-                        let by_model = local.entry(bucket).or_insert_with(HashMap::new);
-                        let summary = by_model.entry(event.model.clone()).or_insert_with(|| ModelUsageSummary {
-                            model: event.model.clone(),
-                            ..Default::default()
-                        });
-                        summary.accumulate_with_ts(&event);
-                    }
+                if let Some(parsed) = cs_parser.parse_for_cold_start(line) {
+                    // Accumulate summary
+                    let summary = local.entry(parsed.model.clone()).or_insert_with(|| ModelUsageSummary {
+                        model: parsed.model.clone(),
+                        ..Default::default()
+                    });
+                    summary.input_tokens += parsed.input_tokens;
+                    summary.cache_creation_input_tokens += parsed.cache_creation_input_tokens;
+                    summary.cache_read_input_tokens += parsed.cache_read_input_tokens;
+                    summary.output_tokens += parsed.output_tokens;
+                    summary.event_count += 1;
+
+                    // Build ColdStartEvent — Arc::clone for session_id/source_file (no alloc)
+                    file_events.push(ColdStartEvent {
+                        ts_ms: parsed.ts_ms,
+                        message_id: parsed.event_key,
+                        model: parsed.model,
+                        session_id: std::sync::Arc::clone(&session_id),
+                        source_file: std::sync::Arc::clone(&source_file),
+                        tokens: TokenFields {
+                            input_tokens: parsed.input_tokens,
+                            output_tokens: parsed.output_tokens,
+                            cache_creation_input_tokens: parsed.cache_creation_input_tokens,
+                            cache_read_input_tokens: parsed.cache_read_input_tokens,
+                        },
+                    });
                 }
             });
             if !local.is_empty() {
-                let mut g = grouped.lock().unwrap_or_else(|e| e.into_inner());
-                merge_grouped(&mut g, local);
+                let mut s = summaries.lock().unwrap_or_else(|e| e.into_inner());
+                merge_summaries(&mut s, local);
+            }
+            // Stream file chunk to writer immediately (no global buffer)
+            if !file_events.is_empty() {
+                event_count.fetch_add(file_events.len(), std::sync::atomic::Ordering::Relaxed);
+                let _ = db_tx.send(DbOp::BulkWrite(file_events));
             }
             if let Ok(Some((_bytes, last_line_len, last_line_hash))) = result {
                 cp_batch.lock().unwrap_or_else(|e| e.into_inner()).push(FileCheckpoint {
@@ -509,35 +204,52 @@ impl TrackerEngine {
             }
         });
 
-        // Save checkpoints
-        let batch = cp_batch.into_inner().unwrap_or_else(|e| e.into_inner());
-        if !batch.is_empty() {
-            for cp in &batch {
-                self.checkpoints.insert(cp.file_path.clone(), cp.clone());
-            }
-            let t_flush = Instant::now();
-            self.db.flush_checkpoints(&batch)?;
-            debug_log!("cold_start_grouped — {} checkpoints flushed ({}µs)",
-                batch.len(), t_flush.elapsed().as_micros());
+        let t_parse = t_cold.elapsed();
+        let result_summaries = summaries.into_inner().unwrap_or_else(|e| e.into_inner());
+        let checkpoints_batch = cp_batch.into_inner().unwrap_or_else(|e| e.into_inner());
+        let total_events = event_count.load(std::sync::atomic::Ordering::Relaxed);
+
+        for cp in &checkpoints_batch {
+            self.checkpoints.insert(cp.file_path.clone(), cp.clone());
         }
 
-        self.sink.emit_grouped(&grouped.into_inner().unwrap_or_else(|e| e.into_inner()), group_by.type_name(), self.pricing.as_ref());
-        debug_log!("cold_start_grouped — ({}µs)", t_cold.elapsed().as_micros());
-        Ok(())
+        // Emit summary (no pricing — cost is calculated client-side)
+        self.sink.emit_summary(&result_summaries, None);
+
+        // Signal writer to flush accumulated rollups, then wait for completion
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        let _ = self.db_tx.send(DbOp::FlushBulkRollups(done_tx));
+        let _ = done_rx.recv();
+
+        // Flush checkpoints
+        let cp_count = checkpoints_batch.len();
+        if !checkpoints_batch.is_empty() {
+            let _ = self.db_tx.send(DbOp::FlushCheckpoints(checkpoints_batch));
+        }
+        let t_total = t_cold.elapsed();
+        let t_db = t_total - t_parse;
+        debug_log!("cold_start — {} sessions, {} files, {} events, {} checkpoints (parse: {}µs, db_wait: {}µs, total: {}µs)",
+            sessions.len(), total_files, total_events, cp_count,
+            t_parse.as_micros(), t_db.as_micros(), t_total.as_micros());
+
+        Ok(result_summaries)
     }
 
     /// Process a single file change (watch mode).
     /// Uses active/idle classification to minimize unnecessary work.
-    pub fn process_file(
+    /// Returns events with timestamps for TSDB storage.
+    pub fn process_file_with_ts<P>(
         &mut self,
         path: &str,
-        parser: &dyn LogParser,
-    ) -> Result<Vec<UsageEvent>, Box<dyn std::error::Error>> {
+        parser: &P,
+    ) -> Result<Vec<crate::common::types::UsageEventWithTs>, Box<dyn std::error::Error>>
+    where
+        P: LogParser + LogParserWithTs,
+    {
         let now = Instant::now();
 
-        // Step 1: Determine state (new file = Active, lazy Idle transition)
-        let (state, cooldown) = match self.activity.get(path) {
-            None => (FileState::Active, ACTIVE_COOLDOWN), // new file
+        let state = match self.activity.get(path) {
+            None => FileState::Active,
             Some(act) => {
                 let mut s = act.state;
                 if s == FileState::Active && now.duration_since(act.last_active) > IDLE_TRANSITION {
@@ -546,29 +258,23 @@ impl TrackerEngine {
                         path, now.duration_since(act.last_active).as_secs());
                 }
                 let cd = if s == FileState::Active { ACTIVE_COOLDOWN } else { IDLE_COOLDOWN };
-                (s, cd)
+                // Cooldown check: skip if checked too recently
+                if now.duration_since(act.last_checked) < cd {
+                    return Ok(Vec::new());
+                }
+                s
             }
         };
 
-        // Step 2: Cooldown check
-        if let Some(act) = self.activity.get(path) {
-            if now.duration_since(act.last_checked) < cooldown {
-                return Ok(Vec::new());
-            }
-        }
-
         let t_total = Instant::now();
+        let path_owned = path.to_string();
 
-        // Step 3: stat() → size change check
         if let Ok(meta) = std::fs::metadata(path) {
             let current_size = meta.len();
             if let Some(&cached_size) = self.file_sizes.get(path) {
                 if current_size == cached_size {
-                    // Update last_checked, preserve state
-                    let act = self.activity.entry(path.to_string()).or_insert(FileActivity {
-                        state,
-                        last_active: now,
-                        last_checked: now,
+                    let act = self.activity.entry(path_owned).or_insert(FileActivity {
+                        state, last_active: now, last_checked: now,
                     });
                     act.last_checked = now;
                     act.state = state;
@@ -581,7 +287,6 @@ impl TrackerEngine {
             }
         }
 
-        // Step 4: Size changed → find_resume + streaming read/parse
         let t0 = Instant::now();
         let offset = self.determine_offset(path)?;
         let find_us = t0.elapsed().as_micros();
@@ -590,80 +295,95 @@ impl TrackerEngine {
         let mut events = Vec::new();
         let mut line_count: u64 = 0;
         let result = process_lines_streaming(path, offset, |line| {
-            if let Some(event) = parser.parse_line(line, path) {
+            if let Some(event) = parser.parse_line_with_ts(line, path) {
                 events.push(event);
             }
             line_count += 1;
         })?;
         let read_us = t1.elapsed().as_micros();
 
-        // Update cached file size from offset + bytes consumed (avoid second metadata() call)
         match result {
             None => {
-                // No lines read — update size cache from offset (file may have trailing incomplete data)
                 if let Ok(meta) = std::fs::metadata(path) {
-                    self.file_sizes.insert(path.to_string(), meta.len());
+                    self.file_sizes.insert(path_owned.clone(), meta.len());
                 }
-                let act = self.activity.entry(path.to_string()).or_insert(FileActivity {
-                    state,
-                    last_active: now,
-                    last_checked: now,
+                let act = self.activity.entry(path_owned).or_insert(FileActivity {
+                    state, last_active: now, last_checked: now,
                 });
                 act.last_checked = now;
                 act.state = state;
                 debug_log_verbose!("process_file {} — no new lines (find_resume: {}µs, read: {}µs)",
                     path, find_us, read_us);
-                return Ok(Vec::new());
+                Ok(Vec::new())
             }
             Some((bytes_read, last_line_len, last_line_hash)) => {
-                // Update cached file size: offset + bytes_read = last consumed position.
-                // File may have more trailing data, so use metadata only if needed for accuracy.
-                self.file_sizes.insert(path.to_string(), offset + bytes_read);
-
+                self.file_sizes.insert(path_owned.clone(), offset + bytes_read);
                 let cp = FileCheckpoint {
-                    file_path: path.to_string(),
+                    file_path: path_owned.clone(),
                     last_line_len,
                     last_line_hash,
                 };
-                self.checkpoints.insert(path.to_string(), cp);
-                self.dirty.insert(path.to_string());
-
-                // Promote to Active if was Idle
+                self.checkpoints.insert(path_owned.clone(), cp);
+                self.dirty.insert(path_owned.clone());
                 if state == FileState::Idle {
                     debug_log!("promote {} → Active ({} new lines)", path, line_count);
                 }
-                self.activity.insert(path.to_string(), FileActivity {
-                    state: FileState::Active,
-                    last_active: now,
-                    last_checked: now,
+                self.activity.insert(path_owned, FileActivity {
+                    state: FileState::Active, last_active: now, last_checked: now,
                 });
-
                 debug_log!("process_file {} — {} lines, {} bytes, {} events, Active | find_resume: {}µs, read: {}µs, total: {}µs",
                     path, line_count, bytes_read, events.len(),
                     find_us, read_us, t_total.elapsed().as_micros());
-
                 Ok(events)
             }
         }
     }
 
-    fn process_and_print(&mut self, path: &str, parser: &dyn LogParser) {
-        if !self.matches_filters(path) {
-            return;
-        }
-        match self.process_file(path, parser) {
+    fn process_and_print<P>(&mut self, path: &str, parser: &P)
+    where
+        P: LogParser + LogParserWithTs,
+    {
+        match self.process_file_with_ts(path, parser) {
             Ok(events) => {
-                for event in &events {
-                    self.sink.emit_event(event, self.pricing.as_ref());
+                let session_id = extract_session_id(path).unwrap_or_default();
+                for event in events {
+                    let ts_ms = parse_timestamp(&event.timestamp)
+                        .map(|dt| dt.and_utc().timestamp_millis())
+                        .unwrap_or_else(|| {
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as i64
+                        });
+
+                    let (usage, _ts) = event.into_usage_event();
+                    self.sink.emit_event(&usage, None);
+
+                    let op = DbOp::WriteEvent {
+                        ts_ms,
+                        message_id: usage.event_key,
+                        model: usage.model,
+                        session_id: session_id.clone(),
+                        source_file: usage.source_file,
+                        tokens: TokenFields {
+                            input_tokens: usage.input_tokens,
+                            output_tokens: usage.output_tokens,
+                            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                            cache_read_input_tokens: usage.cache_read_input_tokens,
+                        },
+                    };
+                    if self.db_tx.try_send(op).is_err() {
+                        debug_log!("writer channel full, dropping event");
+                    }
                 }
             }
             Err(e) => {
-                eprintln!("[clitrace] Error processing {}: {}", path, e);
+                eprintln!("[toki] Error processing {}: {}", path, e);
             }
         }
     }
 
-    /// Flush dirty checkpoints to DB in a single batch transaction.
+    /// Flush dirty checkpoints via writer thread.
     fn flush_dirty(&mut self) {
         if self.dirty.is_empty() {
             return;
@@ -672,13 +392,9 @@ impl TrackerEngine {
             .filter_map(|path| self.checkpoints.get(path).cloned())
             .collect();
         let count = batch.len();
-        let t = Instant::now();
-        if let Err(e) = self.db.flush_checkpoints(&batch) {
-            eprintln!("[clitrace] flush error: {}", e);
-            return;
-        }
+        let _ = self.db_tx.send(DbOp::FlushCheckpoints(batch));
         self.dirty.clear();
-        debug_log!("flush_dirty — {} checkpoints in {}µs", count, t.elapsed().as_micros());
+        debug_log!("flush_dirty — {} checkpoints sent to writer", count);
     }
 
     fn determine_offset(&self, path: &str) -> Result<u64, Box<dyn std::error::Error>> {
@@ -694,14 +410,17 @@ impl TrackerEngine {
     }
 
     /// Watch loop: receive file change events, process incrementally,
-    /// Watch loop: receive file change events, flush dirty checkpoints periodically.
+    /// flush dirty checkpoints periodically.
     /// Graceful shutdown: flushes remaining dirty checkpoints before exiting.
-    pub fn watch_loop(
+    pub fn watch_loop<P>(
         &mut self,
         event_rx: Receiver<String>,
         stop_rx: Receiver<()>,
-        parser: &dyn LogParser,
-    ) {
+        parser: &P,
+    )
+    where
+        P: LogParser + LogParserWithTs,
+    {
         let flush_tick = crossbeam_channel::tick(FLUSH_INTERVAL);
 
         loop {
@@ -756,22 +475,11 @@ fn merge_summaries(
             model,
             ..Default::default()
         });
-        gs.input_tokens += ls.input_tokens;
-        gs.cache_creation_input_tokens += ls.cache_creation_input_tokens;
-        gs.cache_read_input_tokens += ls.cache_read_input_tokens;
-        gs.output_tokens += ls.output_tokens;
-        gs.event_count += ls.event_count;
-    }
-}
-
-/// Merge thread-local grouped summaries into global grouped map.
-fn merge_grouped(
-    global: &mut HashMap<String, HashMap<String, ModelUsageSummary>>,
-    local: HashMap<String, HashMap<String, ModelUsageSummary>>,
-) {
-    for (bucket, local_models) in local {
-        let global_models = global.entry(bucket).or_insert_with(HashMap::new);
-        merge_summaries(global_models, local_models);
+        gs.input_tokens = gs.input_tokens.saturating_add(ls.input_tokens);
+        gs.cache_creation_input_tokens = gs.cache_creation_input_tokens.saturating_add(ls.cache_creation_input_tokens);
+        gs.cache_read_input_tokens = gs.cache_read_input_tokens.saturating_add(ls.cache_read_input_tokens);
+        gs.output_tokens = gs.output_tokens.saturating_add(ls.output_tokens);
+        gs.event_count = gs.event_count.saturating_add(ls.event_count);
     }
 }
 
@@ -805,42 +513,20 @@ where
     });
 }
 
-fn filter_active(filter: ReportFilter) -> bool {
-    filter.since.is_some() || filter.until.is_some()
-}
-
-fn filter_match(ts: NaiveDateTime, filter: ReportFilter) -> bool {
-    if let Some(since) = filter.since {
-        if ts < since {
-            return false;
-        }
-    }
-    if let Some(until) = filter.until {
-        if ts > until {
-            return false;
-        }
-    }
-    true
-}
-
 /// Extract the full session UUID from a file path.
 ///   Parent:   .../projects/<dir>/<UUID>.jsonl        → "<UUID>"
 ///   Subagent: .../<UUID>/subagents/agent-<id>.jsonl  → "<UUID>" (grandparent dir name)
 pub fn extract_session_id(path: &str) -> Option<String> {
-    let parts: Vec<&str> = path.rsplit('/').collect();
-    // Subagent: parts = ["agent-xxx.jsonl", "subagents", "<UUID>", ...]
-    if parts.len() >= 3 && parts[1] == "subagents" {
-        return Some(parts[2].to_string());
+    let mut parts = path.rsplit('/');
+    let filename = parts.next()?;
+    // Subagent: .../\<UUID>/subagents/agent-xxx.jsonl
+    if let Some(dir) = parts.next() {
+        if dir == "subagents" {
+            return parts.next().map(|s| s.to_string());
+        }
     }
     // Parent: filename without .jsonl
-    parts.first().map(|s| s.trim_end_matches(".jsonl").to_string())
-}
-
-/// Filter sessions by session_id prefix match.
-pub fn filter_sessions_by_id(sessions: Vec<crate::common::types::SessionGroup>, prefix: &str) -> Vec<crate::common::types::SessionGroup> {
-    sessions.into_iter()
-        .filter(|s| s.session_id.starts_with(prefix))
-        .collect()
+    Some(filename.trim_end_matches(".jsonl").to_string())
 }
 
 /// Extract project directory name from a file path (zero-alloc, returns &str slice).
@@ -854,60 +540,6 @@ pub fn extract_project_name(path: &str) -> Option<&str> {
     Some(&rest[..end])
 }
 
-/// Apply session and project filters to a list of sessions.
-fn apply_filters(
-    mut sessions: Vec<crate::common::types::SessionGroup>,
-    session_filter: Option<&str>,
-    project_filter: Option<&str>,
-) -> Vec<crate::common::types::SessionGroup> {
-    if let Some(prefix) = session_filter {
-        sessions = filter_sessions_by_id(sessions, prefix);
-    }
-    if let Some(project) = project_filter {
-        sessions.retain(|s| {
-            let path_str = s.parent_jsonl.to_string_lossy();
-            matches!(extract_project_name(&path_str), Some(name) if name.contains(project))
-        });
-    }
-    sessions
-}
-
-fn bucket_from_timestamp(ts: &str, group_by: ReportGroupBy, tz: Option<Tz>) -> Option<String> {
-    // Fast path: string slicing only valid for UTC (no timezone conversion needed)
-    if tz.is_none() && ts.len() >= 4 {
-        match group_by {
-            ReportGroupBy::Year => return Some(ts[0..4].to_string()),
-            ReportGroupBy::Month if ts.len() >= 7 => return Some(ts[0..7].to_string()),
-            ReportGroupBy::Date if ts.len() >= 10 => return Some(ts[0..10].to_string()),
-            ReportGroupBy::Hour if ts.len() >= 13 => {
-                let hour = &ts[0..13];
-                return Some(format!("{}:00", hour));
-            }
-            ReportGroupBy::Week { .. } => {}
-            _ => {}
-        }
-    }
-
-    let dt = parse_timestamp_with_tz(ts, tz)?;
-    Some(bucket_from_datetime(dt, group_by))
-}
-
-fn bucket_from_timestamp_filtered(
-    ts: &str,
-    group_by: ReportGroupBy,
-    filter: ReportFilter,
-) -> Option<String> {
-    if filter_active(filter) {
-        let utc = parse_timestamp(ts)?;
-        if !filter_match(utc, filter) {
-            return None;
-        }
-        let local = apply_tz(utc, filter.tz);
-        return Some(bucket_from_datetime(local, group_by));
-    }
-    bucket_from_timestamp(ts, group_by, filter.tz)
-}
-
 fn parse_timestamp(ts: &str) -> Option<NaiveDateTime> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(ts) {
         return Some(dt.naive_utc());
@@ -915,78 +547,10 @@ fn parse_timestamp(ts: &str) -> Option<NaiveDateTime> {
     NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%SZ").ok()
 }
 
-/// Parse timestamp and convert to target timezone (or UTC if None).
-fn parse_timestamp_with_tz(ts: &str, tz: Option<Tz>) -> Option<NaiveDateTime> {
-    let utc = parse_timestamp(ts)?;
-    Some(apply_tz(utc, tz))
-}
-
-/// Convert UTC NaiveDateTime to target timezone. Noop if tz is None.
-fn apply_tz(utc: NaiveDateTime, tz: Option<Tz>) -> NaiveDateTime {
-    match tz {
-        Some(tz) => chrono::Utc.from_utc_datetime(&utc).with_timezone(&tz).naive_local(),
-        None => utc,
-    }
-}
-
-fn bucket_from_datetime(ts: NaiveDateTime, group_by: ReportGroupBy) -> String {
-    let date = ts.date();
-    match group_by {
-        ReportGroupBy::Date => date.format("%Y-%m-%d").to_string(),
-        ReportGroupBy::Week { start_of_week } => {
-            let (week_year, week) = week_bucket(date, start_of_week);
-            format!("{:04}-W{:02}", week_year, week)
-        }
-        ReportGroupBy::Month => date.format("%Y-%m").to_string(),
-        ReportGroupBy::Year => format!("{:04}", date.year()),
-        ReportGroupBy::Hour => ts.format("%Y-%m-%dT%H:00").to_string(),
-    }
-}
-
-fn week_bucket(date: NaiveDate, start_of_week: Weekday) -> (i32, u32) {
-    let date_week_start = week_start(date, start_of_week);
-    let mut year = date_week_start.year();
-
-    let first_start = first_week_start(year, start_of_week);
-    if date_week_start < first_start {
-        year -= 1;
-    }
-    let first_start = first_week_start(year, start_of_week);
-    let days = date_week_start.signed_duration_since(first_start).num_days();
-    let week = (days / 7 + 1) as u32;
-    (year, week)
-}
-
-fn week_start(date: NaiveDate, start_of_week: Weekday) -> NaiveDate {
-    let date_idx = weekday_index(date.weekday());
-    let start_idx = weekday_index(start_of_week);
-    let delta = (7 + date_idx - start_idx) % 7;
-    date - chrono::Duration::days(delta as i64)
-}
-
-fn first_week_start(year: i32, start_of_week: Weekday) -> NaiveDate {
-    let jan1 = NaiveDate::from_ymd_opt(year, 1, 1).unwrap();
-    let delta = (weekday_index(start_of_week) - weekday_index(jan1.weekday()) + 7) % 7;
-    jan1 + chrono::Duration::days(delta as i64)
-}
-
-fn weekday_index(day: Weekday) -> i32 {
-    match day {
-        Weekday::Mon => 0,
-        Weekday::Tue => 1,
-        Weekday::Wed => 2,
-        Weekday::Thu => 3,
-        Weekday::Fri => 4,
-        Weekday::Sat => 5,
-        Weekday::Sun => 6,
-    }
-}
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::types::SessionGroup;
+    use crate::common::types::{SessionGroup, UsageEvent};
     use std::io::Write;
 
     struct TestParser;
@@ -1045,6 +609,43 @@ mod tests {
         }
     }
 
+    impl LogParserWithTs for TestParser {
+        fn parse_line_with_ts(&self, line: &str, source_file: &str) -> Option<crate::common::types::UsageEventWithTs> {
+            let v: serde_json::Value = serde_json::from_str(line).ok()?;
+            if v.get("type")?.as_str()? != "assistant" {
+                return None;
+            }
+            let msg = v.get("message")?;
+            let usage = msg.get("usage")?;
+            let ts = v.get("timestamp")?.as_str()?.to_string();
+            Some(crate::common::types::UsageEventWithTs {
+                event_key: format!("{}:{}", msg.get("id")?.as_str()?, &ts),
+                source_file: source_file.to_string(),
+                model: msg.get("model")?.as_str()?.to_string(),
+                input_tokens: usage.get("input_tokens")?.as_u64()?,
+                cache_creation_input_tokens: usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                cache_read_input_tokens: usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0),
+                output_tokens: usage.get("output_tokens")?.as_u64()?,
+                timestamp: ts,
+            })
+        }
+    }
+
+    /// Create a db_tx + drain thread that consumes all DbOps (handles FlushBulkRollups done signal).
+    fn test_db_channel() -> (crossbeam_channel::Sender<DbOp>, std::thread::JoinHandle<()>) {
+        let (db_tx, db_rx) = crossbeam_channel::bounded::<DbOp>(1024);
+        let handle = std::thread::spawn(move || {
+            while let Ok(op) = db_rx.recv() {
+                match op {
+                    DbOp::FlushBulkRollups(done_tx) => { let _ = done_tx.send(()); }
+                    DbOp::Shutdown => break,
+                    _ => {}
+                }
+            }
+        });
+        (db_tx, handle)
+    }
+
     fn make_assistant_line(id: &str, model: &str, input: u64, cc: u64, cr: u64, output: u64) -> String {
         format!(
             r#"{{"type":"assistant","message":{{"id":"{}","model":"{}","usage":{{"input_tokens":{},"cache_creation_input_tokens":{},"cache_read_input_tokens":{},"output_tokens":{}}}}},"timestamp":"2026-03-08T12:00:00Z"}}"#,
@@ -1056,8 +657,14 @@ mod tests {
     fn test_cold_start_single_session() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let db = Database::open(&db_path).unwrap();
-        let mut engine = TrackerEngine::new(db);
+        let db = crate::db::Database::open(&db_path).unwrap();
+        let checkpoints_loaded: HashMap<String, FileCheckpoint> = db.load_all_checkpoints()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|cp| (cp.file_path.clone(), cp))
+            .collect();
+        let (db_tx, _drain) = test_db_channel();
+        let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded, Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)));
 
         // Create test JSONL
         let projects_dir = dir.path().join("projects").join("test");
@@ -1086,8 +693,14 @@ mod tests {
     fn test_cold_start_with_subagent() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let db = Database::open(&db_path).unwrap();
-        let mut engine = TrackerEngine::new(db);
+        let db = crate::db::Database::open(&db_path).unwrap();
+        let checkpoints_loaded: HashMap<String, FileCheckpoint> = db.load_all_checkpoints()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|cp| (cp.file_path.clone(), cp))
+            .collect();
+        let (db_tx, _drain) = test_db_channel();
+        let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded, Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)));
 
         let projects_dir = dir.path().join("projects").join("test");
         std::fs::create_dir_all(&projects_dir).unwrap();
@@ -1117,8 +730,14 @@ mod tests {
     fn test_cold_start_multi_model() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let db = Database::open(&db_path).unwrap();
-        let mut engine = TrackerEngine::new(db);
+        let db = crate::db::Database::open(&db_path).unwrap();
+        let checkpoints_loaded: HashMap<String, FileCheckpoint> = db.load_all_checkpoints()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|cp| (cp.file_path.clone(), cp))
+            .collect();
+        let (db_tx, _drain) = test_db_channel();
+        let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded, Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)));
 
         let projects_dir = dir.path().join("projects").join("test");
         std::fs::create_dir_all(&projects_dir).unwrap();
@@ -1147,8 +766,14 @@ mod tests {
     fn test_cold_start_checkpoints_saved() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let db = Database::open(&db_path).unwrap();
-        let mut engine = TrackerEngine::new(db);
+        let db = crate::db::Database::open(&db_path).unwrap();
+        let checkpoints_loaded: HashMap<String, FileCheckpoint> = db.load_all_checkpoints()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|cp| (cp.file_path.clone(), cp))
+            .collect();
+        let (db_tx, _drain) = test_db_channel();
+        let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded, Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)));
 
         let projects_dir = dir.path().join("projects").join("test");
         std::fs::create_dir_all(&projects_dir).unwrap();
@@ -1172,8 +797,14 @@ mod tests {
     fn test_cold_start_incremental() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let db = Database::open(&db_path).unwrap();
-        let mut engine = TrackerEngine::new(db);
+        let db = crate::db::Database::open(&db_path).unwrap();
+        let checkpoints_loaded: HashMap<String, FileCheckpoint> = db.load_all_checkpoints()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|cp| (cp.file_path.clone(), cp))
+            .collect();
+        let (db_tx, _drain) = test_db_channel();
+        let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded, Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)));
 
         let projects_dir = dir.path().join("projects").join("test");
         std::fs::create_dir_all(&projects_dir).unwrap();
@@ -1203,8 +834,14 @@ mod tests {
     fn test_cold_start_empty() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        let db = Database::open(&db_path).unwrap();
-        let mut engine = TrackerEngine::new(db);
+        let db = crate::db::Database::open(&db_path).unwrap();
+        let checkpoints_loaded: HashMap<String, FileCheckpoint> = db.load_all_checkpoints()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|cp| (cp.file_path.clone(), cp))
+            .collect();
+        let (db_tx, _drain) = test_db_channel();
+        let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded, Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)));
 
         let parser = TestParser;
         let summaries = engine.cold_start(&parser, dir.path().to_str().unwrap()).unwrap();
@@ -1265,7 +902,7 @@ mod tests {
 
         // Bench DB upsert
         let db_path = dir.path().join("bench.db");
-        let db = Database::open(&db_path).unwrap();
+        let db = crate::db::Database::open(&db_path).unwrap();
         let start = Instant::now();
         for _ in 0..iterations {
             db.upsert_checkpoint(&cp).unwrap();
@@ -1273,8 +910,9 @@ mod tests {
         let db_us = start.elapsed().as_micros() / iterations as u128;
 
         // Bench full process_file (cold start + incremental)
-        let db2 = Database::open(&dir.path().join("bench2.db")).unwrap();
-        let mut engine = TrackerEngine::new(db2);
+        let _db2 = crate::db::Database::open(&dir.path().join("bench2.db")).unwrap();
+        let (db_tx2, _drain2) = test_db_channel();
+        let mut engine = TrackerEngine::new(db_tx2, HashMap::new(), Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)));
         let parser = TestParser;
 
         let start = Instant::now();
@@ -1292,10 +930,10 @@ mod tests {
             }
         }
         let start = Instant::now();
-        let events = engine.process_file(path_str, &parser).unwrap();
+        let events = engine.process_file_with_ts(path_str, &parser).unwrap();
         let incr_us = start.elapsed().as_micros();
 
-        println!("\n=== clitrace benchmark ===");
+        println!("\n=== toki benchmark ===");
         println!("File: {} lines, {} bytes ({} KB)", 500, file_size, file_size / 1024);
         println!();
         println!("Per-operation (avg of {} runs):", iterations);

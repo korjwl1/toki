@@ -17,7 +17,7 @@ pub struct HttpSink {
 
 impl HttpSink {
     pub fn new(url: String) -> Self {
-        eprintln!("[clitrace] HTTP sink: {}", url);
+        eprintln!("[toki] HTTP sink: {}", url);
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(HTTP_TIMEOUT)
             .timeout_read(HTTP_TIMEOUT)
@@ -30,7 +30,7 @@ impl HttpSink {
         let body = match serde_json::to_string(value) {
             Ok(b) => b,
             Err(e) => {
-                eprintln!("[clitrace] HTTP: serialization error: {}", e);
+                eprintln!("[toki] HTTP: serialization error: {}", e);
                 return;
             }
         };
@@ -39,7 +39,7 @@ impl HttpSink {
             .set("Content-Type", "application/json")
             .send_string(&body)
         {
-            eprintln!("[clitrace] HTTP sink error: {}", e);
+            eprintln!("[toki] HTTP sink error: {}", e);
         }
     }
 }
@@ -55,5 +55,9 @@ impl Sink for HttpSink {
 
     fn emit_event(&self, event: &UsageEvent, pricing: Option<&PricingTable>) {
         self.send(&json::event_to_json(event, pricing));
+    }
+
+    fn emit_list(&self, items: &[String], type_name: &str) {
+        self.send(&serde_json::json!({ "type": type_name, "items": items }));
     }
 }

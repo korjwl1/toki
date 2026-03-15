@@ -1,526 +1,329 @@
-# clitrace
+<p align="center">
+  <img src="assets/logo.png" alt="toki logo" width="160" />
+</p>
 
-Claude Code CLI의 JSONL 세션 로그를 파일 시스템 이벤트 기반으로 감시하여, 모델별 토큰 사용량을 실시간 추적하는 Rust 라이브러리 모듈.
+<h1 align="center">toki</h1>
 
-## Quick Start
+<p align="center">
+AI CLI 도구(Claude Code 등)의 JSONL 세션 로그를 실시간 감시하여 모델별 토큰 사용량을 추적하는 Rust 도구.<br>
+내장 TSDB에 이벤트와 시간별 rollup을 저장하고, 데몬/클라이언트 구조로 실시간 trace와 one-shot report를 모두 지원한다.
+</p>
 
-### 바이너리로 실행
-
-```bash
-cd module/clitrace
-cargo run --release -- trace
-```
-
-기본 설정으로 `~/.claude/projects/` 스캔 후 watch mode 진입.
-`trace` 모드는 동일 DB 경로 기준 단일 인스턴스만 허용한다.
-전체 재스캔이 필요하면 `--full-rescan`을 사용한다.
-
-```bash
-# 시작 시 일별 그룹핑으로 요약 출력
-cargo run --release -- trace --startup-group-by day
-
-# 시작 시 시간별 그룹핑 (체크포인트 필수, --full-rescan 불가)
-cargo run --release -- trace --startup-group-by hour
-```
-
-Trace 옵션:
-- `--startup-group-by hour|day|week|month|year`: cold start 시 시간 단위 그룹핑 요약
-  - `hour`는 기존 체크포인트가 있어야 사용 가능 (증분 데이터만 출력)
-  - `hour`는 `--full-rescan`과 함께 사용 불가
-- `--session-id <PREFIX>`: 세션 UUID 접두사로 필터링
-- `--project <NAME>`: 프로젝트 디렉토리 이름으로 필터링 (서브스트링 매치)
-
-### 글로벌 옵션
-
-- `--output-format table|json`: print sink의 출력 형식 (기본: table)
-- `--sink <SPEC>`: 출력 대상 (기본: print). 복수 지정 가능
-  - `print` — 터미널 출력 (`--output-format`에 따라 table/json)
-  - `uds://<path>` — Unix Domain Socket으로 NDJSON 전송
-  - `http://<url>` — HTTP POST로 JSON 전송 (5초 timeout)
-  - print 외 sink은 자동 JSON 출력
-- `--timezone <IANA>` / `-z <IANA>`: 타임존 지정 (기본: UTC)
-  - 예: `-z Asia/Seoul`, `-z US/Eastern`, `-z Europe/London`
-  - 버킷팅(일별/시간별 등)과 `--since`/`--until` 해석에 적용
-- `--no-cost`: 비용 계산 비활성화 (가격 fetch 스킵)
-
-### Report 모드 (one-shot)
-
-```bash
-cargo run --release -- report
-cargo run --release -- report --since 20260301
-cargo run --release -- report --since 20260301 --until 20260331
-cargo run --release -- report monthly
-cargo run --release -- report monthly --since 20260301
-cargo run --release -- report yearly
-cargo run --release -- report daily --since 20260301
-cargo run --release -- report daily --from-beginning
-cargo run --release -- report weekly --since 20260301 --start-of-week tue
-cargo run --release -- report hourly --since 20260301
-cargo run --release -- report hourly --from-beginning
-
-# 프로젝트별 필터링
-cargo run --release -- report --project clitrace
-cargo run --release -- report --project ddleague daily --since 20260301
-
-# 세션별 그룹핑/필터링
-cargo run --release -- report --group-by-session
-cargo run --release -- report --session-id 4de9291e
-
-# 타임존 지정 (KST 기준 일별 리포트)
-cargo run --release -- -z Asia/Seoul report daily --since 20260301
-
-# 비용 표시 없이 리포트
-cargo run --release -- --no-cost report
-```
-
-Report 옵션:
-- 서브커맨드 없이 실행하면 전체 총합 출력 (`--since`/`--until` 선택적)
-- 서브커맨드: `daily | weekly | monthly | yearly | hourly`
-  - `hourly`, `daily`, `weekly`는 `--since` 또는 `--from-beginning` 필수
-  - `monthly`, `yearly`는 제한 없음
-  - `--start-of-week`는 `weekly`에서만 사용 가능
-- `--since` (inclusive, UTC, `>=`): `YYYYMMDD` 또는 `YYYYMMDDhhmmss`
-  - `YYYYMMDD`는 해당 날짜의 `00:00:00` UTC로 해석
-- `--until` (inclusive, UTC, `<=`): `YYYYMMDD` 또는 `YYYYMMDDhhmmss`
-  - `YYYYMMDD`는 해당 날짜의 `23:59:59` UTC로 해석
-- `--from-beginning`: `--since` 없이 전체 데이터 그룹핑 허용
-- `--project <NAME>`: 프로젝트 디렉토리 이름으로 필터링 (서브스트링 매치)
-  - 예: `--project clitrace`는 `clitrace`가 포함된 프로젝트만 조회
-  - 예: `--project ddleague`는 `ddleague`, `ddleague-module`, `ddleague-module-clitrace` 등 모두 포함
-- `--session-id <PREFIX>`: 세션 UUID 접두사로 필터링
-- `--group-by-session`: 세션별로 그룹핑 (시간 기반 서브커맨드와 함께 사용 불가)
-
-### 비용 계산 (Cost)
-
-기본적으로 모든 출력에 모델별 추정 비용(USD)이 표시된다.
-가격 데이터는 [LiteLLM](https://github.com/BerriAI/litellm)의 커뮤니티 유지 가격표에서 가져온다.
-
-- **최초 실행**: LiteLLM JSON 다운로드 → Claude 모델만 추출 → DB에 캐시
-- **이후 실행**: HTTP ETag 조건부 요청 → 변경 없으면 304 응답 (바디 없이 ~50ms)
-- **오프라인**: 캐시된 가격 데이터로 동작, 캐시 없으면 Cost 컬럼 생략
-- **`--no-cost`**: 가격 fetch 자체를 스킵, Cost 컬럼 미표시
-- **`--full-rescan`**: 체크포인트만 초기화, 가격 캐시는 보존
-
-가격은 현재 시점 기준으로 전체 데이터에 일괄 적용된다 (시간대별 역사적 가격 추적 없음).
-API key 사용자에게는 실제 청구 금액에 가깝고, Max Plan 구독자에게는 참고용 추정치이다.
-
-### 출력 형식 (`--output-format`) & Sink (`--sink`)
-
-```bash
-# 기본값: 테이블 출력 (print sink)
-cargo run --release -- report weekly --from-beginning
-
-# JSON 출력 (print sink)
-cargo run --release -- report --output-format json weekly --from-beginning
-
-# trace에서도 사용 가능 (이벤트가 NDJSON으로 출력)
-cargo run --release -- trace --output-format json
-
-# UDS 전송 (자동 JSON)
-cargo run --release -- trace --sink uds:///tmp/clitrace.sock
-
-# HTTP 전송 (자동 JSON, 5초 timeout)
-cargo run --release -- trace --sink http://localhost:8080/v1/events
-
-# 터미널 + HTTP 동시 출력 (MultiSink)
-cargo run --release -- trace --sink print --sink http://localhost:8080/events
-
-# report에서도 sink 사용 가능
-cargo run --release -- report --sink http://localhost:8080/report
-```
-
-`--output-format`은 print sink에만 적용되며, UDS/HTTP sink은 항상 JSON으로 전송한다.
-`--sink`과 `--output-format`은 글로벌 옵션으로, `report`/`trace` 앞이나 뒤 어디에나 위치할 수 있다.
-
-### 환경변수 오버라이드
-
-```bash
-CLITRACE_CLAUDE_ROOT=/path/to/custom/.claude cargo run --release -- trace
-CLITRACE_DB_PATH=/path/to/custom.db cargo run --release -- trace
-CLITRACE_DEBUG=1 cargo run --release -- trace   # 디버그 로그 (상태 전이, 이벤트, 타이밍)
-CLITRACE_DEBUG=2 cargo run --release -- trace   # 레벨 1 + verbose (size unchanged, no new lines 스킵 로그)
-```
-
-### 라이브러리로 사용
-
-```toml
-# Cargo.toml
-[dependencies]
-clitrace = { path = "../module/clitrace" }
-```
-
-```rust
-use clitrace::{Config, start};
-use clitrace::sink::{PrintSink, OutputFormat};
-
-fn main() {
-    let config = Config::new()
-        .with_claude_root("/custom/path/.claude".to_string());
-
-    let sink = Box::new(PrintSink::new(OutputFormat::Table));
-    let handle = start(config, None, sink, false).expect("Failed to start clitrace");
-
-    // ... 호스트 애플리케이션 로직 ...
-
-    handle.stop(); // 또는 handle이 drop되면 자동 종료
-}
-```
-
-## 출력 예시
-
-### Table (기본)
-
-```
-[clitrace] Token Usage Summary
-┌───────────────────────────┬─────────┬─────────┬────────────┬──────────────┬──────────────┬────────┬─────────┐
-│ Model                     ┆ Input   ┆ Output  ┆ Cache      ┆ Cache        ┆ Total        ┆ Events ┆ Cost    │
-│                           ┆         ┆         ┆ Create     ┆ Read         ┆ Tokens       ┆        ┆ (USD)   │
-╞═══════════════════════════╪═════════╪═════════╪════════════╪══════════════╪══════════════╪════════╪═════════╡
-│ claude-opus-4-6           ┆ 1,234   ┆ 4,321   ┆ 56,789     ┆ 98,765       ┆ 161,109      ┆ 42     ┆ $1.21   │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┤
-│ claude-haiku-4-5-20251001 ┆ 567     ┆ 2,100   ┆ 12,345     ┆ 34,567       ┆ 49,579       ┆ 18     ┆ $0.0234 │
-├╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌┼╌╌╌╌╌╌╌╌╌┤
-│ Total                     ┆ 1,801   ┆ 6,421   ┆ 69,134     ┆ 133,332      ┆ 210,688      ┆ 60     ┆ $1.23   │
-└───────────────────────────┴─────────┴─────────┴────────────┴──────────────┴──────────────┴────────┴─────────┘
-```
-
-### JSON (`--output-format json`)
-
-Summary:
-```json
-{
-  "type": "summary",
-  "data": [
-    {
-      "model": "claude-opus-4-6",
-      "input_tokens": 1234,
-      "output_tokens": 4321,
-      "cache_creation_input_tokens": 56789,
-      "cache_read_input_tokens": 98765,
-      "total_tokens": 161109,
-      "events": 42,
-      "cost_usd": 1.2345
-    }
-  ]
-}
-```
-
-Grouped (daily, weekly, ...):
-```json
-{
-  "type": "daily",
-  "data": [
-    {
-      "period": "2026-03-01",
-      "usage_per_models": [
-        {
-          "model": "claude-opus-4-6",
-          "input_tokens": 1234,
-          "output_tokens": 4321,
-          "cache_creation_input_tokens": 56789,
-          "cache_read_input_tokens": 98765,
-          "total_tokens": 161109,
-          "events": 42,
-          "cost_usd": 1.2345
-        }
-      ]
-    }
-  ]
-}
-```
-
-### Watch Mode (실시간 이벤트)
-
-Table:
-```
-[clitrace] claude-opus-4-6 | session.jsonl | in:3 cc:5139 cr:9631 out:14 | $0.0112
-```
-
-JSON (NDJSON, 한 줄씩):
-```json
-{"type":"event","data":{"model":"claude-opus-4-6","source":"4de9291e","input_tokens":3,"output_tokens":14,"cache_creation_input_tokens":5139,"cache_read_input_tokens":9631,"cost_usd":0.0112}}
-```
+<p align="center">
+<sub><b>toki</b> = <b>to</b>ken <b>i</b>nspector. 발음이 토끼(rabbit)와 비슷하고, 토끼의 빠른 이미지는 이 도구의 성능 철학과 잘 어울린다.</sub>
+</p>
 
 ## Architecture
 
-### Thread Model
+Docker처럼 데몬/클라이언트 구조로 동작한다:
 
-```mermaid
-flowchart TB
-    subgraph Host["Host Application / main.rs"]
-        start["clitrace::start(config)"]
-        handle["Handle"]
-        stop["handle.stop()"]
-        start --> handle
-        handle -.-> stop
-    end
-
-    start -->|spawns| NT
-    start -->|spawns| WT
-
-    subgraph NT["notify thread (FSEvents)"]
-        fsevents["macOS FSEvents"]
-        callback["on_event callback"]
-        fsevents --> callback
-    end
-
-    subgraph WT["worker thread"]
-        loop["select! loop"]
-        recv["event_rx"]
-        process["process_file()"]
-        poll["backup poll (glob)"]
-        db_write["db.upsert_checkpoint()"]
-        loop --> recv
-        recv -->|"Ok(path)"| process
-        process --> db_write
-        loop -->|"default(30s)"| poll
-    end
-
-    callback -->|"tx.send(path)"| recv
-
-    subgraph DB["redb (clitrace.db)"]
-        checkpoints["checkpoints table"]
-        settings["settings table"]
-    end
-
-    db_write --> checkpoints
-    poll --> process
-
-    stop -->|"stop_tx.send()"| loop
+```
+toki daemon start     # 항상 실행 (= dockerd)
+toki daemon restart   # 설정 변경 후 재시작
+toki daemon reset     # DB 전체 삭제 + 초기화
+toki trace            # 실시간 스트림 클라이언트 (= docker logs -f)
+toki report           # TSDB 조회 클라이언트 (= docker ps)
 ```
 
-### Cold Start 병렬 처리
+- **daemon**: 파일 감시 + TSDB 저장. 항상 실행되어야 하며, trace 클라이언트가 없을 때는 Sink 오버헤드 0.
+- **trace**: 데몬에 UDS로 연결하여 실시간 이벤트 스트림 수신. print/uds/http 모든 sink 지원.
+- **report**: 데몬에 UDS로 쿼리 전송 → TSDB 조회 결과 수신. 데몬이 실행 중이어야 사용 가능하다.
 
-```mermaid
-flowchart LR
-    discover["discover_sessions()"] --> sessions["SessionGroup[]"]
+## Build from Source
 
-    sessions --> scope["std::thread::scope"]
-
-    subgraph scope["Scoped Threads (semaphore = num_cpus)"]
-        direction TB
-        s1["Session A"]
-        s2["Session B"]
-        s3["Session C"]
-
-        subgraph s1["Session A"]
-            p1["parent.jsonl"]
-            sub1["agent-1.jsonl"]
-            sub2["agent-2.jsonl"]
-        end
-
-        subgraph s2["Session B"]
-            p2["parent.jsonl"]
-        end
-
-        subgraph s3["Session C"]
-            p3["parent.jsonl"]
-            sub3["agent-3.jsonl"]
-        end
-    end
-
-    scope --> sink["sink.emit_summary() / sink.emit_grouped()"]
-    scope --> flush2["flush_checkpoints()"]
+```bash
+cargo build --release
+# 바이너리: target/release/toki
+# PATH에 추가하거나 직접 실행
 ```
 
-### Active/Idle 파일 분류 & 체크포인트
+## Quick Start
 
-macOS FSEvents가 디렉토리 내 파일 하나가 변해도 같은 디렉토리의 모든 파일에 이벤트를 발생시키므로, 파일별 active/idle 상태를 추적하여 불필요한 처리를 최소화한다.
+```bash
+# 1. 데몬 시작 (foreground, Ctrl+C으로 종료)
+toki daemon start
 
-```mermaid
-flowchart TD
-    start2["process_file(path)"] --> state{"FileActivity\n존재?"}
+# 2. 다른 터미널에서 실시간 이벤트 스트림
+toki trace
 
-    state -->|No| new_active["새 파일 → Active"]
-    state -->|Yes| idle_check{"now - last_active\n> 15s?"}
+# 3. 리포트 조회 (TSDB에서 즉시 조회)
+toki report
+toki report daily --since 20260301
+toki report monthly
 
-    idle_check -->|Yes| demote["Active → Idle 전환"]
-    idle_check -->|No| keep["상태 유지"]
-
-    new_active --> cooldown
-    demote --> cooldown
-    keep --> cooldown
-
-    cooldown{"쿨다운 체크\nActive: 150ms\nIdle: 500ms"} -->|"too soon"| skip_cd["즉시 return"]
-    cooldown -->|"passed"| size_check{"stat()\nsize 변화?"}
-
-    size_check -->|No| skip["스킵 (stat only)"]
-    size_check -->|Yes| find["find_resume_offset()\n+ process_lines_streaming()"]
-
-    find --> new_lines{"새 줄\n있음?"}
-
-    new_lines -->|No| skip2["상태 유지, return"]
-    new_lines -->|Yes| parse["parse + checkpoint"]
-
-    parse --> promote["→ Active 승격\n(Idle이었으면 promote 로그)"]
+# 4. PromQL 스타일 쿼리
+toki report query 'usage{model="claude-opus-4-6"}[1h] by (model)'
+toki report query 'sessions{project="myapp"}'
 ```
 
-| 상수 | 값 | 역할 |
-|------|----|------|
-| `ACTIVE_COOLDOWN` | 150ms | Active 파일 재처리 최소 간격 |
-| `IDLE_COOLDOWN` | 500ms | Idle 파일 stat() 최소 간격 |
-| `IDLE_TRANSITION` | 15s | 새 줄 없이 경과 시 Idle로 전환 |
+## Daemon
 
-**파일 크기 기반 fast skip**:
-- watch 이벤트 수신 시 `stat()`으로 파일 크기만 확인 (파일 open/read 없음)
-- 크기 변화 없으면 즉시 스킵 (~1-5µs vs 기존 ~150-300µs)
-- JSONL 특성상 새 줄 추가 = 크기 증가, compaction = 크기 감소이므로 false negative 없음
+`daemon`은 항상 실행되는 서버 프로세스다. 시작 시 전체 세션 파일을 스캔(cold start)하여 TSDB를 구축하고, 이후 FSEvents로 파일 변경을 감시하며 새 이벤트를 실시간 수집한다.
 
-**역순 스캔 알고리즘**:
-- 파일 끝에서 4KB 청크 단위로 역순 읽기
-- 라인 길이 pre-filter (O(1) 정수 비교, ~85% 후보 제거)
-- 길이 일치 시에만 xxHash3-64 비교 (30GB/s)
-- 청크 경계를 넘는 라인은 fragment 누적으로 처리
-- Compaction으로 바이트 위치가 변해도 라인 해시로 복구
-
-### 데이터 흐름
-
-```mermaid
-flowchart LR
-    subgraph Source["~/.claude/projects/"]
-        jsonl1["UUID.jsonl"]
-        jsonl2["UUID/subagents/agent-*.jsonl"]
-    end
-
-    subgraph Parser["ClaudeCodeParser"]
-        filter["type == assistant"]
-        extract["4종 토큰 추출"]
-    end
-
-    subgraph Storage["redb"]
-        cp["checkpoints\nfile_path → bincode"]
-        st["settings\nkey → value\n(pricing_data, pricing_etag)"]
-    end
-
-    subgraph Pricing["Pricing"]
-        litellm["LiteLLM JSON\n(GitHub)"]
-        ptable["PricingTable"]
-    end
-
-    jsonl1 --> filter
-    jsonl2 --> filter
-    filter --> extract
-    extract --> event["UsageEvent"]
-    event --> summary["ModelUsageSummary"]
-    event --> cp
-    litellm -->|"ETag caching"| st
-    st --> ptable
-    ptable -->|"cost_usd"| summary
-
-    subgraph Sink["Sink (출력)"]
-        print["PrintSink\n(table/json → stdout)"]
-        uds["UdsSink\n(NDJSON → UDS)"]
-        http["HttpSink\n(JSON POST)"]
-    end
-
-    summary --> print
-    summary --> uds
-    summary --> http
+```bash
+toki daemon start       # 데몬 시작 (foreground)
+toki daemon stop        # 데몬 중지
+toki daemon restart     # 중지 + 재시작 (설정 변경 반영)
+toki daemon status      # 실행 상태 확인
+toki daemon reset       # DB 전체 삭제 + 초기화
 ```
 
-## Data Model
+- 데몬 설정(소켓 경로, Claude Code root 등)은 `toki settings`에서 관리
+- PID 파일: `~/.config/toki/daemon.pid`
+- 동일 DB 경로 기준 단일 인스턴스만 허용 (file lock)
+- DB 초기화가 필요하면 `daemon reset` 후 `daemon start`
 
-### UsageEvent
+## Trace (Client)
 
-| 필드 | 타입 | 설명 |
+`trace`는 실행 중인 데몬에 UDS로 연결하여 실시간 이벤트를 스트림으로 수신하는 클라이언트 명령이다. 데몬에 trace 클라이언트가 연결되어 있지 않으면 Sink 처리가 완전히 비활성화되어 리소스 소모가 없다(zero overhead).
+
+```bash
+toki trace
+```
+
+- 데몬이 실행 중이어야 함 (`toki daemon start` 먼저)
+- 복수 클라이언트 동시 연결 지원 (fan-out)
+- 모든 sink 타입 지원: `--sink print`, `--sink uds://...`, `--sink http://...`
+
+## Report (One-Shot)
+
+`report`는 TSDB에 저장된 데이터를 즉시 조회한다. 데몬이 실행 중이어야 사용 가능하다 (`toki daemon start` 먼저).
+
+```bash
+# 전체 요약
+toki report
+toki report --since 20260301
+toki report --since 20260301 --until 20260331
+
+# 시간별 그룹핑
+toki report daily --since 20260301
+toki report weekly --since 20260301 --start-of-week tue
+toki report monthly
+toki report yearly
+toki report hourly --from-beginning
+
+# 세션별 그룹핑
+toki report --group-by-session
+
+# 프로젝트/세션 필터
+toki report --project toki
+toki report --session-id 4de9291e
+toki report daily --since 20260301 --session-id 4de9
+toki report monthly --project myapp
+
+# PromQL 스타일 쿼리
+toki report query 'usage{model="claude-opus-4-6"}[1h] by (model)'
+toki report query 'usage{session="4de9", since="20260301"} by (session)'
+toki report query 'sessions{project="myapp"}'
+toki report query 'projects'
+
+# 타임존 지정
+toki -z Asia/Seoul report daily --since 20260301
+
+# 비용 표시 없이
+toki --no-cost report
+```
+
+| 옵션 | 설명 |
+|------|------|
+| 서브커맨드 없음 | 전체 총합 (`--since`/`--until` 선택적) |
+| `daily\|weekly\|monthly\|yearly\|hourly` | 시간별 그룹핑 |
+| `query '<PROMQL>'` | PromQL 스타일 자유 쿼리 |
+| `--since YYYYMMDD[hhmmss]` | 시작 시점 (inclusive, `>=`) |
+| `--until YYYYMMDD[hhmmss]` | 종료 시점 (inclusive, `<=`) |
+| `--from-beginning` | `--since` 없이 전체 그룹핑 허용 |
+| `--group-by-session` | 세션별 그룹핑 (시간 서브커맨드와 동시 사용 불가) |
+| `--session-id <PREFIX>` | 세션 UUID 접두사 필터 |
+| `--project <NAME>` | 프로젝트 디렉토리 서브스트링 필터 |
+| `--start-of-week mon\|tue\|...\|sun` | `weekly`에서만 사용 |
+
+### Query 문법
+
+PromQL에서 영감을 받은 쿼리 문법:
+
+```
+metric{filters}[bucket] by (dimensions)
+```
+
+| 요소 | 설명 | 예시 |
 |------|------|------|
-| `event_key` | String | `{message.id}:{timestamp}` |
-| `source_file` | String | 원본 JSONL 파일 경로 |
-| `model` | String | `claude-opus-4-6` 등 |
-| `input_tokens` | u64 | 캐시 미적용 입력 토큰 |
-| `cache_creation_input_tokens` | u64 | 캐시 생성 입력 토큰 |
-| `cache_read_input_tokens` | u64 | 캐시 읽기 입력 토큰 |
-| `output_tokens` | u64 | 출력 토큰 |
+| metric | `usage`, `sessions`, `projects` | `usage` |
+| filters | `key="value"` 쌍, `,`로 구분 | `{model="claude-opus-4-6", since="20260301"}` |
+| bucket | 시간 버킷 (s/m/h/d/w) | `[1h]`, `[5m]`, `[1d]` |
+| dimensions | 그룹 기준 (model/session/project) | `by (model, session)` |
 
-### FileCheckpoint
+필터 키: `model`, `session`, `project`, `since`, `until`
 
-| 필드 | 타입 | 설명 |
-|------|------|------|
-| `file_path` | String | JSONL 파일 절대 경로 (key) |
-| `last_line_len` | u64 | 마지막 처리 줄의 바이트 길이 (pre-filter용) |
-| `last_line_hash` | u64 | 마지막 처리 줄의 xxHash3-64 해시 |
+## Settings
 
-### Config
+`settings`는 cursive TUI로 설정 페이지를 연다. 설정은 `~/.config/toki/settings.json` 파일에 저장된다.
 
-| 필드 | 타입 | 기본값 | 설명 |
-|------|------|--------|------|
-| `claude_code_root` | String | `~/.claude` | 루트 디렉토리 |
-| `db_path` | PathBuf | `~/.config/clitrace/clitrace.db` | DB 파일 경로 |
-| `full_rescan` | bool | false | 시작 시 체크포인트 초기화 |
-| `session_filter` | Option\<String\> | None | 세션 UUID 접두사 필터 |
-| `project_filter` | Option\<String\> | None | 프로젝트 이름 서브스트링 필터 |
-| `tz` | Option\<Tz\> | None | 타임존 (IANA 이름, 버킷팅/필터에 적용) |
+```bash
+toki settings                              # TUI 열기
+toki settings set claude_code_root /path   # 개별 설정 변경
+toki settings get timezone                 # 설정 조회
+toki settings list                         # 전체 설정 출력
+```
 
-설정 우선순위: **환경변수** > **DB settings 테이블** > **기본값**
+데몬 영향 설정(`claude_code_root`, `daemon_sock`, `retention_days`, `rollup_retention_days`) 변경 시 데몬 재시작 여부를 묻는다.
+
+| 설정 항목 | 설명 | 기본값 |
+|-----------|------|--------|
+| Claude Code Root | Claude Code 루트 디렉토리 | `~/.claude` |
+| Daemon Socket | 데몬 UDS 소켓 경로 | `~/.config/toki/daemon.sock` |
+| Timezone | IANA 타임존 (빈값=UTC) | (없음) |
+| Output Format | 기본 출력 형식 | `table` |
+| Start of Week | 주간 리포트 시작 요일 | `mon` |
+| No Cost | 비용 계산 비활성화 | `false` |
+| Retention Days | 이벤트 보존 기간 (0=무제한) | `0` |
+| Rollup Retention Days | Rollup 보존 기간 (0=무제한) | `0` |
+
+설정 우선순위: **CLI 인자 > 설정 파일 (settings.json) > 기본값** (환경변수 미사용)
+
+## Client Options (trace / report)
+
+`trace`와 `report` 명령에서만 사용 가능한 옵션. 데몬에는 영향 없음 (데몬 설정은 `toki settings`로 관리).
+
+| 옵션 | 설명 |
+|------|------|
+| `--output-format table\|json` | 출력 형식 오버라이드 |
+| `--sink <SPEC>` | 출력 대상, 복수 지정 가능 |
+| `--timezone <IANA>` / `-z` | 타임존 오버라이드 |
+| `--no-cost` | 비용 계산 비활성화 오버라이드 |
+
+### Sink 종류
+
+| Sink | 설명 |
+|------|------|
+| `print` (기본) | 터미널 출력 (`--output-format`에 따라 table/json) |
+| `uds://<path>` | Unix Domain Socket으로 NDJSON 전송 |
+| `http://<url>` | HTTP POST로 JSON 전송 (5초 timeout) |
+
+```bash
+# 터미널 + HTTP 동시 출력
+toki trace --sink print --sink http://localhost:8080/events
+```
+
+## Cost Calculation
+
+모든 출력에 모델별 추정 비용(USD)이 표시된다.
+가격 데이터는 [LiteLLM](https://github.com/BerriAI/litellm) 커뮤니티 가격표에서 가져온다.
+
+- **최초 실행**: LiteLLM JSON 다운로드 → Claude 모델 추출 → 파일 캐시 (`~/.config/toki/pricing.json`)
+- **이후 실행**: HTTP ETag 조건부 요청 → 변경 없으면 304 (바디 없이 ~50ms)
+- **오프라인**: 캐시된 데이터로 동작, 캐시 없으면 Cost 컬럼 생략
+- **`--no-cost`**: 가격 fetch 스킵
+
+## Environment Variables
+
+| 변수 | 설명 | 기본값 |
+|------|------|--------|
+| `TOKI_DEBUG` | 디버그 로그 (1=normal, 2=verbose) | 0 |
+
+> 모든 설정은 `toki settings` (TUI 또는 `set/get/list`)로 관리한다. 환경변수는 디버그 로그에만 사용.
 
 ## Project Structure
 
 ```
-module/clitrace/
 ├── Cargo.toml
-├── README.md
-├── src/
-│   ├── lib.rs                          # Public API: start(), Handle, Config
-│   ├── main.rs                         # 참조 바이너리 (Ctrl+C 핸들링)
-│   ├── config.rs                       # Config + 환경변수/DB 우선순위
-│   ├── db.rs                           # redb 래퍼 (checkpoints + settings)
-│   ├── engine.rs                       # TrackerEngine: cold_start + watch_loop
-│   ├── pricing.rs                      # LiteLLM 가격 fetch, ETag 캐싱, 비용 계산
-│   ├── checkpoint.rs                   # 역순 라인 스캔, xxHash3 매칭, JSON 완성도 검사
-│   ├── common/
-│   │   ├── mod.rs
-│   │   └── types.rs                    # UsageEvent, FileCheckpoint, LogParser trait
-│   ├── sink/                           # 출력 추상화 (Sink trait)
-│   │   ├── mod.rs                      # Sink trait, MultiSink, create_sinks()
-│   │   ├── json.rs                     # 공통 JSON 직렬화 (3개 sink 공유)
-│   │   ├── print.rs                    # PrintSink: table/json → stdout
-│   │   ├── uds.rs                      # UdsSink: NDJSON over Unix Domain Socket
-│   │   └── http.rs                     # HttpSink: JSON POST (5s timeout)
-│   ├── providers/
-│   │   ├── mod.rs
-│   │   ├── claude_code/
-│   │   │   ├── mod.rs
-│   │   │   └── parser.rs              # JSONL 파싱 + 세션 디스커버리
-│   │   ├── gemini/
-│   │   │   └── mod.rs                 # TODO
-│   │   └── codex/
-│   │       └── mod.rs                 # TODO
-│   └── platform/
-│       ├── mod.rs                     # create_watcher(), watch_directory()
-│       ├── macos/mod.rs               # macOS 기본 경로
-│       ├── windows/mod.rs             # TODO
-│       └── linux/mod.rs               # TODO
-└── tests/                             # 68+ unit tests (cargo test)
+├── README.md                              # 이 파일
+├── assets/
+│   └── logo.png                           # 프로젝트 로고
+├── docs/
+│   ├── DESIGN.md                          # 아키텍처 및 내부 설계
+│   ├── USAGE.md                           # 상세 사용법 및 출력 형식
+│   └── claude-code-jsonl-format.md        # Claude Code JSONL 구조 참고
+├── specs/
+│   └── constitution.md                    # 프로젝트 원칙 (Constitution)
+├── benches/                               # 벤치마크 (benchmark.py, COMPARISON.md)
+└── src/
+    ├── lib.rs                             # Public API: start(), Handle
+    ├── main.rs                            # CLI 바이너리 (clap)
+    ├── config.rs                          # Config + 파일 기반 설정 (settings.json)
+    ├── db.rs                              # fjall 래퍼 (7 keyspaces)
+    ├── engine.rs                          # TrackerEngine: cold_start + watch_loop
+    ├── writer.rs                          # DB writer thread (DbOp channel)
+    ├── query.rs                           # TSDB 쿼리 (report용)
+    ├── query_parser.rs                    # PromQL 스타일 쿼리 파서
+    ├── retention.rs                       # 데이터 보존 정책 (자동 삭제)
+    ├── checkpoint.rs                      # 역순 라인 스캔, xxHash3 매칭
+    ├── pricing.rs                         # LiteLLM 가격 fetch, ETag 캐싱
+    ├── settings.rs                        # cursive TUI 설정 페이지
+    ├── common/
+    │   └── types.rs                       # 공통 타입, trait 정의
+    ├── daemon/                            # 데몬 서버 컴포넌트
+    │   ├── mod.rs                         # default_sock_path, stop/status
+    │   ├── broadcast.rs                   # BroadcastSink (zero overhead fan-out)
+    │   ├── listener.rs                    # UDS accept loop
+    │   └── pidfile.rs                     # PID 파일 관리
+    ├── sink/                              # 출력 추상화 (Sink trait)
+    │   ├── mod.rs                         # Sink trait, MultiSink
+    │   ├── json.rs                        # JSON 직렬화 (공용)
+    │   ├── print.rs                       # PrintSink (table/json → stdout)
+    │   ├── uds.rs                         # UdsSink (NDJSON → UDS)
+    │   └── http.rs                        # HttpSink (JSON POST)
+    ├── providers/
+    │   └── claude_code/parser.rs          # JSONL 파싱 + 세션 디스커버리
+    └── platform/
+        └── macos/mod.rs                   # macOS FSEvents 감시
 ```
+
+## Performance
+
+ccusage (Node.js), zzusage (Zig)와의 벤치마크 비교. 동일 데이터, `sudo purge`로 디스크 캐시 초기화 후 측정.
+
+### Cold Start (전체 파일 색인)
+
+toki는 파싱과 동시에 TSDB에 색인까지 하면서도 ccusage보다 14~21배 빠르다.
+zzusage(Zig)와는 거의 동일한 속도이지만, zzusage는 DB 저장을 하지 않는다.
+
+| 데이터 | toki | ccusage | zzusage | vs ccusage | vs zzusage |
+|--------|------|---------|---------|------------|------------|
+| 100MB | 0.11s | 2.37s | 0.12s | **21x** | 1.0x |
+| 500MB | 0.39s | 6.05s | 0.35s | **16x** | 0.9x |
+| 1GB | 0.78s | 11.07s | 0.65s | **14x** | 0.8x |
+| 2GB | 1.54s | 21.73s | 1.22s | **14x** | 0.8x |
+
+메모리 사용량:
+
+| 데이터 | toki | ccusage | zzusage |
+|--------|------|---------|---------|
+| 500MB | 83MB | 126MB | 613MB |
+| 2GB | 161MB | 126MB | 2,311MB |
+
+- toki: 파일별 스트리밍 처리, mmap zero-copy
+- ccusage: Node.js 힙 고정 (~126MB), 순차 처리 후 GC
+- zzusage: 전체 이벤트를 메모리에 적재, 데이터 크기에 비례하여 폭증
+
+### Report (색인 후 조회)
+
+toki는 daemon이 TSDB에 데이터를 유지하므로 report 시 파일을 다시 읽지 않는다.
+ccusage/zzusage는 매번 전체 파일을 처음부터 다시 읽어야 한다.
+
+| 데이터 | toki | ccusage | zzusage | vs ccusage | vs zzusage |
+|--------|------|---------|---------|------------|------------|
+| 100MB | 0.013s | 2.37s | 0.12s | **182x** | **9x** |
+| 500MB | 0.013s | 6.05s | 0.35s | **465x** | **27x** |
+| 1GB | 0.013s | 11.07s | 0.65s | **851x** | **50x** |
+| 2GB | 0.013s | 21.73s | 1.22s | **1,672x** | **94x** |
+
+toki report는 데이터 크기와 무관하게 **~13ms 고정** (UDS 쿼리 + TSDB rollup 조회).
+메모리 사용량 ~5MB, CPU 사용률 거의 0%.
+
+> 측정 환경: Apple M1 MacBook Air (8GB RAM), macOS, 절전 모드 off
+> 벤치마크 실행: `sudo -v && python3 benches/benchmark.py run --purge --tool all`
 
 ## Tech Stack
 
 | 용도 | 선택 | 근거 |
 |------|------|------|
-| DB | redb 2.x | Pure Rust, C 의존성 없음, key-value에 적합 |
+| DB | fjall 3.x | Pure Rust LSM-tree, TSDB keyspace 구조에 적합 |
 | 동시성 | std::thread + crossbeam-channel | 런타임 충돌 없음, 라이브러리 안전 |
+| 병렬 스캔 | rayon | cold start 세션 파일 병렬 처리 |
 | 파일 감시 | notify 6.x | macOS FSEvents 자동 사용 |
-| 직렬화 | bincode 1.x (checkpoint), serde_json (JSONL) | 바이너리 최소 오버헤드 |
-| 해시 | xxhash-rust 0.8 (xxh3) | 체크포인트 줄 식별 (30GB/s, 비암호화) |
-| HTTP | ureq 2.x | 동기 HTTP client, ETag 조건부 요청 |
-| 테이블 출력 | comfy-table 7.1 | Unicode 테이블 렌더링 |
-
-## JSONL 구조 참고
-
-Claude Code는 `~/.claude/projects/<encoded-path>/` 하위에 세션 로그를 저장한다.
-
-```
-~/.claude/projects/-Users-user-Documents-project/
-├── 4de9291e-061e-414a-85cb-de615826aded.jsonl        # 부모 세션
-├── 4de9291e-061e-414a-85cb-de615826aded/
-│   └── subagents/
-│       └── agent-aed1da92cc2e4e9e7.jsonl             # 서브에이전트
-└── db7cd31e-fdb1-4767-a6a2-f2f3dc68a74b.jsonl        # 다른 세션
-```
-
-JSONL 줄 타입:
-- `file-history-snapshot` — 무시
-- `user` — 무시
-- **`assistant`** — 파싱 대상 (`message.usage`에 4종 토큰)
-
-서브에이전트 토큰은 부모에 포함되지 않으며 별도 파일에 기록된다 (전체의 ~16%).
+| 직렬화 | bincode 1.x (DB), serde_json (JSONL) | 바이너리 최소 오버헤드 |
+| 해시 | xxhash-rust 0.8 (xxh3) | 체크포인트 줄 식별 (30GB/s) |
+| HTTP | ureq 2.x | 동기 HTTP, ETag 조건부 요청 |
+| CLI | clap 4.x | 서브커맨드, 글로벌 옵션 지원 |
+| 테이블 | comfy-table 7.1 | Unicode 테이블 렌더링 |
+| IPC | Unix Domain Socket | 데몬-클라이언트 NDJSON 스트리밍 |

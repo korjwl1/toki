@@ -1,4 +1,4 @@
-use std::io::{BufRead, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -49,11 +49,10 @@ pub fn find_resume_offset(path: &str, cp: &FileCheckpoint) -> std::io::Result<Op
                 None => 0,
             };
             let trailing = &buf[trailing_start..];
-            if !trailing.is_empty() && trailing.len() as u64 == cp.last_line_len {
-                if hash_line(trailing) == cp.last_line_hash {
+            if !trailing.is_empty() && trailing.len() as u64 == cp.last_line_len
+                && hash_line(trailing) == cp.last_line_hash {
                     return Ok(Some(file_size));
                 }
-            }
         }
     }
 
@@ -89,21 +88,18 @@ pub fn find_resume_offset(path: &str, cp: &FileCheckpoint) -> std::io::Result<Op
                 fragment.clear();
                 fragment_consumed = true;
 
-                if !full_line.is_empty() && full_line.len() as u64 == cp.last_line_len {
-                    if hash_line(&full_line) == cp.last_line_hash {
+                if !full_line.is_empty() && full_line.len() as u64 == cp.last_line_len
+                    && hash_line(&full_line) == cp.last_line_hash {
                         return Ok(Some(fragment_resume));
                     }
-                }
             } else {
                 // Complete line entirely within this chunk.
                 if !content_in_buf.is_empty()
                     && content_in_buf.len() as u64 == cp.last_line_len
-                {
-                    if hash_line(content_in_buf) == cp.last_line_hash {
+                    && hash_line(content_in_buf) == cp.last_line_hash {
                         // \n terminating this line is at buf_slice[line_end] (file pos read_start + line_end).
                         return Ok(Some(read_start + line_end as u64 + 1));
                     }
-                }
             }
 
             line_end = i;
@@ -128,11 +124,10 @@ pub fn find_resume_offset(path: &str, cp: &FileCheckpoint) -> std::io::Result<Op
     }
 
     // Check the very first line of the file (no preceding \n).
-    if !fragment.is_empty() && fragment.len() as u64 == cp.last_line_len {
-        if hash_line(&fragment) == cp.last_line_hash {
+    if !fragment.is_empty() && fragment.len() as u64 == cp.last_line_len
+        && hash_line(&fragment) == cp.last_line_hash {
             return Ok(Some(fragment_resume));
         }
-    }
 
     // Line not found — compacted away entirely.
     Ok(None)
@@ -171,9 +166,10 @@ fn is_complete_json_object(bytes: &[u8]) -> bool {
     depth == 0
 }
 
-/// Streaming line processor: reads lines from offset and calls a closure for each line,
-/// avoiding accumulation of all lines in memory. Used for cold start.
-/// Returns (count, bytes_consumed, last_line_len, last_line_hash) or None if no lines.
+/// Streaming line processor: memory-maps the file and iterates over lines from offset,
+/// calling a closure for each line. Uses mmap for zero-copy I/O — the OS handles
+/// page faulting and prefetch, eliminating explicit read() syscalls and buffer copies.
+/// Returns (bytes_consumed, last_line_len, last_line_hash) or None if no lines.
 pub fn process_lines_streaming<F>(
     path: &str,
     offset: u64,
@@ -190,41 +186,52 @@ where
         return Ok(None);
     }
 
-    let mut reader = std::io::BufReader::new(file);
-    reader.seek(SeekFrom::Start(offset))?;
+    // SAFETY: file is opened read-only. We cap the slice at file_size recorded
+    // before mapping, so concurrent appends (new session data) are excluded —
+    // those bytes will be picked up on the next incremental run via checkpoint.
+    let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    let end = std::cmp::min(mmap.len(), file_size as usize);
+    let data = &mmap[offset as usize..end];
 
     let mut bytes_consumed: u64 = 0;
     let mut last_line_len: u64 = 0;
     let mut last_line_hash: u64 = 0;
     let mut has_lines = false;
-    let mut trailing_line: Option<String> = None;
+    let mut pos = 0;
 
-    let mut line_buf = String::new();
-    loop {
-        line_buf.clear();
-        let n = reader.read_line(&mut line_buf)?;
-        if n == 0 {
-            break;
-        }
-        if line_buf.ends_with('\n') {
-            let trimmed = line_buf.trim_end_matches('\n').trim_end_matches('\r');
-            on_line(trimmed);
-            last_line_len = trimmed.len() as u64;
-            last_line_hash = hash_line(trimmed.as_bytes());
-            bytes_consumed += n as u64;
-            has_lines = true;
-        } else {
-            trailing_line = Some(std::mem::take(&mut line_buf));
-        }
-    }
-
-    if let Some(trailing) = trailing_line {
-        if is_complete_json_object(trailing.as_bytes()) {
-            on_line(&trailing);
-            last_line_len = trailing.len() as u64;
-            last_line_hash = hash_line(trailing.as_bytes());
-            bytes_consumed += trailing.len() as u64;
-            has_lines = true;
+    while pos < data.len() {
+        match memchr::memchr(b'\n', &data[pos..]) {
+            Some(nl) => {
+                let line_bytes = &data[pos..pos + nl];
+                // Strip \r if present (Windows-style line endings)
+                let line_bytes = if line_bytes.last() == Some(&b'\r') {
+                    &line_bytes[..line_bytes.len() - 1]
+                } else {
+                    line_bytes
+                };
+                if let Ok(line) = std::str::from_utf8(line_bytes) {
+                    on_line(line);
+                    last_line_len = line.len() as u64;
+                    last_line_hash = hash_line(line.as_bytes());
+                    has_lines = true;
+                }
+                bytes_consumed += (nl + 1) as u64; // include \n
+                pos += nl + 1;
+            }
+            None => {
+                // Trailing content without \n — accept if it's a complete JSON object
+                let trailing = &data[pos..];
+                if is_complete_json_object(trailing) {
+                    if let Ok(line) = std::str::from_utf8(trailing) {
+                        on_line(line);
+                        last_line_len = line.len() as u64;
+                        last_line_hash = hash_line(line.as_bytes());
+                        bytes_consumed += trailing.len() as u64;
+                        has_lines = true;
+                    }
+                }
+                break;
+            }
         }
     }
 

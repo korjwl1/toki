@@ -1,4 +1,7 @@
+use std::io::{BufRead, BufReader};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(target_os = "linux")]
@@ -6,65 +9,57 @@ use std::sync::atomic::{AtomicBool, Ordering};
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use clap::{Args, Parser, Subcommand};
-use chrono::{NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Weekday};
+use chrono::{NaiveDateTime, Weekday};
 use chrono_tz::Tz;
-use clitrace::Config;
+use toki::Config;
 use fs2::FileExt;
 
-// Global flag for signal handler
-static RUNNING: std::sync::atomic::AtomicBool = AtomicBool::new(true);
+static RUNNING: AtomicBool = AtomicBool::new(true);
 
 #[derive(Parser)]
-#[command(name = "clitrace", version, about = "AI CLI tool token usage tracker")]
+#[command(name = "toki", version, about = "AI CLI tool token usage tracker")]
 struct Cli {
-    /// Output format for print sink: table (default) or json
-    #[arg(long, default_value = "table", global = true)]
-    output_format: String,
-    /// Output sink(s): print (default), uds://<path>, http://<url>
-    #[arg(long, global = true)]
-    sink: Vec<String>,
-    /// Timezone for bucketing and --since/--until interpretation (e.g. Asia/Seoul, US/Eastern)
-    #[arg(long, short = 'z', global = true)]
-    timezone: Option<String>,
-    /// Disable cost calculation (skip pricing fetch)
-    #[arg(long, global = true)]
-    no_cost: bool,
     #[command(subcommand)]
     command: Commands,
 }
 
+/// Options shared by trace and report commands.
+#[derive(Args, Clone)]
+struct ClientOptions {
+    /// Output format override: table or json
+    #[arg(long)]
+    output_format: Option<String>,
+    /// Output sink(s): print (default), uds://<path>, http://<url>
+    #[arg(long)]
+    sink: Vec<String>,
+    /// Timezone override (e.g. Asia/Seoul, US/Eastern)
+    #[arg(long, short = 'z')]
+    timezone: Option<String>,
+    /// Disable cost calculation
+    #[arg(long)]
+    no_cost: bool,
+}
+
 #[derive(Subcommand)]
 enum Commands {
-    /// Watch mode: live tracking with checkpoints (single-instance only).
-    Trace {
-        /// Claude Code root directory (default: ~/.claude)
-        #[arg(long)]
-        claude_root: Option<String>,
-        /// DB path for checkpoints (default: ~/.config/clitrace/clitrace.db)
-        #[arg(long)]
-        db_path: Option<PathBuf>,
-        /// Clear checkpoints and perform full rescan on startup
-        #[arg(long)]
-        full_rescan: bool,
-        /// Group startup summary by time period: hour, day, week, month, year
-        #[arg(long = "startup-group-by")]
-        startup_group_by: Option<String>,
-        /// Filter by session ID prefix
-        #[arg(long = "session-id")]
-        session_id: Option<String>,
-        /// Filter by project name (substring match on project directory)
-        #[arg(long)]
-        project: Option<String>,
+    /// Daemon management: start/stop/status
+    Daemon {
+        #[command(subcommand)]
+        command: DaemonCommands,
     },
-    /// Report mode: one-shot summary without writing checkpoints.
+    /// Connect to running daemon and stream real-time events
+    Trace {
+        #[command(flatten)]
+        opts: ClientOptions,
+    },
+    /// Report mode: one-shot summary from TSDB
     Report {
-        /// Claude Code root directory (default: ~/.claude)
-        #[arg(long)]
-        claude_root: Option<String>,
-        /// Filter start time (inclusive, UTC): YYYYMMDD or YYYYMMDDhhmmss
+        #[command(flatten)]
+        opts: ClientOptions,
+        /// Filter start time (inclusive): YYYYMMDD or YYYYMMDDhhmmss
         #[arg(long)]
         since: Option<String>,
-        /// Filter end time (inclusive, UTC): YYYYMMDD or YYYYMMDDhhmmss
+        /// Filter end time (inclusive): YYYYMMDD or YYYYMMDDhhmmss
         #[arg(long)]
         until: Option<String>,
         /// Group results by session instead of time period
@@ -79,14 +74,54 @@ enum Commands {
         #[command(subcommand)]
         command: Option<ReportCommands>,
     },
+    /// Open settings TUI, or set a value non-interactively
+    Settings {
+        /// Database path (default: ~/.config/toki/toki.fjall)
+        #[arg(long)]
+        db_path: Option<PathBuf>,
+        #[command(subcommand)]
+        command: Option<SettingsCommands>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SettingsCommands {
+    /// Set a configuration value (e.g. toki settings set claude_code_root /path)
+    Set {
+        /// Setting key
+        key: String,
+        /// Setting value
+        value: String,
+    },
+    /// Get a configuration value
+    Get {
+        /// Setting key
+        key: String,
+    },
+    /// List all settings
+    List,
+}
+
+#[derive(Subcommand)]
+enum DaemonCommands {
+    /// Start the daemon (foreground). Watches files and writes to TSDB.
+    Start,
+    /// Stop a running daemon
+    Stop,
+    /// Restart the daemon (stop + start). Picks up settings changes.
+    Restart,
+    /// Check daemon status
+    Status,
+    /// Delete all data and reset the database
+    Reset,
 }
 
 #[derive(Args, Clone)]
 struct ReportFilterArgs {
-    /// Filter start time (inclusive, UTC): YYYYMMDD or YYYYMMDDhhmmss
+    /// Filter start time (inclusive): YYYYMMDD or YYYYMMDDhhmmss
     #[arg(long)]
     since: Option<String>,
-    /// Filter end time (inclusive, UTC): YYYYMMDD or YYYYMMDDhhmmss
+    /// Filter end time (inclusive): YYYYMMDD or YYYYMMDDhhmmss
     #[arg(long)]
     until: Option<String>,
     /// Allow full scan without --since (for hourly/daily/weekly)
@@ -95,111 +130,69 @@ struct ReportFilterArgs {
     /// Filter by session ID prefix
     #[arg(long = "session-id")]
     session_id: Option<String>,
-    /// Filter by project name (substring match on project directory)
+    /// Filter by project name (substring match)
     #[arg(long)]
     project: Option<String>,
 }
 
 #[derive(Subcommand)]
 enum ReportCommands {
-    /// Group summary by day.
     Daily {
         #[command(flatten)]
         filter: ReportFilterArgs,
     },
-    /// Group summary by week.
     Weekly {
-        /// Start of week: mon, tue, wed, thu, fri, sat, sun
         #[arg(long = "start-of-week", short = 'w')]
         start_of_week: Option<String>,
         #[command(flatten)]
         filter: ReportFilterArgs,
     },
-    /// Group summary by month.
     Monthly {
         #[command(flatten)]
         filter: ReportFilterArgs,
     },
-    /// Group summary by year.
     Yearly {
         #[command(flatten)]
         filter: ReportFilterArgs,
     },
-    /// Group summary by hour.
     Hourly {
         #[command(flatten)]
         filter: ReportFilterArgs,
     },
+    /// Execute a PromQL-style query (e.g. 'usage{model="claude-opus-4-6"}[1h] by (model)')
+    Query {
+        /// Query string
+        query: String,
+    },
 }
 
-/// Parse a date/time string and return as UTC NaiveDateTime.
-/// When tz is specified, the input is interpreted as local time in that timezone and converted to UTC.
-/// When tz is None, the input is treated as UTC.
-fn parse_range_arg(value: &str, is_until: bool, tz: Option<Tz>) -> Result<NaiveDateTime, String> {
-    let naive = if value.len() == 8 && value.chars().all(|c| c.is_ascii_digit()) {
-        let year: i32 = value[0..4].parse().map_err(|_| "invalid year")?;
-        let month: u32 = value[4..6].parse().map_err(|_| "invalid month")?;
-        let day: u32 = value[6..8].parse().map_err(|_| "invalid day")?;
-        let date = NaiveDate::from_ymd_opt(year, month, day).ok_or("invalid date")?;
-        let time = if is_until {
-            NaiveTime::from_hms_opt(23, 59, 59).unwrap()
-        } else {
-            NaiveTime::from_hms_opt(0, 0, 0).unwrap()
-        };
-        NaiveDateTime::new(date, time)
-    } else if value.len() == 14 && value.chars().all(|c| c.is_ascii_digit()) {
-        let year: i32 = value[0..4].parse().map_err(|_| "invalid year")?;
-        let month: u32 = value[4..6].parse().map_err(|_| "invalid month")?;
-        let day: u32 = value[6..8].parse().map_err(|_| "invalid day")?;
-        let hour: u32 = value[8..10].parse().map_err(|_| "invalid hour")?;
-        let min: u32 = value[10..12].parse().map_err(|_| "invalid minute")?;
-        let sec: u32 = value[12..14].parse().map_err(|_| "invalid second")?;
-        let date = NaiveDate::from_ymd_opt(year, month, day).ok_or("invalid date")?;
-        let time = NaiveTime::from_hms_opt(hour, min, sec).ok_or("invalid time")?;
-        NaiveDateTime::new(date, time)
-    } else {
-        return Err("invalid format (use YYYYMMDD or YYYYMMDDhhmmss)".to_string());
-    };
-
-    // Convert local time to UTC when timezone is specified
-    match tz {
-        Some(tz) => {
-            let local = tz.from_local_datetime(&naive)
-                .single()
-                .ok_or("ambiguous or invalid local time for timezone")?;
-            Ok(local.naive_utc())
-        }
-        None => Ok(naive),
-    }
-}
-
-fn build_config(claude_root: Option<String>, db_path: Option<PathBuf>) -> Config {
+/// Build Config from defaults + settings file + CLI overrides.
+fn build_config(cli_tz: Option<Tz>, cli_no_cost: bool, cli_output_format: Option<&str>) -> Config {
+    // Config::new() auto-loads from ~/.config/toki/settings.json
     let mut config = Config::new();
 
-    if let Ok(root) = std::env::var("CLITRACE_CLAUDE_ROOT") {
-        config = config.with_claude_root(root);
+    // CLI overrides take precedence over settings file
+    if let Some(tz) = cli_tz {
+        config = config.with_tz(Some(tz));
     }
-    if let Ok(path) = std::env::var("CLITRACE_DB_PATH") {
-        config = config.with_db_path(path.into());
+    if cli_no_cost {
+        config.no_cost = true;
     }
-
-    if let Some(root) = claude_root {
-        config = config.with_claude_root(root);
-    }
-    if let Some(path) = db_path {
-        config = config.with_db_path(path);
+    if let Some(fmt) = cli_output_format {
+        config.output_format = fmt.to_string();
     }
 
     config
 }
 
-fn acquire_trace_lock(db_path: &PathBuf) -> std::io::Result<std::fs::File> {
+fn acquire_trace_lock(db_path: &std::path::Path) -> std::io::Result<std::fs::File> {
     let lock_path = db_path.with_extension("lock");
     if let Some(parent) = lock_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let file = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)?;
@@ -207,305 +200,658 @@ fn acquire_trace_lock(db_path: &PathBuf) -> std::io::Result<std::fs::File> {
     Ok(file)
 }
 
-fn main() {
-    let cli = Cli::parse();
+fn resolve_output_format(config: &Config) -> toki::sink::OutputFormat {
+    match config.output_format.as_str() {
+        "json" => toki::sink::OutputFormat::Json,
+        _ => toki::sink::OutputFormat::Table,
+    }
+}
 
-    let output_format = match cli.output_format.as_str() {
-        "table" => clitrace::sink::OutputFormat::Table,
-        "json" => clitrace::sink::OutputFormat::Json,
-        v => {
-            eprintln!("[clitrace] Invalid --output-format: {} (use table|json)", v);
-            std::process::exit(1);
-        }
-    };
-
-    let sink_specs = if cli.sink.is_empty() {
-        vec!["print".to_string()]
-    } else {
-        cli.sink.clone()
-    };
-
-    let tz: Option<Tz> = match cli.timezone.as_deref() {
+/// Parse and validate ClientOptions into config overrides.
+fn parse_client_opts(opts: &ClientOptions) -> (Option<Tz>, bool, Option<&str>) {
+    let cli_tz: Option<Tz> = match opts.timezone.as_deref() {
         Some(name) => match name.parse::<Tz>() {
             Ok(tz) => Some(tz),
             Err(_) => {
-                eprintln!("[clitrace] Invalid --timezone: {} (use IANA name like Asia/Seoul, US/Eastern)", name);
+                eprintln!("[toki] Invalid --timezone: {} (use IANA name like Asia/Seoul)", name);
                 std::process::exit(1);
             }
         },
         None => None,
     };
 
-    match cli.command {
-        Commands::Trace { claude_root, db_path, full_rescan, startup_group_by, session_id, project } => {
-            let mut config = build_config(claude_root, db_path);
-            if full_rescan {
-                config = config.with_full_rescan(true);
-            }
-            if session_id.is_some() {
-                config = config.with_session_filter(session_id);
-            }
-            if project.is_some() {
-                config = config.with_project_filter(project);
-            }
-            config = config.with_tz(tz);
-
-            // Parse --startup-group-by
-            let group_by = match startup_group_by.as_deref() {
-                Some("hour") => Some(clitrace::engine::ReportGroupBy::Hour),
-                Some("day") => Some(clitrace::engine::ReportGroupBy::Date),
-                Some("week") => Some(clitrace::engine::ReportGroupBy::Week { start_of_week: Weekday::Mon }),
-                Some("month") => Some(clitrace::engine::ReportGroupBy::Month),
-                Some("year") => Some(clitrace::engine::ReportGroupBy::Year),
-                Some(v) => {
-                    eprintln!("[clitrace] Invalid --startup-group-by: {} (use hour|day|week|month|year)", v);
-                    std::process::exit(1);
-                }
-                None => None,
-            };
-
-            // Guard: hour requires existing checkpoints and cannot be used with --full-rescan
-            if matches!(group_by, Some(clitrace::engine::ReportGroupBy::Hour)) {
-                if full_rescan {
-                    eprintln!("[clitrace] --startup-group-by hour cannot be used with --full-rescan");
-                    std::process::exit(1);
-                }
-                if !config.db_path.exists() {
-                    eprintln!("[clitrace] --startup-group-by hour requires existing checkpoints (run trace once first)");
-                    std::process::exit(1);
-                }
-            }
-
-            let _lock = match acquire_trace_lock(&config.db_path) {
-                Ok(f) => f,
-                Err(_) => {
-                    eprintln!("[clitrace] Another trace instance is already running.");
-                    std::process::exit(1);
-                }
-            };
-
-            println!("[clitrace] Starting trace...");
-            println!("[clitrace] Claude Code root: {}", config.claude_code_root);
-            println!("[clitrace] Database: {}", config.db_path.display());
-
-            let sink = clitrace::sink::create_sinks(&sink_specs, output_format);
-            let handle = match clitrace::start(config, group_by, sink, cli.no_cost) {
-                Ok(h) => h,
-                Err(e) => {
-                    eprintln!("[clitrace] Failed to start: {}", e);
-                    std::process::exit(1);
-                }
-            };
-
-            println!("[clitrace] Listening for file changes... (Ctrl+C to stop)");
-
-            // Register SIGINT handler
-            unsafe {
-                libc::signal(libc::SIGINT, sigint_handler as libc::sighandler_t);
-            }
-
-            // Wait until SIGINT
-            while RUNNING.load(Ordering::SeqCst) {
-                std::thread::sleep(std::time::Duration::from_millis(200));
-            }
-
-            println!("\n[clitrace] Shutting down...");
-            handle.stop();
-            println!("[clitrace] Done.");
+    let cli_output_format = opts.output_format.as_deref();
+    if let Some(fmt) = cli_output_format {
+        if fmt != "table" && fmt != "json" {
+            eprintln!("[toki] Invalid --output-format: {} (use table|json)", fmt);
+            std::process::exit(1);
         }
-        Commands::Report { claude_root, since, until, group_by_session, session_id, project, command } => {
-            let config = build_config(claude_root, None);
-            println!("[clitrace] Running report...");
-            println!("[clitrace] Claude Code root: {}", config.claude_code_root);
+    }
 
-            // Create sink for report output
-            let sink = clitrace::sink::create_sinks(&sink_specs, output_format);
+    (cli_tz, opts.no_cost, cli_output_format)
+}
 
-            // Load pricing for cost display
-            let pricing = if cli.no_cost {
-                None
-            } else {
-                let db = clitrace::db::Database::open(&config.db_path).ok();
-                match db {
-                    Some(ref d) => {
-                        let p = clitrace::pricing::fetch_pricing(d);
-                        if p.is_empty() { None } else { Some(p) }
-                    }
-                    None => None,
-                }
-            };
-            let pricing_ref = pricing.as_ref();
+fn main() {
+    let cli = Cli::parse();
 
-            let parser = clitrace::providers::claude_code::ClaudeCodeParser;
-            let session_filter = session_id.as_deref();
-            let project_filter = project.as_deref();
-
-            // Validate: --group-by-session cannot be used with subcommands
-            if group_by_session && command.is_some() {
-                eprintln!("[clitrace] --group-by-session cannot be used with time-based subcommands (daily/weekly/etc.)");
-                std::process::exit(1);
-            }
-
-            let command = match command {
-                Some(cmd) => cmd,
+    match cli.command {
+        Commands::Settings { db_path: _, command } => {
+            match command {
                 None => {
-                    // No subcommand: total report (with optional since/until filter)
-                    let since_dt = match since.as_deref() {
-                        Some(v) => match parse_range_arg(v, false, tz) {
-                            Ok(dt) => Some(dt),
-                            Err(e) => {
-                                eprintln!("[clitrace] Invalid --since: {} ({})", v, e);
-                                std::process::exit(1);
-                            }
-                        },
-                        None => None,
-                    };
-                    let until_dt = match until.as_deref() {
-                        Some(v) => match parse_range_arg(v, true, tz) {
-                            Ok(dt) => Some(dt),
-                            Err(e) => {
-                                eprintln!("[clitrace] Invalid --until: {} ({})", v, e);
-                                std::process::exit(1);
-                            }
-                        },
-                        None => None,
-                    };
-                    if let (Some(s), Some(u)) = (since_dt, until_dt) {
-                        if u < s {
-                            eprintln!("[clitrace] Invalid range: --until is earlier than --since");
-                            std::process::exit(1);
+                    toki::settings::run_settings();
+                    // Check if TUI requested daemon restart
+                    if std::env::var("TOKI_RESTART_DAEMON").as_deref() == Ok("1") {
+                        let config = build_config(None, false, None);
+                        stop_running_daemon(&config);
+                        eprintln!("[toki] Starting daemon...");
+                        let toki_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("toki"));
+                        std::process::Command::new(toki_bin)
+                            .args(["daemon", "start"])
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::inherit())
+                            .spawn()
+                            .ok();
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        let pidfile = toki::daemon::default_pidfile_path();
+                        if toki::daemon::daemon_status(&pidfile).is_some() {
+                            eprintln!("[toki] Daemon restarted.");
+                        } else {
+                            eprintln!("[toki] Daemon may still be starting...");
                         }
                     }
-
-                    if group_by_session {
-                        let filter = clitrace::engine::ReportFilter { since: since_dt, until: until_dt, tz };
-                        let checkpoints = std::collections::HashMap::new();
-                        if let Err(e) = clitrace::engine::cold_start_report_by_session(
-                            &parser,
-                            &config.claude_code_root,
-                            &checkpoints,
-                            filter,
-                            session_filter,
-                            project_filter,
-                            sink.as_ref(),
-                            pricing_ref,
-                        ) {
-                            eprintln!("[clitrace] Report failed: {}", e);
-                            std::process::exit(1);
-                        }
-                    } else if since_dt.is_some() || until_dt.is_some() {
-                        let filter = clitrace::engine::ReportFilter { since: since_dt, until: until_dt, tz };
-                        let checkpoints = std::collections::HashMap::new();
-                        match clitrace::engine::cold_start_report_filtered(
-                            &parser,
-                            &config.claude_code_root,
-                            &checkpoints,
-                            filter,
-                            session_filter,
-                            project_filter,
-                        ) {
-                            Ok(summaries) => sink.emit_summary(&summaries, pricing_ref),
-                            Err(e) => {
-                                eprintln!("[clitrace] Report failed: {}", e);
-                                std::process::exit(1);
-                            }
-                        }
-                    } else if let Err(e) = clitrace::engine::cold_start_report(&parser, &config.claude_code_root, sink.as_ref(), session_filter, project_filter, pricing_ref) {
-                        eprintln!("[clitrace] Report failed: {}", e);
-                        std::process::exit(1);
-                    }
-                    return;
                 }
-            };
-
-            // Extract filter args and group_by from subcommand
-            let (filter_args, group_by) = match &command {
-                ReportCommands::Hourly { filter } => (filter.clone(), clitrace::engine::ReportGroupBy::Hour),
-                ReportCommands::Daily { filter } => (filter.clone(), clitrace::engine::ReportGroupBy::Date),
-                ReportCommands::Weekly { start_of_week, filter } => {
-                    let start = match start_of_week.as_deref().unwrap_or("mon") {
-                        "mon" => Weekday::Mon,
-                        "tue" => Weekday::Tue,
-                        "wed" => Weekday::Wed,
-                        "thu" => Weekday::Thu,
-                        "fri" => Weekday::Fri,
-                        "sat" => Weekday::Sat,
-                        "sun" => Weekday::Sun,
-                        _ => {
-                            eprintln!("[clitrace] Invalid start-of-week (use mon|tue|wed|thu|fri|sat|sun)");
-                            std::process::exit(1);
-                        }
-                    };
-                    (filter.clone(), clitrace::engine::ReportGroupBy::Week { start_of_week: start })
+                Some(SettingsCommands::Set { key, value }) => {
+                    handle_settings_set(&key, &value);
                 }
-                ReportCommands::Monthly { filter } => (filter.clone(), clitrace::engine::ReportGroupBy::Month),
-                ReportCommands::Yearly { filter } => (filter.clone(), clitrace::engine::ReportGroupBy::Year),
-            };
-
-            // Parse filter values
-            let since_dt = match filter_args.since.as_deref() {
-                Some(v) => match parse_range_arg(v, false, tz) {
-                    Ok(dt) => Some(dt),
-                    Err(e) => {
-                        eprintln!("[clitrace] Invalid --since: {} ({})", v, e);
-                        std::process::exit(1);
-                    }
-                },
-                None => None,
-            };
-            let until_dt = match filter_args.until.as_deref() {
-                Some(v) => match parse_range_arg(v, true, tz) {
-                    Ok(dt) => Some(dt),
-                    Err(e) => {
-                        eprintln!("[clitrace] Invalid --until: {} ({})", v, e);
-                        std::process::exit(1);
-                    }
-                },
-                None => None,
-            };
-            if let (Some(s), Some(u)) = (since_dt, until_dt) {
-                if u < s {
-                    eprintln!("[clitrace] Invalid range: --until is earlier than --since");
-                    std::process::exit(1);
+                Some(SettingsCommands::Get { key }) => {
+                    handle_settings_get(&key);
+                }
+                Some(SettingsCommands::List) => {
+                    handle_settings_list();
                 }
             }
+        }
+        Commands::Daemon { command } => {
+            let config = build_config(None, false, None);
+            handle_daemon(command, &config);
+        }
+        Commands::Trace { opts } => {
+            let (cli_tz, cli_no_cost, cli_output_format) = parse_client_opts(&opts);
+            let config = build_config(cli_tz, cli_no_cost, cli_output_format);
+            let output_format = resolve_output_format(&config);
+            let sink_specs = if opts.sink.is_empty() {
+                vec!["print".to_string()]
+            } else {
+                opts.sink.clone()
+            };
+            handle_trace(&config, &sink_specs, output_format, config.no_cost);
+        }
+        Commands::Report { opts, since, until, group_by_session, session_id, project, command } => {
+            let (cli_tz, cli_no_cost, cli_output_format) = parse_client_opts(&opts);
+            let config = build_config(cli_tz, cli_no_cost, cli_output_format);
+            let output_format = resolve_output_format(&config);
+            let sink_specs = if opts.sink.is_empty() {
+                vec!["print".to_string()]
+            } else {
+                opts.sink.clone()
+            };
+            handle_report(since, until, group_by_session, session_id, project, command,
+                          &config, &sink_specs, output_format, config.no_cost);
+        }
+    }
+}
 
-            // Guard: hourly/daily/weekly require --since or --from-beginning
-            let requires_range = matches!(
-                group_by,
-                clitrace::engine::ReportGroupBy::Hour
-                    | clitrace::engine::ReportGroupBy::Date
-                    | clitrace::engine::ReportGroupBy::Week { .. }
-            );
-            if requires_range && !filter_args.from_beginning && since_dt.is_none() {
-                eprintln!("[clitrace] hourly/daily/weekly requires --since or --from-beginning");
-                std::process::exit(1);
-            }
+// ── Settings (non-interactive) ──────────────────────────
 
-            // Merge session filters: subcommand --session-id takes precedence, then parent-level
-            let effective_session_filter = filter_args.session_id.as_deref().or(session_filter);
-            let effective_project_filter = filter_args.project.as_deref().or(project_filter);
+const VALID_SETTINGS: &[&str] = &[
+    "claude_code_root", "daemon_sock", "timezone", "output_format",
+    "start_of_week", "no_cost", "retention_days", "rollup_retention_days",
+];
 
-            let filter = clitrace::engine::ReportFilter { since: since_dt, until: until_dt, tz };
-            let checkpoints = std::collections::HashMap::new();
-            if let Err(e) = clitrace::engine::cold_start_report_grouped(
-                &parser,
-                &config.claude_code_root,
-                group_by,
-                &checkpoints,
-                filter,
-                sink.as_ref(),
-                effective_session_filter,
-                effective_project_filter,
-                pricing_ref,
-            ) {
-                eprintln!("[clitrace] Report failed: {}", e);
-                std::process::exit(1);
+/// Settings that require daemon restart to take effect.
+const DAEMON_SETTINGS: &[&str] = &[
+    "claude_code_root", "daemon_sock", "retention_days", "rollup_retention_days",
+];
+
+fn handle_settings_set(key: &str, value: &str) {
+    if !VALID_SETTINGS.contains(&key) {
+        eprintln!("[toki] Unknown setting: {}", key);
+        eprintln!("[toki] Valid keys: {}", VALID_SETTINGS.join(", "));
+        std::process::exit(1);
+    }
+
+    if let Err(e) = toki::config::set_setting(key, value) {
+        eprintln!("[toki] Failed to set {}: {}", key, e);
+        std::process::exit(1);
+    }
+    println!("{} = {}", key, value);
+
+    // Prompt daemon restart for daemon-affecting settings
+    if DAEMON_SETTINGS.contains(&key) {
+        let pidfile = toki::daemon::default_pidfile_path();
+        if toki::daemon::daemon_status(&pidfile).is_some() {
+            eprintln!("[toki] This setting requires daemon restart to take effect.");
+            eprint!("[toki] Restart daemon now? [y/N]: ");
+            let mut input = String::new();
+            if std::io::stdin().read_line(&mut input).is_ok() && input.trim().eq_ignore_ascii_case("y") {
+                let config = Config::new();
+                stop_running_daemon(&config);
+                RUNNING.store(true, Ordering::SeqCst);
+                eprintln!("[toki] Starting daemon...");
+                let toki_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("toki"));
+                std::process::Command::new(toki_bin)
+                    .args(["daemon", "start"])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::inherit())
+                    .spawn()
+                    .ok();
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let pidfile = toki::daemon::default_pidfile_path();
+                if toki::daemon::daemon_status(&pidfile).is_some() {
+                    eprintln!("[toki] Daemon restarted.");
+                } else {
+                    eprintln!("[toki] Daemon may still be starting...");
+                }
+            } else {
+                eprintln!("[toki] Run `toki daemon restart` to apply.");
             }
         }
     }
 }
 
-extern "C" fn sigint_handler(_: libc::c_int) {
+fn handle_settings_get(key: &str) {
+    if !VALID_SETTINGS.contains(&key) {
+        eprintln!("[toki] Unknown setting: {}", key);
+        eprintln!("[toki] Valid keys: {}", VALID_SETTINGS.join(", "));
+        std::process::exit(1);
+    }
+
+    match toki::config::get_setting(key) {
+        Some(v) => println!("{}", v),
+        None => println!("(not set)"),
+    }
+}
+
+fn handle_settings_list() {
+    let settings = toki::config::list_settings();
+    for key in VALID_SETTINGS {
+        let value = settings.get(*key).map(|s| s.as_str()).unwrap_or("(not set)");
+        println!("{:>24} = {}", key, value);
+    }
+}
+
+// ── Daemon ──────────────────────────────────────────────
+
+fn stop_running_daemon(config: &Config) -> bool {
+    let pidfile = toki::daemon::default_pidfile_path();
+    let sock_path = &config.daemon_sock;
+    match toki::daemon::stop_daemon(&pidfile, sock_path) {
+        Ok(true) => { println!("[toki] Daemon stopped."); true }
+        Ok(false) => { println!("[toki] Daemon is not running."); false }
+        Err(e) => {
+            eprintln!("[toki] Error stopping daemon: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn run_daemon_foreground(config: &Config) {
+    let sock_path = config.daemon_sock.clone();
+    let pidfile = toki::daemon::default_pidfile_path();
+
+    if let Some(pid) = toki::daemon::daemon_status(&pidfile) {
+        eprintln!("[toki] Daemon already running (PID {})", pid);
+        std::process::exit(1);
+    }
+
+    let _lock = match acquire_trace_lock(&config.db_path) {
+        Ok(f) => f,
+        Err(_) => {
+            eprintln!("[toki] Another instance is already running.");
+            std::process::exit(1);
+        }
+    };
+
+    let broadcast = Arc::new(toki::daemon::BroadcastSink::new());
+
+    eprintln!("[toki:daemon] Starting...");
+    eprintln!("[toki:daemon] Claude Code root: {}", config.claude_code_root);
+    eprintln!("[toki:daemon] Database: {}", config.db_path.display());
+    eprintln!("[toki:daemon] Socket: {}", sock_path.display());
+
+    let handle = match toki::start(config.clone(), Box::new(broadcast.clone())) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("[toki:daemon] Failed to start: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    toki::daemon::write_pidfile(&pidfile);
+
+    let (listener_stop_tx, listener_stop_rx) = crossbeam_channel::bounded::<()>(1);
+    let listener_sock = sock_path.clone();
+    let listener_broadcast = broadcast.clone();
+    let listener_db = handle.db().clone();
+    let listener_handle = std::thread::Builder::new()
+        .name("toki-listener".to_string())
+        .spawn(move || {
+            toki::daemon::run_listener(&listener_sock, listener_broadcast, listener_db, listener_stop_rx);
+        })
+        .expect("Failed to spawn listener thread");
+
+    unsafe {
+        libc::signal(libc::SIGINT, sighandler as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, sighandler as *const () as libc::sighandler_t);
+    }
+
+    eprintln!("[toki:daemon] Running (PID {}). Send SIGTERM or use 'toki daemon stop' to stop.",
+        std::process::id());
+
+    while RUNNING.load(Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    eprintln!("\n[toki:daemon] Shutting down...");
+    let _ = listener_stop_tx.send(());
+    let _ = listener_handle.join();
+    handle.stop();
+    toki::daemon::remove_pidfile(&pidfile);
+    let _ = std::fs::remove_file(&sock_path);
+    eprintln!("[toki:daemon] Done.");
+}
+
+fn handle_daemon(command: DaemonCommands, config: &Config) {
+    match command {
+        DaemonCommands::Start => {
+            run_daemon_foreground(config);
+        }
+
+        DaemonCommands::Stop => {
+            stop_running_daemon(config);
+        }
+
+        DaemonCommands::Restart => {
+            stop_running_daemon(config);
+            RUNNING.store(true, Ordering::SeqCst);
+            run_daemon_foreground(config);
+        }
+
+        DaemonCommands::Status => {
+            let pidfile = toki::daemon::default_pidfile_path();
+            match toki::daemon::daemon_status(&pidfile) {
+                Some(pid) => {
+                    println!("[toki] Daemon is running (PID {})", pid);
+                    println!("[toki] Socket: {}", config.daemon_sock.display());
+                }
+                None => {
+                    println!("[toki] Daemon is not running.");
+                }
+            }
+        }
+
+        DaemonCommands::Reset => {
+            let pidfile = toki::daemon::default_pidfile_path();
+            if toki::daemon::daemon_status(&pidfile).is_some() {
+                println!("[toki] Stopping daemon first...");
+                stop_running_daemon(config);
+            }
+
+            if config.db_path.exists() {
+                if let Err(e) = std::fs::remove_dir_all(&config.db_path) {
+                    eprintln!("[toki] Failed to delete database: {}", e);
+                    std::process::exit(1);
+                }
+                println!("[toki] Database deleted: {}", config.db_path.display());
+            } else {
+                println!("[toki] No database found at {}", config.db_path.display());
+            }
+            println!("[toki] Reset complete. Start the daemon to rebuild: toki daemon start");
+        }
+    }
+}
+
+// ── Trace (client) ──────────────────────────────────────
+
+fn handle_trace(config: &Config, sink_specs: &[String], output_format: toki::sink::OutputFormat, no_cost: bool) {
+    let sock_path = config.daemon_sock.clone();
+
+    let stream = match UnixStream::connect(&sock_path) {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("[toki] Cannot connect to daemon at {}", sock_path.display());
+            eprintln!("[toki] Start the daemon first: toki daemon start");
+            std::process::exit(1);
+        }
+    };
+
+    // Load pricing client-side (ETag-based fetch, file cache)
+    let pricing_cache_path = toki::pricing::default_cache_path();
+    let mut pricing = if no_cost {
+        None
+    } else {
+        let p = toki::pricing::fetch_pricing(&pricing_cache_path);
+        if p.is_empty() { None } else { Some(p) }
+    };
+    let mut last_pricing_refresh = std::time::Instant::now();
+
+    let sink = toki::sink::create_sinks(sink_specs, output_format);
+    let reader = BufReader::new(stream);
+
+    // Register SIGINT to exit cleanly
+    unsafe {
+        libc::signal(libc::SIGINT, sighandler as *const () as libc::sighandler_t);
+    }
+
+    println!("[toki] Connected to daemon. Streaming events... (Ctrl+C to stop)");
+
+    for line_result in reader.lines() {
+        if !RUNNING.load(Ordering::SeqCst) {
+            break;
+        }
+
+        // Periodic pricing refresh (24h)
+        if !no_cost && last_pricing_refresh.elapsed() >= std::time::Duration::from_secs(86400) {
+            let p = toki::pricing::fetch_pricing(&pricing_cache_path);
+            if !p.is_empty() {
+                pricing = Some(p);
+            }
+            last_pricing_refresh = std::time::Instant::now();
+        }
+
+        let line = match line_result {
+            Ok(l) => l,
+            Err(_) => {
+                eprintln!("[toki] Daemon disconnected.");
+                break;
+            }
+        };
+
+        if line.is_empty() {
+            continue;
+        }
+
+        let mut v: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(e) => {
+                if std::env::var("TOKI_DEBUG").is_ok() {
+                    eprintln!("[toki] malformed JSON from daemon: {}", e);
+                }
+                continue;
+            }
+        };
+
+        match v["type"].as_str() {
+            Some("event") => {
+                if let Ok(event) = serde_json::from_value::<toki::UsageEvent>(v["data"].take()) {
+                    sink.emit_event(&event, pricing.as_ref());
+                }
+            }
+            Some("summary") => {
+                println!("{}", line);
+            }
+            _ => {
+                println!("{}", line);
+            }
+        }
+    }
+
+    println!("[toki] Disconnected.");
+}
+
+// ── Report ──────────────────────────────────────────────
+
+fn handle_report(
+    since: Option<String>,
+    until: Option<String>,
+    group_by_session: bool,
+    session_id: Option<String>,
+    project: Option<String>,
+    command: Option<ReportCommands>,
+    config: &Config,
+    sink_specs: &[String],
+    output_format: toki::sink::OutputFormat,
+    no_cost: bool,
+) {
+    let sink = toki::sink::create_sinks(sink_specs, output_format);
+    let tz = config.tz;
+    let sock_path = config.daemon_sock.clone();
+
+    // Require daemon to be running
+    let pidfile = toki::daemon::default_pidfile_path();
+    if toki::daemon::daemon_status(&pidfile).is_none() {
+        eprintln!("[toki] Cannot connect to toki daemon.");
+        eprintln!("[toki] Start the daemon first: toki daemon start");
+        std::process::exit(1);
+    }
+
+    if group_by_session && command.is_some() {
+        eprintln!("[toki] --group-by-session cannot be used with time-based subcommands");
+        std::process::exit(1);
+    }
+
+    // Build query string from CLI arguments
+    let query_str = if let Some(ReportCommands::Query { ref query }) = command {
+        query.clone()
+    } else {
+        let query = if let Some(cmd) = &command {
+            // Time-grouped subcommands
+            let (filter_args, group_by) = match cmd {
+                ReportCommands::Hourly { filter } => (filter.clone(), toki::engine::ReportGroupBy::Hour),
+                ReportCommands::Daily { filter } => (filter.clone(), toki::engine::ReportGroupBy::Date),
+                ReportCommands::Weekly { start_of_week, filter } => {
+                    let start = start_of_week.as_deref()
+                        .map(parse_weekday)
+                        .unwrap_or(config.start_of_week);
+                    (filter.clone(), toki::engine::ReportGroupBy::Week { start_of_week: start })
+                }
+                ReportCommands::Monthly { filter } => (filter.clone(), toki::engine::ReportGroupBy::Month),
+                ReportCommands::Yearly { filter } => (filter.clone(), toki::engine::ReportGroupBy::Year),
+                ReportCommands::Query { .. } => unreachable!(),
+            };
+
+            let eff_since = filter_args.since.or(since.clone());
+            let eff_until = filter_args.until.or(until.clone());
+            let eff_session = filter_args.session_id.or(session_id.clone());
+            let eff_project = filter_args.project.or(project.clone());
+
+            let since_dt = parse_opt_range(&eff_since, false, tz);
+            let until_dt = parse_opt_range(&eff_until, true, tz);
+            validate_range(since_dt, until_dt);
+
+            let requires_range = matches!(
+                group_by,
+                toki::engine::ReportGroupBy::Hour
+                    | toki::engine::ReportGroupBy::Date
+                    | toki::engine::ReportGroupBy::Week { .. }
+            );
+            if requires_range && !filter_args.from_beginning && since_dt.is_none() {
+                eprintln!("[toki] hourly/daily/weekly requires a date range.");
+                eprintln!("[toki] Usage: toki report daily --since 20250101");
+                eprintln!("[toki]        toki report daily --from-beginning");
+                std::process::exit(1);
+            }
+
+            // Convert to PromQL-style query string
+            build_query_from_flags(
+                &eff_since, &eff_until, eff_session.as_deref(), eff_project.as_deref(),
+                &[], // group_by handled via bucket
+            ).to_query_string_with_bucket(group_by)
+        } else {
+            // No subcommand — summary or session grouping
+            build_query_from_flags(
+                &since, &until, session_id.as_deref(), project.as_deref(),
+                if group_by_session { &["session"][..] } else { &[] },
+            ).to_query_string()
+        };
+        query
+    };
+
+    // Send query to daemon via UDS
+    let response = send_report_query(&sock_path, &query_str, tz);
+
+    // Load pricing client-side (file cache, no DB)
+    let pricing = if no_cost {
+        None
+    } else {
+        let p = toki::pricing::fetch_pricing(&toki::pricing::default_cache_path());
+        if p.is_empty() { None } else { Some(p) }
+    };
+
+    match response {
+        Ok(data) => {
+            for item in data.as_array().unwrap_or(&vec![]) {
+                dispatch_result_to_sink(item, sink.as_ref(), pricing.as_ref());
+            }
+        }
+        Err(e) => {
+            eprintln!("[toki] {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Send a report query to the daemon via UDS and return the response.
+fn send_report_query(
+    sock_path: &std::path::Path,
+    query: &str,
+    tz: Option<chrono_tz::Tz>,
+) -> Result<serde_json::Value, String> {
+    use std::io::{BufRead, Write};
+
+    let mut stream = UnixStream::connect(sock_path)
+        .map_err(|_| "Cannot connect to daemon. Start it first: toki daemon start".to_string())?;
+
+    // Send request
+    let request = serde_json::json!({
+        "query": query,
+        "tz": tz.map(|t| t.to_string()),
+    });
+    let line = serde_json::to_string(&request).unwrap();
+    writeln!(stream, "{}", line).map_err(|e| format!("Failed to send query: {}", e))?;
+    stream.flush().map_err(|e| format!("Failed to flush: {}", e))?;
+
+    // Read response
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(60))).ok();
+    let mut reader = std::io::BufReader::new(stream);
+    let mut response_line = String::new();
+    reader.read_line(&mut response_line)
+        .map_err(|e| format!("Failed to read response: {}", e))?;
+
+    let resp: serde_json::Value = serde_json::from_str(&response_line)
+        .map_err(|e| format!("Invalid response: {}", e))?;
+
+    if resp["ok"].as_bool() == Some(true) {
+        Ok(resp["data"].clone())
+    } else {
+        Err(resp["error"].as_str().unwrap_or("Unknown error").to_string())
+    }
+}
+
+/// Dispatch a JSON result from the daemon to the local sink for display.
+fn dispatch_result_to_sink(
+    item: &serde_json::Value,
+    sink: &dyn toki::sink::Sink,
+    pricing: Option<&toki::pricing::PricingTable>,
+) {
+    match item["type"].as_str() {
+        Some("summary") => {
+            // data is an array of model summaries → convert to HashMap
+            if let Ok(summaries_vec) = serde_json::from_value::<Vec<toki::ModelUsageSummary>>(item["data"].clone()) {
+                let summaries: std::collections::HashMap<String, toki::ModelUsageSummary> =
+                    summaries_vec.into_iter().map(|s| (s.model.clone(), s)).collect();
+                sink.emit_summary(&summaries, pricing);
+            }
+        }
+        Some(type_name) if type_name == "sessions" || type_name == "projects" => {
+            if let Some(items) = item["items"].as_array() {
+                let strings: Vec<String> = items.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect();
+                sink.emit_list(&strings, type_name);
+            }
+        }
+        Some(type_name) => {
+            // Grouped data: { data: [ { period: "...", usage_per_models: [...] } ] }
+            if let Some(data_arr) = item["data"].as_array() {
+                let mut grouped: std::collections::HashMap<String, std::collections::HashMap<String, toki::ModelUsageSummary>> =
+                    std::collections::HashMap::new();
+                for entry in data_arr {
+                    let period = entry["period"].as_str().unwrap_or("total").to_string();
+                    if let Ok(models) = serde_json::from_value::<Vec<toki::ModelUsageSummary>>(entry["usage_per_models"].clone()) {
+                        let map: std::collections::HashMap<String, toki::ModelUsageSummary> =
+                            models.into_iter().map(|s| (s.model.clone(), s)).collect();
+                        grouped.insert(period, map);
+                    }
+                }
+                sink.emit_grouped(&grouped, type_name, pricing);
+            }
+        }
+        None => {}
+    }
+}
+
+/// Build a Query struct from CLI flags.
+fn build_query_from_flags(
+    since: &Option<String>,
+    until: &Option<String>,
+    session_id: Option<&str>,
+    project: Option<&str>,
+    group_by: &[&str],
+) -> toki::query_parser::Query {
+    use toki::query_parser::{Query, Metric, LabelFilter};
+    let mut filters = Vec::new();
+    if let Some(s) = session_id {
+        filters.push(LabelFilter { key: "session".into(), value: s.into() });
+    }
+    if let Some(p) = project {
+        filters.push(LabelFilter { key: "project".into(), value: p.into() });
+    }
+    Query {
+        metric: Metric::Usage,
+        filters,
+        bucket: None,
+        group_by: group_by.iter().map(|s| s.to_string()).collect(),
+        since: since.clone(),
+        until: until.clone(),
+    }
+}
+
+// ── Helpers ─────────────────────────────────────────────
+
+fn parse_opt_range(value: &Option<String>, is_until: bool, tz: Option<chrono_tz::Tz>) -> Option<NaiveDateTime> {
+    value.as_deref().map(|v| {
+        toki::query::parse_range_time(v, is_until, tz).unwrap_or_else(|e| {
+            let label = if is_until { "--until" } else { "--since" };
+            eprintln!("[toki] Invalid {}: {} ({})", label, v, e);
+            std::process::exit(1);
+        })
+    })
+}
+
+fn validate_range(since: Option<NaiveDateTime>, until: Option<NaiveDateTime>) {
+    if let (Some(s), Some(u)) = (since, until) {
+        if u < s {
+            eprintln!("[toki] Invalid range: --until is earlier than --since");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn parse_weekday(s: &str) -> Weekday {
+    match s {
+        "mon" => Weekday::Mon, "tue" => Weekday::Tue, "wed" => Weekday::Wed,
+        "thu" => Weekday::Thu, "fri" => Weekday::Fri, "sat" => Weekday::Sat,
+        "sun" => Weekday::Sun,
+        _ => {
+            eprintln!("[toki] Invalid start-of-week (use mon|tue|wed|thu|fri|sat|sun)");
+            std::process::exit(1);
+        }
+    }
+}
+
+extern "C" fn sighandler(_: libc::c_int) {
     RUNNING.store(false, Ordering::SeqCst);
 }

@@ -1,4 +1,4 @@
-mod json;
+pub(crate) mod json;
 mod print;
 mod uds;
 mod http;
@@ -18,6 +18,7 @@ pub trait Sink: Send + Sync {
     fn emit_summary(&self, summaries: &HashMap<String, ModelUsageSummary>, pricing: Option<&PricingTable>);
     fn emit_grouped(&self, grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>, type_name: &str, pricing: Option<&PricingTable>);
     fn emit_event(&self, event: &UsageEvent, pricing: Option<&PricingTable>);
+    fn emit_list(&self, items: &[String], type_name: &str);
 }
 
 /// Dispatch to multiple sinks simultaneously.
@@ -43,6 +44,10 @@ impl Sink for MultiSink {
     fn emit_event(&self, event: &UsageEvent, pricing: Option<&PricingTable>) {
         for s in &self.sinks { s.emit_event(event, pricing); }
     }
+
+    fn emit_list(&self, items: &[String], type_name: &str) {
+        for s in &self.sinks { s.emit_list(items, type_name); }
+    }
 }
 
 /// Create sink(s) from `--sink` argument values.
@@ -57,7 +62,7 @@ pub fn create_sinks(specs: &[String], print_format: OutputFormat) -> Box<dyn Sin
         } else if spec.starts_with("http://") || spec.starts_with("https://") {
             sinks.push(Box::new(HttpSink::new(spec.to_string())));
         } else {
-            eprintln!("[clitrace] Unknown sink: {} (use: print, uds://<path>, http://<url>)", spec);
+            eprintln!("[toki] Unknown sink: {} (use: print, uds://<path>, http://<url>)", spec);
             std::process::exit(1);
         }
     }
@@ -82,11 +87,13 @@ pub(crate) fn shorten_id(id: &str) -> &str {
 ///   Parent:   .../projects/<dir>/<UUID>.jsonl        → "<UUID short>"
 ///   Subagent: .../<UUID>/subagents/agent-<id>.jsonl  → "<UUID short>/agent-<id short>"
 pub(crate) fn format_source_label(path: &str) -> String {
-    let parts: Vec<&str> = path.rsplit('/').collect();
-    let filename = parts.first().map_or("", |s| s.trim_end_matches(".jsonl"));
+    let mut parts = path.rsplit('/');
+    let filename = parts.next().map_or("", |s| s.trim_end_matches(".jsonl"));
+    let dir = parts.next().unwrap_or("");
+    let grandparent = parts.next().unwrap_or("");
 
-    if parts.len() >= 3 && parts[1] == "subagents" {
-        let session_id = shorten_id(parts[2]);
+    if dir == "subagents" && !grandparent.is_empty() {
+        let session_id = shorten_id(grandparent);
         let agent_id = shorten_id(filename);
         return format!("{}/{}", session_id, agent_id);
     }

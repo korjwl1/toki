@@ -17,9 +17,9 @@ impl UdsSink {
     pub fn new(path: String) -> Self {
         let conn = UnixStream::connect(&path).ok();
         if conn.is_some() {
-            eprintln!("[clitrace] UDS: connected to {}", path);
+            eprintln!("[toki] UDS: connected to {}", path);
         } else {
-            eprintln!("[clitrace] UDS: will connect to {} on first event", path);
+            eprintln!("[toki] UDS: will connect to {} on first event", path);
         }
         UdsSink { path, conn: Mutex::new(conn) }
     }
@@ -28,7 +28,7 @@ impl UdsSink {
         let data = match serde_json::to_string(value) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("[clitrace] UDS: serialization error: {}", e);
+                eprintln!("[toki] UDS: serialization error: {}", e);
                 return;
             }
         };
@@ -49,7 +49,7 @@ impl UdsSink {
                 *conn = Some(stream);
             }
             Err(e) => {
-                eprintln!("[clitrace] UDS: failed to connect to {}: {}", self.path, e);
+                eprintln!("[toki] UDS: failed to connect to {}: {}", self.path, e);
                 *conn = None;
             }
         }
@@ -67,5 +67,9 @@ impl Sink for UdsSink {
 
     fn emit_event(&self, event: &UsageEvent, pricing: Option<&PricingTable>) {
         self.send(&json::event_to_json(event, pricing));
+    }
+
+    fn emit_list(&self, items: &[String], type_name: &str) {
+        self.send(&serde_json::json!({ "type": type_name, "items": items }));
     }
 }

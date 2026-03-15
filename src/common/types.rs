@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// A single usage event extracted from a JSONL log line.
@@ -26,6 +27,23 @@ pub struct UsageEventWithTs {
     pub timestamp: String,
 }
 
+impl UsageEventWithTs {
+    /// Convert to UsageEvent, consuming self to avoid cloning strings.
+    pub fn into_usage_event(self) -> (UsageEvent, String) {
+        let ts = self.timestamp;
+        let event = UsageEvent {
+            event_key: self.event_key,
+            source_file: self.source_file,
+            model: self.model,
+            input_tokens: self.input_tokens,
+            cache_creation_input_tokens: self.cache_creation_input_tokens,
+            cache_read_input_tokens: self.cache_read_input_tokens,
+            output_tokens: self.output_tokens,
+        };
+        (event, ts)
+    }
+}
+
 /// File checkpoint for incremental reading.
 /// Uses line-length pre-filter + xxHash3-64 for fast reverse-scan matching.
 /// No byte offset stored — immune to compaction shifting file contents.
@@ -37,33 +55,73 @@ pub struct FileCheckpoint {
 }
 
 /// Aggregated usage per model.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct ModelUsageSummary {
     pub model: String,
     pub input_tokens: u64,
     pub cache_creation_input_tokens: u64,
     pub cache_read_input_tokens: u64,
     pub output_tokens: u64,
+    #[serde(alias = "events")]
     pub event_count: u64,
+    /// Pre-calculated cost from daemon (used when pricing table is not available client-side).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
 }
 
 impl ModelUsageSummary {
     pub fn accumulate(&mut self, event: &UsageEvent) {
-        self.input_tokens += event.input_tokens;
-        self.cache_creation_input_tokens += event.cache_creation_input_tokens;
-        self.cache_read_input_tokens += event.cache_read_input_tokens;
-        self.output_tokens += event.output_tokens;
-        self.event_count += 1;
+        self.input_tokens = self.input_tokens.saturating_add(event.input_tokens);
+        self.cache_creation_input_tokens = self.cache_creation_input_tokens.saturating_add(event.cache_creation_input_tokens);
+        self.cache_read_input_tokens = self.cache_read_input_tokens.saturating_add(event.cache_read_input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(event.output_tokens);
+        self.event_count = self.event_count.saturating_add(1);
     }
 
     pub fn accumulate_with_ts(&mut self, event: &UsageEventWithTs) {
-        self.input_tokens += event.input_tokens;
-        self.cache_creation_input_tokens += event.cache_creation_input_tokens;
-        self.cache_read_input_tokens += event.cache_read_input_tokens;
-        self.output_tokens += event.output_tokens;
-        self.event_count += 1;
+        self.input_tokens = self.input_tokens.saturating_add(event.input_tokens);
+        self.cache_creation_input_tokens = self.cache_creation_input_tokens.saturating_add(event.cache_creation_input_tokens);
+        self.cache_read_input_tokens = self.cache_read_input_tokens.saturating_add(event.cache_read_input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(event.output_tokens);
+        self.event_count = self.event_count.saturating_add(1);
     }
 }
+
+/// A stored event in the TSDB (events keyspace).
+/// Uses dictionary-compressed IDs for repeated strings (model, session, source_file).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredEvent {
+    pub model_id: u32,
+    pub session_id: u32,
+    pub source_file_id: u32,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+}
+
+/// Hourly rollup aggregation per model (rollups keyspace).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RollupValue {
+    pub input: u64,
+    pub output: u64,
+    pub cache_create: u64,
+    pub cache_read: u64,
+    pub count: u64,
+}
+
+/// Token fields for DbOp::WriteEvent.
+#[derive(Debug, Clone)]
+pub struct TokenFields {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+}
+
+/// Result from TSDB queries.
+pub type SummaryMap = HashMap<String, ModelUsageSummary>;
+pub type GroupedSummaryMap = HashMap<String, HashMap<String, ModelUsageSummary>>;
 
 /// A session group: parent JSONL + subagent JSONLs.
 #[derive(Debug, Clone)]
@@ -85,40 +143,40 @@ pub trait LogParserWithTs: Send + Sync {
     fn parse_line_with_ts(&self, line: &str, source_file: &str) -> Option<UsageEventWithTs>;
 }
 
-/// Clitrace error types.
+/// Toki error types.
 #[derive(Debug)]
-pub enum ClitraceError {
-    Db(redb::Error),
+pub enum TokiError {
+    Db(fjall::Error),
     Io(std::io::Error),
     Watcher(notify::Error),
 }
 
-impl std::fmt::Display for ClitraceError {
+impl std::fmt::Display for TokiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ClitraceError::Db(e) => write!(f, "database error: {}", e),
-            ClitraceError::Io(e) => write!(f, "io error: {}", e),
-            ClitraceError::Watcher(e) => write!(f, "watcher error: {}", e),
+            TokiError::Db(e) => write!(f, "database error: {}", e),
+            TokiError::Io(e) => write!(f, "io error: {}", e),
+            TokiError::Watcher(e) => write!(f, "watcher error: {}", e),
         }
     }
 }
 
-impl std::error::Error for ClitraceError {}
+impl std::error::Error for TokiError {}
 
-impl From<redb::Error> for ClitraceError {
-    fn from(e: redb::Error) -> Self {
-        ClitraceError::Db(e)
+impl From<fjall::Error> for TokiError {
+    fn from(e: fjall::Error) -> Self {
+        TokiError::Db(e)
     }
 }
 
-impl From<std::io::Error> for ClitraceError {
+impl From<std::io::Error> for TokiError {
     fn from(e: std::io::Error) -> Self {
-        ClitraceError::Io(e)
+        TokiError::Io(e)
     }
 }
 
-impl From<notify::Error> for ClitraceError {
+impl From<notify::Error> for TokiError {
     fn from(e: notify::Error) -> Self {
-        ClitraceError::Watcher(e)
+        TokiError::Watcher(e)
     }
 }

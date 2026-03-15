@@ -1,46 +1,54 @@
+use std::collections::HashMap;
 use std::path::Path;
 
-use redb::{Database as RedbDatabase, ReadableTable, TableDefinition};
+use fjall::{Database as FjallDatabase, Keyspace, KeyspaceCreateOptions};
 
-use crate::common::types::FileCheckpoint;
-
-const CHECKPOINTS: TableDefinition<&str, &[u8]> = TableDefinition::new("checkpoints");
-const SETTINGS: TableDefinition<&str, &str> = TableDefinition::new("settings");
+use crate::common::types::{FileCheckpoint, RollupValue, StoredEvent};
 
 pub struct Database {
-    db: RedbDatabase,
+    db: FjallDatabase,
+    checkpoints: Keyspace,
+    meta: Keyspace,
+    events: Keyspace,
+    rollups: Keyspace,
+    idx_sessions: Keyspace,
+    idx_projects: Keyspace,
+    dict: Keyspace,
 }
 
 impl Database {
-    pub fn open(path: &Path) -> Result<Self, redb::Error> {
+    pub fn open(path: &Path) -> Result<Self, fjall::Error> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
-        let db = RedbDatabase::create(path)?;
 
-        // Ensure tables exist
-        let txn = db.begin_write()?;
-        {
-            let _ = txn.open_table(CHECKPOINTS)?;
-            let _ = txn.open_table(SETTINGS)?;
-        }
-        txn.commit()?;
+        let db = FjallDatabase::builder(path)
+            .open()?;
 
-        Ok(Database { db })
+        let opts = || KeyspaceCreateOptions::default();
+        let checkpoints = db.keyspace("checkpoints", opts)?;
+        let meta = db.keyspace("meta", opts)?;
+        let events = db.keyspace("events", opts)?;
+        let rollups = db.keyspace("rollups", opts)?;
+        let idx_sessions = db.keyspace("idx_sessions", opts)?;
+        let idx_projects = db.keyspace("idx_projects", opts)?;
+        let dict = db.keyspace("dict", opts)?;
+
+        Ok(Database { db, checkpoints, meta, events, rollups, idx_sessions, idx_projects, dict })
+    }
+
+    pub fn inner(&self) -> &FjallDatabase {
+        &self.db
     }
 
     // -- Checkpoint operations --
 
-    pub fn load_all_checkpoints(&self) -> Result<Vec<FileCheckpoint>, redb::Error> {
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(CHECKPOINTS)?;
+    pub fn load_all_checkpoints(&self) -> Result<Vec<FileCheckpoint>, fjall::Error> {
         let mut checkpoints = Vec::new();
 
-        let iter = table.iter()?;
-        for entry in iter {
-            let entry = entry?;
-            let bytes = entry.1.value();
-            if let Ok(cp) = bincode::deserialize::<FileCheckpoint>(bytes) {
+        for guard in self.checkpoints.iter() {
+            let kv = guard.into_inner()?;
+            if let Ok(cp) = bincode::deserialize::<FileCheckpoint>(&kv.1) {
                 checkpoints.push(cp);
             }
         }
@@ -48,39 +56,29 @@ impl Database {
         Ok(checkpoints)
     }
 
-    pub fn upsert_checkpoint(&self, cp: &FileCheckpoint) -> Result<(), redb::Error> {
+    pub fn upsert_checkpoint(&self, cp: &FileCheckpoint) -> Result<(), fjall::Error> {
         let bytes = bincode::serialize(cp).expect("FileCheckpoint serialization failed");
-        let txn = self.db.begin_write()?;
-        {
-            let mut table = txn.open_table(CHECKPOINTS)?;
-            table.insert(cp.file_path.as_str(), bytes.as_slice())?;
-        }
-        txn.commit()?;
+        self.checkpoints.insert(cp.file_path.as_str(), bytes)?;
         Ok(())
     }
 
-    pub fn flush_checkpoints(&self, checkpoints: &[FileCheckpoint]) -> Result<(), redb::Error> {
+    pub fn flush_checkpoints(&self, checkpoints: &[FileCheckpoint]) -> Result<(), fjall::Error> {
         if checkpoints.is_empty() {
             return Ok(());
         }
-        let txn = self.db.begin_write()?;
-        {
-            let mut table = txn.open_table(CHECKPOINTS)?;
-            for cp in checkpoints {
-                let bytes = bincode::serialize(cp).expect("FileCheckpoint serialization failed");
-                table.insert(cp.file_path.as_str(), bytes.as_slice())?;
-            }
+        let mut batch = self.db.batch();
+        for cp in checkpoints {
+            let bytes = bincode::serialize(cp).expect("FileCheckpoint serialization failed");
+            batch.insert(&self.checkpoints, cp.file_path.as_str(), bytes);
         }
-        txn.commit()?;
+        batch.commit()?;
         Ok(())
     }
 
-    pub fn get_checkpoint(&self, file_path: &str) -> Result<Option<FileCheckpoint>, redb::Error> {
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(CHECKPOINTS)?;
-        match table.get(file_path)? {
+    pub fn get_checkpoint(&self, file_path: &str) -> Result<Option<FileCheckpoint>, fjall::Error> {
+        match self.checkpoints.get(file_path)? {
             Some(bytes) => {
-                let cp = bincode::deserialize::<FileCheckpoint>(bytes.value())
+                let cp = bincode::deserialize::<FileCheckpoint>(&bytes)
                     .expect("FileCheckpoint deserialization failed");
                 Ok(Some(cp))
             }
@@ -88,63 +86,324 @@ impl Database {
         }
     }
 
-    pub fn remove_checkpoint(&self, file_path: &str) -> Result<(), redb::Error> {
-        let txn = self.db.begin_write()?;
-        {
-            let mut table = txn.open_table(CHECKPOINTS)?;
-            table.remove(file_path)?;
-        }
-        txn.commit()?;
+    pub fn remove_checkpoint(&self, file_path: &str) -> Result<(), fjall::Error> {
+        self.checkpoints.remove(file_path)?;
         Ok(())
     }
 
     /// Remove all checkpoints (used for forced cold start).
-    pub fn clear_checkpoints(&self) -> Result<(), redb::Error> {
-        let txn = self.db.begin_write()?;
-        {
-            let mut table = txn.open_table(CHECKPOINTS)?;
-            // Collect keys first, then remove
-            let keys: Vec<String> = {
-                let iter = table.iter()?;
-                iter.filter_map(|e| e.ok().map(|e| e.0.value().to_string())).collect()
-            };
-            for key in &keys {
-                table.remove(key.as_str())?;
-            }
-        }
-        txn.commit()?;
+    pub fn clear_checkpoints(&self) -> Result<(), fjall::Error> {
+        self.checkpoints.clear()?;
         Ok(())
     }
 
     // -- Settings operations --
 
-    pub fn get_setting(&self, key: &str) -> Result<Option<String>, redb::Error> {
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(SETTINGS)?;
-        match table.get(key)? {
-            Some(val) => Ok(Some(val.value().to_string())),
+    pub fn get_setting(&self, key: &str) -> Result<Option<String>, fjall::Error> {
+        match self.meta.get(key)? {
+            Some(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).to_string())),
             None => Ok(None),
         }
     }
 
-    pub fn set_setting(&self, key: &str, value: &str) -> Result<(), redb::Error> {
-        let txn = self.db.begin_write()?;
-        {
-            let mut table = txn.open_table(SETTINGS)?;
-            table.insert(key, value)?;
-        }
-        txn.commit()?;
+    pub fn set_setting(&self, key: &str, value: &str) -> Result<(), fjall::Error> {
+        self.meta.insert(key, value)?;
         Ok(())
+    }
+
+    // -- Event operations --
+
+    /// Build event key: [ts_ms big-endian 8 bytes][message_id bytes]
+    fn event_key(ts_ms: i64, message_id: &str) -> Vec<u8> {
+        let mut key = Vec::with_capacity(8 + message_id.len());
+        key.extend_from_slice(&ts_ms.to_be_bytes());
+        key.extend_from_slice(message_id.as_bytes());
+        key
+    }
+
+    pub fn insert_event(&self, ts_ms: i64, message_id: &str, event: &StoredEvent) -> Result<(), fjall::Error> {
+        let key = Self::event_key(ts_ms, message_id);
+        let value = bincode::serialize(event).expect("StoredEvent serialization failed");
+        self.events.insert(key, value)?;
+        Ok(())
+    }
+
+    /// Insert a batch of events in a single transaction.
+    pub fn insert_event_batch(&self, batch: &mut fjall::OwnedWriteBatch, ts_ms: i64, message_id: &str, event: &StoredEvent) {
+        let key = Self::event_key(ts_ms, message_id);
+        let value = bincode::serialize(event).expect("StoredEvent serialization failed");
+        batch.insert(&self.events, key, value);
+    }
+
+    // -- Rollup operations --
+
+    /// Build rollup key: [hour_ts big-endian 8 bytes][model_name bytes]
+    fn rollup_key(hour_ts: i64, model_name: &str) -> Vec<u8> {
+        let mut key = Vec::with_capacity(8 + model_name.len());
+        key.extend_from_slice(&hour_ts.to_be_bytes());
+        key.extend_from_slice(model_name.as_bytes());
+        key
+    }
+
+    pub fn get_rollup(&self, hour_ts: i64, model_name: &str) -> Result<Option<RollupValue>, fjall::Error> {
+        let key = Self::rollup_key(hour_ts, model_name);
+        match self.rollups.get(&key)? {
+            Some(bytes) => Ok(bincode::deserialize::<RollupValue>(&bytes).ok()),
+            None => Ok(None),
+        }
+    }
+
+    pub fn upsert_rollup(&self, batch: &mut fjall::OwnedWriteBatch, hour_ts: i64, model_name: &str, rollup: &RollupValue) {
+        let key = Self::rollup_key(hour_ts, model_name);
+        let value = bincode::serialize(rollup).expect("RollupValue serialization failed");
+        batch.insert(&self.rollups, key, value);
+    }
+
+    // -- Index operations --
+
+    /// Insert session index entry: key = "{session_id}\0[ts:8][msg_id]", value = empty
+    pub fn insert_session_index(&self, batch: &mut fjall::OwnedWriteBatch, session_id: &str, ts_ms: i64, message_id: &str) {
+        let mut key = Vec::with_capacity(session_id.len() + 1 + 8 + message_id.len());
+        key.extend_from_slice(session_id.as_bytes());
+        key.push(0);
+        key.extend_from_slice(&ts_ms.to_be_bytes());
+        key.extend_from_slice(message_id.as_bytes());
+        batch.insert(&self.idx_sessions, key, b"");
+    }
+
+    /// Insert project index entry: key = "{project}\0[ts:8][msg_id]", value = empty
+    pub fn insert_project_index(&self, batch: &mut fjall::OwnedWriteBatch, project: &str, ts_ms: i64, message_id: &str) {
+        let mut key = Vec::with_capacity(project.len() + 1 + 8 + message_id.len());
+        key.extend_from_slice(project.as_bytes());
+        key.push(0);
+        key.extend_from_slice(&ts_ms.to_be_bytes());
+        key.extend_from_slice(message_id.as_bytes());
+        batch.insert(&self.idx_projects, key, b"");
+    }
+
+    /// List distinct session IDs from the session index.
+    /// Keys are sorted in LSM-tree, so consecutive duplicates are adjacent.
+    pub fn list_sessions(&self) -> Result<Vec<String>, fjall::Error> {
+        let mut sessions = Vec::new();
+        let mut last_prefix: Vec<u8> = Vec::new();
+        for guard in self.idx_sessions.iter() {
+            let kv = guard.into_inner()?;
+            let key = &kv.0;
+            let null_pos = key.iter().position(|&b| b == 0).unwrap_or(key.len());
+            let prefix = &key[..null_pos];
+            if prefix != last_prefix.as_slice() {
+                last_prefix.clear();
+                last_prefix.extend_from_slice(prefix);
+                sessions.push(String::from_utf8_lossy(prefix).into_owned());
+            }
+        }
+        Ok(sessions)
+    }
+
+    /// List distinct project names from the project index.
+    pub fn list_projects(&self) -> Result<Vec<String>, fjall::Error> {
+        let mut projects = Vec::new();
+        let mut last_prefix: Vec<u8> = Vec::new();
+        for guard in self.idx_projects.iter() {
+            let kv = guard.into_inner()?;
+            let key = &kv.0;
+            let null_pos = key.iter().position(|&b| b == 0).unwrap_or(key.len());
+            let prefix = &key[..null_pos];
+            if prefix != last_prefix.as_slice() {
+                last_prefix.clear();
+                last_prefix.extend_from_slice(prefix);
+                projects.push(String::from_utf8_lossy(prefix).into_owned());
+            }
+        }
+        Ok(projects)
+    }
+
+    // -- Dictionary operations --
+
+    pub fn dict_get(&self, key: &str) -> Result<Option<u32>, fjall::Error> {
+        match self.dict.get(key)? {
+            Some(bytes) => Ok(bincode::deserialize::<u32>(&bytes).ok()),
+            None => Ok(None),
+        }
+    }
+
+    pub fn dict_put(&self, batch: &mut fjall::OwnedWriteBatch, key: &str, id: u32) {
+        let value = bincode::serialize(&id).expect("dict id serialization failed");
+        batch.insert(&self.dict, key, value);
+    }
+
+    /// Load the full dictionary for reverse lookup (id → string).
+    pub fn load_dict_reverse(&self) -> Result<HashMap<u32, String>, fjall::Error> {
+        let mut map = HashMap::new();
+        for guard in self.dict.iter() {
+            let kv = guard.into_inner()?;
+            let key = String::from_utf8_lossy(&kv.0).into_owned();
+            if let Ok(id) = bincode::deserialize::<u32>(&kv.1) {
+                map.insert(id, key);
+            }
+        }
+        Ok(map)
+    }
+
+    /// Load the full dictionary for forward lookup (string → id).
+    pub fn load_dict_forward(&self) -> Result<HashMap<String, u32>, fjall::Error> {
+        let mut map = HashMap::new();
+        for guard in self.dict.iter() {
+            let kv = guard.into_inner()?;
+            let key = String::from_utf8_lossy(&kv.0).into_owned();
+            if let Ok(id) = bincode::deserialize::<u32>(&kv.1) {
+                map.insert(key, id);
+            }
+        }
+        Ok(map)
+    }
+
+    // -- Query operations --
+
+    /// Query events in a timestamp range [since_ms, until_ms].
+    pub fn query_events_range(&self, since_ms: i64, until_ms: i64) -> Result<Vec<(i64, String, StoredEvent)>, fjall::Error> {
+        let start_key = since_ms.to_be_bytes().to_vec();
+
+        let mut results = Vec::new();
+        for guard in self.events.range(start_key..) {
+            let kv = guard.into_inner()?;
+            let key = &kv.0;
+            if key.len() < 8 { continue; }
+            let ts = i64::from_be_bytes(key[..8].try_into().unwrap());
+            if ts > until_ms { break; }
+            let msg_id = String::from_utf8_lossy(&key[8..]).into_owned();
+            if let Ok(event) = bincode::deserialize::<StoredEvent>(&kv.1) {
+                results.push((ts, msg_id, event));
+            }
+        }
+        Ok(results)
+    }
+
+    /// Check if any rollup data exists (O(1) — reads only first entry).
+    pub fn has_any_rollups(&self) -> bool {
+        self.rollups.first_key_value().is_some()
+    }
+
+    /// Iterate rollups in [since_ms, until_ms] range, calling `f` for each.
+    /// Avoids allocating a Vec when only aggregation is needed.
+    pub fn for_each_rollup<F>(&self, since_ms: i64, until_ms: i64, mut f: F) -> Result<(), fjall::Error>
+    where
+        F: FnMut(i64, String, RollupValue),
+    {
+        let start_key = since_ms.to_be_bytes().to_vec();
+        for guard in self.rollups.range(start_key..) {
+            let kv = guard.into_inner()?;
+            let key = &kv.0;
+            if key.len() < 8 { continue; }
+            let ts = i64::from_be_bytes(key[..8].try_into().unwrap());
+            if ts > until_ms { break; }
+            let model = String::from_utf8_lossy(&key[8..]).into_owned();
+            if let Ok(rollup) = bincode::deserialize::<RollupValue>(&kv.1) {
+                f(ts, model, rollup);
+            }
+        }
+        Ok(())
+    }
+
+    /// Iterate events in [since_ms, until_ms] range, calling `f` for each.
+    pub fn for_each_event<F>(&self, since_ms: i64, until_ms: i64, mut f: F) -> Result<(), fjall::Error>
+    where
+        F: FnMut(i64, StoredEvent),
+    {
+        let start_key = since_ms.to_be_bytes().to_vec();
+        for guard in self.events.range(start_key..) {
+            let kv = guard.into_inner()?;
+            let key = &kv.0;
+            if key.len() < 8 { continue; }
+            let ts = i64::from_be_bytes(key[..8].try_into().unwrap());
+            if ts > until_ms { break; }
+            if let Ok(event) = bincode::deserialize::<StoredEvent>(&kv.1) {
+                f(ts, event);
+            }
+        }
+        Ok(())
+    }
+
+    // -- Deletion operations --
+
+    /// Delete events with timestamp before cutoff_ms. Returns count deleted.
+    pub fn delete_events_before(&self, cutoff_ms: i64) -> Result<u64, fjall::Error> {
+        let cutoff_key = cutoff_ms.to_be_bytes().to_vec();
+        let mut deleted = 0u64;
+        let mut keys_to_delete = Vec::new();
+
+        for guard in self.events.iter() {
+            let kv = guard.into_inner()?;
+            if kv.0.as_ref() >= cutoff_key.as_slice() {
+                break;
+            }
+            keys_to_delete.push(kv.0.to_vec());
+            if keys_to_delete.len() >= 1000 {
+                let mut batch = self.db.batch();
+                for key in keys_to_delete.drain(..) {
+                    batch.remove(&self.events, key);
+                    deleted += 1;
+                }
+                batch.commit()?;
+            }
+        }
+        if !keys_to_delete.is_empty() {
+            let mut batch = self.db.batch();
+            for key in keys_to_delete {
+                batch.remove(&self.events, key);
+                deleted += 1;
+            }
+            batch.commit()?;
+        }
+        Ok(deleted)
+    }
+
+    /// Delete rollups with timestamp before cutoff_ms. Returns count deleted.
+    pub fn delete_rollups_before(&self, cutoff_ms: i64) -> Result<u64, fjall::Error> {
+        let cutoff_key = cutoff_ms.to_be_bytes().to_vec();
+        let mut deleted = 0u64;
+        let mut keys_to_delete = Vec::new();
+
+        for guard in self.rollups.iter() {
+            let kv = guard.into_inner()?;
+            if kv.0.as_ref() >= cutoff_key.as_slice() {
+                break;
+            }
+            keys_to_delete.push(kv.0.to_vec());
+            if keys_to_delete.len() >= 1000 {
+                let mut batch = self.db.batch();
+                for key in keys_to_delete.drain(..) {
+                    batch.remove(&self.rollups, key);
+                    deleted += 1;
+                }
+                batch.commit()?;
+            }
+        }
+        if !keys_to_delete.is_empty() {
+            let mut batch = self.db.batch();
+            for key in keys_to_delete {
+                batch.remove(&self.rollups, key);
+                deleted += 1;
+            }
+            batch.commit()?;
+        }
+        Ok(deleted)
+    }
+
+    /// Create a new batch.
+    pub fn batch(&self) -> fjall::OwnedWriteBatch {
+        self.db.batch()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::common::types::RollupValue;
 
     fn temp_db() -> (Database, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("test.db");
+        let db_path = dir.path().join("test.fjall");
         let db = Database::open(&db_path).unwrap();
         (db, dir)
     }
@@ -266,5 +525,89 @@ mod tests {
 
         let val = db.get_setting("key").unwrap().unwrap();
         assert_eq!(val, "value2");
+    }
+
+    #[test]
+    fn test_event_insert_and_query() {
+        let (db, _dir) = temp_db();
+
+        let event = StoredEvent {
+            model_id: 1,
+            session_id: 2,
+            source_file_id: 3,
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_creation_input_tokens: 10,
+            cache_read_input_tokens: 20,
+        };
+
+        db.insert_event(1000, "msg1", &event).unwrap();
+        db.insert_event(2000, "msg2", &event).unwrap();
+        db.insert_event(3000, "msg3", &event).unwrap();
+
+        let results = db.query_events_range(1000, 2000).unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, 1000);
+        assert_eq!(results[1].0, 2000);
+    }
+
+    #[test]
+    fn test_rollup_upsert_and_query() {
+        let (db, _dir) = temp_db();
+
+        let hour_ts = 3_600_000i64;
+        let rollup = RollupValue {
+            input: 100,
+            output: 50,
+            cache_create: 10,
+            cache_read: 20,
+            count: 5,
+        };
+
+        let mut batch = db.batch();
+        db.upsert_rollup(&mut batch, hour_ts, "claude-opus-4-6", &rollup);
+        batch.commit().unwrap();
+
+        let loaded = db.get_rollup(hour_ts, "claude-opus-4-6").unwrap().unwrap();
+        assert_eq!(loaded.input, 100);
+        assert_eq!(loaded.count, 5);
+    }
+
+    #[test]
+    fn test_dict_round_trip() {
+        let (db, _dir) = temp_db();
+
+        let mut batch = db.batch();
+        db.dict_put(&mut batch, "claude-opus-4-6", 1);
+        db.dict_put(&mut batch, "session-123", 2);
+        batch.commit().unwrap();
+
+        assert_eq!(db.dict_get("claude-opus-4-6").unwrap(), Some(1));
+        assert_eq!(db.dict_get("session-123").unwrap(), Some(2));
+        assert_eq!(db.dict_get("nonexistent").unwrap(), None);
+
+        let reverse = db.load_dict_reverse().unwrap();
+        assert_eq!(reverse.get(&1).unwrap(), "claude-opus-4-6");
+        assert_eq!(reverse.get(&2).unwrap(), "session-123");
+    }
+
+    #[test]
+    fn test_delete_events_before() {
+        let (db, _dir) = temp_db();
+
+        let event = StoredEvent {
+            model_id: 1, session_id: 1, source_file_id: 1,
+            input_tokens: 10, output_tokens: 5,
+            cache_creation_input_tokens: 0, cache_read_input_tokens: 0,
+        };
+        db.insert_event(1000, "a", &event).unwrap();
+        db.insert_event(2000, "b", &event).unwrap();
+        db.insert_event(3000, "c", &event).unwrap();
+
+        let deleted = db.delete_events_before(2000).unwrap();
+        assert_eq!(deleted, 1); // only ts=1000
+
+        let remaining = db.query_events_range(0, 10000).unwrap();
+        assert_eq!(remaining.len(), 2);
     }
 }
