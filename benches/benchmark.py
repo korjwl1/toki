@@ -893,6 +893,9 @@ def generate_charts(json_path: Path) -> list[Path]:
         ("ccusage", "val"):  {"color": "#3498db", "ls": "-",  "marker": "s", "ms": 5, "lw": 2.2, "label": "ccusage"},
         ("ccusage", "avg"):  {"color": "#3498db", "ls": "-",  "marker": "s", "ms": 5, "lw": 2.2, "label": "ccusage avg"},
         ("ccusage", "peak"): {"color": "#85c1e9", "ls": "--", "marker": "^", "ms": 4, "lw": 1.6, "label": "ccusage peak"},
+        ("zzusage", "val"):  {"color": "#2ecc71", "ls": "-",  "marker": "^", "ms": 5, "lw": 2.2, "label": "zzusage"},
+        ("zzusage", "avg"):  {"color": "#2ecc71", "ls": "-",  "marker": "^", "ms": 5, "lw": 2.2, "label": "zzusage avg"},
+        ("zzusage", "peak"): {"color": "#a9dfbf", "ls": "--", "marker": "v", "ms": 4, "lw": 1.6, "label": "zzusage peak"},
     }
 
     def _plot(ax, x, y, tool, kind):
