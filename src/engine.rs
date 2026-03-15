@@ -155,8 +155,8 @@ impl TrackerEngine {
         parallel_scan(&sessions, &self.checkpoints, |path, offset| {
             let mut local: HashMap<String, ModelUsageSummary> = HashMap::new();
             let mut file_events: Vec<ColdStartEvent> = Vec::new();
-            let session_id: std::rc::Rc<str> = extract_session_id(path).unwrap_or_default().into();
-            let source_file: std::rc::Rc<str> = path.into();
+            let session_id: std::sync::Arc<str> = extract_session_id(path).unwrap_or_default().into();
+            let source_file: std::sync::Arc<str> = path.into();
             let result = process_lines_streaming(path, offset, |line| {
                 if let Some(parsed) = cs_parser.parse_for_cold_start(line) {
                     // Accumulate summary
@@ -170,13 +170,13 @@ impl TrackerEngine {
                     summary.output_tokens += parsed.output_tokens;
                     summary.event_count += 1;
 
-                    // Build ColdStartEvent — reuse Rc for session_id/source_file
+                    // Build ColdStartEvent — Arc::clone for session_id/source_file (no alloc)
                     file_events.push(ColdStartEvent {
                         ts_ms: parsed.ts_ms,
                         message_id: parsed.event_key,
                         model: parsed.model,
-                        session_id: session_id.to_string(),
-                        source_file: source_file.to_string(),
+                        session_id: std::sync::Arc::clone(&session_id),
+                        source_file: std::sync::Arc::clone(&source_file),
                         tokens: TokenFields {
                             input_tokens: parsed.input_tokens,
                             output_tokens: parsed.output_tokens,

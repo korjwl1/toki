@@ -10,12 +10,13 @@ use crate::engine::extract_project_name;
 use crate::retention::{RetentionPolicy, run_retention};
 
 /// Event data for cold start bulk write.
+/// Uses Rc<str> for session_id/source_file to avoid per-event String clones.
 pub struct ColdStartEvent {
     pub ts_ms: i64,
     pub message_id: String,
     pub model: String,
-    pub session_id: String,
-    pub source_file: String,
+    pub session_id: std::sync::Arc<str>,
+    pub source_file: std::sync::Arc<str>,
     pub tokens: TokenFields,
 }
 
