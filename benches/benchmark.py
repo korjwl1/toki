@@ -292,6 +292,8 @@ class BenchResult:
     samples: int
     exit_code: int
     db_size_mb: float = 0.0
+    parse_time_s: float = 0.0
+    db_wait_s: float = 0.0
 
 
 def purge_disk_cache():
@@ -376,17 +378,25 @@ def run_daemon_cold_start(toki: str, data_path: Path) -> BenchResult:
     mon.stop()
     log_file.close()
 
-    # Parse pure cold_start time from debug log (excludes daemon startup overhead)
+    # Parse cold_start timing from debug log (excludes daemon startup overhead)
     elapsed = 0.0
+    parse_time = 0.0
+    db_wait = 0.0
     try:
         import re
         with open(log_path, "r") as f:
             for line in f:
                 if "cold_start" in line and "total:" in line:
                     # Format: cold_start — ... (parse: Xµs, db_wait: Yµs, total: Zµs)
-                    m = re.search(r'total:\s*(\d+)µs', line)
-                    if m:
-                        elapsed = int(m.group(1)) / 1_000_000
+                    m_total = re.search(r'total:\s*(\d+)µs', line)
+                    m_parse = re.search(r'parse:\s*(\d+)µs', line)
+                    m_db = re.search(r'db_wait:\s*(\d+)µs', line)
+                    if m_total:
+                        elapsed = int(m_total.group(1)) / 1_000_000
+                    if m_parse:
+                        parse_time = int(m_parse.group(1)) / 1_000_000
+                    if m_db:
+                        db_wait = int(m_db.group(1)) / 1_000_000
                     break
     except OSError:
         pass
@@ -401,6 +411,8 @@ def run_daemon_cold_start(toki: str, data_path: Path) -> BenchResult:
         scenario="cold_start", run=0,
         wall_time_s=round(elapsed, 4),
         exit_code=0 if proc.poll() is None else proc.returncode,
+        parse_time_s=round(parse_time, 4),
+        db_wait_s=round(db_wait, 4),
         **s,
     )
 
@@ -578,7 +590,7 @@ def cmd_run(args):
                 results.append(r)
 
                 status = "OK" if r.exit_code == 0 else f"EXIT={r.exit_code}"
-                print(f"  {r.wall_time_s:7.3f}s  {r.peak_rss_mb:6.1f}MB  DB:{r.db_size_mb:.1f}MB  {status}")
+                print(f"  {r.wall_time_s:7.3f}s  parse:{r.parse_time_s:.3f}s  db:{r.db_wait_s:.3f}s  {r.peak_rss_mb:6.1f}MB  DB:{r.db_size_mb:.1f}MB  {status}")
 
                 # Stop daemon after each cold start run (next run needs fresh start)
                 if i < runs:
@@ -721,6 +733,8 @@ def compute_averages(results: list[BenchResult]) -> list[dict]:
         # Include db_size_mb for cold_start entries
         if scenario == "cold_start":
             entry["db_size_mb"] = round(max(r.db_size_mb for r in runs), 2)
+            entry["parse_time_s"] = round(sum(r.parse_time_s for r in runs) / n, 4)
+            entry["db_wait_s"] = round(sum(r.db_wait_s for r in runs) / n, 4)
         avgs.append(entry)
     return avgs
 
@@ -742,7 +756,7 @@ def print_summary(results: list[BenchResult]):
         for tool in tools:
             header += f"  {'time(s)':>8s}  {'RSS(MB)':>8s}  {'CPU%':>6s}"
             if scenario == "cold_start" and tool == "toki":
-                header += f"  {'DB(MB)':>7s}"
+                header += f"  {'parse(s)':>9s}  {'db(s)':>6s}  {'DB(MB)':>7s}"
         print(header)
 
         for label in labels:
@@ -755,11 +769,11 @@ def print_summary(results: list[BenchResult]):
                     a = match[0]
                     row += f"  {a['wall_time_s']:8.3f}  {a['peak_rss_mb']:8.1f}  {a['avg_cpu_pct']:6.1f}"
                     if scenario == "cold_start" and tool == "toki":
-                        row += f"  {a.get('db_size_mb', 0):7.1f}"
+                        row += f"  {a.get('parse_time_s', 0):9.3f}  {a.get('db_wait_s', 0):6.3f}  {a.get('db_size_mb', 0):7.1f}"
                 else:
                     row += f"  {'—':>8s}  {'—':>8s}  {'—':>6s}"
                     if scenario == "cold_start" and tool == "toki":
-                        row += f"  {'—':>7s}"
+                        row += f"  {'—':>9s}  {'—':>6s}  {'—':>7s}"
             print(row)
         print()
 
