@@ -56,11 +56,10 @@ toki는 파싱과 **동시에** TSDB 색인까지 수행합니다. 파싱만 하
 
 ### 메모리 & CPU
 
-| 상태 | 데이터 | toki | ccusage | zzusage |
-|------|--------|------|---------|---------|
-| **Cold Start** | 500 MB | **83 MB** | 126 MB | 613 MB |
-| **Cold Start** | 2 GB | **161 MB** | 126 MB | 2,311 MB |
-| **Idle / Report** | *무관* | **5–11 MB** | — | — |
+| 데이터 | toki (cold start) | toki (idle) | ccusage | zzusage |
+|--------|-------------------|-------------|---------|---------|
+| 500 MB | 83 MB | **5–11 MB** | 126 MB | 613 MB |
+| 2 GB | 161 MB | **5–11 MB** | 126 MB | 2,311 MB |
 
 - **toki** — cold start 때는 파일별 스트리밍 + mmap zero-copy로 처리합니다. 색인이 끝나면 데몬은 5–11 MB, CPU ~0%로 내려갑니다. FSEvents(커널 레벨, 폴링 없음)로 파일 변경을 감시하고, Claude Code가 새 로그를 쓸 때만 깨어납니다. 리포트는 TSDB 쿼리로 13ms면 끝나고, ~5 MB에서 즉시 종료됩니다.
 - **ccusage** — Node.js 힙 ~126MB 고정, 순차 처리 후 GC. idle 상태 없이 매번 전체 비용을 지불합니다.

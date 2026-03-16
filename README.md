@@ -56,11 +56,10 @@ toki parses **and** indexes into a TSDB simultaneously — yet still outruns too
 
 ### Memory & CPU
 
-| Phase | Data Size | toki | ccusage | zzusage |
-|-------|-----------|------|---------|---------|
-| **Cold Start** | 500 MB | **83 MB** | 126 MB | 613 MB |
-| **Cold Start** | 2 GB | **161 MB** | 126 MB | 2,311 MB |
-| **Idle / Report** | *any* | **5–11 MB** | — | — |
+| Data Size | toki (cold start) | toki (idle) | ccusage | zzusage |
+|-----------|-------------------|-------------|---------|---------|
+| 500 MB | 83 MB | **5–11 MB** | 126 MB | 613 MB |
+| 2 GB | 161 MB | **5–11 MB** | 126 MB | 2,311 MB |
 
 - **toki** — streaming per-file with mmap zero-copy during cold start. After indexing, the daemon drops to 5–11 MB and ~0% CPU. It watches for changes via FSEvents (kernel-level, zero polling) and only wakes when Claude Code writes new lines. Reports query the TSDB in 13 ms and exit at ~5 MB.
 - **ccusage** — Node.js heap capped at ~126 MB, sequential with GC. No idle state — every invocation pays full cost.
