@@ -54,31 +54,19 @@ toki는 파싱과 **동시에** TSDB 색인까지 수행합니다. 파싱만 하
 
 > **zzusage 대비 ~1.0x가 의미하는 것:** toki는 라인마다 *엄밀히 더 많은 일*을 합니다 — TSDB 쓰기(fjall LSM-tree insert), rollup 집계, 체크포인트 저장, JSON 스키마 검증까지. zzusage는 이걸 전부 생략합니다. DB도 없고, 검증도 없고, 순수 파싱만 합니다. 그런데도 wall-clock 시간은 거의 같습니다. 검증이 없다는 건 실용적인 문제이기도 합니다. zzusage는 구조 검사 없이 모든 콘텐츠를 그대로 받아들이기 때문에, 조작된 JSONL을 넣어서 사용량을 부풀리거나 위조하는 게 가능합니다. toki는 모든 레코드를 TSDB에 넣기 전에 검증하므로, 변조된 데이터는 파싱 단계에서 거부됩니다.
 
-### 리소스 사용량
+### 메모리 & CPU
 
-ccusage와 zzusage는 배치 도구입니다. 매번 실행할 때마다 전체 시간 동안 리소스를 점유하면서, 에디터, 컴파일러, AI 에이전트와 CPU/메모리를 경쟁합니다. toki의 데몬 아키텍처는 무거운 작업을 cold start 한 번으로 끝내고, 그 이후에는 사실상 사라집니다.
+| 상태 | 데이터 | toki | ccusage | zzusage |
+|------|--------|------|---------|---------|
+| **Cold Start** | 500 MB | **83 MB** | 126 MB | 613 MB |
+| **Cold Start** | 2 GB | **161 MB** | 126 MB | 2,311 MB |
+| **Idle / Report** | *무관* | **5–11 MB** | — | — |
 
-#### Cold Start 시 (1회성 색인 구축)
+- **toki** — cold start 때는 파일별 스트리밍 + mmap zero-copy로 처리합니다. 색인이 끝나면 데몬은 5–11 MB, CPU ~0%로 내려갑니다. FSEvents(커널 레벨, 폴링 없음)로 파일 변경을 감시하고, Claude Code가 새 로그를 쓸 때만 깨어납니다. 리포트는 TSDB 쿼리로 13ms면 끝나고, ~5 MB에서 즉시 종료됩니다.
+- **ccusage** — Node.js 힙 ~126MB 고정, 순차 처리 후 GC. idle 상태 없이 매번 전체 비용을 지불합니다.
+- **zzusage** — 전체 이벤트를 메모리에 올립니다. 2GB 데이터면 2.3GB RAM. idle 상태 없음. 더 크면 OOM입니다.
 
-| 데이터 | toki | ccusage | zzusage |
-|--------|------|---------|---------|
-| 500 MB | **83 MB** | 126 MB | 613 MB |
-| 2 GB | **161 MB** | 126 MB | 2,311 MB |
-
-- **toki** — 파일별 스트리밍 처리, mmap zero-copy. 데이터가 커져도 메모리는 flat하게 유지됩니다.
-- **ccusage** — Node.js 힙 ~126MB 고정, 순차 처리 후 GC.
-- **zzusage** — 전체 이벤트를 메모리에 올립니다. 2GB 데이터면 2.3GB RAM. 더 크면 OOM입니다.
-
-#### 색인 완료 후 (idle 데몬)
-
-| | 메모리 (RSS) | CPU |
-|---|---|---|
-| **toki daemon** | **5–11 MB** | **~0%** |
-| **toki report** | **~5 MB** | 즉시 종료 |
-
-데몬은 FSEvents(커널 레벨, 폴링 없음)로 파일 변경을 감시하고, Claude Code가 새 로그를 쓸 때만 깨어납니다. 이벤트 사이에는 사실상 아무것도 소모하지 않습니다. 리포트는 TSDB에 대한 UDS 쿼리로, 13ms면 반환하고 바로 종료됩니다.
-
-**이게 본질적인 차이입니다.** ccusage와 zzusage는 매번 전체 데이터를 다시 읽고 다시 파싱합니다 — 126MB에서 2.3GB의 RAM, 수 초에서 수 분의 CPU 시간을, 매번. toki는 그 비용을 딱 한 번만 치르고, 이후에는 5MB로 백그라운드에 있습니다. AI 코딩 세션이든, 컴파일이든, 테스트든 — 아무것도 방해받지 않습니다.
+ccusage와 zzusage는 배치 도구입니다. 질문할 때마다 모든 걸 처음부터 다시 읽습니다 — 126MB에서 2.3GB의 RAM, 수 초에서 수 분의 CPU를, 에디터, 컴파일러, AI 에이전트와 경쟁하면서. toki는 그 비용을 한 번만 치르고, 이후에는 5MB로 백그라운드에 있습니다. 아무것도 방해받지 않습니다.
 
 > 측정 환경: Apple M1 MacBook Air (8GB RAM), macOS, 절전 모드 off.
 > 재현: `sudo -v && python3 benches/benchmark.py run --purge --tool all`

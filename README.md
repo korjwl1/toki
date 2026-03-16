@@ -54,31 +54,19 @@ toki parses **and** indexes into a TSDB simultaneously — yet still outruns too
 
 > **Why ~1.0x vs zzusage matters:** toki does *strictly more work* per line — TSDB writes (fjall LSM-tree inserts), rollup aggregation, checkpoint persistence, and JSON schema validation. zzusage skips all of this: no DB, no validation, just raw parsing. Despite the extra workload, toki matches zzusage in wall-clock time. The validation gap also has a practical consequence: zzusage accepts any content without structural checks, making it trivial to feed crafted JSONL that inflates or fabricates usage numbers. toki validates every record before it reaches the TSDB, so tampered data is rejected at parse time.
 
-### Resource Usage
+### Memory & CPU
 
-ccusage and zzusage are batch tools — they consume resources for the entire duration of every run, competing with your editor, compiler, and AI agent for CPU and memory. toki's daemon architecture means the heavy lifting happens once at cold start, then it virtually disappears.
+| Phase | Data Size | toki | ccusage | zzusage |
+|-------|-----------|------|---------|---------|
+| **Cold Start** | 500 MB | **83 MB** | 126 MB | 613 MB |
+| **Cold Start** | 2 GB | **161 MB** | 126 MB | 2,311 MB |
+| **Idle / Report** | *any* | **5–11 MB** | — | — |
 
-#### During Cold Start (one-time index build)
+- **toki** — streaming per-file with mmap zero-copy during cold start. After indexing, the daemon drops to 5–11 MB and ~0% CPU. It watches for changes via FSEvents (kernel-level, zero polling) and only wakes when Claude Code writes new lines. Reports query the TSDB in 13 ms and exit at ~5 MB.
+- **ccusage** — Node.js heap capped at ~126 MB, sequential with GC. No idle state — every invocation pays full cost.
+- **zzusage** — loads all events into memory. 2 GB data → 2.3 GB RAM. No idle state. Will OOM on larger datasets.
 
-| Data Size | toki | ccusage | zzusage |
-|-----------|------|---------|---------|
-| 500 MB | **83 MB** | 126 MB | 613 MB |
-| 2 GB | **161 MB** | 126 MB | 2,311 MB |
-
-- **toki** — streaming per-file processing with mmap zero-copy. Memory stays flat regardless of data size.
-- **ccusage** — Node.js heap capped at ~126 MB, sequential with GC.
-- **zzusage** — loads all events into memory. 2 GB data → 2.3 GB RAM. Will OOM on larger datasets.
-
-#### After Indexing (idle daemon)
-
-| | Memory (RSS) | CPU |
-|---|---|---|
-| **toki daemon** | **5–11 MB** | **~0%** |
-| **toki report** | **~5 MB** | instant exit |
-
-The daemon watches for file changes via FSEvents (kernel-level, zero polling) and only wakes when Claude Code writes new log lines. Between events, it consumes virtually nothing. Reports are UDS queries to the TSDB — they return in 13 ms and exit immediately.
-
-**This is the real difference.** ccusage and zzusage must re-read and re-parse all your data on every invocation — 126 MB to 2.3 GB of RAM, seconds to minutes of CPU time, every single time. toki pays that cost once, then runs in the background at 5 MB. Your AI coding session, your compiler, your tests — nothing competes for resources.
+ccusage and zzusage are batch tools. Every time you ask a question, they re-read everything from scratch — 126 MB to 2.3 GB of RAM, seconds to minutes of CPU, competing with your editor, compiler, and AI agent. toki pays that cost once, then sits at 5 MB in the background. Nothing competes for resources.
 
 > Measured on Apple M1 MacBook Air (8 GB RAM), macOS, power saving off.
 > Reproduce: `sudo -v && python3 benches/benchmark.py run --purge --tool all`
