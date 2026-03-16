@@ -19,7 +19,7 @@
 
 ---
 
-> **Vibe-coded right.** Yes, toki was built with AI assistance — but every architectural decision was made by a professional systems engineer who knows exactly why each piece exists. The TSDB schema, rollup-on-write strategy, xxHash3 checkpoint recovery — all designed by hand, then implemented with precision. This is what vibe coding looks like when the person driving actually knows where they're going.
+> **Engineered, not just coded.** In the age of vibe coding, toki stands apart — every architectural decision was made by a professional systems engineer who knows exactly why each piece exists. The TSDB schema, rollup-on-write strategy, xxHash3 checkpoint recovery, 4-thread daemon model — all designed with intent, built with precision.
 
 ---
 
