@@ -27,7 +27,7 @@
 
 단순히 빠른 게 아닙니다 — **돌아가는지도 모를 만큼 가볍습니다.** idle 상태에서 5MB, CPU 거의 0%, 어떤 리포트든 13ms면 끝납니다. ccusage와 zzusage는 질문할 때마다 전체 데이터를 처음부터 다시 읽으면서 CPU와 메모리를 잡아먹습니다. toki는 한 번 색인하고, 그 뒤로는 사라집니다.
 
-[ccusage](https://github.com/ryoppippi/ccusage) (Node.js), [zzusage](https://github.com/nickarellano/zzusage) (Zig)와 동일 데이터셋으로 벤치마크했습니다. 매 실행 전 `sudo purge`로 디스크 캐시를 초기화했습니다.
+[ccusage](https://github.com/ryoppippi/ccusage) (Node.js), [zzusage](https://github.com/joelreymont/zzusage) (Zig)와 동일 데이터셋으로 벤치마크했습니다. 매 실행 전 `sudo purge`로 디스크 캐시를 초기화했습니다.
 
 ### 리포트 속도 (색인 조회 vs 전체 재스캔)
 
