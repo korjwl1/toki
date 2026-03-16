@@ -5,8 +5,8 @@
 <h1 align="center">toki</h1>
 
 <p align="center">
-  <b>Blazing-fast token usage tracker for AI CLI tools</b><br>
-  Built in Rust. Daemon-powered. Indexed in a TSDB. Reports in 13 ms — always.
+  <b>Invisible token usage tracker for AI CLI tools</b><br>
+  Built in Rust. Daemon-powered. 5 MB idle. Reports in 13 ms. Your workflow never notices.
 </p>
 
 <p align="center">
@@ -25,7 +25,9 @@
 
 ## Performance
 
-The reason toki exists. Benchmarked against [ccusage](https://github.com/ryoppippi/ccusage) (Node.js) and [zzusage](https://github.com/nickarellano/zzusage) (Zig) on the same dataset, disk cache purged before each run.
+Not just fast — **lightweight enough to forget it's running.** toki sits at 5 MB idle, near-zero CPU, and answers any report in 13 ms. ccusage and zzusage spike your CPU and memory every time you ask a question, because they re-read everything from scratch. toki doesn't. It indexes once, then gets out of your way.
+
+Benchmarked against [ccusage](https://github.com/ryoppippi/ccusage) (Node.js) and [zzusage](https://github.com/nickarellano/zzusage) (Zig) on the same dataset, disk cache purged before each run.
 
 ### Report Speed (indexed query vs full re-scan)
 
@@ -52,18 +54,31 @@ toki parses **and** indexes into a TSDB simultaneously — yet still outruns too
 
 > **Why ~1.0x vs zzusage matters:** toki does *strictly more work* per line — TSDB writes (fjall LSM-tree inserts), rollup aggregation, checkpoint persistence, and JSON schema validation. zzusage skips all of this: no DB, no validation, just raw parsing. Despite the extra workload, toki matches zzusage in wall-clock time. The validation gap also has a practical consequence: zzusage accepts any content without structural checks, making it trivial to feed crafted JSONL that inflates or fabricates usage numbers. toki validates every record before it reaches the TSDB, so tampered data is rejected at parse time.
 
-### Memory & CPU
+### Resource Usage
+
+ccusage and zzusage are batch tools — they consume resources for the entire duration of every run, competing with your editor, compiler, and AI agent for CPU and memory. toki's daemon architecture means the heavy lifting happens once at cold start, then it virtually disappears.
+
+#### During Cold Start (one-time index build)
 
 | Data Size | toki | ccusage | zzusage |
 |-----------|------|---------|---------|
 | 500 MB | **83 MB** | 126 MB | 613 MB |
 | 2 GB | **161 MB** | 126 MB | 2,311 MB |
 
-- **toki** — streaming per-file processing with mmap zero-copy. Memory stays flat.
+- **toki** — streaming per-file processing with mmap zero-copy. Memory stays flat regardless of data size.
 - **ccusage** — Node.js heap capped at ~126 MB, sequential with GC.
-- **zzusage** — loads all events into memory. Scales linearly with data (2 GB data → 2.3 GB RAM).
+- **zzusage** — loads all events into memory. 2 GB data → 2.3 GB RAM. Will OOM on larger datasets.
 
-toki report: **~5 MB RSS, ~0% CPU**. Data size is irrelevant.
+#### After Indexing (idle daemon)
+
+| | Memory (RSS) | CPU |
+|---|---|---|
+| **toki daemon** | **5–11 MB** | **~0%** |
+| **toki report** | **~5 MB** | instant exit |
+
+The daemon watches for file changes via FSEvents (kernel-level, zero polling) and only wakes when Claude Code writes new log lines. Between events, it consumes virtually nothing. Reports are UDS queries to the TSDB — they return in 13 ms and exit immediately.
+
+**This is the real difference.** ccusage and zzusage must re-read and re-parse all your data on every invocation — 126 MB to 2.3 GB of RAM, seconds to minutes of CPU time, every single time. toki pays that cost once, then runs in the background at 5 MB. Your AI coding session, your compiler, your tests — nothing competes for resources.
 
 > Measured on Apple M1 MacBook Air (8 GB RAM), macOS, power saving off.
 > Reproduce: `sudo -v && python3 benches/benchmark.py run --purge --tool all`

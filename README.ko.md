@@ -5,8 +5,8 @@
 <h1 align="center">toki</h1>
 
 <p align="center">
-  <b>AI CLI 도구를 위한 초고속 토큰 사용량 트래커</b><br>
-  Rust로 구축. 데몬 기반. TSDB에 색인. 리포트는 언제나 13ms.
+  <b>존재감 없는 토큰 사용량 트래커</b><br>
+  Rust로 구축. 데몬 기반. idle 5MB. 리포트 13ms. 작업을 전혀 방해하지 않는다.
 </p>
 
 <p align="center">
@@ -25,7 +25,9 @@
 
 ## 성능
 
-toki가 존재하는 이유. [ccusage](https://github.com/ryoppippi/ccusage) (Node.js), [zzusage](https://github.com/nickarellano/zzusage) (Zig)와 동일 데이터셋으로 벤치마크, 매 실행 전 `sudo purge`로 디스크 캐시 초기화.
+단순히 빠른 게 아니다 — **돌아가는지도 모를 만큼 가볍다.** toki는 idle 상태에서 5MB, CPU 거의 0%, 어떤 리포트든 13ms에 응답한다. ccusage와 zzusage는 질문할 때마다 CPU와 메모리를 점유한다 — 매번 모든 데이터를 처음부터 다시 읽기 때문이다. toki는 한 번 색인하고, 그 뒤로는 사라진다.
+
+[ccusage](https://github.com/ryoppippi/ccusage) (Node.js), [zzusage](https://github.com/nickarellano/zzusage) (Zig)와 동일 데이터셋으로 벤치마크, 매 실행 전 `sudo purge`로 디스크 캐시 초기화.
 
 ### 리포트 속도 (색인 조회 vs 전체 재스캔)
 
@@ -52,18 +54,31 @@ toki는 파싱과 **동시에** TSDB에 색인까지 하면서도, 파싱만 하
 
 > **zzusage 대비 ~1.0x가 의미하는 것:** toki는 라인당 *엄밀히 더 많은 작업*을 수행한다 — TSDB 쓰기(fjall LSM-tree insert), rollup 집계, 체크포인트 저장, JSON 스키마 검증. zzusage는 이 모든 것을 생략한다: DB 없음, 검증 없음, 순수 파싱만. 이 추가 작업에도 불구하고 toki는 wall-clock 시간에서 zzusage와 대등하다. 검증의 부재는 실용적인 문제도 낳는다: zzusage는 구조적 검사 없이 모든 콘텐츠를 수용하므로, 조작된 JSONL을 주입하여 사용량을 부풀리거나 위조하는 것이 쉽다. toki는 모든 레코드를 TSDB에 도달하기 전에 검증하므로, 변조된 데이터는 파싱 단계에서 거부된다.
 
-### 메모리 & CPU
+### 리소스 사용량
+
+ccusage와 zzusage는 배치 도구다 — 매 실행마다 전체 시간 동안 리소스를 점유하며, 에디터, 컴파일러, AI 에이전트와 CPU/메모리를 경쟁한다. toki의 데몬 아키텍처는 무거운 작업을 cold start 한 번으로 끝내고, 그 이후에는 사실상 사라진다.
+
+#### Cold Start 시 (1회성 색인 구축)
 
 | 데이터 | toki | ccusage | zzusage |
 |--------|------|---------|---------|
 | 500 MB | **83 MB** | 126 MB | 613 MB |
 | 2 GB | **161 MB** | 126 MB | 2,311 MB |
 
-- **toki** — 파일별 스트리밍 처리, mmap zero-copy. 메모리가 flat하게 유지됨.
+- **toki** — 파일별 스트리밍 처리, mmap zero-copy. 데이터 크기와 무관하게 메모리가 flat 유지.
 - **ccusage** — Node.js 힙 ~126MB 고정, 순차 처리 후 GC.
-- **zzusage** — 전체 이벤트를 메모리에 적재. 데이터 크기에 비례하여 폭증 (2GB 데이터 → 2.3GB RAM).
+- **zzusage** — 전체 이벤트를 메모리에 적재. 2GB 데이터 → 2.3GB RAM. 더 큰 데이터는 OOM.
 
-toki report: **~5 MB RSS, ~0% CPU**. 데이터 크기는 무관.
+#### 색인 완료 후 (idle 데몬)
+
+| | 메모리 (RSS) | CPU |
+|---|---|---|
+| **toki daemon** | **5–11 MB** | **~0%** |
+| **toki report** | **~5 MB** | 즉시 종료 |
+
+데몬은 FSEvents(커널 레벨, 폴링 제로)로 파일 변경을 감시하며, Claude Code가 새 로그를 기록할 때만 깨어난다. 이벤트 사이에는 사실상 아무것도 소모하지 않는다. 리포트는 TSDB에 대한 UDS 쿼리 — 13ms 만에 반환하고 즉시 종료한다.
+
+**이것이 본질적인 차이다.** ccusage와 zzusage는 매 실행마다 모든 데이터를 다시 읽고 다시 파싱해야 한다 — 126MB에서 2.3GB의 RAM, 수 초에서 수 분의 CPU 시간을, 매번. toki는 그 비용을 한 번만 치르고, 이후에는 5MB로 백그라운드에서 동작한다. AI 코딩 세션, 컴파일러, 테스트 — 아무것도 리소스 경쟁을 하지 않는다.
 
 > 측정 환경: Apple M1 MacBook Air (8GB RAM), macOS, 절전 모드 off.
 > 재현: `sudo -v && python3 benches/benchmark.py run --purge --tool all`
