@@ -45,6 +45,8 @@ ccusage and zzusage re-read every file from scratch, every time.
 
 toki parses **and** indexes into a TSDB simultaneously — yet still outruns tools that only parse.
 
+> **Note:** These benchmarks assume a fresh start with no prior data. In normal operation, toki resumes from its last checkpoint and only processes new data accumulated since the previous shutdown — so subsequent cold starts are significantly faster than shown here.
+
 | Data Size | toki | ccusage | zzusage | vs ccusage | vs zzusage |
 |-----------|------|---------|---------|------------|------------|
 | 100 MB | 0.11 s | 2.37 s | 0.12 s | **21x** | ~1.0x |
@@ -61,11 +63,11 @@ toki parses **and** indexes into a TSDB simultaneously — yet still outruns too
 | 500 MB | 83 MB | **5–11 MB** | 126 MB | 613 MB |
 | 2 GB | 161 MB | **5–11 MB** | 126 MB | 2,311 MB |
 
-- **toki** — streaming per-file with mmap zero-copy during cold start. After indexing, the daemon drops to 5–11 MB and ~0% CPU. It watches for changes via FSEvents (kernel-level, zero polling) and only wakes when Claude Code writes new lines. Reports query the TSDB in 13 ms and exit at ~5 MB.
-- **ccusage** — Node.js heap capped at ~126 MB, sequential with GC. No idle state — every invocation pays full cost.
-- **zzusage** — loads all events into memory. 2 GB data → 2.3 GB RAM. No idle state. Will OOM on larger datasets.
+- **toki** — rayon parallel processing across all CPU cores with mmap zero-copy and per-file streaming. Despite doing maximum parallelism, memory stays flat because each file is streamed and discarded — no accumulation. After cold start the daemon drops to 5–11 MB and ~0% CPU, watching for changes via FSEvents (kernel-level, zero polling) and only waking when Claude Code writes new lines.
+- **ccusage** — processes one file at a time, synchronous and blocking. The 126 MB looks modest on paper, but it means your terminal hangs for seconds to minutes on every invocation while Node.js chews through every file sequentially. No parallelism, no incremental processing — just a long blocking wait, every time.
+- **zzusage** — loads every event from every file into memory before doing anything. Fast parsing, but 2 GB of data means 2.3 GB of RAM consumed at once. On larger datasets it simply OOMs.
 
-ccusage and zzusage are batch tools. Every time you ask a question, they re-read everything from scratch — 126 MB to 2.3 GB of RAM, seconds to minutes of CPU, competing with your editor, compiler, and AI agent. toki pays that cost once, then sits at 5 MB in the background. Nothing competes for resources.
+toki is the only tool with an idle state. ccusage and zzusage pay full resource cost on every run — your editor, compiler, and AI agent all compete for the same CPU and memory. toki pays that cost once, drops to 5 MB, and stays out of the way.
 
 > Measured on Apple M1 MacBook Air (8 GB RAM), macOS, power saving off.
 > Reproduce: `sudo -v && python3 benches/benchmark.py run --purge --tool all`
