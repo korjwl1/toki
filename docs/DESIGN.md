@@ -7,44 +7,35 @@ The daemon runs 4 threads (Worker, Writer, Listener, Notify) and stores data in 
 
 ## Architecture
 
-```
-┌──────────────────────────────────────────────────────────────────┐
-│ Daemon Process (toki daemon start)                           │
-│                                                                  │
-│ ┌─────────────────────┐    ┌─────────────────────────────┐       │
-│ │ Worker Thread       │    │ Writer Thread               │       │
-│ │                     │    │                             │       │
-│ │ select! {           │    │ select! {                   │       │
-│ │   event_rx → file   │    │   op_rx → handle_op()      │       │
-│ │   stop_rx  → exit   │    │   tick(86400s) → retention  │       │
-│ │   default(30s)→poll │    │ }                           │       │
-│ │ }                   │    │                             │       │
-│ │                     │    │ Owns: Database              │       │
-│ │ db_tx.try_send()  ──┼───▶│ dict_cache: HashMap         │       │
-│ │ db_tx.send()        │    │ pending_events: Vec (≤64)   │       │
-│ │                     │    └─────────────────────────────┘       │
-│ │ sink.emit_event() ──┼──┐                                      │
-│ └─────────────────────┘  │                                      │
-│         ▲                │  ┌─────────────────────────────┐     │
-│         │                └─▶│ BroadcastSink               │     │
-│ ┌───────┴─────────────┐    │ clients: Mutex<Vec<Client>>  │     │
-│ │ Notify Thread       │    │                             │     │
-│ │ macOS FSEvents      │    │ 0 clients = zero overhead   │     │
-│ └─────────────────────┘    └──────────────▲──────────────┘     │
-│                                           │ add_client()       │
-│                            ┌──────────────┴──────────────┐     │
-│                            │ Listener Thread             │     │
-│                            │ UnixListener.accept()       │     │
-│                            │ → BroadcastSink.add_client()│     │
-│                            └─────────────────────────────┘     │
-└──────────────────────────────────────────────────────────────────┘
-         ▲ UDS connect                    ▲ DB read-only open
-         │                                │
-┌────────┴────────┐              ┌────────┴────────┐
-│ Trace Client    │              │ Report Client   │
-│ NDJSON stream   │              │ TSDB query      │
-│ → local sinks   │              │ → sink output   │
-└─────────────────┘              └─────────────────┘
+```mermaid
+graph TD
+    subgraph Daemon["Daemon Process (toki daemon start)"]
+        subgraph Worker["Worker Thread"]
+            W_select["select!<br/>event_rx → file<br/>stop_rx → exit<br/>default(30s) → poll"]
+        end
+
+        subgraph Writer["Writer Thread"]
+            Wr_select["select!<br/>op_rx → handle_op()<br/>tick(86400s) → retention"]
+            Wr_db["Owns: Database<br/>dict_cache: HashMap<br/>pending_events: Vec ≤64"]
+        end
+
+        subgraph Notify["Notify Thread<br/>macOS FSEvents"]
+        end
+
+        subgraph Broadcast["BroadcastSink<br/>clients: Mutex&lt;Vec&lt;Client&gt;&gt;<br/>0 clients = zero overhead"]
+        end
+
+        subgraph Listener["Listener Thread<br/>UnixListener.accept()"]
+        end
+    end
+
+    Notify -->|"file events"| Worker
+    Worker -->|"db_tx.send() / try_send()"| Writer
+    Worker -->|"sink.emit_event()"| Broadcast
+    Listener -->|"add_client()"| Broadcast
+
+    TraceClient["Trace Client<br/>NDJSON stream → local sinks"] -->|"UDS connect"| Daemon
+    ReportClient["Report Client<br/>TSDB query → sink output"] -->|"DB read-only open"| Daemon
 ```
 
 ### Daemon Process
