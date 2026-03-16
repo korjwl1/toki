@@ -1,39 +1,39 @@
 # Claude Code JSONL Format Reference
 
-Claude Code CLI는 세션 로그를 `~/.claude/projects/<encoded-path>/` 하위에 JSONL 파일로 기록한다.
+Claude Code CLI records session logs as JSONL files under `~/.claude/projects/<encoded-path>/`.
 
-## 파일 구조
+## File Structure
 
 ```
 ~/.claude/projects/-Users-user-Documents-project/
-├── 4de9291e-061e-414a-85cb-de615826aded.jsonl          # 부모 세션
+├── 4de9291e-061e-414a-85cb-de615826aded.jsonl          # Parent session
 ├── 4de9291e-061e-414a-85cb-de615826aded/
 │   └── subagents/
-│       └── agent-aed1da92cc2e4e9e7.jsonl               # 서브에이전트
-└── db7cd31e-fdb1-4767-a6a2-f2f3dc68a74b.jsonl          # 다른 세션
+│       └── agent-aed1da92cc2e4e9e7.jsonl               # Subagent
+└── db7cd31e-fdb1-4767-a6a2-f2f3dc68a74b.jsonl          # Another session
 ```
 
-- 부모 세션: UUID 형식 (`8-4-4-4-12` hex) 파일명
-- 서브에이전트: `<UUID>/subagents/agent-*.jsonl`
-- 서브에이전트 토큰은 부모에 포함되지 않으며 별도 파일에 기록됨
+- Parent session: UUID format (`8-4-4-4-12` hex) filename
+- Subagent: `<UUID>/subagents/agent-*.jsonl`
+- Subagent tokens are not included in the parent and are recorded in separate files
 
-## 줄 타입 (type 필드)
+## Line Types (type field)
 
-JSONL의 각 줄은 `"type"` 필드로 구분된다. 총 7종 확인됨:
+Each JSONL line is identified by its `"type"` field. 7 types observed:
 
-| type | 용도 | 토큰 정보 | 크기 특성 |
-|------|------|----------|----------|
-| `assistant` | AI 응답 (텍스트, tool use 포함) | **있음** (`message.usage`) | 평균 ~1.5KB |
-| `user` | 사용자 입력 | 없음 | 평균 ~8.3KB (파일 내용 포함 시 큼) |
-| `progress` | 스트리밍 진행 상태 | 없음 (내부에 assistant 중첩됨) | 평균 ~1.1KB |
-| `file-history-snapshot` | 파일 스냅샷 | 없음 | 평균 ~0.6KB |
-| `system` | 시스템 이벤트 (hook, stop 등) | 없음 | 평균 ~0.6KB |
-| `queue-operation` | 큐 작업 | 없음 | 평균 ~0.2KB |
-| `pr-link` | PR 링크 | 없음 | ~0.2KB |
+| type | Purpose | Token Info | Size Characteristics |
+|------|---------|-----------|---------------------|
+| `assistant` | AI response (text, tool use) | **Present** (`message.usage`) | Avg ~1.5KB |
+| `user` | User input | None | Avg ~8.3KB (large when file content included) |
+| `progress` | Streaming progress | None (has nested assistant) | Avg ~1.1KB |
+| `file-history-snapshot` | File snapshot | None | Avg ~0.6KB |
+| `system` | System events (hooks, stop, etc.) | None | Avg ~0.6KB |
+| `queue-operation` | Queue operation | None | Avg ~0.2KB |
+| `pr-link` | PR link | None | ~0.2KB |
 
-**토큰 추적에 필요한 타입은 `assistant`만 해당.**
+**Only the `assistant` type is relevant for token tracking.**
 
-## assistant 줄 상세 구조
+## assistant Line Detailed Structure
 
 ```json
 {
@@ -72,64 +72,64 @@ JSONL의 각 줄은 `"type"` 필드로 구분된다. 총 7종 확인됨:
 }
 ```
 
-### toki가 추출하는 필드
+### Fields Extracted by toki
 
-| 필드 경로 | 용도 |
-|-----------|------|
-| `type` | `"assistant"` 여부 판별 |
-| `message.model` | 모델명 (집계 키) |
-| `message.id` | 이벤트 식별자 |
-| `message.usage.input_tokens` | 캐시 미적용 입력 토큰 |
-| `message.usage.cache_creation_input_tokens` | 캐시 생성 입력 토큰 |
-| `message.usage.cache_read_input_tokens` | 캐시 읽기 입력 토큰 |
-| `message.usage.output_tokens` | 출력 토큰 |
-| `timestamp` | 이벤트 시점 |
+| Field Path | Purpose |
+|------------|---------|
+| `type` | Identify `"assistant"` lines |
+| `message.model` | Model name (aggregation key) |
+| `message.id` | Event identifier |
+| `message.usage.input_tokens` | Non-cached input tokens |
+| `message.usage.cache_creation_input_tokens` | Cache creation input tokens |
+| `message.usage.cache_read_input_tokens` | Cache read input tokens |
+| `message.usage.output_tokens` | Output tokens |
+| `timestamp` | Event time |
 
-### toki가 무시하는 필드
+### Fields Ignored by toki
 
-| 필드 경로 | 무시 이유 |
-|-----------|----------|
-| `message.content[]` | 텍스트/thinking/tool_use 내용 — 토큰 추적에 불필요, 줄의 대부분을 차지 |
-| `message.usage.server_tool_use` | 서버 측 도구 사용 메타데이터 |
-| `message.usage.service_tier` | 서비스 티어 |
-| `message.usage.cache_creation` | 캐시 생성 상세 |
-| `message.usage.inference_geo` | 추론 지역 |
-| `message.usage.iterations` | 반복 횟수 |
-| `message.usage.speed` | 속도 메트릭 |
-| `parentUuid`, `sessionId`, `cwd`, ... | 세션 메타데이터 — 현재 미사용 |
+| Field Path | Reason |
+|------------|--------|
+| `message.content[]` | Text/thinking/tool_use content — not needed for token tracking, makes up bulk of each line |
+| `message.usage.server_tool_use` | Server-side tool use metadata |
+| `message.usage.service_tier` | Service tier |
+| `message.usage.cache_creation` | Cache creation details |
+| `message.usage.inference_geo` | Inference region |
+| `message.usage.iterations` | Iteration count |
+| `message.usage.speed` | Speed metric |
+| `parentUuid`, `sessionId`, `cwd`, ... | Session metadata — currently unused |
 
-### content 블록 타입
+### Content Block Types
 
-`message.content[]` 배열 내 블록은 3종:
+3 types in the `message.content[]` array:
 
-| content[].type | 설명 |
-|----------------|------|
-| `text` | 텍스트 응답 |
-| `thinking` | 사고 과정 (extended thinking) |
-| `tool_use` | 도구 호출 (파일 읽기, bash, 검색 등) |
+| content[].type | Description |
+|----------------|-------------|
+| `text` | Text response |
+| `thinking` | Thought process (extended thinking) |
+| `tool_use` | Tool invocation (file read, bash, search, etc.) |
 
-## 파싱 최적화
+## Parsing Optimizations
 
-### 프리필터
+### Pre-filter
 
-줄에 `"assistant"` 문자열이 포함되지 않으면 JSON 파싱 없이 즉시 스킵한다.
+Lines not containing the `"assistant"` string are immediately skipped without JSON parsing.
 
-- `user`, `file-history-snapshot`, `system`, `queue-operation`, `pr-link` → 100% 스킵
-- `progress` → `data.message` 안에 `"assistant"`가 중첩되어 있어 프리필터 통과 (false positive), serde 단계에서 `type != "assistant"`로 탈락
+- `user`, `file-history-snapshot`, `system`, `queue-operation`, `pr-link` → 100% skipped
+- `progress` → has `"assistant"` nested inside `data.message`, passes pre-filter (false positive), rejected at serde stage where `type != "assistant"`
 
-실측 기준 (5,162줄, 13.2MB):
-- **67% 데이터량을 JSON 파싱 없이 스킵**
-- false negative 0 (누락 없음)
+Measured on real data (5,162 lines, 13.2MB):
+- **67% of data volume skipped without JSON parsing**
+- Zero false negatives (no missed events)
 
-### 타겟 struct 역직렬화
+### Targeted Struct Deserialization
 
-`serde_json::Value` 대신 필요한 필드만 정의한 struct로 역직렬화한다.
-`content` 배열 등 불필요한 필드는 serde가 스캔은 하지만 힙에 할당하지 않는다.
-문자열은 `&str` 차용으로 복사를 최소화한다.
+Deserializes into a struct with only the needed fields instead of `serde_json::Value`.
+Unnecessary fields like the `content` array are scanned by serde but not allocated on the heap.
+Strings use `&str` borrowing to minimize copies.
 
-## 주의사항
+## Caveats
 
-- JSON 키 순서는 보장되지 않음 — 필드 위치에 의존하는 최적화는 위험
-- `"type"` 필드가 줄 시작이 아닌 중간(~280-388바이트)에 위치함
-- 서버가 minified JSON을 출력하지만 향후 변경 가능 — 공백 유무에 의존하지 않음
-- `assistant` 타입은 현재까지 100% `message.usage`를 동반 (없는 케이스 0건)
+- JSON key ordering is not guaranteed — optimizations depending on field position are risky
+- The `"type"` field is located in the middle of the line (~280-388 bytes), not at the start
+- The server outputs minified JSON but this may change — do not rely on whitespace presence
+- `assistant` type lines have so far always included `message.usage` (zero cases without it)

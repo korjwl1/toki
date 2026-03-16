@@ -253,10 +253,10 @@ toki settings list                         # 전체 설정 출력
 
 | 문서 | 설명 |
 |------|------|
-| **[아키텍처 & 설계](docs/DESIGN.md)** | 데몬 스레드, TSDB 스키마, rollup 전략, 체크포인트 복구, 데이터 흐름 |
-| **[사용법 가이드](docs/USAGE.md)** | 상세 명령어 레퍼런스, 출력 형식, 라이브러리 API, 예제 |
-| **[JSONL 형식 레퍼런스](docs/claude-code-jsonl-format.md)** | Claude Code JSONL 구조, 라인 타입, 파싱 최적화 |
-| **[벤치마크 상세](benches/COMPARISON.md)** | 전체 비교 방법론, 아키텍처 분석, 스케일링 예측 |
+| **[아키텍처 & 설계](docs/DESIGN.ko.md)** | 데몬 스레드, TSDB 스키마, rollup 전략, 체크포인트 복구, 데이터 흐름 |
+| **[사용법 가이드](docs/USAGE.ko.md)** | 상세 명령어 레퍼런스, 출력 형식, 라이브러리 API, 예제 |
+| **[JSONL 형식 레퍼런스](docs/claude-code-jsonl-format.ko.md)** | Claude Code JSONL 구조, 라인 타입, 파싱 최적화 |
+| **[벤치마크 상세](benches/COMPARISON.ko.md)** | 전체 비교 방법론, 아키텍처 분석, 스케일링 예측 |
 
 ---
 
