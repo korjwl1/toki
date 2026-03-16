@@ -50,6 +50,8 @@ toki parses **and** indexes into a TSDB simultaneously — yet still outruns too
 | 1 GB | 0.78 s | 11.07 s | 0.65 s | **14x** | ~0.8x |
 | 2 GB | 1.54 s | 21.73 s | 1.22 s | **14x** | ~0.8x |
 
+> **Why ~1.0x vs zzusage matters:** toki does *strictly more work* per line — TSDB writes (fjall LSM-tree inserts), rollup aggregation, checkpoint persistence, and JSON schema validation. zzusage skips all of this: no DB, no validation, just raw parsing. Despite the extra workload, toki matches zzusage in wall-clock time. The validation gap also has a practical consequence: zzusage accepts any content without structural checks, making it trivial to feed crafted JSONL that inflates or fabricates usage numbers. toki validates every record before it reaches the TSDB, so tampered data is rejected at parse time.
+
 ### Memory & CPU
 
 | Data Size | toki | ccusage | zzusage |
