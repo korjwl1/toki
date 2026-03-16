@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <sub><b>toki</b> = <b>to</b>ken <b>i</b>nspector — sounds like <i>tokki</i> (토끼, rabbit in Korean). Fast like one, too.</sub>
+  <sub><b>toki</b> = <b>to</b>ken <b>i</b>nspector — sounds like <i>tokki</i> (토끼, rabbit in Korean). Fast and light, just like one.</sub>
 </p>
 
 <p align="center">
@@ -19,7 +19,7 @@
 
 ---
 
-> **Not vibe-coded.** Every module in toki was hand-designed and hand-optimized by a professional systems engineer — from the TSDB schema and rollup-on-write strategy down to the xxHash3 checkpoint recovery. No AI-generated architecture. No copy-paste abstractions. Just deliberate engineering.
+> **Vibe-coded right.** Yes, toki was built with AI assistance — but every architectural decision was made by a professional systems engineer who knows exactly why each piece exists. The TSDB schema, rollup-on-write strategy, xxHash3 checkpoint recovery — all designed by hand, then implemented with precision. This is what vibe coding looks like when the person driving actually knows where they're going.
 
 ---
 
