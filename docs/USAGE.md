@@ -14,6 +14,7 @@ toki operates with a daemon/client architecture:
 - **`daemon start`**: Server process. Cold start followed by file watching + TSDB storage
 - **`daemon stop/restart/status`**: Daemon management
 - **`daemon reset`**: Full DB wipe and reinitialization
+- **`provider add/remove/list`**: Provider management (Claude Code, Codex CLI, etc.)
 - **`trace`**: Connect to daemon for real-time event streaming
 - **`report`**: One-shot TSDB query. Retrieves data collected by the daemon
 
@@ -25,8 +26,8 @@ toki operates with a daemon/client architecture:
 toki daemon start
 ```
 
-1. Scans all session files under `~/.claude/projects/` (cold start)
-2. Stores parsed events in TSDB
+1. Scans configured providers' session files (cold start)
+2. Stores parsed events in per-provider TSDB
 3. Outputs total token usage summary
 4. Enters FSEvents watch mode
 5. Starts UDS listener (awaits trace client connections)
@@ -72,6 +73,27 @@ If the daemon is running, stops it first, then completely deletes the TSDB datab
 All events, rollups, checkpoints, and settings are reset.
 After deletion, use `toki daemon start` to collect data from scratch.
 
+## Provider Management
+
+Use `settings set providers --add/--remove` to manage which AI CLI tools to track. At least one provider must be added before first run.
+
+```bash
+# Enable Claude Code tracking
+toki settings set providers --add claude_code
+
+# Enable Codex CLI tracking
+toki settings set providers --add codex
+
+# Disable a provider
+toki settings set providers --remove codex
+
+# List all providers + status
+toki settings get providers
+```
+
+Each provider has an independent database (`~/.config/toki/<provider>.fjall`).
+After adding or removing a provider, restart the daemon if it is running.
+
 ## trace
 
 trace is a client command that connects to a running daemon via UDS to receive real-time events.
@@ -112,11 +134,13 @@ If the daemon is running but has no data yet (cold start in progress), shows "No
 
 ```bash
 toki report
+toki report --provider claude_code            # Single provider only
 toki report --since 20260301
 toki report --since 20260301 --until 20260331
 ```
 
 Outputs per-model token usage totals for the entire period or specified range.
+By default, results from all active providers are merged. Use `--provider` to filter to a single provider.
 
 ### Time-based Grouping
 
@@ -170,7 +194,7 @@ Cannot be used simultaneously with time-based subcommands (`daily`, `weekly`, et
 
 ### Filtering
 
-`--session-id` and `--project` can be used with all report modes.
+`--session-id`, `--project`, and `--provider` can be used with all report modes.
 
 ```bash
 # Project filter (substring match)
@@ -181,6 +205,10 @@ toki report monthly --project myapp
 # Session filter (UUID prefix)
 toki report --session-id 4de9291e
 toki report --session-id 4de9 --group-by-session
+
+# Provider filter
+toki report --provider claude_code
+toki report --provider codex daily --since 20260301
 
 # Combination
 toki report --session-id abc --project myapp
@@ -204,9 +232,9 @@ metric{filters}[bucket] by (dimensions)
 | `metric` | Yes | `usage`, `sessions`, `projects` |
 | `{filters}` | No | `key="value"` pairs, comma-separated |
 | `[bucket]` | No | Time bucket: `s`, `m`, `h`, `d`, `w` |
-| `by (dims)` | No | Group by: `model`, `session`, `project` |
+| `by (dims)` | No | Group by: `model`, `session`, `project`, `provider` |
 
-Filter keys: `model`, `session`, `project`, `since`, `until`
+Filter keys: `model`, `session`, `project`, `provider`, `since`, `until`
 
 #### Examples
 
@@ -219,6 +247,12 @@ toki report query 'usage{model="claude-opus-4-6"}'
 
 # 1-hour bucket + model grouping
 toki report query 'usage{since="20260301"}[1h] by (model)'
+
+# Provider filter + model grouping
+toki report query 'usage{provider="codex"} by (model)'
+
+# Provider grouping
+toki report query 'usage by (provider)'
 
 # Session grouping + time range
 toki report query 'usage{since="20260301", until="20260331"} by (session)'
@@ -258,6 +292,7 @@ When daemon-affecting settings (`claude_code_root`, `daemon_sock`, `retention_da
 
 | Setting | Key | Default | Daemon Effect |
 |---------|-----|---------|---------------|
+| Providers | `providers` | `[]` | Yes |
 | Claude Code Root | `claude_code_root` | `~/.claude` | Yes |
 | Daemon Socket | `daemon_sock` | `~/.config/toki/daemon.sock` | Yes |
 | Timezone | `timezone` | (empty = UTC) | No |
@@ -525,3 +560,5 @@ Parsed line types:
 
 Subagent tokens are not included in the parent and are recorded in separate files.
 See `docs/claude-code-jsonl-format.md` for detailed JSONL format.
+
+> **Note:** Codex CLI also uses a similar JSONL format but is handled by a separate parser. See `docs/codex-cli-analysis.md` for detailed Codex data format.

@@ -73,22 +73,22 @@ toki daemon reset
 모든 이벤트, rollup, 체크포인트, 설정이 초기화된다.
 삭제 후 `toki daemon start`로 처음부터 다시 데이터를 수집할 수 있다.
 
-## provider
+## provider 관리
 
-provider 명령으로 추적할 AI CLI 도구를 관리한다. 최초 실행 전에 최소 하나의 provider를 추가해야 한다.
+`settings set providers --add/--remove`로 추적할 AI CLI 도구를 관리한다. 최초 실행 전에 최소 하나의 provider를 추가해야 한다.
 
 ```bash
 # Claude Code 추적 활성화
-toki provider add claude_code
+toki settings set providers --add claude_code
 
 # Codex CLI 추적 활성화
-toki provider add codex
+toki settings set providers --add codex
 
-# Provider 비활성화 (DB 삭제 선택 가능)
-toki provider remove codex
+# Provider 비활성화
+toki settings set providers --remove codex
 
 # 전체 provider 목록 + 상태 확인
-toki provider list
+toki settings get providers
 ```
 
 각 provider는 독립된 데이터베이스(`~/.config/toki/<provider>.fjall`)를 가진다.

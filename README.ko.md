@@ -98,9 +98,9 @@ cargo build --release
 # 바이너리: target/release/toki — PATH에 추가하거나 직접 실행
 
 # 0. Provider 설정 (최초 실행 전 필수)
-toki provider add claude_code
-toki provider add codex           # 선택: Codex CLI 지원 추가
-toki provider list                # 활성화된 provider 확인
+toki settings set providers --add claude_code
+toki settings set providers --add codex    # 선택: Codex CLI 지원 추가
+toki settings get providers                 # 활성화된 provider 확인
 
 # 1. 데몬 시작 (foreground, Ctrl+C으로 종료)
 toki daemon start
@@ -133,15 +133,6 @@ toki daemon stop        # 데몬 중지
 toki daemon restart     # 중지 + 재시작 (설정 변경 반영)
 toki daemon status      # 실행 상태 확인
 toki daemon reset       # DB 전체 삭제 + 초기화
-```
-
-### Provider
-
-```bash
-toki provider add claude_code     # Claude Code 추적 활성화
-toki provider add codex           # Codex CLI 추적 활성화
-toki provider remove codex        # 비활성화 (DB 삭제 선택 가능)
-toki provider list                # 전체 provider + 상태 확인
 ```
 
 ### Report
@@ -227,10 +218,14 @@ toki trace --sink print --sink http://localhost:8080     # 멀티 싱크
 ### Settings
 
 ```bash
-toki settings                              # TUI 열기 (cursive)
-toki settings set claude_code_root /path   # 개별 설정 변경
-toki settings get timezone                 # 설정 조회
-toki settings list                         # 전체 설정 출력
+toki settings                                  # TUI 열기 (cursive)
+toki settings set claude_code_root /path       # 개별 설정 변경
+toki settings set providers --add claude_code  # Provider 추가
+toki settings set providers --add codex        # Provider 추가
+toki settings set providers --remove codex     # Provider 제거
+toki settings get providers                     # Provider 목록 + 상태 확인
+toki settings get timezone                     # 설정 조회
+toki settings list                             # 전체 설정 출력
 ```
 
 <details>
@@ -238,7 +233,7 @@ toki settings list                         # 전체 설정 출력
 
 | 설정 항목 | 설명 | 기본값 |
 |-----------|------|--------|
-| Providers | 활성화된 provider (`toki provider`로 관리) | `[]` |
+| Providers | 활성화된 provider (`toki settings set providers --add/--remove`로 관리) | `[]` |
 | Claude Code Root | Claude Code 루트 디렉토리 | `~/.claude` |
 | Daemon Socket | 데몬 UDS 소켓 경로 | `~/.config/toki/daemon.sock` |
 | Timezone | IANA 타임존 (빈값=UTC) | *(없음)* |

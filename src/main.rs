@@ -85,21 +85,23 @@ enum Commands {
         #[command(subcommand)]
         command: Option<SettingsCommands>,
     },
-    /// Manage providers (add/remove/list)
-    Provider {
-        #[command(subcommand)]
-        command: ProviderCommands,
-    },
 }
 
 #[derive(Subcommand)]
 enum SettingsCommands {
-    /// Set a configuration value (e.g. toki settings set claude_code_root /path)
+    /// Set a configuration value (e.g. toki settings set timezone Asia/Seoul)
+    /// For providers, use --add/--remove (e.g. toki settings set providers --add codex)
     Set {
         /// Setting key
         key: String,
-        /// Setting value
-        value: String,
+        /// Setting value (not used for providers --add/--remove)
+        value: Option<String>,
+        /// Add a provider (only for `providers` key)
+        #[arg(long)]
+        add: Option<String>,
+        /// Remove a provider (only for `providers` key)
+        #[arg(long)]
+        remove: Option<String>,
     },
     /// Get a configuration value
     Get {
@@ -107,16 +109,6 @@ enum SettingsCommands {
         key: String,
     },
     /// List all settings
-    List,
-}
-
-#[derive(Subcommand)]
-enum ProviderCommands {
-    /// Add a provider (e.g. claude_code, codex)
-    Add { name: String },
-    /// Remove a provider
-    Remove { name: String },
-    /// List all known providers and their status
     List,
 }
 
@@ -279,8 +271,17 @@ fn main() {
                         }
                     }
                 }
-                Some(SettingsCommands::Set { key, value }) => {
-                    handle_settings_set(&key, &value);
+                Some(SettingsCommands::Set { key, value, add, remove }) => {
+                    if key == "providers" {
+                        handle_providers_set(add.as_deref(), remove.as_deref());
+                    } else {
+                        let val = value.unwrap_or_else(|| {
+                            eprintln!("[toki] Missing value for setting '{}'", key);
+                            eprintln!("[toki] Usage: toki settings set {} <value>", key);
+                            std::process::exit(1);
+                        });
+                        handle_settings_set(&key, &val);
+                    }
                 }
                 Some(SettingsCommands::Get { key }) => {
                     handle_settings_get(&key);
@@ -326,9 +327,6 @@ fn main() {
 
             handle_report(since, until, group_by_session, session_id, project, provider, command,
                           &config, &sink_specs, output_format, config.no_cost);
-        }
-        Commands::Provider { command } => {
-            handle_provider(command);
         }
     }
 }
@@ -399,6 +397,28 @@ fn handle_settings_get(key: &str) {
         eprintln!("[toki] Unknown setting: {}", key);
         eprintln!("[toki] Valid keys: {}", VALID_SETTINGS.join(", "));
         std::process::exit(1);
+    }
+
+    if key == "providers" {
+        let enabled = toki::config::get_providers();
+        let config = Config::new();
+        let all_providers = toki::providers::create_providers(
+            &toki::providers::KNOWN_PROVIDERS.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            &config,
+        );
+
+        println!("{:<16} {:<16} {:<30} {}", "ID", "Name", "Root", "Status");
+        println!("{}", "-".repeat(76));
+        for provider in &all_providers {
+            let root = provider.root_dir().unwrap_or_else(|| "(not found)".to_string());
+            let status = if enabled.contains(&provider.name().to_string()) {
+                "[enabled]"
+            } else {
+                "[disabled]"
+            };
+            println!("{:<16} {:<16} {:<30} {}", provider.name(), provider.display_name(), root, status);
+        }
+        return;
     }
 
     match toki::config::get_setting(key) {
@@ -878,31 +898,32 @@ fn build_query_from_flags(
     }
 }
 
-// ── Provider management ─────────────────────────────────
+// ── Provider management (via settings set providers) ─────
 
-fn handle_provider(command: ProviderCommands) {
-    match command {
-        ProviderCommands::Add { name } => {
-            if !toki::providers::KNOWN_PROVIDERS.contains(&name.as_str()) {
+fn handle_providers_set(add: Option<&str>, remove: Option<&str>) {
+    match (add, remove) {
+        (Some(name), None) => {
+            // --add
+            if !toki::providers::KNOWN_PROVIDERS.contains(&name) {
                 eprintln!("[toki] Unknown provider: {}", name);
                 eprintln!("[toki] Known providers: {}", toki::providers::KNOWN_PROVIDERS.join(", "));
                 std::process::exit(1);
             }
 
             let mut providers = toki::config::get_providers();
-            if providers.contains(&name) {
+            if providers.contains(&name.to_string()) {
                 println!("[toki] Provider '{}' is already enabled.", name);
                 return;
             }
 
-            providers.push(name.clone());
+            providers.push(name.to_string());
             if let Err(e) = toki::config::set_setting_array("providers", &providers) {
                 eprintln!("[toki] Failed to save: {}", e);
                 std::process::exit(1);
             }
             println!("[toki] Provider '{}' added.", name);
+            println!("[toki] Active providers: [{}]", providers.join(", "));
 
-            // Prompt daemon restart if running
             let pidfile = toki::daemon::default_pidfile_path();
             if toki::daemon::daemon_status(&pidfile).is_some() {
                 eprintln!("[toki] Restart the daemon to pick up the new provider:");
@@ -910,19 +931,21 @@ fn handle_provider(command: ProviderCommands) {
             }
         }
 
-        ProviderCommands::Remove { name } => {
+        (None, Some(name)) => {
+            // --remove
             let mut providers = toki::config::get_providers();
-            if !providers.contains(&name) {
+            if !providers.contains(&name.to_string()) {
                 println!("[toki] Provider '{}' is not enabled.", name);
                 return;
             }
 
-            providers.retain(|p| p != &name);
+            providers.retain(|p| p != name);
             if let Err(e) = toki::config::set_setting_array("providers", &providers) {
                 eprintln!("[toki] Failed to save: {}", e);
                 std::process::exit(1);
             }
             println!("[toki] Provider '{}' removed.", name);
+            println!("[toki] Active providers: [{}]", providers.join(", "));
 
             let pidfile = toki::daemon::default_pidfile_path();
             if toki::daemon::daemon_status(&pidfile).is_some() {
@@ -931,25 +954,17 @@ fn handle_provider(command: ProviderCommands) {
             }
         }
 
-        ProviderCommands::List => {
-            let enabled = toki::config::get_providers();
-            let config = Config::new();
-            let all_providers = toki::providers::create_providers(
-                &toki::providers::KNOWN_PROVIDERS.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
-                &config,
-            );
+        (None, None) => {
+            eprintln!("[toki] Usage: toki settings set providers --add <name>");
+            eprintln!("[toki]        toki settings set providers --remove <name>");
+            eprintln!("[toki] To view providers: toki settings get providers");
+            eprintln!("[toki] Known providers: {}", toki::providers::KNOWN_PROVIDERS.join(", "));
+            std::process::exit(1);
+        }
 
-            println!("{:<16} {:<16} {:<30} {}", "ID", "Name", "Root", "Status");
-            println!("{}", "-".repeat(76));
-            for provider in &all_providers {
-                let root = provider.root_dir().unwrap_or_else(|| "(not found)".to_string());
-                let status = if enabled.contains(&provider.name().to_string()) {
-                    "[enabled]"
-                } else {
-                    "[disabled]"
-                };
-                println!("{:<16} {:<16} {:<30} {}", provider.name(), provider.display_name(), root, status);
-            }
+        (Some(_), Some(_)) => {
+            eprintln!("[toki] Cannot use --add and --remove at the same time.");
+            std::process::exit(1);
         }
     }
 }

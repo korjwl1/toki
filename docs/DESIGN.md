@@ -30,7 +30,7 @@ graph TD
     end
 
     Notify -->|"file events"| Worker
-    Worker -->|"db_tx.send() / try_send()"| Writer
+    Worker -->|"db_tx.send()"| Writer
     Worker -->|"sink.emit_event()"| Broadcast
     Listener -->|"add_client()"| Broadcast
 
@@ -88,7 +88,7 @@ Pricing is loaded by the client from the file cache (`~/.config/toki/pricing.jso
 
 - Multiplexes FSEvents events, stop signal, and 30-second backup polling via `crossbeam_channel::select!`
 - File change detected → `process_file_with_ts()` → parsed events output to Sink + `DbOp::WriteEvent` sent to writer
-- Watch mode uses `try_send` (prevents UI thread blocking)
+- Watch mode uses `send` (blocking, consistent with cold start)
 - Every 5 seconds, dirty checkpoints are batch-flushed to the writer
 
 ## Writer Thread
@@ -208,7 +208,7 @@ FSEvents → event_tx → Worker thread
     → process_lines_streaming() incremental read
     → parse_line_with_ts()
     → BroadcastSink.emit_event()    ← no-op if 0 clients
-    → db_tx.try_send(WriteEvent)    ← non-blocking (drop if channel full)
+    → db_tx.send(WriteEvent)        ← blocking (zero data loss)
 ```
 
 ### Trace Client (real-time stream)
@@ -404,7 +404,5 @@ Engine → Writer bounded channel (1024):
 | Scenario | Behavior |
 |----------|----------|
 | Cold start (rayon parallel scan) | `send()` — blocking. Guarantees zero data loss |
-| Watch mode (real-time events) | `try_send()` — non-blocking. Drop + debug log if channel full |
+| Watch mode (real-time events) | `send()` — blocking. Guarantees zero data loss |
 | Checkpoints flush | `send()` — blocking. Prevents checkpoint loss |
-
-In watch mode, dropped events are recovered on the next file change via incremental read.

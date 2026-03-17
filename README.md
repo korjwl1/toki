@@ -98,9 +98,9 @@ cargo build --release
 # Binary: target/release/toki — add to PATH or run directly
 
 # 0. Configure providers (required before first run)
-toki provider add claude_code
-toki provider add codex           # optional: add Codex CLI support
-toki provider list                # show enabled providers
+toki settings set providers --add claude_code
+toki settings set providers --add codex    # optional: add Codex CLI support
+toki settings get providers                 # show enabled providers
 
 # 1. Start the daemon (foreground, Ctrl+C to stop)
 toki daemon start
@@ -133,15 +133,6 @@ toki daemon stop        # Stop
 toki daemon restart     # Restart (reload settings)
 toki daemon status      # Check status
 toki daemon reset       # Wipe DB + reinitialize
-```
-
-### Provider
-
-```bash
-toki provider add claude_code     # Enable Claude Code tracking
-toki provider add codex           # Enable Codex CLI tracking
-toki provider remove codex        # Disable (optionally delete DB)
-toki provider list                # Show all providers + status
 ```
 
 ### Report
@@ -227,10 +218,14 @@ toki trace --sink print --sink http://localhost:8080     # Multi-sink
 ### Settings
 
 ```bash
-toki settings                              # Open TUI (cursive)
-toki settings set claude_code_root /path   # Set individual value
-toki settings get timezone                 # Get value
-toki settings list                         # List all
+toki settings                                  # Open TUI (cursive)
+toki settings set claude_code_root /path       # Set individual value
+toki settings set providers --add claude_code  # Add a provider
+toki settings set providers --add codex        # Add another provider
+toki settings set providers --remove codex     # Remove a provider
+toki settings get providers                     # List providers + status
+toki settings get timezone                     # Get value
+toki settings list                             # List all
 ```
 
 <details>
