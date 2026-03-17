@@ -71,6 +71,9 @@ enum Commands {
         /// Filter by project name (substring match on project directory)
         #[arg(long)]
         project: Option<String>,
+        /// Filter by provider (e.g. claude_code, codex)
+        #[arg(long)]
+        provider: Option<String>,
         #[command(subcommand)]
         command: Option<ReportCommands>,
     },
@@ -81,6 +84,11 @@ enum Commands {
         db_path: Option<PathBuf>,
         #[command(subcommand)]
         command: Option<SettingsCommands>,
+    },
+    /// Manage providers (add/remove/list)
+    Provider {
+        #[command(subcommand)]
+        command: ProviderCommands,
     },
 }
 
@@ -99,6 +107,16 @@ enum SettingsCommands {
         key: String,
     },
     /// List all settings
+    List,
+}
+
+#[derive(Subcommand)]
+enum ProviderCommands {
+    /// Add a provider (e.g. claude_code, codex)
+    Add { name: String },
+    /// Remove a provider
+    Remove { name: String },
+    /// List all known providers and their status
     List,
 }
 
@@ -238,9 +256,9 @@ fn main() {
         Commands::Settings { db_path: _, command } => {
             match command {
                 None => {
-                    toki::settings::run_settings();
+                    let restart_requested = toki::settings::run_settings();
                     // Check if TUI requested daemon restart
-                    if std::env::var("TOKI_RESTART_DAEMON").as_deref() == Ok("1") {
+                    if restart_requested {
                         let config = build_config(None, false, None);
                         stop_running_daemon(&config);
                         eprintln!("[toki] Starting daemon...");
@@ -287,7 +305,7 @@ fn main() {
             };
             handle_trace(&config, &sink_specs, output_format, config.no_cost);
         }
-        Commands::Report { opts, since, until, group_by_session, session_id, project, command } => {
+        Commands::Report { opts, since, until, group_by_session, session_id, project, provider, command } => {
             let (cli_tz, cli_no_cost, cli_output_format) = parse_client_opts(&opts);
             let config = build_config(cli_tz, cli_no_cost, cli_output_format);
             let output_format = resolve_output_format(&config);
@@ -296,8 +314,21 @@ fn main() {
             } else {
                 opts.sink.clone()
             };
-            handle_report(since, until, group_by_session, session_id, project, command,
+
+            // Validate --provider against known providers
+            if let Some(ref p) = provider {
+                if !toki::providers::KNOWN_PROVIDERS.contains(&p.as_str()) {
+                    eprintln!("[toki] Unknown provider: {}", p);
+                    eprintln!("[toki] Known providers: {}", toki::providers::KNOWN_PROVIDERS.join(", "));
+                    std::process::exit(1);
+                }
+            }
+
+            handle_report(since, until, group_by_session, session_id, project, provider, command,
                           &config, &sink_specs, output_format, config.no_cost);
+        }
+        Commands::Provider { command } => {
+            handle_provider(command);
         }
     }
 }
@@ -307,11 +338,13 @@ fn main() {
 const VALID_SETTINGS: &[&str] = &[
     "claude_code_root", "daemon_sock", "timezone", "output_format",
     "start_of_week", "no_cost", "retention_days", "rollup_retention_days",
+    "providers",
 ];
 
 /// Settings that require daemon restart to take effect.
 const DAEMON_SETTINGS: &[&str] = &[
     "claude_code_root", "daemon_sock", "retention_days", "rollup_retention_days",
+    "providers",
 ];
 
 fn handle_settings_set(key: &str, value: &str) {
@@ -337,7 +370,7 @@ fn handle_settings_set(key: &str, value: &str) {
             if std::io::stdin().read_line(&mut input).is_ok() && input.trim().eq_ignore_ascii_case("y") {
                 let config = Config::new();
                 stop_running_daemon(&config);
-                RUNNING.store(true, Ordering::SeqCst);
+                RUNNING.store(true, Ordering::Relaxed);
                 eprintln!("[toki] Starting daemon...");
                 let toki_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("toki"));
                 std::process::Command::new(toki_bin)
@@ -417,8 +450,8 @@ fn run_daemon_foreground(config: &Config) {
     let broadcast = Arc::new(toki::daemon::BroadcastSink::new());
 
     eprintln!("[toki:daemon] Starting...");
-    eprintln!("[toki:daemon] Claude Code root: {}", config.claude_code_root);
-    eprintln!("[toki:daemon] Database: {}", config.db_path.display());
+    eprintln!("[toki:daemon] Providers: {:?}", config.providers);
+    eprintln!("[toki:daemon] Database dir: {}", config.db_base_dir.display());
     eprintln!("[toki:daemon] Socket: {}", sock_path.display());
 
     let handle = match toki::start(config.clone(), Box::new(broadcast.clone())) {
@@ -434,11 +467,13 @@ fn run_daemon_foreground(config: &Config) {
     let (listener_stop_tx, listener_stop_rx) = crossbeam_channel::bounded::<()>(1);
     let listener_sock = sock_path.clone();
     let listener_broadcast = broadcast.clone();
-    let listener_db = handle.db().clone();
+    let listener_dbs: Vec<(String, Arc<toki::db::Database>)> = handle.dbs().into_iter()
+        .map(|(name, db)| (name.to_string(), db.clone()))
+        .collect();
     let listener_handle = std::thread::Builder::new()
         .name("toki-listener".to_string())
         .spawn(move || {
-            toki::daemon::run_listener(&listener_sock, listener_broadcast, listener_db, listener_stop_rx);
+            toki::daemon::run_listener(&listener_sock, listener_broadcast, listener_dbs, listener_stop_rx);
         })
         .expect("Failed to spawn listener thread");
 
@@ -450,7 +485,7 @@ fn run_daemon_foreground(config: &Config) {
     eprintln!("[toki:daemon] Running (PID {}). Send SIGTERM or use 'toki daemon stop' to stop.",
         std::process::id());
 
-    while RUNNING.load(Ordering::SeqCst) {
+    while RUNNING.load(Ordering::Relaxed) {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
@@ -475,7 +510,7 @@ fn handle_daemon(command: DaemonCommands, config: &Config) {
 
         DaemonCommands::Restart => {
             stop_running_daemon(config);
-            RUNNING.store(true, Ordering::SeqCst);
+            RUNNING.store(true, Ordering::Relaxed);
             run_daemon_foreground(config);
         }
 
@@ -499,14 +534,33 @@ fn handle_daemon(command: DaemonCommands, config: &Config) {
                 stop_running_daemon(config);
             }
 
+            let mut deleted_any = false;
+
+            // Delete legacy DB path
             if config.db_path.exists() {
                 if let Err(e) = std::fs::remove_dir_all(&config.db_path) {
                     eprintln!("[toki] Failed to delete database: {}", e);
                     std::process::exit(1);
                 }
                 println!("[toki] Database deleted: {}", config.db_path.display());
-            } else {
-                println!("[toki] No database found at {}", config.db_path.display());
+                deleted_any = true;
+            }
+
+            // Delete per-provider DB directories (e.g., claude_code.fjall, codex.fjall)
+            for provider_name in toki::providers::KNOWN_PROVIDERS {
+                let provider_db = config.db_base_dir.join(format!("{}.fjall", provider_name));
+                if provider_db.exists() {
+                    if let Err(e) = std::fs::remove_dir_all(&provider_db) {
+                        eprintln!("[toki] Failed to delete {}: {}", provider_db.display(), e);
+                    } else {
+                        println!("[toki] Database deleted: {}", provider_db.display());
+                        deleted_any = true;
+                    }
+                }
+            }
+
+            if !deleted_any {
+                println!("[toki] No databases found in {}", config.db_base_dir.display());
             }
             println!("[toki] Reset complete. Start the daemon to rebuild: toki daemon start");
         }
@@ -548,7 +602,7 @@ fn handle_trace(config: &Config, sink_specs: &[String], output_format: toki::sin
     println!("[toki] Connected to daemon. Streaming events... (Ctrl+C to stop)");
 
     for line_result in reader.lines() {
-        if !RUNNING.load(Ordering::SeqCst) {
+        if !RUNNING.load(Ordering::Relaxed) {
             break;
         }
 
@@ -609,6 +663,7 @@ fn handle_report(
     group_by_session: bool,
     session_id: Option<String>,
     project: Option<String>,
+    provider: Option<String>,
     command: Option<ReportCommands>,
     config: &Config,
     sink_specs: &[String],
@@ -636,19 +691,19 @@ fn handle_report(
     let query_str = if let Some(ReportCommands::Query { ref query }) = command {
         query.clone()
     } else {
-        let query = if let Some(cmd) = &command {
-            // Time-grouped subcommands
+        let query = if let Some(cmd) = command {
+            // Time-grouped subcommands — destructure directly to avoid cloning
             let (filter_args, group_by) = match cmd {
-                ReportCommands::Hourly { filter } => (filter.clone(), toki::engine::ReportGroupBy::Hour),
-                ReportCommands::Daily { filter } => (filter.clone(), toki::engine::ReportGroupBy::Date),
+                ReportCommands::Hourly { filter } => (filter, toki::engine::ReportGroupBy::Hour),
+                ReportCommands::Daily { filter } => (filter, toki::engine::ReportGroupBy::Date),
                 ReportCommands::Weekly { start_of_week, filter } => {
                     let start = start_of_week.as_deref()
                         .map(parse_weekday)
                         .unwrap_or(config.start_of_week);
-                    (filter.clone(), toki::engine::ReportGroupBy::Week { start_of_week: start })
+                    (filter, toki::engine::ReportGroupBy::Week { start_of_week: start })
                 }
-                ReportCommands::Monthly { filter } => (filter.clone(), toki::engine::ReportGroupBy::Month),
-                ReportCommands::Yearly { filter } => (filter.clone(), toki::engine::ReportGroupBy::Year),
+                ReportCommands::Monthly { filter } => (filter, toki::engine::ReportGroupBy::Month),
+                ReportCommands::Yearly { filter } => (filter, toki::engine::ReportGroupBy::Year),
                 ReportCommands::Query { .. } => unreachable!(),
             };
 
@@ -677,12 +732,14 @@ fn handle_report(
             // Convert to PromQL-style query string
             build_query_from_flags(
                 &eff_since, &eff_until, eff_session.as_deref(), eff_project.as_deref(),
+                provider.as_deref(),
                 &[], // group_by handled via bucket
             ).to_query_string_with_bucket(group_by)
         } else {
             // No subcommand — summary or session grouping
             build_query_from_flags(
                 &since, &until, session_id.as_deref(), project.as_deref(),
+                provider.as_deref(),
                 if group_by_session { &["session"][..] } else { &[] },
             ).to_query_string()
         };
@@ -799,6 +856,7 @@ fn build_query_from_flags(
     until: &Option<String>,
     session_id: Option<&str>,
     project: Option<&str>,
+    provider: Option<&str>,
     group_by: &[&str],
 ) -> toki::query_parser::Query {
     use toki::query_parser::{Query, Metric, LabelFilter};
@@ -816,6 +874,83 @@ fn build_query_from_flags(
         group_by: group_by.iter().map(|s| s.to_string()).collect(),
         since: since.clone(),
         until: until.clone(),
+        provider: provider.map(|s| s.to_string()),
+    }
+}
+
+// ── Provider management ─────────────────────────────────
+
+fn handle_provider(command: ProviderCommands) {
+    match command {
+        ProviderCommands::Add { name } => {
+            if !toki::providers::KNOWN_PROVIDERS.contains(&name.as_str()) {
+                eprintln!("[toki] Unknown provider: {}", name);
+                eprintln!("[toki] Known providers: {}", toki::providers::KNOWN_PROVIDERS.join(", "));
+                std::process::exit(1);
+            }
+
+            let mut providers = toki::config::get_providers();
+            if providers.contains(&name) {
+                println!("[toki] Provider '{}' is already enabled.", name);
+                return;
+            }
+
+            providers.push(name.clone());
+            if let Err(e) = toki::config::set_setting_array("providers", &providers) {
+                eprintln!("[toki] Failed to save: {}", e);
+                std::process::exit(1);
+            }
+            println!("[toki] Provider '{}' added.", name);
+
+            // Prompt daemon restart if running
+            let pidfile = toki::daemon::default_pidfile_path();
+            if toki::daemon::daemon_status(&pidfile).is_some() {
+                eprintln!("[toki] Restart the daemon to pick up the new provider:");
+                eprintln!("[toki]   toki daemon restart");
+            }
+        }
+
+        ProviderCommands::Remove { name } => {
+            let mut providers = toki::config::get_providers();
+            if !providers.contains(&name) {
+                println!("[toki] Provider '{}' is not enabled.", name);
+                return;
+            }
+
+            providers.retain(|p| p != &name);
+            if let Err(e) = toki::config::set_setting_array("providers", &providers) {
+                eprintln!("[toki] Failed to save: {}", e);
+                std::process::exit(1);
+            }
+            println!("[toki] Provider '{}' removed.", name);
+
+            let pidfile = toki::daemon::default_pidfile_path();
+            if toki::daemon::daemon_status(&pidfile).is_some() {
+                eprintln!("[toki] Restart the daemon to apply:");
+                eprintln!("[toki]   toki daemon restart");
+            }
+        }
+
+        ProviderCommands::List => {
+            let enabled = toki::config::get_providers();
+            let config = Config::new();
+            let all_providers = toki::providers::create_providers(
+                &toki::providers::KNOWN_PROVIDERS.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                &config,
+            );
+
+            println!("{:<16} {:<16} {:<30} {}", "ID", "Name", "Root", "Status");
+            println!("{}", "-".repeat(76));
+            for provider in &all_providers {
+                let root = provider.root_dir().unwrap_or_else(|| "(not found)".to_string());
+                let status = if enabled.contains(&provider.name().to_string()) {
+                    "[enabled]"
+                } else {
+                    "[disabled]"
+                };
+                println!("{:<16} {:<16} {:<30} {}", provider.name(), provider.display_name(), root, status);
+            }
+        }
     }
 }
 
@@ -853,5 +988,5 @@ fn parse_weekday(s: &str) -> Weekday {
 }
 
 extern "C" fn sighandler(_: libc::c_int) {
-    RUNNING.store(false, Ordering::SeqCst);
+    RUNNING.store(false, Ordering::Relaxed);
 }

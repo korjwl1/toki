@@ -41,16 +41,36 @@ impl Bucket {
         self.0
     }
 
-    /// Format a bucket label from an epoch timestamp.
+    /// Format a bucket label from an epoch timestamp (seconds) in the given timezone.
     /// Produces ISO-like labels: "2026-03-10T14:05:00" for sub-day,
     /// "2026-03-10" for day+.
-    pub fn format_label(&self, epoch_secs: i64) -> String {
-        let floored = (epoch_secs / self.0 as i64) * self.0 as i64;
-        let dt = chrono::DateTime::from_timestamp(floored, 0).unwrap_or_default();
-        let naive = dt.naive_utc();
-        if self.0 >= 86400 {
-            naive.format("%Y-%m-%d").to_string()
+    ///
+    /// For day+ buckets, flooring is done in the user's local timezone so that
+    /// date boundaries align with local midnight rather than UTC midnight.
+    pub fn format_label(&self, epoch_secs: i64, tz: Option<chrono_tz::Tz>) -> String {
+        let bucket_secs = self.0 as i64;
+
+        if bucket_secs >= 86400 {
+            if let Some(tz) = tz {
+                // Day+ buckets: floor in local timezone
+                let dt = chrono::DateTime::from_timestamp(epoch_secs, 0)
+                    .unwrap_or_default()
+                    .with_timezone(&tz);
+                let local_date = dt.date_naive();
+                format!("{}", local_date.format("%Y-%m-%d"))
+            } else {
+                let floored = (epoch_secs / bucket_secs) * bucket_secs;
+                let dt = chrono::DateTime::from_timestamp(floored, 0).unwrap_or_default();
+                dt.naive_utc().format("%Y-%m-%d").to_string()
+            }
         } else {
+            // Sub-day buckets: floor in UTC, then convert
+            let floored = (epoch_secs / bucket_secs) * bucket_secs;
+            let dt = chrono::DateTime::from_timestamp(floored, 0).unwrap_or_default();
+            let naive = match tz {
+                Some(tz) => dt.with_timezone(&tz).naive_local(),
+                None => dt.naive_utc(),
+            };
             naive.format("%Y-%m-%dT%H:%M:%S").to_string()
         }
     }
@@ -84,6 +104,8 @@ pub struct Query {
     pub since: Option<String>,
     /// Time range filter: until (inclusive). Format: YYYYMMDD or YYYYMMDDhhmmss.
     pub until: Option<String>,
+    /// Provider filter: if set, only query this provider's DB.
+    pub provider: Option<String>,
 }
 
 impl Query {
@@ -106,6 +128,9 @@ impl Query {
         let mut filters: Vec<(&str, &str)> = self.filters.iter()
             .map(|f| (f.key.as_str(), f.value.as_str()))
             .collect();
+        if let Some(ref provider) = self.provider {
+            filters.push(("provider", provider));
+        }
         if let Some(ref since) = self.since {
             filters.push(("since", since));
         }
@@ -153,8 +178,8 @@ impl Query {
     }
 }
 
-const VALID_FILTER_KEYS: &[&str] = &["model", "session", "project", "since", "until"];
-const VALID_GROUP_KEYS: &[&str] = &["model", "session", "project"];
+const VALID_FILTER_KEYS: &[&str] = &["model", "session", "project", "since", "until", "provider"];
+const VALID_GROUP_KEYS: &[&str] = &["model", "session", "project", "provider"];
 
 /// Parse a PromQL-like query string.
 pub fn parse(input: &str) -> Result<Query, String> {
@@ -179,9 +204,10 @@ pub fn parse(input: &str) -> Result<Query, String> {
         Vec::new()
     };
 
-    // Extract since/until from filters into dedicated fields
+    // Extract since/until/provider from filters into dedicated fields
     let since = extract_filter(&mut raw_filters, "since");
     let until = extract_filter(&mut raw_filters, "until");
+    let provider = extract_filter(&mut raw_filters, "provider");
 
     // Optional bucket: [ ... ]
     let bucket = if p.peek() == Some('[') {
@@ -213,7 +239,7 @@ pub fn parse(input: &str) -> Result<Query, String> {
         }
     }
 
-    Ok(Query { metric, filters: raw_filters, bucket, group_by, since, until })
+    Ok(Query { metric, filters: raw_filters, bucket, group_by, since, until, provider })
 }
 
 /// Extract and remove a filter by key, returning its value if present.
@@ -633,5 +659,50 @@ mod tests {
     fn test_duplicate_filter_key() {
         let err = parse(r#"usage{model="a", model="b"}"#).unwrap_err();
         assert!(err.contains("duplicate filter key"));
+    }
+
+    #[test]
+    fn test_provider_filter() {
+        let q = parse(r#"usage{provider="claude_code"}"#).unwrap();
+        assert_eq!(q.provider, Some("claude_code".to_string()));
+        // provider should be extracted from filters, not remain as a label filter
+        assert!(q.filters.is_empty());
+    }
+
+    #[test]
+    fn test_provider_filter_with_other_filters() {
+        let q = parse(r#"usage{provider="codex", model="gpt-5.4"}[1h] by (model)"#).unwrap();
+        assert_eq!(q.provider, Some("codex".to_string()));
+        assert_eq!(q.filters.len(), 1);
+        assert_eq!(q.filters[0].key, "model");
+        assert_eq!(q.bucket, Some(Bucket(3600)));
+        assert_eq!(q.group_by, vec!["model"]);
+    }
+
+    #[test]
+    fn test_sessions_with_provider_filter() {
+        let q = parse(r#"sessions{provider="claude_code"}"#).unwrap();
+        assert_eq!(q.metric, Metric::Sessions);
+        assert_eq!(q.provider, Some("claude_code".to_string()));
+    }
+
+    #[test]
+    fn test_group_by_provider() {
+        let q = parse("usage by (provider)").unwrap();
+        assert_eq!(q.group_by, vec!["provider"]);
+    }
+
+    #[test]
+    fn test_group_by_model_and_provider() {
+        let q = parse("usage by (model, provider)").unwrap();
+        assert_eq!(q.group_by, vec!["model", "provider"]);
+    }
+
+    #[test]
+    fn test_provider_filter_serialization() {
+        let q = parse(r#"usage{provider="claude_code", model="opus"}"#).unwrap();
+        let s = q.to_query_string();
+        assert!(s.contains(r#"provider="claude_code""#));
+        assert!(s.contains(r#"model="opus""#));
     }
 }

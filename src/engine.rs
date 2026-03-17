@@ -6,6 +6,7 @@ use crossbeam_channel::{Receiver, Sender};
 
 use crate::checkpoint::{find_resume_offset, process_lines_streaming};
 use crate::common::types::{FileCheckpoint, LogParser, LogParserWithTs, ModelUsageSummary, TokenFields};
+use crate::providers::Provider;
 use chrono::{DateTime, NaiveDateTime, Weekday};
 use chrono_tz::Tz;
 use crate::sink::Sink;
@@ -34,7 +35,7 @@ macro_rules! debug_log {
     };
 }
 
-/// Verbose debug log — only emitted at level 2.
+/// Verbose debug log -- only emitted at level 2.
 /// Used for high-frequency skip events (size unchanged, no new lines).
 macro_rules! debug_log_verbose {
     ($($arg:tt)*) => {
@@ -48,7 +49,7 @@ macro_rules! debug_log_verbose {
 const ACTIVE_COOLDOWN: Duration = Duration::from_millis(150);
 /// Cooldown for idle files (no new lines for a while).
 const IDLE_COOLDOWN: Duration = Duration::from_millis(500);
-/// Time without new lines before a file transitions Active → Idle.
+/// Time without new lines before a file transitions Active -> Idle.
 const IDLE_TRANSITION: Duration = Duration::from_secs(15);
 
 /// Flush interval for dirty checkpoints.
@@ -67,14 +68,15 @@ struct FileActivity {
 }
 
 pub struct TrackerEngine {
-    db_tx: Sender<DbOp>,
+    /// provider_name -> db_tx channel
+    channels: HashMap<String, Sender<DbOp>>,
     checkpoints: HashMap<String, FileCheckpoint>,
     /// Cached file sizes for fast skip when size unchanged.
     file_sizes: HashMap<String, u64>,
     /// Per-file activity tracking (state + cooldowns).
     activity: HashMap<String, FileActivity>,
-    /// Paths with checkpoints updated since last flush.
-    dirty: HashSet<String>,
+    /// file_path -> provider_name for routing flushes.
+    dirty: HashMap<String, String>,
     /// Output sink (print, UDS, HTTP, or multi).
     sink: Box<dyn Sink>,
 }
@@ -111,33 +113,52 @@ pub struct ReportFilter {
 
 
 impl TrackerEngine {
-    pub fn new(db_tx: Sender<DbOp>, checkpoints: HashMap<String, FileCheckpoint>, sink: Box<dyn Sink>) -> Self {
+    pub fn new(
+        channels: HashMap<String, Sender<DbOp>>,
+        checkpoints: HashMap<String, FileCheckpoint>,
+        sink: Box<dyn Sink>,
+    ) -> Self {
         TrackerEngine {
-            db_tx,
+            channels,
             checkpoints,
             file_sizes: HashMap::new(),
             activity: HashMap::new(),
-            dirty: HashSet::new(),
+            dirty: HashMap::new(),
             sink,
         }
     }
 
+    /// Backward-compatible constructor for single-provider use (tests).
+    pub fn new_single(db_tx: Sender<DbOp>, checkpoints: HashMap<String, FileCheckpoint>, sink: Box<dyn Sink>) -> Self {
+        let mut channels = HashMap::new();
+        channels.insert("default".to_string(), db_tx);
+        TrackerEngine {
+            channels,
+            checkpoints,
+            file_sizes: HashMap::new(),
+            activity: HashMap::new(),
+            dirty: HashMap::new(),
+            sink,
+        }
+    }
 
-    /// Cold start: discover all sessions, process them in parallel,
+    /// Get a db_tx channel by provider name, falling back to "default" for backward compat.
+    fn get_channel(&self, provider_name: &str) -> Option<&Sender<DbOp>> {
+        self.channels.get(provider_name).or_else(|| self.channels.get("default"))
+    }
+
+    /// Cold start with Provider trait: discover all sessions, process in parallel,
     /// aggregate by model, print summary, flush checkpoints, and populate TSDB.
-    pub fn cold_start<P>(
+    pub fn cold_start_provider(
         &mut self,
-        parser: &P,
-        root_dir: &str,
-    ) -> Result<HashMap<String, ModelUsageSummary>, Box<dyn std::error::Error>>
-    where
-        P: LogParser + LogParserWithTs + Sync,
-    {
+        provider: &dyn Provider,
+        db_tx: &Sender<DbOp>,
+    ) -> Result<HashMap<String, ModelUsageSummary>, Box<dyn std::error::Error>> {
         let t_cold = Instant::now();
-        let sessions = parser.discover_sessions(root_dir);
+        let sessions = provider.discover_sessions();
 
         if sessions.is_empty() {
-            debug_log!("cold_start — 0 sessions, 0 files ({}µs)", t_cold.elapsed().as_micros());
+            debug_log!("cold_start[{}] -- 0 sessions, 0 files ({}us)", provider.name(), t_cold.elapsed().as_micros());
             return Ok(HashMap::new());
         }
 
@@ -145,52 +166,50 @@ impl TrackerEngine {
         let summaries: Mutex<HashMap<String, ModelUsageSummary>> = Mutex::new(HashMap::new());
         let cp_batch: Mutex<Vec<FileCheckpoint>> = Mutex::new(Vec::new());
         let event_count: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let db_tx = &self.db_tx;
 
-        // Parallel parse + streaming bulk write:
-        // Each rayon thread collects events per file, then sends the chunk
-        // to the writer thread immediately. No global event buffer.
-        // Uses optimized cold start parser to avoid intermediate allocations.
-        let cs_parser = crate::providers::claude_code::ClaudeCodeParser;
         parallel_scan(&sessions, &self.checkpoints, |path, offset| {
             let mut local: HashMap<String, ModelUsageSummary> = HashMap::new();
             let mut file_events: Vec<ColdStartEvent> = Vec::new();
-            let session_id: std::sync::Arc<str> = extract_session_id(path).unwrap_or_default().into();
+            let session_id: std::sync::Arc<str> = provider.extract_session_id(path).unwrap_or_default().into();
             let source_file: std::sync::Arc<str> = path.into();
+            // Path-based project name (used by Claude Code); Codex returns None here.
+            let path_project_name: Option<std::sync::Arc<str>> = provider
+                .extract_project_name(path)
+                .map(|s| s.into());
+            // Track the last parser-provided project name (e.g., from Codex session_meta cwd).
+            let mut parser_project_name: Option<std::sync::Arc<str>> = None;
+
+            let mut file_parser = provider.create_file_parser();
             let result = process_lines_streaming(path, offset, |line| {
-                if let Some(parsed) = cs_parser.parse_for_cold_start(line) {
+                if let Some(parsed) = file_parser.parse_line(line) {
+                    // Update parser-provided project name if present
+                    if let Some(ref pn) = parsed.project_name {
+                        parser_project_name = Some(pn.as_str().into());
+                    }
+
                     // Accumulate summary
                     let summary = local.entry(parsed.model.clone()).or_insert_with(|| ModelUsageSummary {
                         model: parsed.model.clone(),
                         ..Default::default()
                     });
-                    summary.input_tokens += parsed.input_tokens;
-                    summary.cache_creation_input_tokens += parsed.cache_creation_input_tokens;
-                    summary.cache_read_input_tokens += parsed.cache_read_input_tokens;
-                    summary.output_tokens += parsed.output_tokens;
-                    summary.event_count += 1;
+                    parsed.accumulate_summary(summary);
 
-                    // Build ColdStartEvent — Arc::clone for session_id/source_file (no alloc)
-                    file_events.push(ColdStartEvent {
-                        ts_ms: parsed.ts_ms,
-                        message_id: parsed.event_key,
-                        model: parsed.model,
-                        session_id: std::sync::Arc::clone(&session_id),
-                        source_file: std::sync::Arc::clone(&source_file),
-                        tokens: TokenFields {
-                            input_tokens: parsed.input_tokens,
-                            output_tokens: parsed.output_tokens,
-                            cache_creation_input_tokens: parsed.cache_creation_input_tokens,
-                            cache_read_input_tokens: parsed.cache_read_input_tokens,
-                        },
-                    });
+                    // Use parser-provided project name, falling back to path-based extraction
+                    let effective_project = parser_project_name.clone()
+                        .or_else(|| path_project_name.clone());
+
+                    // Build ColdStartEvent
+                    file_events.push(parsed.to_cold_start_event(
+                        std::sync::Arc::clone(&session_id),
+                        std::sync::Arc::clone(&source_file),
+                        effective_project,
+                    ));
                 }
             });
             if !local.is_empty() {
                 let mut s = summaries.lock().unwrap_or_else(|e| e.into_inner());
                 merge_summaries(&mut s, local);
             }
-            // Stream file chunk to writer immediately (no global buffer)
             if !file_events.is_empty() {
                 event_count.fetch_add(file_events.len(), std::sync::atomic::Ordering::Relaxed);
                 let _ = db_tx.send(DbOp::BulkWrite(file_events));
@@ -213,22 +232,114 @@ impl TrackerEngine {
             self.checkpoints.insert(cp.file_path.clone(), cp.clone());
         }
 
-        // Emit summary (no pricing — cost is calculated client-side)
+        // Emit summary
         self.sink.emit_summary(&result_summaries, None);
 
         // Signal writer to flush accumulated rollups, then wait for completion
         let (done_tx, done_rx) = crossbeam_channel::bounded(1);
-        let _ = self.db_tx.send(DbOp::FlushBulkRollups(done_tx));
+        let _ = db_tx.send(DbOp::FlushBulkRollups(done_tx));
         let _ = done_rx.recv();
 
         // Flush checkpoints
         let cp_count = checkpoints_batch.len();
         if !checkpoints_batch.is_empty() {
-            let _ = self.db_tx.send(DbOp::FlushCheckpoints(checkpoints_batch));
+            let _ = db_tx.send(DbOp::FlushCheckpoints(checkpoints_batch));
         }
         let t_total = t_cold.elapsed();
         let t_db = t_total - t_parse;
-        debug_log!("cold_start — {} sessions, {} files, {} events, {} checkpoints (parse: {}µs, db_wait: {}µs, total: {}µs)",
+        debug_log!("cold_start[{}] -- {} sessions, {} files, {} events, {} checkpoints (parse: {}us, db_wait: {}us, total: {}us)",
+            provider.name(), sessions.len(), total_files, total_events, cp_count,
+            t_parse.as_micros(), t_db.as_micros(), t_total.as_micros());
+
+        Ok(result_summaries)
+    }
+
+    /// Legacy cold start for backward compatibility (used by tests with LogParser trait).
+    /// NOTE: Kept as a thin wrapper to avoid test disruption. New code should use
+    /// `cold_start_provider()` with a proper Provider implementation.
+    pub fn cold_start<P>(
+        &mut self,
+        parser: &P,
+        root_dir: &str,
+    ) -> Result<HashMap<String, ModelUsageSummary>, Box<dyn std::error::Error>>
+    where
+        P: LogParser + LogParserWithTs + Sync,
+    {
+        let t_cold = Instant::now();
+        let sessions = parser.discover_sessions(root_dir);
+
+        if sessions.is_empty() {
+            debug_log!("cold_start -- 0 sessions, 0 files ({}us)", t_cold.elapsed().as_micros());
+            return Ok(HashMap::new());
+        }
+
+        let total_files: usize = sessions.iter().map(|s| 1 + s.subagent_jsonls.len()).sum();
+        let summaries: Mutex<HashMap<String, ModelUsageSummary>> = Mutex::new(HashMap::new());
+        let cp_batch: Mutex<Vec<FileCheckpoint>> = Mutex::new(Vec::new());
+        let event_count: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let db_tx = self.channels.values().next().expect("no db channel");
+
+        let cs_parser = crate::providers::claude_code::ClaudeCodeParser;
+        parallel_scan(&sessions, &self.checkpoints, |path, offset| {
+            let mut local: HashMap<String, ModelUsageSummary> = HashMap::new();
+            let mut file_events: Vec<ColdStartEvent> = Vec::new();
+            let session_id: std::sync::Arc<str> = crate::providers::claude_code::extract_session_id(path).unwrap_or_default().into();
+            let source_file: std::sync::Arc<str> = path.into();
+            let project_name: Option<std::sync::Arc<str>> = crate::providers::claude_code::extract_project_name(path).map(|s| s.into());
+            let result = process_lines_streaming(path, offset, |line| {
+                if let Some(parsed) = cs_parser.parse_for_cold_start(line) {
+                    let summary = local.entry(parsed.model.clone()).or_insert_with(|| ModelUsageSummary {
+                        model: parsed.model.clone(),
+                        ..Default::default()
+                    });
+                    parsed.accumulate_summary(summary);
+
+                    file_events.push(parsed.to_cold_start_event(
+                        std::sync::Arc::clone(&session_id),
+                        std::sync::Arc::clone(&source_file),
+                        project_name.clone(),
+                    ));
+                }
+            });
+            if !local.is_empty() {
+                let mut s = summaries.lock().unwrap_or_else(|e| e.into_inner());
+                merge_summaries(&mut s, local);
+            }
+            if !file_events.is_empty() {
+                event_count.fetch_add(file_events.len(), std::sync::atomic::Ordering::Relaxed);
+                let _ = db_tx.send(DbOp::BulkWrite(file_events));
+            }
+            if let Ok(Some((_bytes, last_line_len, last_line_hash))) = result {
+                cp_batch.lock().unwrap_or_else(|e| e.into_inner()).push(FileCheckpoint {
+                    file_path: path.to_string(),
+                    last_line_len,
+                    last_line_hash,
+                });
+            }
+        });
+
+        let t_parse = t_cold.elapsed();
+        let result_summaries = summaries.into_inner().unwrap_or_else(|e| e.into_inner());
+        let checkpoints_batch = cp_batch.into_inner().unwrap_or_else(|e| e.into_inner());
+        let total_events = event_count.load(std::sync::atomic::Ordering::Relaxed);
+
+        for cp in &checkpoints_batch {
+            self.checkpoints.insert(cp.file_path.clone(), cp.clone());
+        }
+
+        self.sink.emit_summary(&result_summaries, None);
+
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        let _ = db_tx.send(DbOp::FlushBulkRollups(done_tx));
+        let _ = done_rx.recv();
+
+        let cp_count = checkpoints_batch.len();
+        if !checkpoints_batch.is_empty() {
+            let _ = db_tx.send(DbOp::FlushCheckpoints(checkpoints_batch));
+        }
+        let t_total = t_cold.elapsed();
+        let t_db = t_total - t_parse;
+        debug_log!("cold_start -- {} sessions, {} files, {} events, {} checkpoints (parse: {}us, db_wait: {}us, total: {}us)",
             sessions.len(), total_files, total_events, cp_count,
             t_parse.as_micros(), t_db.as_micros(), t_total.as_micros());
 
@@ -254,11 +365,10 @@ impl TrackerEngine {
                 let mut s = act.state;
                 if s == FileState::Active && now.duration_since(act.last_active) > IDLE_TRANSITION {
                     s = FileState::Idle;
-                    debug_log!("demote {} → Idle ({}s since last active)",
+                    debug_log!("demote {} -> Idle ({}s since last active)",
                         path, now.duration_since(act.last_active).as_secs());
                 }
                 let cd = if s == FileState::Active { ACTIVE_COOLDOWN } else { IDLE_COOLDOWN };
-                // Cooldown check: skip if checked too recently
                 if now.duration_since(act.last_checked) < cd {
                     return Ok(Vec::new());
                 }
@@ -278,7 +388,7 @@ impl TrackerEngine {
                     });
                     act.last_checked = now;
                     act.state = state;
-                    debug_log_verbose!("process_file {} — size unchanged ({}B), {} ({}µs)",
+                    debug_log_verbose!("process_file {} -- size unchanged ({}B), {} ({}us)",
                         path, current_size,
                         if state == FileState::Active { "Active" } else { "Idle" },
                         t_total.elapsed().as_micros());
@@ -312,7 +422,7 @@ impl TrackerEngine {
                 });
                 act.last_checked = now;
                 act.state = state;
-                debug_log_verbose!("process_file {} — no new lines (find_resume: {}µs, read: {}µs)",
+                debug_log_verbose!("process_file {} -- no new lines (find_resume: {}us, read: {}us)",
                     path, find_us, read_us);
                 Ok(Vec::new())
             }
@@ -324,14 +434,15 @@ impl TrackerEngine {
                     last_line_hash,
                 };
                 self.checkpoints.insert(path_owned.clone(), cp);
-                self.dirty.insert(path_owned.clone());
+                // Use "default" provider name for backward compat dirty tracking
+                self.dirty.insert(path_owned.clone(), "default".to_string());
                 if state == FileState::Idle {
-                    debug_log!("promote {} → Active ({} new lines)", path, line_count);
+                    debug_log!("promote {} -> Active ({} new lines)", path, line_count);
                 }
                 self.activity.insert(path_owned, FileActivity {
                     state: FileState::Active, last_active: now, last_checked: now,
                 });
-                debug_log!("process_file {} — {} lines, {} bytes, {} events, Active | find_resume: {}µs, read: {}µs, total: {}µs",
+                debug_log!("process_file {} -- {} lines, {} bytes, {} events, Active | find_resume: {}us, read: {}us, total: {}us",
                     path, line_count, bytes_read, events.len(),
                     find_us, read_us, t_total.elapsed().as_micros());
                 Ok(events)
@@ -339,16 +450,107 @@ impl TrackerEngine {
         }
     }
 
-    fn process_and_print<P>(&mut self, path: &str, parser: &P)
-    where
-        P: LogParser + LogParserWithTs,
-    {
-        match self.process_file_with_ts(path, parser) {
+    /// Process a single file change using dynamic dispatch (for multi-provider watch mode).
+    fn process_file_with_ts_dyn(
+        &mut self,
+        path: &str,
+        parser_ts: &dyn LogParserWithTs,
+        provider_name: &str,
+    ) -> Result<Vec<crate::common::types::UsageEventWithTs>, Box<dyn std::error::Error>> {
+        let now = Instant::now();
+
+        let state = match self.activity.get(path) {
+            None => FileState::Active,
+            Some(act) => {
+                let mut s = act.state;
+                if s == FileState::Active && now.duration_since(act.last_active) > IDLE_TRANSITION {
+                    s = FileState::Idle;
+                    debug_log!("demote {} -> Idle ({}s since last active)",
+                        path, now.duration_since(act.last_active).as_secs());
+                }
+                let cd = if s == FileState::Active { ACTIVE_COOLDOWN } else { IDLE_COOLDOWN };
+                if now.duration_since(act.last_checked) < cd {
+                    return Ok(Vec::new());
+                }
+                s
+            }
+        };
+
+        let t_total = Instant::now();
+        let path_owned = path.to_string();
+
+        if let Ok(meta) = std::fs::metadata(path) {
+            let current_size = meta.len();
+            if let Some(&cached_size) = self.file_sizes.get(path) {
+                if current_size == cached_size {
+                    let act = self.activity.entry(path_owned).or_insert(FileActivity {
+                        state, last_active: now, last_checked: now,
+                    });
+                    act.last_checked = now;
+                    act.state = state;
+                    return Ok(Vec::new());
+                }
+            }
+        }
+
+        let t0 = Instant::now();
+        let offset = self.determine_offset(path)?;
+        let find_us = t0.elapsed().as_micros();
+
+        let t1 = Instant::now();
+        let mut events = Vec::new();
+        let mut line_count: u64 = 0;
+        let result = process_lines_streaming(path, offset, |line| {
+            if let Some(event) = parser_ts.parse_line_with_ts(line, path) {
+                events.push(event);
+            }
+            line_count += 1;
+        })?;
+        let read_us = t1.elapsed().as_micros();
+
+        match result {
+            None => {
+                if let Ok(meta) = std::fs::metadata(path) {
+                    self.file_sizes.insert(path_owned.clone(), meta.len());
+                }
+                let act = self.activity.entry(path_owned).or_insert(FileActivity {
+                    state, last_active: now, last_checked: now,
+                });
+                act.last_checked = now;
+                act.state = state;
+                Ok(Vec::new())
+            }
+            Some((bytes_read, last_line_len, last_line_hash)) => {
+                self.file_sizes.insert(path_owned.clone(), offset + bytes_read);
+                let cp = FileCheckpoint {
+                    file_path: path_owned.clone(),
+                    last_line_len,
+                    last_line_hash,
+                };
+                self.checkpoints.insert(path_owned.clone(), cp);
+                self.dirty.insert(path_owned.clone(), provider_name.to_string());
+                if state == FileState::Idle {
+                    debug_log!("promote {} -> Active ({} new lines)", path, line_count);
+                }
+                self.activity.insert(path_owned, FileActivity {
+                    state: FileState::Active, last_active: now, last_checked: now,
+                });
+                debug_log!("process_file {} -- {} lines, {} bytes, {} events, Active | find_resume: {}us, read: {}us, total: {}us",
+                    path, line_count, bytes_read, events.len(),
+                    find_us, read_us, t_total.elapsed().as_micros());
+                Ok(events)
+            }
+        }
+    }
+
+    fn process_and_print_provider(&mut self, path: &str, provider: &dyn Provider, db_tx: &Sender<DbOp>) {
+        match self.process_file_with_ts_dyn(path, provider.parser_with_ts(), provider.name()) {
             Ok(events) => {
-                let session_id = extract_session_id(path).unwrap_or_default();
+                let session_id = provider.extract_session_id(path).unwrap_or_default();
+                let project_name = provider.extract_project_name(path).map(|s| s.to_string());
                 for event in events {
-                    let ts_ms = parse_timestamp(&event.timestamp)
-                        .map(|dt| dt.and_utc().timestamp_millis())
+                    // Use fast parse_ts_to_ms (~0.1us) instead of chrono parse (~3-5us)
+                    let ts_ms = crate::common::time::parse_ts_to_ms(&event.timestamp)
                         .unwrap_or_else(|| {
                             std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -365,6 +567,7 @@ impl TrackerEngine {
                         model: usage.model,
                         session_id: session_id.clone(),
                         source_file: usage.source_file,
+                        project_name: project_name.clone(),
                         tokens: TokenFields {
                             input_tokens: usage.input_tokens,
                             output_tokens: usage.output_tokens,
@@ -372,8 +575,61 @@ impl TrackerEngine {
                             cache_read_input_tokens: usage.cache_read_input_tokens,
                         },
                     };
-                    if self.db_tx.try_send(op).is_err() {
-                        debug_log!("writer channel full, dropping event");
+                    // Use blocking send to apply backpressure instead of dropping events
+                    if let Err(e) = db_tx.send(op) {
+                        debug_log!("writer channel closed: {}", e);
+                    }
+                }
+                // dirty is already marked inside process_file_with_ts_dyn with the correct provider name
+            }
+            Err(e) => {
+                eprintln!("[toki] Error processing {}: {}", path, e);
+            }
+        }
+    }
+
+    /// Legacy process_and_print for backward compat (used in legacy watch_loop).
+    /// NOTE: Kept for test backward compatibility. New code should use `process_and_print_provider()`.
+    fn process_and_print<P>(&mut self, path: &str, parser: &P)
+    where
+        P: LogParser + LogParserWithTs,
+    {
+        match self.process_file_with_ts(path, parser) {
+            Ok(events) => {
+                let session_id = crate::providers::claude_code::extract_session_id(path).unwrap_or_default();
+                let project_name = crate::providers::claude_code::extract_project_name(path).map(|s| s.to_string());
+                for event in events {
+                    // Use fast parse_ts_to_ms (~0.1us) instead of chrono parse (~3-5us)
+                    let ts_ms = crate::common::time::parse_ts_to_ms(&event.timestamp)
+                        .unwrap_or_else(|| {
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as i64
+                        });
+
+                    let (usage, _ts) = event.into_usage_event();
+                    self.sink.emit_event(&usage, None);
+
+                    let op = DbOp::WriteEvent {
+                        ts_ms,
+                        message_id: usage.event_key,
+                        model: usage.model,
+                        session_id: session_id.clone(),
+                        source_file: usage.source_file,
+                        project_name: project_name.clone(),
+                        tokens: TokenFields {
+                            input_tokens: usage.input_tokens,
+                            output_tokens: usage.output_tokens,
+                            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                            cache_read_input_tokens: usage.cache_read_input_tokens,
+                        },
+                    };
+                    if let Some(tx) = self.channels.values().next() {
+                        // Use blocking send to apply backpressure instead of dropping events
+                        if let Err(e) = tx.send(op) {
+                            debug_log!("writer channel closed: {}", e);
+                        }
                     }
                 }
             }
@@ -383,18 +639,46 @@ impl TrackerEngine {
         }
     }
 
-    /// Flush dirty checkpoints via writer thread.
+    /// Flush dirty checkpoints via writer thread, routing to correct provider channel.
     fn flush_dirty(&mut self) {
         if self.dirty.is_empty() {
             return;
         }
-        let batch: Vec<FileCheckpoint> = self.dirty.iter()
-            .filter_map(|path| self.checkpoints.get(path).cloned())
-            .collect();
-        let count = batch.len();
-        let _ = self.db_tx.send(DbOp::FlushCheckpoints(batch));
+        // Group dirty paths by provider
+        let mut by_provider: HashMap<String, Vec<FileCheckpoint>> = HashMap::new();
+        for (path, provider_name) in &self.dirty {
+            if let Some(cp) = self.checkpoints.get(path) {
+                by_provider.entry(provider_name.clone())
+                    .or_default()
+                    .push(cp.clone());
+            }
+        }
+        let total_count: usize = by_provider.values().map(|v| v.len()).sum();
+        for (provider_name, batch) in by_provider {
+            if let Some(tx) = self.get_channel(&provider_name) {
+                let _ = tx.send(DbOp::FlushCheckpoints(batch));
+            }
+        }
         self.dirty.clear();
-        debug_log!("flush_dirty — {} checkpoints sent to writer", count);
+        debug_log!("flush_dirty -- {} checkpoints sent to writer(s)", total_count);
+    }
+
+    /// Remove entries for files that no longer exist on disk.
+    /// Called periodically from the watch loop to prevent unbounded HashMap growth.
+    fn prune_stale_entries(&mut self) {
+        let stale_keys: Vec<String> = self.file_sizes.keys()
+            .filter(|path| !std::path::Path::new(path.as_str()).exists())
+            .cloned()
+            .collect();
+        let count = stale_keys.len();
+        for key in &stale_keys {
+            self.file_sizes.remove(key);
+            self.activity.remove(key);
+            self.checkpoints.remove(key);
+        }
+        if count > 0 {
+            debug_log!("prune_stale_entries -- removed {} stale file entries", count);
+        }
     }
 
     fn determine_offset(&self, path: &str) -> Result<u64, Box<dyn std::error::Error>> {
@@ -409,9 +693,66 @@ impl TrackerEngine {
         }
     }
 
-    /// Watch loop: receive file change events, process incrementally,
+    /// Multi-provider watch loop: receive file change events, route to owning provider,
     /// flush dirty checkpoints periodically.
-    /// Graceful shutdown: flushes remaining dirty checkpoints before exiting.
+    pub fn watch_loop_providers(
+        &mut self,
+        event_rx: Receiver<String>,
+        stop_rx: Receiver<()>,
+        providers: &[(Box<dyn Provider>, Sender<DbOp>)],
+    ) {
+        let flush_tick = crossbeam_channel::tick(FLUSH_INTERVAL);
+        let prune_tick = crossbeam_channel::tick(Duration::from_secs(60));
+
+        loop {
+            crossbeam_channel::select! {
+                recv(stop_rx) -> _ => {
+                    self.flush_dirty();
+                    break;
+                }
+                recv(prune_tick) -> _ => {
+                    self.prune_stale_entries();
+                }
+                recv(event_rx) -> msg => {
+                    match msg {
+                        Ok(path) => {
+                            let mut paths = HashSet::new();
+                            paths.insert(path);
+                            while let Ok(more) = event_rx.try_recv() {
+                                paths.insert(more);
+                            }
+                            debug_log!("watch event -- {} unique paths queued", paths.len());
+
+                            for path in paths {
+                                // Route to owning provider
+                                let mut handled = false;
+                                for (provider, db_tx) in providers {
+                                    if provider.owns_path(&path) {
+                                        self.process_and_print_provider(&path, provider.as_ref(), db_tx);
+                                        handled = true;
+                                        break;
+                                    }
+                                }
+                                if !handled {
+                                    debug_log_verbose!("watch: no provider owns path {}", path);
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            self.flush_dirty();
+                            break;
+                        }
+                    }
+                }
+                recv(flush_tick) -> _ => {
+                    self.flush_dirty();
+                }
+            }
+        }
+    }
+
+    /// Legacy watch loop for backward compatibility (single parser).
+    /// NOTE: Kept for test backward compatibility. New code should use `watch_loop_providers()`.
     pub fn watch_loop<P>(
         &mut self,
         event_rx: Receiver<String>,
@@ -432,13 +773,12 @@ impl TrackerEngine {
                 recv(event_rx) -> msg => {
                     match msg {
                         Ok(path) => {
-                            // Drain any queued events (dedup by path).
                             let mut paths = HashSet::new();
                             paths.insert(path);
                             while let Ok(more) = event_rx.try_recv() {
                                 paths.insert(more);
                             }
-                            debug_log!("watch event — {} unique paths queued", paths.len());
+                            debug_log!("watch event -- {} unique paths queued", paths.len());
 
                             for path in paths {
                                 self.process_and_print(&path, parser);
@@ -484,8 +824,8 @@ fn merge_summaries(
 }
 
 /// Common parallel file scan over all sessions.
-/// Resolves checkpoint offsets and runs `on_file(path, offset)` in parallel
-/// using rayon's thread pool (bounded worker threads, work stealing).
+/// Uses rayon's global thread pool (default: num_cpus threads).
+/// A custom pool is not configured; the global default is sufficient for cold start scans.
 fn parallel_scan<F>(
     sessions: &[crate::common::types::SessionGroup],
     checkpoints: &HashMap<String, FileCheckpoint>,
@@ -499,9 +839,9 @@ where
     let all_files: Vec<String> = sessions
         .iter()
         .flat_map(|session| {
-            let mut files = vec![session.parent_jsonl.to_string_lossy().to_string()];
+            let mut files = vec![session.parent_jsonl.to_str().unwrap_or_default().to_string()];
             for sub in &session.subagent_jsonls {
-                files.push(sub.to_string_lossy().to_string());
+                files.push(sub.to_str().unwrap_or_default().to_string());
             }
             files
         })
@@ -513,33 +853,23 @@ where
     });
 }
 
-/// Extract the full session UUID from a file path.
-///   Parent:   .../projects/<dir>/<UUID>.jsonl        → "<UUID>"
-///   Subagent: .../<UUID>/subagents/agent-<id>.jsonl  → "<UUID>" (grandparent dir name)
+/// Extract the full session UUID from a file path (legacy, delegates to claude_code).
 pub fn extract_session_id(path: &str) -> Option<String> {
-    let mut parts = path.rsplit('/');
-    let filename = parts.next()?;
-    // Subagent: .../\<UUID>/subagents/agent-xxx.jsonl
-    if let Some(dir) = parts.next() {
-        if dir == "subagents" {
-            return parts.next().map(|s| s.to_string());
-        }
-    }
-    // Parent: filename without .jsonl
-    Some(filename.trim_end_matches(".jsonl").to_string())
+    crate::providers::claude_code::extract_session_id(path)
 }
 
-/// Extract project directory name from a file path (zero-alloc, returns &str slice).
-///   .../projects/<PROJECT_DIR>/<UUID>.jsonl → "<PROJECT_DIR>"
-///   .../projects/<PROJECT_DIR>/<UUID>/subagents/agent-<id>.jsonl → "<PROJECT_DIR>"
+/// Extract project directory name from a source file path.
+/// Currently only works for Claude Code paths (which contain `/projects/<name>/`).
+/// Codex events don't encode the project in the file path; instead, project_name
+/// is extracted from session_meta.cwd during cold start and stored in the project index.
+/// Event-level project filtering for Codex will fall through (return None) and
+/// those events won't match project filters in bucketed queries — this is a known
+/// limitation that can be resolved by adding project_name_id to StoredEvent.
 pub fn extract_project_name(path: &str) -> Option<&str> {
-    let marker = "/projects/";
-    let start = path.find(marker)? + marker.len();
-    let rest = &path[start..];
-    let end = rest.find('/').unwrap_or(rest.len());
-    Some(&rest[..end])
+    crate::providers::claude_code::extract_project_name(path)
 }
 
+#[allow(dead_code)]
 fn parse_timestamp(ts: &str) -> Option<NaiveDateTime> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(ts) {
         return Some(dt.naive_utc());
@@ -584,7 +914,6 @@ mod tests {
 
             for entry in glob::glob(&pattern).into_iter().flatten().flatten() {
                 let stem = entry.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-                // Simple: treat each jsonl as its own session
                 if !stem.starts_with("agent-") {
                     let Some(parent_dir) = entry.parent() else { continue };
                     let sub_dir = parent_dir.join(stem).join("subagents");
@@ -664,9 +993,8 @@ mod tests {
             .map(|cp| (cp.file_path.clone(), cp))
             .collect();
         let (db_tx, _drain) = test_db_channel();
-        let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded, Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)));
+        let mut engine = TrackerEngine::new_single(db_tx, checkpoints_loaded, Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)));
 
-        // Create test JSONL
         let projects_dir = dir.path().join("projects").join("test");
         std::fs::create_dir_all(&projects_dir).unwrap();
 
@@ -700,7 +1028,7 @@ mod tests {
             .map(|cp| (cp.file_path.clone(), cp))
             .collect();
         let (db_tx, _drain) = test_db_channel();
-        let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded, Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)));
+        let mut engine = TrackerEngine::new_single(db_tx, checkpoints_loaded, Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)));
 
         let projects_dir = dir.path().join("projects").join("test");
         std::fs::create_dir_all(&projects_dir).unwrap();
@@ -711,7 +1039,6 @@ mod tests {
         let mut f = std::fs::File::create(&jsonl_path).unwrap();
         writeln!(f, "{}", make_assistant_line("msg1", "claude-opus-4-6", 10, 100, 200, 50)).unwrap();
 
-        // Create subagent
         let sub_dir = projects_dir.join(session_id).join("subagents");
         std::fs::create_dir_all(&sub_dir).unwrap();
         let sub_path = sub_dir.join("agent-abc123.jsonl");
@@ -737,7 +1064,7 @@ mod tests {
             .map(|cp| (cp.file_path.clone(), cp))
             .collect();
         let (db_tx, _drain) = test_db_channel();
-        let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded, Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)));
+        let mut engine = TrackerEngine::new_single(db_tx, checkpoints_loaded, Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)));
 
         let projects_dir = dir.path().join("projects").join("test");
         std::fs::create_dir_all(&projects_dir).unwrap();
@@ -773,7 +1100,7 @@ mod tests {
             .map(|cp| (cp.file_path.clone(), cp))
             .collect();
         let (db_tx, _drain) = test_db_channel();
-        let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded, Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)));
+        let mut engine = TrackerEngine::new_single(db_tx, checkpoints_loaded, Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)));
 
         let projects_dir = dir.path().join("projects").join("test");
         std::fs::create_dir_all(&projects_dir).unwrap();
@@ -787,7 +1114,6 @@ mod tests {
         let parser = TestParser;
         engine.cold_start(&parser, dir.path().to_str().unwrap()).unwrap();
 
-        // Verify checkpoint was saved
         let path_str = jsonl_path.to_str().unwrap();
         assert!(engine.checkpoints.contains_key(path_str));
         assert!(engine.checkpoints[path_str].last_line_len > 0);
@@ -804,7 +1130,7 @@ mod tests {
             .map(|cp| (cp.file_path.clone(), cp))
             .collect();
         let (db_tx, _drain) = test_db_channel();
-        let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded, Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)));
+        let mut engine = TrackerEngine::new_single(db_tx, checkpoints_loaded, Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)));
 
         let projects_dir = dir.path().join("projects").join("test");
         std::fs::create_dir_all(&projects_dir).unwrap();
@@ -812,7 +1138,6 @@ mod tests {
         let session_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let jsonl_path = projects_dir.join(format!("{}.jsonl", session_id));
 
-        // Write initial data
         let mut f = std::fs::File::create(&jsonl_path).unwrap();
         writeln!(f, "{}", make_assistant_line("msg1", "claude-opus-4-6", 10, 100, 200, 50)).unwrap();
 
@@ -820,13 +1145,11 @@ mod tests {
         let s1 = engine.cold_start(&parser, dir.path().to_str().unwrap()).unwrap();
         assert_eq!(s1["claude-opus-4-6"].event_count, 1);
 
-        // Append more data
         let mut f = std::fs::OpenOptions::new().append(true).open(&jsonl_path).unwrap();
         writeln!(f, "{}", make_assistant_line("msg2", "claude-opus-4-6", 20, 200, 400, 100)).unwrap();
 
-        // Second cold start should only process new data
         let s2 = engine.cold_start(&parser, dir.path().to_str().unwrap()).unwrap();
-        assert_eq!(s2["claude-opus-4-6"].event_count, 1); // only the new line
+        assert_eq!(s2["claude-opus-4-6"].event_count, 1);
         assert_eq!(s2["claude-opus-4-6"].input_tokens, 20);
     }
 
@@ -841,7 +1164,7 @@ mod tests {
             .map(|cp| (cp.file_path.clone(), cp))
             .collect();
         let (db_tx, _drain) = test_db_channel();
-        let mut engine = TrackerEngine::new(db_tx, checkpoints_loaded, Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)));
+        let mut engine = TrackerEngine::new_single(db_tx, checkpoints_loaded, Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)));
 
         let parser = TestParser;
         let summaries = engine.cold_start(&parser, dir.path().to_str().unwrap()).unwrap();
@@ -857,7 +1180,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let iterations = 200;
 
-        // Create 500-line JSONL file (~realistic session)
         let projects_dir = dir.path().join("projects").join("test");
         std::fs::create_dir_all(&projects_dir).unwrap();
         let session_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
@@ -875,7 +1197,6 @@ mod tests {
         let path_str = jsonl_path.to_str().unwrap();
         let file_size = std::fs::metadata(path_str).unwrap().len();
 
-        // Build checkpoint on line 490
         let content = std::fs::read_to_string(path_str).unwrap();
         let line_490: Vec<&str> = content.lines().collect();
         let target = line_490[490];
@@ -885,14 +1206,12 @@ mod tests {
             last_line_hash: hash_line(target.as_bytes()),
         };
 
-        // Bench find_resume_offset
         let start = Instant::now();
         for _ in 0..iterations {
             let _ = find_resume_offset(path_str, &cp).unwrap();
         }
         let find_us = start.elapsed().as_micros() / iterations as u128;
 
-        // Bench process_lines_streaming (last 10 lines)
         let offset = find_resume_offset(path_str, &cp).unwrap().unwrap();
         let start = Instant::now();
         for _ in 0..iterations {
@@ -900,7 +1219,6 @@ mod tests {
         }
         let read_us = start.elapsed().as_micros() / iterations as u128;
 
-        // Bench DB upsert
         let db_path = dir.path().join("bench.db");
         let db = crate::db::Database::open(&db_path).unwrap();
         let start = Instant::now();
@@ -909,17 +1227,15 @@ mod tests {
         }
         let db_us = start.elapsed().as_micros() / iterations as u128;
 
-        // Bench full process_file (cold start + incremental)
         let _db2 = crate::db::Database::open(&dir.path().join("bench2.db")).unwrap();
         let (db_tx2, _drain2) = test_db_channel();
-        let mut engine = TrackerEngine::new(db_tx2, HashMap::new(), Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)));
+        let mut engine = TrackerEngine::new_single(db_tx2, HashMap::new(), Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)));
         let parser = TestParser;
 
         let start = Instant::now();
         engine.cold_start(&parser, dir.path().to_str().unwrap()).unwrap();
         let cold_us = start.elapsed().as_micros();
 
-        // Append 10 lines, measure incremental
         {
             let mut f = std::fs::OpenOptions::new().append(true).open(&jsonl_path).unwrap();
             for i in 500..510 {
@@ -937,12 +1253,12 @@ mod tests {
         println!("File: {} lines, {} bytes ({} KB)", 500, file_size, file_size / 1024);
         println!();
         println!("Per-operation (avg of {} runs):", iterations);
-        println!("  find_resume_offset:        {:>6}µs", find_us);
-        println!("  process_lines_streaming:   {:>6}µs", read_us);
-        println!("  db.upsert_checkpoint:      {:>6}µs", db_us);
+        println!("  find_resume_offset:        {:>6}us", find_us);
+        println!("  process_lines_streaming:   {:>6}us", read_us);
+        println!("  db.upsert_checkpoint:      {:>6}us", db_us);
         println!();
         println!("End-to-end:");
-        println!("  cold_start (500 lines):    {:>6}µs", cold_us);
-        println!("  process_file (10 new):     {:>6}µs  ({} events)", incr_us, events.len());
+        println!("  cold_start (500 lines):    {:>6}us", cold_us);
+        println!("  process_file (10 new):     {:>6}us  ({} events)", incr_us, events.len());
     }
 }

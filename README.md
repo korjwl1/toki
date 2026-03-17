@@ -84,9 +84,9 @@ toki trace            # real-time stream    (≈ docker logs -f)
 toki report           # instant TSDB query  (≈ docker ps)
 ```
 
-- **daemon** — watches Claude Code JSONL session logs via FSEvents, parses events, writes to an embedded TSDB (fjall). Zero sink overhead when no trace clients are connected.
+- **daemon** — watches session logs from configured providers (Claude Code, Codex CLI) via FSEvents, parses events, writes to per-provider embedded TSDBs (fjall). Zero sink overhead when no trace clients are connected.
 - **trace** — connects to the daemon over UDS for real-time event streaming. Supports `print`, `uds://`, `http://` sinks.
-- **report** — sends a query to the daemon over UDS, gets results from the TSDB. Always fast, always indexed.
+- **report** — sends a query to the daemon over UDS, gets merged results from all provider TSDBs. Always fast, always indexed. Filter by `--provider` to query a single provider.
 
 ---
 
@@ -97,6 +97,11 @@ toki report           # instant TSDB query  (≈ docker ps)
 cargo build --release
 # Binary: target/release/toki — add to PATH or run directly
 
+# 0. Configure providers (required before first run)
+toki provider add claude_code
+toki provider add codex           # optional: add Codex CLI support
+toki provider list                # show enabled providers
+
 # 1. Start the daemon (foreground, Ctrl+C to stop)
 toki daemon start
 
@@ -104,12 +109,15 @@ toki daemon start
 toki trace
 
 # 3. Reports (instant TSDB queries)
-toki report
+toki report                                   # all providers merged
+toki report --provider claude_code            # single provider
 toki report daily --since 20260301
 toki report monthly
 
 # 4. PromQL-style queries
 toki report query 'usage{model="claude-opus-4-6"}[1h] by (model)'
+toki report query 'usage{provider="codex"} by (model)'
+toki report query 'usage by (provider)'
 toki report query 'sessions{project="myapp"}'
 ```
 
@@ -127,11 +135,21 @@ toki daemon status      # Check status
 toki daemon reset       # Wipe DB + reinitialize
 ```
 
+### Provider
+
+```bash
+toki provider add claude_code     # Enable Claude Code tracking
+toki provider add codex           # Enable Codex CLI tracking
+toki provider remove codex        # Disable (optionally delete DB)
+toki provider list                # Show all providers + status
+```
+
 ### Report
 
 ```bash
 # Summary
-toki report
+toki report                                         # all providers
+toki report --provider claude_code                  # single provider
 toki report --since 20260301 --until 20260331
 
 # Time grouping
@@ -146,8 +164,13 @@ toki report --group-by-session
 toki report --project toki
 toki report --session-id 4de9291e
 
+# Provider filter
+toki report --provider codex daily --since 20260301
+
 # PromQL-style queries
 toki report query 'usage{model="claude-opus-4-6"}[1h] by (model)'
+toki report query 'usage{provider="codex"} by (model)'
+toki report query 'usage by (provider)'
 toki report query 'usage{session="4de9", since="20260301"} by (session)'
 toki report query 'sessions{project="myapp"}'
 toki report query 'projects'
@@ -171,6 +194,7 @@ toki --no-cost report                               # skip cost
 | `--group-by-session` | Group by session (mutually exclusive with time subcommand) |
 | `--session-id <PREFIX>` | Filter by session UUID prefix |
 | `--project <NAME>` | Filter by project directory substring |
+| `--provider <NAME>` | Filter by provider (`claude_code`, `codex`) |
 | `--start-of-week mon\|tue\|...\|sun` | Only for `weekly` |
 
 </details>
@@ -187,9 +211,9 @@ metric{filters}[bucket] by (dimensions)
 | metric | `usage`, `sessions`, `projects` | `usage` |
 | filters | `key="value"` pairs, comma-separated | `{model="claude-opus-4-6", since="20260301"}` |
 | bucket | Time bucket (s/m/h/d/w) | `[1h]`, `[5m]`, `[1d]` |
-| dimensions | Group by (model/session/project) | `by (model, session)` |
+| dimensions | Group by (model/session/project/provider) | `by (model, provider)` |
 
-Filter keys: `model`, `session`, `project`, `since`, `until`
+Filter keys: `model`, `session`, `project`, `provider`, `since`, `until`
 
 </details>
 
@@ -214,6 +238,7 @@ toki settings list                         # List all
 
 | Setting | Description | Default |
 |---------|-------------|---------|
+| Providers | Enabled providers (managed via `toki provider`) | `[]` |
 | Claude Code Root | Claude Code root directory | `~/.claude` |
 | Daemon Socket | Daemon UDS socket path | `~/.config/toki/daemon.sock` |
 | Timezone | IANA timezone (empty = UTC) | *(none)* |
@@ -238,6 +263,18 @@ Priority: **CLI args > settings.json > defaults**
 
 ---
 
+## Supported Providers
+
+| Provider | CLI Tool | Data Format | Status |
+|----------|---------|-------------|--------|
+| `claude_code` | [Claude Code](https://claude.ai/code) | JSONL (append-only) | Supported |
+| `codex` | [Codex CLI](https://github.com/openai/codex) | JSONL (append-only) | Supported |
+| *(gemini)* | [Gemini CLI](https://github.com/google-gemini/gemini-cli) | JSON (full rewrite) | Planned |
+
+Each provider gets its own isolated database (`~/.config/toki/<provider>.fjall`). Reports merge results across all enabled providers by default, or filter to a single provider with `--provider`.
+
+---
+
 ## Documentation
 
 | Document | Description |
@@ -246,6 +283,10 @@ Priority: **CLI args > settings.json > defaults**
 | **[Usage Guide](docs/USAGE.md)** | Detailed command reference, output formats, library API, examples |
 | **[JSONL Format Reference](docs/claude-code-jsonl-format.md)** | Claude Code JSONL structure, line types, parsing optimizations |
 | **[Benchmark Details](benches/COMPARISON.md)** | Full comparison methodology, architecture analysis, scaling predictions |
+| **[Codex CLI Analysis](docs/codex-cli-analysis.md)** | Codex CLI local data format, token structure, parsing strategy |
+| **[Gemini CLI Analysis](docs/gemini-cli-analysis.md)** | Gemini CLI local data format analysis (future provider) |
+| **[Why Not OpenTelemetry?](docs/why-not-otel.md)** | Why toki parses local files instead of receiving OTEL data |
+| **[OTEL Comparison](docs/otel-comparison.md)** | OpenTelemetry implementation details: Claude Code vs Gemini CLI vs toki |
 
 ---
 
@@ -253,10 +294,23 @@ Priority: **CLI args > settings.json > defaults**
 
 All outputs include estimated cost (USD) per model, sourced from [LiteLLM](https://github.com/BerriAI/litellm) community pricing.
 
-- **First run**: downloads LiteLLM JSON → extracts Claude model prices → caches to `~/.config/toki/pricing.json`
+- **First run**: downloads LiteLLM JSON → extracts Claude + OpenAI model prices → caches to `~/.config/toki/pricing.json`
 - **Subsequent runs**: HTTP ETag conditional request → 304 if unchanged (~50 ms, no body)
 - **Offline**: uses cached data; if no cache, cost column is omitted
 - **`--no-cost`**: skips price fetch entirely
+
+---
+
+## Privacy & Security
+
+toki is designed to be **privacy-safe by architecture**, not by policy.
+
+- **No prompt access**: toki's JSONL parser only deserializes the `"assistant"` type lines and extracts the `usage` object (token counts) and `model` field. User prompts, assistant responses, file contents, and thinking blocks are **never loaded into memory** — serde skips over them entirely without heap allocation.
+- **No network transmission of your data**: all processing happens locally. toki never sends your data anywhere. The only outbound request is an optional pricing table fetch from the public LiteLLM repository (disable with `--no-cost`).
+- **No logs of conversation content**: the TSDB stores only: timestamp, model name, session ID, source file path, and four token count integers. Nothing else.
+- **Read-only access**: toki only reads session files. It never writes to, modifies, or deletes any CLI tool's data.
+
+This is fundamentally different from OpenTelemetry-based monitoring, where the OTEL SDK runs inside the CLI process and may include prompts, tool calls, or API request bodies in log events depending on configuration. toki operates externally and sees only what it chooses to parse — which is strictly token metadata.
 
 ---
 
@@ -293,16 +347,25 @@ src/
 ├── checkpoint.rs                   # Reverse-scan, xxHash3 matching
 ├── pricing.rs                      # LiteLLM price fetch, ETag caching
 ├── settings.rs                     # Cursive TUI settings
-├── common/types.rs                 # Shared types & traits
+├── common/
+│   ├── types.rs                    # Shared types & traits
+│   └── time.rs                     # Fast timestamp parser (0.1µs)
 ├── daemon/                         # Daemon server components
 │   ├── broadcast.rs                # BroadcastSink (zero-overhead fan-out)
-│   ├── listener.rs                 # UDS accept loop
+│   ├── listener.rs                 # UDS accept loop + multi-DB query merge
 │   └── pidfile.rs                  # PID file management
 ├── sink/                           # Output abstraction (Sink trait)
 │   ├── print.rs                    # PrintSink (table/json → stdout)
 │   ├── uds.rs                      # UdsSink (NDJSON → UDS)
 │   └── http.rs                     # HttpSink (JSON POST)
-├── providers/claude_code/parser.rs # JSONL parsing + session discovery
+├── providers/                      # Per-provider parsers (Provider trait)
+│   ├── mod.rs                      # Provider trait, FileParser trait, registry
+│   ├── claude_code/                # Claude Code JSONL parser
+│   │   ├── mod.rs                  # ClaudeCodeProvider impl
+│   │   └── parser.rs              # Session discovery + line parsing
+│   └── codex/                      # Codex CLI JSONL parser
+│       ├── mod.rs                  # CodexProvider impl
+│       └── parser.rs              # Stateful parser (model tracking)
 └── platform/macos/mod.rs           # macOS FSEvents watcher
 ```
 

@@ -2,9 +2,13 @@ use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::BroadcastSink;
 use crate::db::Database;
+
+/// Maximum number of concurrent report handler threads.
+const MAX_REPORT_THREADS: usize = 8;
 
 /// Run the UDS listener in a loop, accepting new clients.
 /// Discriminates between trace clients (long-lived stream) and
@@ -13,7 +17,7 @@ use crate::db::Database;
 pub fn run_listener(
     sock_path: &Path,
     broadcast: Arc<BroadcastSink>,
-    db: Arc<Database>,
+    dbs: Vec<(String, Arc<Database>)>,
     stop_rx: crossbeam_channel::Receiver<()>,
 ) {
     // Clean up stale socket
@@ -29,10 +33,29 @@ pub fn run_listener(
         }
     };
 
-    // Set non-blocking so we can check stop_rx periodically
-    listener.set_nonblocking(true).ok();
+    // Use blocking accept with a read timeout so we can periodically check stop_rx.
+    // Much more efficient than non-blocking + 5ms sleep polling.
+    listener.set_nonblocking(false).ok();
+    // set_read_timeout doesn't exist for UnixListener, but we can set SO_RCVTIMEO
+    // on the underlying socket. Use a short accept timeout via the socket option.
+    use std::os::unix::io::AsRawFd;
+    let timeout = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 100_000, // 100ms
+    };
+    unsafe {
+        libc::setsockopt(
+            listener.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            &timeout as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        );
+    }
 
     eprintln!("[toki:daemon] Listening on {}", sock_path.display());
+
+    let report_thread_count = Arc::new(AtomicUsize::new(0));
 
     loop {
         // Check for stop signal
@@ -43,14 +66,14 @@ pub fn run_listener(
         match listener.accept() {
             Ok((stream, _addr)) => {
                 stream.set_nonblocking(false).ok();
-                classify_and_handle(stream, &broadcast, &db);
+                classify_and_handle(stream, &broadcast, &dbs, &report_thread_count);
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(std::time::Duration::from_millis(5));
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut => {
+                // Timeout expired, loop back to check stop_rx
             }
             Err(e) => {
                 eprintln!("[toki:daemon] Accept error: {}", e);
-                std::thread::sleep(std::time::Duration::from_millis(5));
             }
         }
     }
@@ -63,7 +86,7 @@ pub fn run_listener(
 /// Classify a new connection as trace (stream) or report (request-response).
 /// If the client sends a JSON line within 200ms, it's a report query.
 /// Otherwise, it's a trace client.
-fn classify_and_handle(stream: UnixStream, broadcast: &Arc<BroadcastSink>, db: &Arc<Database>) {
+fn classify_and_handle(stream: UnixStream, broadcast: &Arc<BroadcastSink>, dbs: &[(String, Arc<Database>)], report_thread_count: &Arc<AtomicUsize>) {
     // Clone the stream for reading; keep original for writing/passing
     let reader_stream = match stream.try_clone() {
         Ok(s) => s,
@@ -82,14 +105,24 @@ fn classify_and_handle(stream: UnixStream, broadcast: &Arc<BroadcastSink>, db: &
 
     match reader.read_line(&mut first_line) {
         Ok(n) if n > 0 && first_line.trim_start().starts_with('{') => {
-            // Report client — handle in a dedicated thread
-            let db = db.clone();
-            std::thread::Builder::new()
-                .name("toki-report".to_string())
-                .spawn(move || {
-                    handle_report_client(stream, &first_line, &db);
-                })
-                .ok();
+            // Report client — handle in a dedicated thread (with concurrency limit)
+            let current = report_thread_count.load(Ordering::SeqCst);
+            if current >= MAX_REPORT_THREADS {
+                eprintln!("[toki:daemon] Too many concurrent report clients ({}), rejecting", current);
+                let error_resp = serde_json::json!({ "ok": false, "error": "server busy, too many concurrent requests" });
+                let _ = writeln!(&stream, "{}", serde_json::to_string(&error_resp).unwrap_or_default());
+            } else {
+                let dbs: Vec<(String, Arc<Database>)> = dbs.to_vec();
+                let counter = Arc::clone(report_thread_count);
+                counter.fetch_add(1, Ordering::SeqCst);
+                std::thread::Builder::new()
+                    .name("toki-report".to_string())
+                    .spawn(move || {
+                        handle_report_client(stream, &first_line, &dbs);
+                        counter.fetch_sub(1, Ordering::SeqCst);
+                    })
+                    .ok();
+            }
         }
         _ => {
             // Trace client — add to broadcast
@@ -102,11 +135,11 @@ fn classify_and_handle(stream: UnixStream, broadcast: &Arc<BroadcastSink>, db: &
 }
 
 /// Handle a report query: parse request, execute query, send response.
-fn handle_report_client(mut stream: UnixStream, request_line: &str, db: &Database) {
+fn handle_report_client(mut stream: UnixStream, request_line: &str, dbs: &[(String, Arc<Database>)]) {
     // Remove read timeout for query execution
     stream.set_read_timeout(None).ok();
 
-    let response = match execute_report_request(request_line, db) {
+    let response = match execute_report_request(request_line, dbs) {
         Ok(data) => serde_json::json!({ "ok": true, "data": data }),
         Err(e) => serde_json::json!({ "ok": false, "error": e }),
     };
@@ -116,8 +149,8 @@ fn handle_report_client(mut stream: UnixStream, request_line: &str, db: &Databas
     let _ = stream.flush();
 }
 
-/// Parse and execute a report request.
-fn execute_report_request(request_line: &str, db: &Database) -> Result<serde_json::Value, String> {
+/// Parse and execute a report request against all provider DBs, merging results.
+fn execute_report_request(request_line: &str, dbs: &[(String, Arc<Database>)]) -> Result<serde_json::Value, String> {
     let req: ReportRequest = serde_json::from_str(request_line)
         .map_err(|e| format!("invalid request: {}", e))?;
 
@@ -128,12 +161,264 @@ fn execute_report_request(request_line: &str, db: &Database) -> Result<serde_jso
     let parsed = crate::query_parser::parse(&req.query)
         .map_err(|e| format!("query parse error: {}", e))?;
 
-    // Collect results into JSON (no pricing — client handles cost calculation)
+    // Extract provider filter — handled at DB routing level, not passed to execute_parsed_query
+    let group_by_provider = parsed.group_by.contains(&"provider".to_string());
+
+    // Strip "provider" from group_by before passing to per-DB query execution
+    // (provider grouping is handled at the DB routing level in the listener)
+    let mut parsed = parsed;
+    parsed.group_by.retain(|k| k != "provider");
+
+    // Take provider filter out of parsed query (handled at DB routing level)
+    let provider_filter = parsed.provider.take();
+
+    // Select which DBs to query based on provider filter
+    let target_dbs: Vec<(&str, &Arc<Database>)> = if let Some(ref pf) = provider_filter {
+        dbs.iter()
+            .filter(|(name, _)| name == pf)
+            .map(|(name, db)| (name.as_str(), db))
+            .collect()
+    } else {
+        dbs.iter().map(|(name, db)| (name.as_str(), db)).collect()
+    };
+
+    // If provider filter specified but no matching DB, return empty
+    if target_dbs.is_empty() {
+        return Ok(serde_json::Value::Array(Vec::new()));
+    }
+
+    // Collect results from selected provider DBs
     let collector = CollectorSink::new();
-    crate::query::execute_parsed_query(db, &parsed, tz, None, &collector)?;
+    for (provider_name, db) in &target_dbs {
+        crate::query::execute_parsed_query(db, &parsed, tz, None, &collector)?;
+
+        // If grouping by provider, tag all collected results with the provider name
+        if group_by_provider {
+            collector.tag_untagged_results(provider_name);
+        }
+    }
 
     let results = collector.take();
-    Ok(serde_json::Value::Array(results))
+
+    // Merge results across providers to avoid duplicate tables
+    let merged = if group_by_provider {
+        // When grouping by provider, don't merge — keep results tagged by provider
+        merge_collected_results_by_provider(results)
+    } else {
+        merge_collected_results(results)
+    };
+    Ok(serde_json::Value::Array(merged))
+}
+
+/// Merge collected JSON results from multiple provider DBs.
+/// - "summary" results: merge ModelUsageSummary entries by model name (sum numeric fields).
+/// - "sessions"/"projects" list results: concatenate and deduplicate.
+/// - Grouped results: merge by period/bucket key, then by model name within each bucket.
+/// - Other results: pass through as-is.
+fn merge_collected_results(results: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    if results.len() <= 1 {
+        return results;
+    }
+
+    // Group results by type
+    let mut summaries: Vec<&serde_json::Value> = Vec::new();
+    let mut lists: std::collections::HashMap<String, Vec<&serde_json::Value>> = std::collections::HashMap::new();
+    let mut grouped: std::collections::HashMap<String, Vec<&serde_json::Value>> = std::collections::HashMap::new();
+    let mut other: Vec<serde_json::Value> = Vec::new();
+
+    for result in &results {
+        match result["type"].as_str() {
+            Some("summary") => summaries.push(result),
+            Some(t) if t == "sessions" || t == "projects" => {
+                lists.entry(t.to_string()).or_default().push(result);
+            }
+            Some(t) => {
+                grouped.entry(t.to_string()).or_default().push(result);
+            }
+            None => other.push(result.clone()),
+        }
+    }
+
+    let mut merged = Vec::new();
+
+    // Merge summary results: combine model summaries across providers
+    if !summaries.is_empty() {
+        let mut model_map: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
+        for summary in &summaries {
+            if let Some(data) = summary["data"].as_array() {
+                for entry in data {
+                    let model = entry["model"].as_str().unwrap_or("unknown").to_string();
+                    let existing = model_map.entry(model).or_insert_with(|| entry.clone());
+                    if !std::ptr::eq(existing, entry) {
+                        // Merge numeric fields
+                        merge_summary_entry(existing, entry);
+                    }
+                }
+            }
+        }
+        let mut merged_data: Vec<serde_json::Value> = model_map.into_values().collect();
+        merged_data.sort_by(|a, b| {
+            let ae = a["events"].as_u64().unwrap_or(0);
+            let be = b["events"].as_u64().unwrap_or(0);
+            be.cmp(&ae)
+        });
+        merged.push(serde_json::json!({ "type": "summary", "data": merged_data }));
+    }
+
+    // Merge list results: concatenate and deduplicate
+    for (type_name, items_list) in lists {
+        let mut all_items: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for item in items_list {
+            if let Some(arr) = item["items"].as_array() {
+                for v in arr {
+                    if let Some(s) = v.as_str() {
+                        if seen.insert(s.to_string()) {
+                            all_items.push(s.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        all_items.sort();
+        merged.push(serde_json::json!({ "type": type_name, "items": all_items }));
+    }
+
+    // Merge grouped results: combine by period/bucket key, then merge model entries
+    for (type_name, group_list) in grouped {
+        let mut period_map: std::collections::HashMap<String, std::collections::HashMap<String, serde_json::Value>> =
+            std::collections::HashMap::new();
+        for group in &group_list {
+            if let Some(data) = group["data"].as_array() {
+                for entry in data {
+                    let period = entry["period"].as_str()
+                        .or_else(|| entry["session"].as_str())
+                        .unwrap_or("total")
+                        .to_string();
+                    let models = period_map.entry(period).or_default();
+                    if let Some(usage_arr) = entry["usage_per_models"].as_array() {
+                        for model_entry in usage_arr {
+                            let model = model_entry["model"].as_str().unwrap_or("unknown").to_string();
+                            let existing = models.entry(model).or_insert_with(|| model_entry.clone());
+                            if !std::ptr::eq(existing, model_entry) {
+                                merge_summary_entry(existing, model_entry);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let is_session = type_name == "session";
+        let json_key = if is_session { "session" } else { "period" };
+        let mut periods: Vec<String> = period_map.keys().cloned().collect();
+        periods.sort();
+        let data: Vec<serde_json::Value> = periods.into_iter().map(|period| {
+            let models = period_map.remove(&period).unwrap_or_default();
+            let mut model_list: Vec<serde_json::Value> = models.into_values().collect();
+            model_list.sort_by(|a, b| {
+                let ae = a["events"].as_u64().unwrap_or(0);
+                let be = b["events"].as_u64().unwrap_or(0);
+                be.cmp(&ae)
+            });
+            serde_json::json!({ json_key: period, "usage_per_models": model_list })
+        }).collect();
+        merged.push(serde_json::json!({ "type": type_name, "data": data }));
+    }
+
+    merged.extend(other);
+    merged
+}
+
+/// Merge collected results grouped by provider.
+/// Each result is tagged with a "provider" field; we group summaries by provider name
+/// and present them as a grouped result (like time-bucketed, but keyed by provider).
+fn merge_collected_results_by_provider(results: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    if results.is_empty() {
+        return results;
+    }
+
+    // Group results by provider, then by type
+    let mut provider_summaries: std::collections::HashMap<String, Vec<serde_json::Value>> = std::collections::HashMap::new();
+    let mut lists: std::collections::HashMap<String, Vec<&serde_json::Value>> = std::collections::HashMap::new();
+    let mut other: Vec<serde_json::Value> = Vec::new();
+
+    for result in &results {
+        let provider = result["provider"].as_str().unwrap_or("unknown").to_string();
+        match result["type"].as_str() {
+            Some("summary") => {
+                if let Some(data) = result["data"].as_array() {
+                    provider_summaries.entry(provider).or_default().extend(data.clone());
+                }
+            }
+            Some(t) if t == "sessions" || t == "projects" => {
+                lists.entry(t.to_string()).or_default().push(result);
+            }
+            _ => other.push(result.clone()),
+        }
+    }
+
+    let mut merged = Vec::new();
+
+    // Convert provider-grouped summaries into a grouped result (like time buckets)
+    if !provider_summaries.is_empty() {
+        let mut data: Vec<serde_json::Value> = Vec::new();
+        let mut providers: Vec<String> = provider_summaries.keys().cloned().collect();
+        providers.sort();
+        for provider in providers {
+            let mut model_map: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
+            for entry in provider_summaries.remove(&provider).unwrap_or_default() {
+                let model = entry["model"].as_str().unwrap_or("unknown").to_string();
+                let existing = model_map.entry(model).or_insert_with(|| entry.clone());
+                if !std::ptr::eq(existing, &entry) {
+                    merge_summary_entry(existing, &entry);
+                }
+            }
+            let mut model_list: Vec<serde_json::Value> = model_map.into_values().collect();
+            model_list.sort_by(|a, b| {
+                let ae = a["events"].as_u64().unwrap_or(0);
+                let be = b["events"].as_u64().unwrap_or(0);
+                be.cmp(&ae)
+            });
+            data.push(serde_json::json!({ "period": provider, "usage_per_models": model_list }));
+        }
+        merged.push(serde_json::json!({ "type": "by provider", "data": data }));
+    }
+
+    // Merge list results: concatenate and deduplicate
+    for (type_name, items_list) in lists {
+        let mut all_items: Vec<String> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for item in items_list {
+            if let Some(arr) = item["items"].as_array() {
+                for v in arr {
+                    if let Some(s) = v.as_str() {
+                        if seen.insert(s.to_string()) {
+                            all_items.push(s.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        all_items.sort();
+        merged.push(serde_json::json!({ "type": type_name, "items": all_items }));
+    }
+
+    merged.extend(other);
+    merged
+}
+
+/// Merge numeric fields from `src` into `dst` (both are JSON model summary entries).
+fn merge_summary_entry(dst: &mut serde_json::Value, src: &serde_json::Value) {
+    for field in &["input_tokens", "output_tokens", "cache_creation_input_tokens",
+                    "cache_read_input_tokens", "total_tokens", "events"] {
+        if let (Some(d), Some(s)) = (dst[*field].as_u64(), src[*field].as_u64()) {
+            dst[*field] = serde_json::json!(d + s);
+        }
+    }
+    // Merge cost if both have it
+    if let (Some(d), Some(s)) = (dst["cost_usd"].as_f64(), src["cost_usd"].as_f64()) {
+        dst["cost_usd"] = serde_json::json!(d + s);
+    }
 }
 
 /// Request payload from report client.
@@ -158,6 +443,17 @@ impl CollectorSink {
 
     fn take(self) -> Vec<serde_json::Value> {
         self.collected.into_inner().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Tag all results that don't yet have a "provider" field with the given provider name.
+    /// Used when grouping by provider to attribute results to their source DB.
+    fn tag_untagged_results(&self, provider_name: &str) {
+        let mut collected = self.collected.lock().unwrap_or_else(|e| e.into_inner());
+        for result in collected.iter_mut() {
+            if result.get("provider").is_none() {
+                result["provider"] = serde_json::json!(provider_name);
+            }
+        }
     }
 }
 

@@ -66,35 +66,43 @@ impl PricingTable {
     }
 }
 
-/// Parse LiteLLM JSON and extract Claude model prices.
+/// Parse LiteLLM JSON and extract all model prices.
+/// No provider-specific filtering — any model with valid pricing data is included.
+/// Model names are stored both as-is and with common provider prefixes stripped
+/// (e.g., "anthropic/claude-opus-4-6" → also stored as "claude-opus-4-6"),
+/// so exact-match lookups work regardless of how the CLI tool reports the model name.
 fn parse_litellm_json(json_str: &str) -> HashMap<String, ModelPricing> {
     let raw: HashMap<String, LiteLLMEntry> = match serde_json::from_str(json_str) {
         Ok(v) => v,
         Err(_) => return HashMap::new(),
     };
 
-    let mut prices = HashMap::with_capacity(32);
+    let mut prices = HashMap::with_capacity(raw.len());
 
     for (key, entry) in &raw {
-        let model_name = if let Some(stripped) = key.strip_prefix("anthropic/") {
-            stripped
-        } else if key.starts_with("claude-") {
-            key.as_str()
-        } else {
-            continue;
-        };
-
         let (input_cost, output_cost) = match (entry.input_cost_per_token, entry.output_cost_per_token) {
-            (Some(i), Some(o)) => (i, o),
+            (Some(i), Some(o)) if i > 0.0 || o > 0.0 => (i, o),
             _ => continue,
         };
 
-        prices.entry(model_name.to_string()).or_insert(ModelPricing {
+        let pricing = ModelPricing {
             input_cost_per_token: input_cost,
             output_cost_per_token: output_cost,
             cache_creation_input_token_cost: entry.cache_creation_input_token_cost,
             cache_read_input_token_cost: entry.cache_read_input_token_cost,
-        });
+        };
+
+        // Store with original key
+        prices.entry(key.clone()).or_insert_with(|| pricing.clone());
+
+        // Also store with provider prefix stripped, so CLI-reported model names
+        // (e.g., "claude-opus-4-6" instead of "anthropic/claude-opus-4-6") match.
+        if let Some(pos) = key.find('/') {
+            let stripped = &key[pos + 1..];
+            if !stripped.is_empty() {
+                prices.entry(stripped.to_string()).or_insert(pricing);
+            }
+        }
     }
 
     prices
@@ -152,6 +160,9 @@ pub fn fetch_pricing(cache_path: &Path) -> PricingTable {
     let cached = load_cache(cache_path);
     let cached_etag = cached.as_ref().and_then(|c| c.etag.clone());
 
+    // Note: ureq's into_string() enforces a 10 MB default response size limit,
+    // which is sufficient for the LiteLLM pricing JSON (~5 MB as of 2025).
+    // No additional size limit needed.
     let mut req = ureq::get(LITELLM_URL);
     if let Some(ref etag) = cached_etag {
         req = req.set("If-None-Match", etag);
@@ -176,7 +187,7 @@ pub fn fetch_pricing(cache_path: &Path) -> PricingTable {
 
             let prices = parse_litellm_json(&body);
             if prices.is_empty() {
-                eprintln!("[toki] Pricing: no Claude models found in response");
+                eprintln!("[toki] Pricing: no supported models found in response");
                 return fallback(cached);
             }
 
@@ -251,13 +262,29 @@ mod tests {
                 "output_cost_per_token": 0.000075,
                 "cache_creation_input_token_cost": 0.00001875,
                 "cache_read_input_token_cost": 0.0000015
+            },
+            "gemini/gemini-2.5-pro": {
+                "input_cost_per_token": 0.00000125,
+                "output_cost_per_token": 0.00001
+            },
+            "some-free-model": {
+                "input_cost_per_token": 0.0,
+                "output_cost_per_token": 0.0
             }
         }"#;
 
         let prices = parse_litellm_json(json);
+        // Direct keys
         assert!(prices.contains_key("claude-sonnet-4-20250514"));
+        assert!(prices.contains_key("gpt-4"));
+        // Prefix-stripped keys (anthropic/ and gemini/ stripped)
         assert!(prices.contains_key("claude-opus-4-20250514"));
-        assert!(!prices.contains_key("gpt-4"));
+        assert!(prices.contains_key("gemini-2.5-pro"));
+        // Original prefixed keys also present
+        assert!(prices.contains_key("anthropic/claude-opus-4-20250514"));
+        assert!(prices.contains_key("gemini/gemini-2.5-pro"));
+        // Zero-cost models excluded
+        assert!(!prices.contains_key("some-free-model"));
     }
 
     #[test]

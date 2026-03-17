@@ -6,8 +6,10 @@ use chrono_tz::Tz;
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub providers: Vec<String>,
     pub claude_code_root: String,
     pub db_path: PathBuf,
+    pub db_base_dir: PathBuf,
     pub tz: Option<Tz>,
     pub retention_days: u32,
     pub rollup_retention_days: u32,
@@ -26,10 +28,13 @@ impl Default for Config {
 impl Config {
     pub fn new() -> Self {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let config_dir = home.join(".config").join("toki");
 
         let mut config = Config {
+            providers: vec![],
             claude_code_root: home.join(".claude").to_string_lossy().to_string(),
-            db_path: home.join(".config").join("toki").join("toki.fjall"),
+            db_path: config_dir.join("toki.fjall"),
+            db_base_dir: config_dir.clone(),
             tz: None,
             retention_days: 0,
             rollup_retention_days: 0,
@@ -58,12 +63,35 @@ impl Config {
     pub fn load_from_settings_file(&mut self) {
         let settings = match load_settings_file() {
             Some(s) => s,
-            None => return,
+            None => {
+                // No settings file: default to claude_code if ~/.claude exists
+                if std::path::Path::new(&self.claude_code_root).exists() {
+                    self.providers = vec!["claude_code".to_string()];
+                }
+                return;
+            }
         };
 
         if let Some(v) = settings.get("claude_code_root").and_then(|v| v.as_str()) {
             self.claude_code_root = v.to_string();
         }
+
+        // Load providers list
+        if let Some(v) = settings.get("providers") {
+            if let Some(arr) = v.as_array() {
+                self.providers = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect();
+            }
+        } else {
+            // Backward compat: no "providers" key.
+            // If claude_code_root exists (explicitly set or default), default to ["claude_code"].
+            if std::path::Path::new(&self.claude_code_root).exists() {
+                self.providers = vec!["claude_code".to_string()];
+            }
+        }
+
         if let Some(v) = settings.get("retention_days").and_then(|v| v.as_str()) {
             if let Ok(n) = v.parse::<u32>() { self.retention_days = n; }
         }
@@ -146,17 +174,79 @@ pub fn set_setting(key: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Save a JSON array setting to the settings file.
+pub fn set_setting_array(key: &str, values: &[String]) -> Result<(), String> {
+    let path = settings_file_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+
+    let lock_path = path.with_extension("lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true).truncate(false).read(true).write(true)
+        .open(&lock_path).map_err(|e| e.to_string())?;
+    use fs2::FileExt;
+    lock_file.lock_exclusive().map_err(|e| format!("settings lock: {}", e))?;
+
+    let mut settings: HashMap<String, serde_json::Value> = if path.exists() {
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|data| serde_json::from_str(&data).ok())
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+
+    let arr: Vec<serde_json::Value> = values
+        .iter()
+        .map(|s| serde_json::Value::String(s.clone()))
+        .collect();
+    settings.insert(key.to_string(), serde_json::Value::Array(arr));
+
+    let tmp = path.with_extension("tmp");
+    let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
+    std::fs::write(&tmp, &json).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+
+    lock_file.unlock().ok();
+    Ok(())
+}
+
 /// Get a single setting from the settings file.
 pub fn get_setting(key: &str) -> Option<String> {
     let settings = load_settings_file()?;
     settings.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
 }
 
+/// Get providers list from settings file.
+pub fn get_providers() -> Vec<String> {
+    let settings = match load_settings_file() {
+        Some(s) => s,
+        None => return vec![],
+    };
+    settings
+        .get("providers")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// List all settings as (key, value) pairs.
 pub fn list_settings() -> HashMap<String, String> {
     let settings = load_settings_file().unwrap_or_default();
     settings.into_iter()
-        .filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string())))
+        .filter_map(|(k, v)| {
+            v.as_str().map(|s| (k.clone(), s.to_string()))
+                .or_else(|| if v.is_array() || v.is_object() {
+                    Some((k, v.to_string()))
+                } else {
+                    None
+                })
+        })
         .collect()
 }
 
@@ -176,8 +266,10 @@ mod tests {
     #[test]
     fn test_config_defaults() {
         let config = Config {
+            providers: vec![],
             claude_code_root: "~/.claude".to_string(),
             db_path: PathBuf::from("toki.fjall"),
+            db_base_dir: PathBuf::from("."),
             tz: None,
             retention_days: 0,
             rollup_retention_days: 0,
@@ -195,8 +287,10 @@ mod tests {
     #[test]
     fn test_config_builder() {
         let mut config = Config {
+            providers: vec![],
             claude_code_root: String::new(),
             db_path: PathBuf::new(),
+            db_base_dir: PathBuf::new(),
             tz: None,
             retention_days: 0,
             rollup_retention_days: 0,

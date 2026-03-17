@@ -6,17 +6,17 @@ use crossbeam_channel::Receiver;
 
 use crate::common::types::{FileCheckpoint, RollupValue, StoredEvent, TokenFields};
 use crate::db::Database;
-use crate::engine::extract_project_name;
 use crate::retention::{RetentionPolicy, run_retention};
 
 /// Event data for cold start bulk write.
-/// Uses Rc<str> for session_id/source_file to avoid per-event String clones.
+/// Uses Arc<str> for session_id/source_file to avoid per-event String clones.
 pub struct ColdStartEvent {
     pub ts_ms: i64,
     pub message_id: String,
     pub model: String,
     pub session_id: std::sync::Arc<str>,
     pub source_file: std::sync::Arc<str>,
+    pub project_name: Option<std::sync::Arc<str>>,
     pub tokens: TokenFields,
 }
 
@@ -28,9 +28,10 @@ pub enum DbOp {
         model: String,
         session_id: String,
         source_file: String,
+        project_name: Option<String>,
         tokens: TokenFields,
     },
-    /// Bulk write chunk for cold start — events from one file.
+    /// Bulk write chunk for cold start -- events from one file.
     /// Rollups are accumulated in memory until FlushBulkRollups.
     BulkWrite(Vec<ColdStartEvent>),
     /// Flush accumulated rollups from cold start bulk writes. Signals done.
@@ -62,6 +63,7 @@ struct PendingEvent {
     model: String,
     session_id: String,
     source_file: String,
+    project_name: Option<String>,
     tokens: TokenFields,
 }
 
@@ -135,9 +137,9 @@ impl DbWriter {
     /// Handle a single operation. Returns false on Shutdown.
     fn handle_op(&mut self, op: DbOp) -> bool {
         match op {
-            DbOp::WriteEvent { ts_ms, message_id, model, session_id, source_file, tokens } => {
+            DbOp::WriteEvent { ts_ms, message_id, model, session_id, source_file, project_name, tokens } => {
                 self.pending_events.push(PendingEvent {
-                    ts_ms, message_id, model, session_id, source_file, tokens,
+                    ts_ms, message_id, model, session_id, source_file, project_name, tokens,
                 });
                 if self.pending_events.len() >= BATCH_SIZE {
                     self.flush_pending();
@@ -170,6 +172,8 @@ impl DbWriter {
     }
 
     /// Flush pending events as a batch transaction.
+    /// Note: does a DB read per unique (hour, model) to fetch current rollup values.
+    /// This is acceptable for the current BATCH_SIZE (64) — at most ~64 reads per flush.
     fn flush_pending(&mut self) {
         if self.pending_events.is_empty() {
             return;
@@ -219,8 +223,8 @@ impl DbWriter {
             // Session index
             self.db.insert_session_index(&mut batch, &event.session_id, event.ts_ms, &event.message_id);
 
-            // Project index (extract from source_file path)
-            if let Some(project) = extract_project_name(&event.source_file) {
+            // Project index
+            if let Some(ref project) = event.project_name {
                 self.db.insert_project_index(&mut batch, project, event.ts_ms, &event.message_id);
             }
         }
@@ -242,7 +246,8 @@ impl DbWriter {
 
     /// Buffer a chunk of cold start events. Flushes to DB when buffer reaches BULK_BATCH_SIZE.
     fn bulk_write_chunk(&mut self, mut events: Vec<ColdStartEvent>) {
-        // Accumulate rollups in memory (no DB reads)
+        // Accumulate rollups in memory (no DB reads).
+        // Note: model.clone() is acceptable here — this only runs during cold start (one-time).
         for event in &events {
             let hour_ts = event.ts_ms - (event.ts_ms % 3_600_000);
             let rollup = self.bulk_rollups.entry((hour_ts, event.model.clone())).or_default();
@@ -286,7 +291,7 @@ impl DbWriter {
             self.db.insert_event_batch(&mut batch, event.ts_ms, &event.message_id, &stored);
             self.db.insert_session_index(&mut batch, &event.session_id, event.ts_ms, &event.message_id);
 
-            if let Some(project) = extract_project_name(&event.source_file) {
+            if let Some(ref project) = event.project_name {
                 self.db.insert_project_index(&mut batch, project, event.ts_ms, &event.message_id);
             }
         }

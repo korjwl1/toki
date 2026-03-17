@@ -25,6 +25,8 @@ pub fn find_resume_offset(path: &str, cp: &FileCheckpoint) -> std::io::Result<Op
 
     // Bytes carried from the beginning of the previously-read (rightward) chunk.
     // These form the tail end of a line whose start is in an earlier chunk.
+    // Note: allocation only happens for lines spanning 4KB chunk boundaries, which is rare.
+    // The allocation is small (line-sized), so not worth optimizing.
     let mut fragment: Vec<u8> = Vec::new();
     // If the line containing `fragment` matches, this is the resume offset.
     let mut fragment_resume: u64 = file_size;
@@ -48,7 +50,11 @@ pub fn find_resume_offset(path: &str, cp: &FileCheckpoint) -> std::io::Result<Op
                 Some(pos) => pos + 1,
                 None => 0,
             };
-            let trailing = &buf[trailing_start..];
+            let mut trailing = &buf[trailing_start..];
+            // Strip trailing \r for Windows-style line endings
+            if trailing.last() == Some(&b'\r') {
+                trailing = &trailing[..trailing.len() - 1];
+            }
             if !trailing.is_empty() && trailing.len() as u64 == cp.last_line_len
                 && hash_line(trailing) == cp.last_line_hash {
                     return Ok(Some(file_size));
@@ -79,7 +85,11 @@ pub fn find_resume_offset(path: &str, cp: &FileCheckpoint) -> std::io::Result<Op
             found_newline = true;
 
             // Content between this \n and the previous boundary.
-            let content_in_buf = &buf_slice[i + 1..line_end];
+            let mut content_in_buf = &buf_slice[i + 1..line_end];
+            // Strip trailing \r for Windows-style line endings
+            if content_in_buf.last() == Some(&b'\r') {
+                content_in_buf = &content_in_buf[..content_in_buf.len() - 1];
+            }
 
             if !fragment_consumed {
                 // First \n from the right: combine with carried fragment.
@@ -87,6 +97,11 @@ pub fn find_resume_offset(path: &str, cp: &FileCheckpoint) -> std::io::Result<Op
                 full_line.extend_from_slice(&fragment);
                 fragment.clear();
                 fragment_consumed = true;
+
+                // Strip trailing \r that may be at the end of the fragment portion
+                if full_line.last() == Some(&b'\r') {
+                    full_line.pop();
+                }
 
                 if !full_line.is_empty() && full_line.len() as u64 == cp.last_line_len
                     && hash_line(&full_line) == cp.last_line_hash {
@@ -124,6 +139,10 @@ pub fn find_resume_offset(path: &str, cp: &FileCheckpoint) -> std::io::Result<Op
     }
 
     // Check the very first line of the file (no preceding \n).
+    // Strip trailing \r for Windows-style line endings
+    if fragment.last() == Some(&b'\r') {
+        fragment.pop();
+    }
     if !fragment.is_empty() && fragment.len() as u64 == cp.last_line_len
         && hash_line(&fragment) == cp.last_line_hash {
             return Ok(Some(fragment_resume));
@@ -135,6 +154,11 @@ pub fn find_resume_offset(path: &str, cp: &FileCheckpoint) -> std::io::Result<Op
 
 /// Check if bytes form a complete JSON object by bracket-depth counting.
 /// Handles strings and escape sequences correctly. O(n) with minimal branching.
+///
+/// Limitations: This is not a general JSON validator. It uses bracket-depth counting
+/// which is sufficient for detecting truncated trailing content in JSONL files
+/// (our use case), but does not validate JSON correctness (e.g., it wouldn't catch
+/// malformed keys, mismatched types, or invalid escape sequences outside of `\"`/`\\`).
 #[inline]
 fn is_complete_json_object(bytes: &[u8]) -> bool {
     if bytes.first() != Some(&b'{') {

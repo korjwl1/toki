@@ -79,8 +79,9 @@ pub fn create_sinks(specs: &[String], print_format: OutputFormat) -> Box<dyn Sin
 }
 
 /// Shorten a UUID or agent ID to first 8 chars.
+/// Uses `get` to safely handle UTF-8 boundary cases.
 pub(crate) fn shorten_id(id: &str) -> &str {
-    if id.len() > 8 { &id[..8] } else { id }
+    id.get(..8).unwrap_or(id)
 }
 
 /// Extract a human-readable label from a source file path.

@@ -269,7 +269,11 @@ impl Database {
             let kv = guard.into_inner()?;
             let key = &kv.0;
             if key.len() < 8 { continue; }
-            let ts = i64::from_be_bytes(key[..8].try_into().unwrap());
+            let ts_bytes: [u8; 8] = match key[..8].try_into() {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let ts = i64::from_be_bytes(ts_bytes);
             if ts > until_ms { break; }
             let msg_id = String::from_utf8_lossy(&key[8..]).into_owned();
             if let Ok(event) = bincode::deserialize::<StoredEvent>(&kv.1) {
@@ -295,7 +299,11 @@ impl Database {
             let kv = guard.into_inner()?;
             let key = &kv.0;
             if key.len() < 8 { continue; }
-            let ts = i64::from_be_bytes(key[..8].try_into().unwrap());
+            let ts_bytes: [u8; 8] = match key[..8].try_into() {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let ts = i64::from_be_bytes(ts_bytes);
             if ts > until_ms { break; }
             let model = String::from_utf8_lossy(&key[8..]).into_owned();
             if let Ok(rollup) = bincode::deserialize::<RollupValue>(&kv.1) {
@@ -315,7 +323,11 @@ impl Database {
             let kv = guard.into_inner()?;
             let key = &kv.0;
             if key.len() < 8 { continue; }
-            let ts = i64::from_be_bytes(key[..8].try_into().unwrap());
+            let ts_bytes: [u8; 8] = match key[..8].try_into() {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let ts = i64::from_be_bytes(ts_bytes);
             if ts > until_ms { break; }
             if let Ok(event) = bincode::deserialize::<StoredEvent>(&kv.1) {
                 f(ts, event);

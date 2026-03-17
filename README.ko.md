@@ -84,9 +84,9 @@ toki trace            # 실시간 스트림        (≈ docker logs -f)
 toki report           # 즉시 TSDB 조회      (≈ docker ps)
 ```
 
-- **daemon** — Claude Code JSONL 세션 로그를 FSEvents로 감시하고, 이벤트를 파싱해서 내장 TSDB(fjall)에 기록합니다. trace 클라이언트가 없으면 Sink 오버헤드는 0입니다.
+- **daemon** — 설정된 provider(Claude Code, Codex CLI)의 세션 로그를 FSEvents로 감시하고, 이벤트를 파싱해서 provider별 내장 TSDB(fjall)에 기록합니다. trace 클라이언트가 없으면 Sink 오버헤드는 0입니다.
 - **trace** — UDS로 데몬에 연결해서 실시간 이벤트 스트림을 받습니다. `print`, `uds://`, `http://` 모든 sink을 지원합니다.
-- **report** — UDS로 데몬에 쿼리를 보내고 TSDB 결과를 받습니다. 언제나 빠르고, 언제나 색인된 상태입니다.
+- **report** — UDS로 데몬에 쿼리를 보내고, 모든 provider TSDB의 결과를 병합하여 받습니다. 언제나 빠르고, 언제나 색인된 상태입니다. `--provider`로 단일 provider만 조회할 수도 있습니다.
 
 ---
 
@@ -97,6 +97,11 @@ toki report           # 즉시 TSDB 조회      (≈ docker ps)
 cargo build --release
 # 바이너리: target/release/toki — PATH에 추가하거나 직접 실행
 
+# 0. Provider 설정 (최초 실행 전 필수)
+toki provider add claude_code
+toki provider add codex           # 선택: Codex CLI 지원 추가
+toki provider list                # 활성화된 provider 확인
+
 # 1. 데몬 시작 (foreground, Ctrl+C으로 종료)
 toki daemon start
 
@@ -104,12 +109,15 @@ toki daemon start
 toki trace
 
 # 3. 리포트 조회 (TSDB에서 즉시 조회)
-toki report
+toki report                                   # 전체 provider 병합
+toki report --provider claude_code            # 단일 provider
 toki report daily --since 20260301
 toki report monthly
 
 # 4. PromQL 스타일 쿼리
 toki report query 'usage{model="claude-opus-4-6"}[1h] by (model)'
+toki report query 'usage{provider="codex"} by (model)'
+toki report query 'usage by (provider)'
 toki report query 'sessions{project="myapp"}'
 ```
 
@@ -127,11 +135,21 @@ toki daemon status      # 실행 상태 확인
 toki daemon reset       # DB 전체 삭제 + 초기화
 ```
 
+### Provider
+
+```bash
+toki provider add claude_code     # Claude Code 추적 활성화
+toki provider add codex           # Codex CLI 추적 활성화
+toki provider remove codex        # 비활성화 (DB 삭제 선택 가능)
+toki provider list                # 전체 provider + 상태 확인
+```
+
 ### Report
 
 ```bash
 # 전체 요약
-toki report
+toki report                                         # 전체 provider
+toki report --provider claude_code                  # 단일 provider
 toki report --since 20260301 --until 20260331
 
 # 시간별 그룹핑
@@ -146,8 +164,13 @@ toki report --group-by-session
 toki report --project toki
 toki report --session-id 4de9291e
 
+# Provider 필터
+toki report --provider codex daily --since 20260301
+
 # PromQL 스타일 쿼리
 toki report query 'usage{model="claude-opus-4-6"}[1h] by (model)'
+toki report query 'usage{provider="codex"} by (model)'
+toki report query 'usage by (provider)'
 toki report query 'usage{session="4de9", since="20260301"} by (session)'
 toki report query 'sessions{project="myapp"}'
 toki report query 'projects'
@@ -171,6 +194,7 @@ toki --no-cost report                               # 비용 표시 없이
 | `--group-by-session` | 세션별 그룹핑 (시간 서브커맨드와 동시 사용 불가) |
 | `--session-id <PREFIX>` | 세션 UUID 접두사 필터 |
 | `--project <NAME>` | 프로젝트 디렉토리 서브스트링 필터 |
+| `--provider <NAME>` | provider 필터 (`claude_code`, `codex`) |
 | `--start-of-week mon\|tue\|...\|sun` | `weekly`에서만 사용 |
 
 </details>
@@ -187,9 +211,9 @@ metric{filters}[bucket] by (dimensions)
 | metric | `usage`, `sessions`, `projects` | `usage` |
 | filters | `key="value"` 쌍, `,`로 구분 | `{model="claude-opus-4-6", since="20260301"}` |
 | bucket | 시간 버킷 (s/m/h/d/w) | `[1h]`, `[5m]`, `[1d]` |
-| dimensions | 그룹 기준 (model/session/project) | `by (model, session)` |
+| dimensions | 그룹 기준 (model/session/project/provider) | `by (model, provider)` |
 
-필터 키: `model`, `session`, `project`, `since`, `until`
+필터 키: `model`, `session`, `project`, `provider`, `since`, `until`
 
 </details>
 
@@ -214,6 +238,7 @@ toki settings list                         # 전체 설정 출력
 
 | 설정 항목 | 설명 | 기본값 |
 |-----------|------|--------|
+| Providers | 활성화된 provider (`toki provider`로 관리) | `[]` |
 | Claude Code Root | Claude Code 루트 디렉토리 | `~/.claude` |
 | Daemon Socket | 데몬 UDS 소켓 경로 | `~/.config/toki/daemon.sock` |
 | Timezone | IANA 타임존 (빈값=UTC) | *(없음)* |
@@ -234,7 +259,19 @@ toki settings list                         # 전체 설정 출력
 | `--output-format table\|json` | 출력 형식 오버라이드 |
 | `--sink <SPEC>` | 출력 대상, 복수 지정 가능 |
 | `--timezone <IANA>` / `-z` | 타임존 오버라이드 |
-| `--no-cost` | 비용 계산 비활성화 오버라이드 |
+| `--no-cost` | 비용 계산 비활성화 |
+
+---
+
+## 지원 Provider
+
+| Provider | CLI 도구 | 데이터 형식 | 상태 |
+|----------|---------|-------------|------|
+| `claude_code` | [Claude Code](https://claude.ai/code) | JSONL (append-only) | 지원 |
+| `codex` | [Codex CLI](https://github.com/openai/codex) | JSONL (append-only) | 지원 |
+| *(gemini)* | [Gemini CLI](https://github.com/google-gemini/gemini-cli) | JSON (full rewrite) | 예정 |
+
+각 provider는 독립된 데이터베이스(`~/.config/toki/<provider>.fjall`)를 가집니다. 리포트는 기본적으로 모든 활성 provider의 결과를 병합하며, `--provider`로 단일 provider만 필터링할 수 있습니다.
 
 ---
 
@@ -246,6 +283,10 @@ toki settings list                         # 전체 설정 출력
 | **[사용법 가이드](docs/USAGE.ko.md)** | 상세 명령어 레퍼런스, 출력 형식, 라이브러리 API, 예제 |
 | **[JSONL 형식 레퍼런스](docs/claude-code-jsonl-format.ko.md)** | Claude Code JSONL 구조, 라인 타입, 파싱 최적화 |
 | **[벤치마크 상세](benches/COMPARISON.ko.md)** | 전체 비교 방법론, 아키텍처 분석, 스케일링 예측 |
+| **[Codex CLI 분석](docs/codex-cli-analysis.md)** | Codex CLI 로컬 데이터 형식, 토큰 구조, 파싱 전략 |
+| **[Gemini CLI 분석](docs/gemini-cli-analysis.md)** | Gemini CLI 로컬 데이터 형식 분석 (향후 provider) |
+| **[왜 OpenTelemetry가 아닌가?](docs/why-not-otel.md)** | toki가 OTEL 데이터 대신 로컬 파일을 파싱하는 이유 |
+| **[OTEL 비교](docs/otel-comparison.md)** | OpenTelemetry 구현 상세: Claude Code vs Gemini CLI vs toki |
 
 ---
 
@@ -253,10 +294,23 @@ toki settings list                         # 전체 설정 출력
 
 모든 출력에 모델별 추정 비용(USD)이 포함됩니다. 가격 데이터는 [LiteLLM](https://github.com/BerriAI/litellm) 커뮤니티 가격표에서 가져옵니다.
 
-- **최초 실행**: LiteLLM JSON 다운로드 → Claude 모델 추출 → 파일 캐시 (`~/.config/toki/pricing.json`)
+- **최초 실행**: LiteLLM JSON 다운로드 → Claude + OpenAI 모델 가격 추출 → 파일 캐시 (`~/.config/toki/pricing.json`)
 - **이후 실행**: HTTP ETag 조건부 요청 → 변경 없으면 304 (바디 없이 ~50ms)
 - **오프라인**: 캐시된 데이터로 동작합니다. 캐시가 없으면 Cost 컬럼이 생략됩니다.
 - **`--no-cost`**: 가격 fetch를 건너뜁니다.
+
+---
+
+## 프라이버시 & 보안
+
+toki는 정책이 아닌 **아키텍처로 프라이버시를 보장**하도록 설계되었습니다.
+
+- **프롬프트 접근 없음**: toki의 JSONL 파서는 `"assistant"` 타입 줄만 역직렬화하고, `usage` 객체(토큰 수)와 `model` 필드만 추출합니다. 사용자 프롬프트, 어시스턴트 응답, 파일 내용, thinking 블록은 **메모리에 절대 로드되지 않습니다** — serde가 힙 할당 없이 건너뜁니다.
+- **데이터 네트워크 전송 없음**: 모든 처리는 로컬에서 이루어집니다. toki는 데이터를 어디에도 보내지 않습니다. 유일한 외부 요청은 공개 LiteLLM 레포지토리에서 가격표를 가져오는 선택적 요청뿐입니다 (`--no-cost`로 비활성화).
+- **대화 내용 로깅 없음**: TSDB에는 타임스탬프, 모델명, 세션 ID, 소스 파일 경로, 4개의 토큰 수 정수만 저장됩니다. 그 외에는 아무것도 없습니다.
+- **읽기 전용 접근**: toki는 세션 파일을 읽기만 합니다. CLI 도구의 데이터를 수정, 쓰기, 삭제하지 않습니다.
+
+이는 OpenTelemetry 기반 모니터링과 근본적으로 다릅니다. OTEL SDK는 CLI 프로세스 내부에서 실행되며, 설정에 따라 프롬프트, 도구 호출, API 요청 본문이 로그 이벤트에 포함될 수 있습니다. toki는 외부에서 동작하며 파싱 대상으로 선택한 것만 봅니다 — 그것은 엄밀히 토큰 메타데이터뿐입니다.
 
 ---
 
@@ -293,16 +347,25 @@ src/
 ├── checkpoint.rs                   # 역순 라인 스캔, xxHash3 매칭
 ├── pricing.rs                      # LiteLLM 가격 fetch, ETag 캐싱
 ├── settings.rs                     # Cursive TUI 설정 페이지
-├── common/types.rs                 # 공통 타입, trait 정의
+├── common/
+│   ├── types.rs                    # 공통 타입, trait 정의
+│   └── time.rs                     # 고속 타임스탬프 파서 (0.1µs)
 ├── daemon/                         # 데몬 서버 컴포넌트
 │   ├── broadcast.rs                # BroadcastSink (zero-overhead fan-out)
-│   ├── listener.rs                 # UDS accept loop
+│   ├── listener.rs                 # UDS accept loop + multi-DB 쿼리 병합
 │   └── pidfile.rs                  # PID 파일 관리
 ├── sink/                           # 출력 추상화 (Sink trait)
 │   ├── print.rs                    # PrintSink (table/json → stdout)
 │   ├── uds.rs                      # UdsSink (NDJSON → UDS)
 │   └── http.rs                     # HttpSink (JSON POST)
-├── providers/claude_code/parser.rs # JSONL 파싱 + 세션 디스커버리
+├── providers/                      # provider별 파서 (Provider trait)
+│   ├── mod.rs                      # Provider trait, FileParser trait, registry
+│   ├── claude_code/                # Claude Code JSONL 파서
+│   │   ├── mod.rs                  # ClaudeCodeProvider impl
+│   │   └── parser.rs              # 세션 디스커버리 + 라인 파싱
+│   └── codex/                      # Codex CLI JSONL 파서
+│       ├── mod.rs                  # CodexProvider impl
+│       └── parser.rs              # Stateful 파서 (model tracking)
 └── platform/macos/mod.rs           # macOS FSEvents 감시
 ```
 

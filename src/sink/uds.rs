@@ -33,7 +33,7 @@ impl UdsSink {
             }
         };
 
-        let mut conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
 
         // Try existing connection
         if let Some(ref mut stream) = *conn {

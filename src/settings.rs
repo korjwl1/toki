@@ -108,11 +108,15 @@ fn labeled_checkbox(label: &str, checked: bool, name: &str) -> LinearLayout {
         .child(Checkbox::new().with_checked(checked).with_name(name))
 }
 
-pub fn run_settings() {
+/// Run the settings TUI. Returns `true` if daemon restart was requested.
+pub fn run_settings() -> bool {
     let state = SettingsState::load();
 
     let mut siv = cursive::default();
     siv.set_theme(build_theme());
+
+    // Shared flag to signal daemon restart request
+    let restart_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // -- Paths section --
     let paths_section = LinearLayout::vertical()
@@ -139,8 +143,22 @@ pub fn run_settings() {
         .child(labeled_edit("Rollup Retention", &state.rollup_retention_days, "rollup_retention_days"))
         .child(hint_text("                        Days to keep rollups (0 = forever)"));
 
+    // -- Providers section (read-only) --
+    let providers = crate::config::get_providers();
+    let provider_display = if providers.is_empty() {
+        "(none configured)".to_string()
+    } else {
+        providers.join(", ")
+    };
+    let providers_section = LinearLayout::vertical()
+        .child(field_label(&format!("  Active:  {}", provider_display)))
+        .child(DummyView.fixed_height(1))
+        .child(hint_text("  Use `toki provider add/remove` to manage"));
+
     // Assemble form with section panels
     let form = LinearLayout::vertical()
+        .child(Panel::new(PaddedView::new(Margins::lrtb(1, 1, 1, 0), providers_section)).title("Providers"))
+        .child(DummyView.fixed_height(1))
         .child(Panel::new(PaddedView::new(Margins::lrtb(1, 1, 1, 0), paths_section)).title("Paths"))
         .child(DummyView.fixed_height(1))
         .child(Panel::new(PaddedView::new(Margins::lrtb(1, 1, 1, 0), display_section)).title("Display"))
@@ -171,11 +189,12 @@ pub fn run_settings() {
         .child(DummyView.fixed_height(1))
         .child(PaddedView::lrtb(2, 0, 0, 0, footer));
 
+    let restart_flag = restart_requested.clone();
     siv.add_layer(
         Dialog::around(main_layout)
             .title("toki settings")
             .button("Save", move |s| {
-                save_settings(s);
+                save_settings(s, restart_flag.clone());
             })
             .button("Cancel", |s| s.quit())
             .min_width(70)
@@ -185,9 +204,11 @@ pub fn run_settings() {
     siv.add_global_callback(Key::Esc, |s| s.quit());
 
     siv.run();
+
+    restart_requested.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-fn save_settings(siv: &mut Cursive) {
+fn save_settings(siv: &mut Cursive, restart_flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
     let claude_root = get_edit(siv, "claude_code_root");
     let daemon_sock = get_edit(siv, "daemon_sock");
     let timezone = get_edit(siv, "timezone");
@@ -260,11 +281,13 @@ fn save_settings(siv: &mut Cursive) {
         siv.add_layer(
             Dialog::text("Settings saved.\n\nDaemon-affecting settings changed.\nRestart daemon now?")
                 .title("Restart Required")
-                .button("Yes", |s| {
-                    s.quit();
-                    // Restart daemon after TUI exits
-                    // Signal via exit code or env var
-                    std::env::set_var("TOKI_RESTART_DAEMON", "1");
+                .button("Yes", {
+                    let flag = restart_flag.clone();
+                    move |s| {
+                        s.quit();
+                        // Signal restart via atomic flag (avoids deprecated set_var)
+                        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
                 })
                 .button("No", |s| {
                     s.pop_layer();

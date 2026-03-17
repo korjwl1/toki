@@ -30,9 +30,13 @@ pub fn report_summary_from_db(
     let (since, until) = filter_range(filter);
     let mut summaries: SummaryMap = HashMap::new();
     db.for_each_rollup(since, until, |_ts, model, rollup| {
-        let entry = summaries.entry(model.clone()).or_insert_with(|| ModelUsageSummary {
-            model, ..Default::default()
-        });
+        // Avoid cloning model string when the entry already exists
+        if !summaries.contains_key(&model) {
+            summaries.insert(model.clone(), ModelUsageSummary {
+                model: model.clone(), ..Default::default()
+            });
+        }
+        let entry = summaries.get_mut(&model).unwrap();
         accumulate_rollup(entry, &rollup);
     })?;
     Ok(summaries)
@@ -244,8 +248,8 @@ pub fn execute_parsed_query(
                             }
 
                             let bucket_key = if let Some(ref bucket) = parsed.bucket {
-                                let ts_display = ts_to_datetime(ts, tz);
-                                bucket.format_label(ts_display.and_utc().timestamp())
+                                // Pass original UTC timestamp (ms -> s) and let format_label handle tz
+                                bucket.format_label(ts / 1000, tz)
                             } else {
                                 String::new()
                             };
@@ -278,8 +282,8 @@ pub fn execute_parsed_query(
                                 if model != mf { return; }
                             }
                             let bucket_key = if let Some(ref bucket) = parsed.bucket {
-                                let dt = ts_to_datetime(hour_ts, tz);
-                                bucket.format_label(dt.and_utc().timestamp())
+                                // Pass original UTC timestamp (ms -> s) and let format_label handle tz
+                                bucket.format_label(hour_ts / 1000, tz)
                             } else {
                                 "total".to_string()
                             };

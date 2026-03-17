@@ -32,7 +32,7 @@ fn format_number(n: u64) -> String {
     let commas = if len > 0 { (len - 1) / 3 } else { 0 };
     let mut result = String::with_capacity(len + commas);
     for (i, &b) in bytes.iter().enumerate() {
-        if i > 0 && (len - i).is_multiple_of(3) {
+        if i > 0 && (len - i) % 3 == 0 {
             result.push(',');
         }
         result.push(b as char);
