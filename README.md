@@ -5,325 +5,309 @@
 <h1 align="center">toki</h1>
 
 <p align="center">
-AI CLI 도구(Claude Code 등)의 JSONL 세션 로그를 실시간 감시하여 모델별 토큰 사용량을 추적하는 Rust 도구.<br>
-내장 TSDB에 이벤트와 시간별 rollup을 저장하고, 데몬/클라이언트 구조로 실시간 trace와 one-shot report를 모두 지원한다.
+  <b>Invisible token usage tracker for AI CLI tools</b><br>
+  Built in Rust. Daemon-powered. 5 MB idle. Reports in 13 ms. Your workflow never notices.
 </p>
 
 <p align="center">
-<sub><b>toki</b> = <b>to</b>ken <b>i</b>nspector. 발음이 토끼(rabbit)와 비슷하고, 토끼의 빠른 이미지는 이 도구의 성능 철학과 잘 어울린다.</sub>
+  <sub><b>toki</b> = <b>to</b>ken <b>i</b>nspector — sounds like <i>tokki</i> (토끼, rabbit in Korean). Fast and light, just like one.</sub>
 </p>
 
-## Architecture
+<p align="center">
+  <a href="README.ko.md">🇰🇷 한국어</a>
+</p>
 
-Docker처럼 데몬/클라이언트 구조로 동작한다:
+---
+
+> **Engineered, not just coded.** In the age of vibe coding, toki stands apart — every architectural decision was made by a professional systems engineer who knows exactly why each piece exists. The TSDB schema, rollup-on-write strategy, xxHash3 checkpoint recovery, 4-thread daemon model — all designed with intent, built with precision.
+
+---
+
+## Performance
+
+Not just fast — **lightweight enough to forget it's running.** toki sits at 5 MB idle, near-zero CPU, and answers any report in 13 ms. ccusage and zzusage spike your CPU and memory every time you ask a question, because they re-read everything from scratch. toki doesn't. It indexes once, then gets out of your way.
+
+Benchmarked against [ccusage](https://github.com/ryoppippi/ccusage) (Node.js) and [zzusage](https://github.com/joelreymont/zzusage) (Zig) on the same dataset, disk cache purged before each run.
+
+### Report Speed (indexed query vs full re-scan)
+
+toki report is **~13 ms fixed** regardless of data size (UDS query → TSDB rollup lookup).
+ccusage and zzusage re-read every file from scratch, every time.
+
+| Data Size | toki | ccusage | zzusage | vs ccusage | vs zzusage |
+|-----------|------|---------|---------|------------|------------|
+| 100 MB | **0.013 s** | 2.37 s | 0.12 s | **182x** faster | **9x** faster |
+| 500 MB | **0.013 s** | 6.05 s | 0.35 s | **465x** faster | **27x** faster |
+| 1 GB | **0.013 s** | 11.07 s | 0.65 s | **851x** faster | **50x** faster |
+| 2 GB | **0.013 s** | 21.73 s | 1.22 s | **1,672x** faster | **94x** faster |
+
+### Cold Start (full index build)
+
+toki parses **and** indexes into a TSDB simultaneously — yet still outruns tools that only parse.
+
+> **Note:** These benchmarks assume a fresh start with no prior data. In normal operation, toki resumes from its last checkpoint and only processes new data accumulated since the previous shutdown — so subsequent cold starts are significantly faster than shown here.
+
+| Data Size | toki | ccusage | zzusage | vs ccusage | vs zzusage |
+|-----------|------|---------|---------|------------|------------|
+| 100 MB | 0.11 s | 2.37 s | 0.12 s | **21x** | ~1.0x |
+| 500 MB | 0.39 s | 6.05 s | 0.35 s | **16x** | ~0.9x |
+| 1 GB | 0.78 s | 11.07 s | 0.65 s | **14x** | ~0.8x |
+| 2 GB | 1.54 s | 21.73 s | 1.22 s | **14x** | ~0.8x |
+
+> **Why ~1.0x vs zzusage matters:** toki does *strictly more work* per line — TSDB writes (fjall LSM-tree inserts), rollup aggregation, checkpoint persistence, and JSON schema validation. zzusage skips all of this: no DB, no validation, just raw parsing. Despite the extra workload, toki matches zzusage in wall-clock time. The validation gap also has a practical consequence: zzusage accepts any content without structural checks, making it trivial to feed crafted JSONL that inflates or fabricates usage numbers. toki validates every record before it reaches the TSDB, so tampered data is rejected at parse time.
+
+### Memory & CPU
+
+| Data Size | toki (cold start) | toki (idle) | ccusage | zzusage |
+|-----------|-------------------|-------------|---------|---------|
+| 500 MB | 83 MB | **5–11 MB** | 126 MB | 613 MB |
+| 2 GB | 161 MB | **5–11 MB** | 126 MB | 2,311 MB |
+
+- **toki** — rayon parallel processing across all CPU cores with mmap zero-copy and per-file streaming. Despite doing maximum parallelism, memory stays flat because each file is streamed and discarded — no accumulation. After cold start the daemon drops to 5–11 MB and ~0% CPU, watching for changes via FSEvents (kernel-level, zero polling) and only waking when Claude Code writes new lines.
+- **ccusage** — processes one file at a time, synchronous and blocking. The 126 MB looks modest on paper, but it means your terminal hangs for seconds to minutes on every invocation while Node.js chews through every file sequentially. No parallelism, no incremental processing — just a long blocking wait, every time.
+- **zzusage** — loads every event from every file into memory before doing anything. Fast parsing, but 2 GB of data means 2.3 GB of RAM consumed at once. On larger datasets it simply OOMs.
+
+toki is the only tool with an idle state. ccusage and zzusage pay full resource cost on every run — your editor, compiler, and AI agent all compete for the same CPU and memory. toki pays that cost once, drops to 5 MB, and stays out of the way.
+
+> Measured on Apple M1 MacBook Air (8 GB RAM), macOS, power saving off.
+> Reproduce: `sudo -v && python3 benches/benchmark.py run --purge --tool all`
+
+---
+
+## How It Works
+
+Docker-like daemon/client architecture:
 
 ```
-toki daemon start     # 항상 실행 (= dockerd)
-toki daemon restart   # 설정 변경 후 재시작
-toki daemon reset     # DB 전체 삭제 + 초기화
-toki trace            # 실시간 스트림 클라이언트 (= docker logs -f)
-toki report           # TSDB 조회 클라이언트 (= docker ps)
+toki daemon start     # always-on server   (≈ dockerd)
+toki trace            # real-time stream    (≈ docker logs -f)
+toki report           # instant TSDB query  (≈ docker ps)
 ```
 
-- **daemon**: 파일 감시 + TSDB 저장. 항상 실행되어야 하며, trace 클라이언트가 없을 때는 Sink 오버헤드 0.
-- **trace**: 데몬에 UDS로 연결하여 실시간 이벤트 스트림 수신. print/uds/http 모든 sink 지원.
-- **report**: 데몬에 UDS로 쿼리 전송 → TSDB 조회 결과 수신. 데몬이 실행 중이어야 사용 가능하다.
+- **daemon** — watches Claude Code JSONL session logs via FSEvents, parses events, writes to an embedded TSDB (fjall). Zero sink overhead when no trace clients are connected.
+- **trace** — connects to the daemon over UDS for real-time event streaming. Supports `print`, `uds://`, `http://` sinks.
+- **report** — sends a query to the daemon over UDS, gets results from the TSDB. Always fast, always indexed.
 
-## Build from Source
-
-```bash
-cargo build --release
-# 바이너리: target/release/toki
-# PATH에 추가하거나 직접 실행
-```
+---
 
 ## Quick Start
 
 ```bash
-# 1. 데몬 시작 (foreground, Ctrl+C으로 종료)
+# Build
+cargo build --release
+# Binary: target/release/toki — add to PATH or run directly
+
+# 1. Start the daemon (foreground, Ctrl+C to stop)
 toki daemon start
 
-# 2. 다른 터미널에서 실시간 이벤트 스트림
+# 2. In another terminal — real-time event stream
 toki trace
 
-# 3. 리포트 조회 (TSDB에서 즉시 조회)
+# 3. Reports (instant TSDB queries)
 toki report
 toki report daily --since 20260301
 toki report monthly
 
-# 4. PromQL 스타일 쿼리
+# 4. PromQL-style queries
 toki report query 'usage{model="claude-opus-4-6"}[1h] by (model)'
 toki report query 'sessions{project="myapp"}'
 ```
 
-## Daemon
+---
 
-`daemon`은 항상 실행되는 서버 프로세스다. 시작 시 전체 세션 파일을 스캔(cold start)하여 TSDB를 구축하고, 이후 FSEvents로 파일 변경을 감시하며 새 이벤트를 실시간 수집한다.
+## Commands
+
+### Daemon
 
 ```bash
-toki daemon start       # 데몬 시작 (foreground)
-toki daemon stop        # 데몬 중지
-toki daemon restart     # 중지 + 재시작 (설정 변경 반영)
-toki daemon status      # 실행 상태 확인
-toki daemon reset       # DB 전체 삭제 + 초기화
+toki daemon start       # Start (foreground)
+toki daemon stop        # Stop
+toki daemon restart     # Restart (reload settings)
+toki daemon status      # Check status
+toki daemon reset       # Wipe DB + reinitialize
 ```
 
-- 데몬 설정(소켓 경로, Claude Code root 등)은 `toki settings`에서 관리
-- PID 파일: `~/.config/toki/daemon.pid`
-- 동일 DB 경로 기준 단일 인스턴스만 허용 (file lock)
-- DB 초기화가 필요하면 `daemon reset` 후 `daemon start`
-
-## Trace (Client)
-
-`trace`는 실행 중인 데몬에 UDS로 연결하여 실시간 이벤트를 스트림으로 수신하는 클라이언트 명령이다. 데몬에 trace 클라이언트가 연결되어 있지 않으면 Sink 처리가 완전히 비활성화되어 리소스 소모가 없다(zero overhead).
+### Report
 
 ```bash
-toki trace
-```
-
-- 데몬이 실행 중이어야 함 (`toki daemon start` 먼저)
-- 복수 클라이언트 동시 연결 지원 (fan-out)
-- 모든 sink 타입 지원: `--sink print`, `--sink uds://...`, `--sink http://...`
-
-## Report (One-Shot)
-
-`report`는 TSDB에 저장된 데이터를 즉시 조회한다. 데몬이 실행 중이어야 사용 가능하다 (`toki daemon start` 먼저).
-
-```bash
-# 전체 요약
+# Summary
 toki report
-toki report --since 20260301
 toki report --since 20260301 --until 20260331
 
-# 시간별 그룹핑
+# Time grouping
 toki report daily --since 20260301
 toki report weekly --since 20260301 --start-of-week tue
 toki report monthly
 toki report yearly
 toki report hourly --from-beginning
 
-# 세션별 그룹핑
+# Session/project filters
 toki report --group-by-session
-
-# 프로젝트/세션 필터
 toki report --project toki
 toki report --session-id 4de9291e
-toki report daily --since 20260301 --session-id 4de9
-toki report monthly --project myapp
 
-# PromQL 스타일 쿼리
+# PromQL-style queries
 toki report query 'usage{model="claude-opus-4-6"}[1h] by (model)'
 toki report query 'usage{session="4de9", since="20260301"} by (session)'
 toki report query 'sessions{project="myapp"}'
 toki report query 'projects'
 
-# 타임존 지정
-toki -z Asia/Seoul report daily --since 20260301
-
-# 비용 표시 없이
-toki --no-cost report
+# Options
+toki -z Asia/Seoul report daily --since 20260301   # timezone
+toki --no-cost report                               # skip cost
 ```
 
-| 옵션 | 설명 |
-|------|------|
-| 서브커맨드 없음 | 전체 총합 (`--since`/`--until` 선택적) |
-| `daily\|weekly\|monthly\|yearly\|hourly` | 시간별 그룹핑 |
-| `query '<PROMQL>'` | PromQL 스타일 자유 쿼리 |
-| `--since YYYYMMDD[hhmmss]` | 시작 시점 (inclusive, `>=`) |
-| `--until YYYYMMDD[hhmmss]` | 종료 시점 (inclusive, `<=`) |
-| `--from-beginning` | `--since` 없이 전체 그룹핑 허용 |
-| `--group-by-session` | 세션별 그룹핑 (시간 서브커맨드와 동시 사용 불가) |
-| `--session-id <PREFIX>` | 세션 UUID 접두사 필터 |
-| `--project <NAME>` | 프로젝트 디렉토리 서브스트링 필터 |
-| `--start-of-week mon\|tue\|...\|sun` | `weekly`에서만 사용 |
+<details>
+<summary>Report options reference</summary>
 
-### Query 문법
+| Option | Description |
+|--------|-------------|
+| *(no subcommand)* | Total summary (`--since`/`--until` optional) |
+| `daily\|weekly\|monthly\|yearly\|hourly` | Time-based grouping |
+| `query '<PROMQL>'` | PromQL-style free query |
+| `--since YYYYMMDD[hhmmss]` | Start time (inclusive, `>=`) |
+| `--until YYYYMMDD[hhmmss]` | End time (inclusive, `<=`) |
+| `--from-beginning` | Allow full grouping without `--since` |
+| `--group-by-session` | Group by session (mutually exclusive with time subcommand) |
+| `--session-id <PREFIX>` | Filter by session UUID prefix |
+| `--project <NAME>` | Filter by project directory substring |
+| `--start-of-week mon\|tue\|...\|sun` | Only for `weekly` |
 
-PromQL에서 영감을 받은 쿼리 문법:
+</details>
+
+<details>
+<summary>PromQL query syntax</summary>
 
 ```
 metric{filters}[bucket] by (dimensions)
 ```
 
-| 요소 | 설명 | 예시 |
-|------|------|------|
+| Element | Description | Example |
+|---------|-------------|---------|
 | metric | `usage`, `sessions`, `projects` | `usage` |
-| filters | `key="value"` 쌍, `,`로 구분 | `{model="claude-opus-4-6", since="20260301"}` |
-| bucket | 시간 버킷 (s/m/h/d/w) | `[1h]`, `[5m]`, `[1d]` |
-| dimensions | 그룹 기준 (model/session/project) | `by (model, session)` |
+| filters | `key="value"` pairs, comma-separated | `{model="claude-opus-4-6", since="20260301"}` |
+| bucket | Time bucket (s/m/h/d/w) | `[1h]`, `[5m]`, `[1d]` |
+| dimensions | Group by (model/session/project) | `by (model, session)` |
 
-필터 키: `model`, `session`, `project`, `since`, `until`
+Filter keys: `model`, `session`, `project`, `since`, `until`
 
-## Settings
+</details>
 
-`settings`는 cursive TUI로 설정 페이지를 연다. 설정은 `~/.config/toki/settings.json` 파일에 저장된다.
-
-```bash
-toki settings                              # TUI 열기
-toki settings set claude_code_root /path   # 개별 설정 변경
-toki settings get timezone                 # 설정 조회
-toki settings list                         # 전체 설정 출력
-```
-
-데몬 영향 설정(`claude_code_root`, `daemon_sock`, `retention_days`, `rollup_retention_days`) 변경 시 데몬 재시작 여부를 묻는다.
-
-| 설정 항목 | 설명 | 기본값 |
-|-----------|------|--------|
-| Claude Code Root | Claude Code 루트 디렉토리 | `~/.claude` |
-| Daemon Socket | 데몬 UDS 소켓 경로 | `~/.config/toki/daemon.sock` |
-| Timezone | IANA 타임존 (빈값=UTC) | (없음) |
-| Output Format | 기본 출력 형식 | `table` |
-| Start of Week | 주간 리포트 시작 요일 | `mon` |
-| No Cost | 비용 계산 비활성화 | `false` |
-| Retention Days | 이벤트 보존 기간 (0=무제한) | `0` |
-| Rollup Retention Days | Rollup 보존 기간 (0=무제한) | `0` |
-
-설정 우선순위: **CLI 인자 > 설정 파일 (settings.json) > 기본값** (환경변수 미사용)
-
-## Client Options (trace / report)
-
-`trace`와 `report` 명령에서만 사용 가능한 옵션. 데몬에는 영향 없음 (데몬 설정은 `toki settings`로 관리).
-
-| 옵션 | 설명 |
-|------|------|
-| `--output-format table\|json` | 출력 형식 오버라이드 |
-| `--sink <SPEC>` | 출력 대상, 복수 지정 가능 |
-| `--timezone <IANA>` / `-z` | 타임존 오버라이드 |
-| `--no-cost` | 비용 계산 비활성화 오버라이드 |
-
-### Sink 종류
-
-| Sink | 설명 |
-|------|------|
-| `print` (기본) | 터미널 출력 (`--output-format`에 따라 table/json) |
-| `uds://<path>` | Unix Domain Socket으로 NDJSON 전송 |
-| `http://<url>` | HTTP POST로 JSON 전송 (5초 timeout) |
+### Trace
 
 ```bash
-# 터미널 + HTTP 동시 출력
-toki trace --sink print --sink http://localhost:8080/events
+toki trace                                              # Default (print to terminal)
+toki trace --sink print --sink http://localhost:8080     # Multi-sink
 ```
+
+### Settings
+
+```bash
+toki settings                              # Open TUI (cursive)
+toki settings set claude_code_root /path   # Set individual value
+toki settings get timezone                 # Get value
+toki settings list                         # List all
+```
+
+<details>
+<summary>Settings reference</summary>
+
+| Setting | Description | Default |
+|---------|-------------|---------|
+| Claude Code Root | Claude Code root directory | `~/.claude` |
+| Daemon Socket | Daemon UDS socket path | `~/.config/toki/daemon.sock` |
+| Timezone | IANA timezone (empty = UTC) | *(none)* |
+| Output Format | Default output format | `table` |
+| Start of Week | Weekly report start day | `mon` |
+| No Cost | Disable cost calculation | `false` |
+| Retention Days | Event retention (0 = unlimited) | `0` |
+| Rollup Retention Days | Rollup retention (0 = unlimited) | `0` |
+
+Priority: **CLI args > settings.json > defaults**
+
+</details>
+
+### Client Options (trace / report)
+
+| Option | Description |
+|--------|-------------|
+| `--output-format table\|json` | Override output format |
+| `--sink <SPEC>` | Output target (repeatable) |
+| `--timezone <IANA>` / `-z` | Override timezone |
+| `--no-cost` | Disable cost calculation |
+
+---
+
+## Documentation
+
+| Document | Description |
+|----------|-------------|
+| **[Architecture & Design](docs/DESIGN.md)** | Daemon threads, TSDB schema, rollup strategy, checkpoint recovery, data flow |
+| **[Usage Guide](docs/USAGE.md)** | Detailed command reference, output formats, library API, examples |
+| **[JSONL Format Reference](docs/claude-code-jsonl-format.md)** | Claude Code JSONL structure, line types, parsing optimizations |
+| **[Benchmark Details](benches/COMPARISON.md)** | Full comparison methodology, architecture analysis, scaling predictions |
+
+---
 
 ## Cost Calculation
 
-모든 출력에 모델별 추정 비용(USD)이 표시된다.
-가격 데이터는 [LiteLLM](https://github.com/BerriAI/litellm) 커뮤니티 가격표에서 가져온다.
+All outputs include estimated cost (USD) per model, sourced from [LiteLLM](https://github.com/BerriAI/litellm) community pricing.
 
-- **최초 실행**: LiteLLM JSON 다운로드 → Claude 모델 추출 → 파일 캐시 (`~/.config/toki/pricing.json`)
-- **이후 실행**: HTTP ETag 조건부 요청 → 변경 없으면 304 (바디 없이 ~50ms)
-- **오프라인**: 캐시된 데이터로 동작, 캐시 없으면 Cost 컬럼 생략
-- **`--no-cost`**: 가격 fetch 스킵
+- **First run**: downloads LiteLLM JSON → extracts Claude model prices → caches to `~/.config/toki/pricing.json`
+- **Subsequent runs**: HTTP ETag conditional request → 304 if unchanged (~50 ms, no body)
+- **Offline**: uses cached data; if no cache, cost column is omitted
+- **`--no-cost`**: skips price fetch entirely
 
-## Environment Variables
+---
 
-| 변수 | 설명 | 기본값 |
-|------|------|--------|
-| `TOKI_DEBUG` | 디버그 로그 (1=normal, 2=verbose) | 0 |
+## Tech Stack
 
-> 모든 설정은 `toki settings` (TUI 또는 `set/get/list`)로 관리한다. 환경변수는 디버그 로그에만 사용.
+| Purpose | Choice | Rationale |
+|---------|--------|-----------|
+| Database | fjall 3.x | Pure Rust LSM-tree, fits TSDB keyspace model |
+| Concurrency | std::thread + crossbeam-channel | No async runtime conflicts, library-safe |
+| Parallel scan | rayon | Cold start parallel file processing |
+| File watching | notify 6.x | macOS FSEvents integration |
+| Serialization | bincode (DB), serde_json (JSONL) | Minimal binary overhead |
+| Hashing | xxhash-rust 0.8 (xxh3) | Checkpoint line identification (30 GB/s) |
+| HTTP | ureq 2.x | Synchronous, ETag conditional requests |
+| CLI | clap 4.x | Subcommands, global options |
+| Tables | comfy-table 7.1 | Unicode table rendering |
+| IPC | Unix Domain Socket | Daemon-client NDJSON streaming |
+
+---
 
 ## Project Structure
 
 ```
-├── Cargo.toml
-├── README.md                              # 이 파일
-├── assets/
-│   └── logo.png                           # 프로젝트 로고
-├── docs/
-│   ├── DESIGN.md                          # 아키텍처 및 내부 설계
-│   ├── USAGE.md                           # 상세 사용법 및 출력 형식
-│   └── claude-code-jsonl-format.md        # Claude Code JSONL 구조 참고
-├── specs/
-│   └── constitution.md                    # 프로젝트 원칙 (Constitution)
-├── benches/                               # 벤치마크 (benchmark.py, COMPARISON.md)
-└── src/
-    ├── lib.rs                             # Public API: start(), Handle
-    ├── main.rs                            # CLI 바이너리 (clap)
-    ├── config.rs                          # Config + 파일 기반 설정 (settings.json)
-    ├── db.rs                              # fjall 래퍼 (7 keyspaces)
-    ├── engine.rs                          # TrackerEngine: cold_start + watch_loop
-    ├── writer.rs                          # DB writer thread (DbOp channel)
-    ├── query.rs                           # TSDB 쿼리 (report용)
-    ├── query_parser.rs                    # PromQL 스타일 쿼리 파서
-    ├── retention.rs                       # 데이터 보존 정책 (자동 삭제)
-    ├── checkpoint.rs                      # 역순 라인 스캔, xxHash3 매칭
-    ├── pricing.rs                         # LiteLLM 가격 fetch, ETag 캐싱
-    ├── settings.rs                        # cursive TUI 설정 페이지
-    ├── common/
-    │   └── types.rs                       # 공통 타입, trait 정의
-    ├── daemon/                            # 데몬 서버 컴포넌트
-    │   ├── mod.rs                         # default_sock_path, stop/status
-    │   ├── broadcast.rs                   # BroadcastSink (zero overhead fan-out)
-    │   ├── listener.rs                    # UDS accept loop
-    │   └── pidfile.rs                     # PID 파일 관리
-    ├── sink/                              # 출력 추상화 (Sink trait)
-    │   ├── mod.rs                         # Sink trait, MultiSink
-    │   ├── json.rs                        # JSON 직렬화 (공용)
-    │   ├── print.rs                       # PrintSink (table/json → stdout)
-    │   ├── uds.rs                         # UdsSink (NDJSON → UDS)
-    │   └── http.rs                        # HttpSink (JSON POST)
-    ├── providers/
-    │   └── claude_code/parser.rs          # JSONL 파싱 + 세션 디스커버리
-    └── platform/
-        └── macos/mod.rs                   # macOS FSEvents 감시
+src/
+├── lib.rs                          # Public API: start(), Handle
+├── main.rs                         # CLI binary (clap)
+├── config.rs                       # Config + file-based settings
+├── db.rs                           # fjall wrapper (7 keyspaces)
+├── engine.rs                       # TrackerEngine: cold_start + watch_loop
+├── writer.rs                       # DB writer thread (DbOp channel)
+├── query.rs                        # TSDB query engine (report)
+├── query_parser.rs                 # PromQL-style query parser
+├── retention.rs                    # Data retention policy
+├── checkpoint.rs                   # Reverse-scan, xxHash3 matching
+├── pricing.rs                      # LiteLLM price fetch, ETag caching
+├── settings.rs                     # Cursive TUI settings
+├── common/types.rs                 # Shared types & traits
+├── daemon/                         # Daemon server components
+│   ├── broadcast.rs                # BroadcastSink (zero-overhead fan-out)
+│   ├── listener.rs                 # UDS accept loop
+│   └── pidfile.rs                  # PID file management
+├── sink/                           # Output abstraction (Sink trait)
+│   ├── print.rs                    # PrintSink (table/json → stdout)
+│   ├── uds.rs                      # UdsSink (NDJSON → UDS)
+│   └── http.rs                     # HttpSink (JSON POST)
+├── providers/claude_code/parser.rs # JSONL parsing + session discovery
+└── platform/macos/mod.rs           # macOS FSEvents watcher
 ```
 
-## Performance
+---
 
-ccusage (Node.js), zzusage (Zig)와의 벤치마크 비교. 동일 데이터, `sudo purge`로 디스크 캐시 초기화 후 측정.
+## License
 
-### Cold Start (전체 파일 색인)
-
-toki는 파싱과 동시에 TSDB에 색인까지 하면서도 ccusage보다 14~21배 빠르다.
-zzusage(Zig)와는 거의 동일한 속도이지만, zzusage는 DB 저장을 하지 않는다.
-
-| 데이터 | toki | ccusage | zzusage | vs ccusage | vs zzusage |
-|--------|------|---------|---------|------------|------------|
-| 100MB | 0.11s | 2.37s | 0.12s | **21x** | 1.0x |
-| 500MB | 0.39s | 6.05s | 0.35s | **16x** | 0.9x |
-| 1GB | 0.78s | 11.07s | 0.65s | **14x** | 0.8x |
-| 2GB | 1.54s | 21.73s | 1.22s | **14x** | 0.8x |
-
-메모리 사용량:
-
-| 데이터 | toki | ccusage | zzusage |
-|--------|------|---------|---------|
-| 500MB | 83MB | 126MB | 613MB |
-| 2GB | 161MB | 126MB | 2,311MB |
-
-- toki: 파일별 스트리밍 처리, mmap zero-copy
-- ccusage: Node.js 힙 고정 (~126MB), 순차 처리 후 GC
-- zzusage: 전체 이벤트를 메모리에 적재, 데이터 크기에 비례하여 폭증
-
-### Report (색인 후 조회)
-
-toki는 daemon이 TSDB에 데이터를 유지하므로 report 시 파일을 다시 읽지 않는다.
-ccusage/zzusage는 매번 전체 파일을 처음부터 다시 읽어야 한다.
-
-| 데이터 | toki | ccusage | zzusage | vs ccusage | vs zzusage |
-|--------|------|---------|---------|------------|------------|
-| 100MB | 0.013s | 2.37s | 0.12s | **182x** | **9x** |
-| 500MB | 0.013s | 6.05s | 0.35s | **465x** | **27x** |
-| 1GB | 0.013s | 11.07s | 0.65s | **851x** | **50x** |
-| 2GB | 0.013s | 21.73s | 1.22s | **1,672x** | **94x** |
-
-toki report는 데이터 크기와 무관하게 **~13ms 고정** (UDS 쿼리 + TSDB rollup 조회).
-메모리 사용량 ~5MB, CPU 사용률 거의 0%.
-
-> 측정 환경: Apple M1 MacBook Air (8GB RAM), macOS, 절전 모드 off
-> 벤치마크 실행: `sudo -v && python3 benches/benchmark.py run --purge --tool all`
-
-## Tech Stack
-
-| 용도 | 선택 | 근거 |
-|------|------|------|
-| DB | fjall 3.x | Pure Rust LSM-tree, TSDB keyspace 구조에 적합 |
-| 동시성 | std::thread + crossbeam-channel | 런타임 충돌 없음, 라이브러리 안전 |
-| 병렬 스캔 | rayon | cold start 세션 파일 병렬 처리 |
-| 파일 감시 | notify 6.x | macOS FSEvents 자동 사용 |
-| 직렬화 | bincode 1.x (DB), serde_json (JSONL) | 바이너리 최소 오버헤드 |
-| 해시 | xxhash-rust 0.8 (xxh3) | 체크포인트 줄 식별 (30GB/s) |
-| HTTP | ureq 2.x | 동기 HTTP, ETag 조건부 요청 |
-| CLI | clap 4.x | 서브커맨드, 글로벌 옵션 지원 |
-| 테이블 | comfy-table 7.1 | Unicode 테이블 렌더링 |
-| IPC | Unix Domain Socket | 데몬-클라이언트 NDJSON 스트리밍 |
+[FSL-1.1-Apache-2.0](LICENSE)
