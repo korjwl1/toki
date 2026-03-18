@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use serde::Deserialize;
 
 use crate::common::types::{LogParser, LogParserWithTs, SessionGroup, UsageEvent, UsageEventWithTs};
-use crate::providers::{CodexTokenFields, ColdStartParsed, FileParser, ProviderTokenData};
+use crate::providers::{ColdStartParsed, FileParser};
 
 /// Stateful per-file parser for Codex CLI cold start.
 /// Tracks model name across turn_context -> token_count events.
@@ -81,7 +81,9 @@ impl FileParser for CodexFileParser {
                     .get("cached_input_tokens")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
-                let reasoning_output_tokens = last_usage
+                // reasoning_output_tokens is parsed but currently dropped in TokenFields mapping.
+                // Kept for future use when per-provider DB schema is implemented.
+                let _reasoning_output_tokens = last_usage
                     .get("reasoning_output_tokens")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
@@ -100,14 +102,14 @@ impl FileParser for CodexFileParser {
                     event_key,
                     model: self.last_model.clone(),
                     ts_ms,
-                    total_input: input_tokens + cached_input_tokens,
-                    total_output: output_tokens + reasoning_output_tokens,
-                    provider_data: ProviderTokenData::Codex(CodexTokenFields {
+                    // Map Codex fields to common TokenFields:
+                    // cached_input_tokens → cache_read, reasoning tokens dropped
+                    tokens: crate::common::types::TokenFields {
                         input_tokens,
                         output_tokens,
-                        cached_input_tokens,
-                        reasoning_output_tokens,
-                    }),
+                        cache_creation_input_tokens: 0,
+                        cache_read_input_tokens: cached_input_tokens,
+                    },
                     project_name: self.cwd.clone(),
                 })
             }
@@ -354,15 +356,10 @@ mod tests {
         assert_eq!(result.model, "gpt-5.4");
         assert!(result.ts_ms > 0);
 
-        match &result.provider_data {
-            ProviderTokenData::Codex(f) => {
-                assert_eq!(f.input_tokens, 15262);
-                assert_eq!(f.output_tokens, 82);
-                assert_eq!(f.cached_input_tokens, 15104);
-                assert_eq!(f.reasoning_output_tokens, 0);
-            }
-            _ => panic!("Expected Codex token data"),
-        }
+        assert_eq!(result.tokens.input_tokens, 15262);
+        assert_eq!(result.tokens.output_tokens, 82);
+        assert_eq!(result.tokens.cache_read_input_tokens, 15104);
+        assert_eq!(result.tokens.cache_creation_input_tokens, 0);
     }
 
     #[test]

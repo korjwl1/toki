@@ -110,25 +110,16 @@ impl ClaudeCodeParser {
         let ts_ms = crate::common::time::parse_ts_to_ms(parsed.timestamp)?;
         let event_key = format!("{}:{}", parsed.message_id, parsed.timestamp);
 
-        let total_input = parsed.usage.input_tokens
-            + parsed.usage.cache_creation_input_tokens
-            + parsed.usage.cache_read_input_tokens;
-
         Some(crate::providers::ColdStartParsed {
             event_key,
             model: parsed.model.to_string(),
             ts_ms,
-            total_input,
-            total_output: parsed.usage.output_tokens,
-            provider_data: crate::providers::ProviderTokenData::ClaudeCode(
-                crate::providers::ClaudeTokenFields {
-                    input_tokens: parsed.usage.input_tokens,
-                    output_tokens: parsed.usage.output_tokens,
-                    cache_creation_input_tokens: parsed.usage.cache_creation_input_tokens,
-                    cache_read_input_tokens: parsed.usage.cache_read_input_tokens,
-                },
-            ),
-            // Claude Code extracts project_name from the file path, not from file content
+            tokens: crate::common::types::TokenFields {
+                input_tokens: parsed.usage.input_tokens,
+                output_tokens: parsed.usage.output_tokens,
+                cache_creation_input_tokens: parsed.usage.cache_creation_input_tokens,
+                cache_read_input_tokens: parsed.usage.cache_read_input_tokens,
+            },
             project_name: None,
         })
     }
