@@ -92,27 +92,23 @@ fn parse_litellm_json(json_str: &str) -> HashMap<String, ModelPricing> {
             cache_read_input_token_cost: entry.cache_read_input_token_cost,
         };
 
-        // Strip cloud provider prefix (azure/, vertex_ai/, bedrock/, etc.)
+        // Filter by litellm_provider field
+        let provider = match entry.litellm_provider.as_deref() {
+            Some(p) => p,
+            None => continue,
+        };
+        if !SUPPORTED_LITELLM_PROVIDERS.contains(&provider) {
+            continue;
+        }
+
+        // Strip cloud provider prefix from key (azure/, vertex_ai/, bedrock/, etc.)
+        // CLI tools report bare model names (e.g., "claude-opus-4-6", "gpt-5.2-codex")
         let model_name = if key.contains('/') {
             key.rsplit('/').next().unwrap_or(key)
         } else {
             key.as_str()
         };
         if model_name.is_empty() {
-            continue;
-        }
-
-        // Only keep models from providers we support (or plan to support).
-        // Bump PRICING_CACHE_VERSION when adding new provider prefixes.
-        let dominated = model_name.to_lowercase();
-        let dominated = dominated.as_str();
-        let dominated = dominated.starts_with("claude")
-            || dominated.starts_with("gpt-")
-            || dominated.starts_with("o1-") || dominated.starts_with("o1")
-            || dominated.starts_with("o3-") || dominated.starts_with("o3")
-            || dominated.starts_with("o4-") || dominated.starts_with("o4")
-            || dominated.starts_with("gemini");
-        if !dominated {
             continue;
         }
 
@@ -126,6 +122,8 @@ fn parse_litellm_json(json_str: &str) -> HashMap<String, ModelPricing> {
 #[derive(Deserialize)]
 struct LiteLLMEntry {
     #[serde(default)]
+    litellm_provider: Option<String>,
+    #[serde(default)]
     input_cost_per_token: Option<f64>,
     #[serde(default)]
     output_cost_per_token: Option<f64>,
@@ -135,10 +133,14 @@ struct LiteLLMEntry {
     cache_read_input_token_cost: Option<f64>,
 }
 
+/// Providers whose models we track pricing for.
+/// Bump PRICING_CACHE_VERSION when adding entries.
+const SUPPORTED_LITELLM_PROVIDERS: &[&str] = &["anthropic", "openai", "gemini"];
+
 /// On-disk pricing cache format.
 /// Bump this when the parsing logic changes (e.g., adding new provider prefixes).
 /// Forces a full re-fetch even if the server returns 304 Not Modified.
-const PRICING_CACHE_VERSION: u32 = 4;
+const PRICING_CACHE_VERSION: u32 = 5;
 
 #[derive(Serialize, Deserialize)]
 struct PricingCache {
@@ -275,28 +277,38 @@ mod tests {
     fn test_parse_litellm_json() {
         let json = r#"{
             "claude-sonnet-4-20250514": {
+                "litellm_provider": "anthropic",
                 "input_cost_per_token": 0.000003,
                 "output_cost_per_token": 0.000015,
                 "cache_creation_input_token_cost": 0.00000375,
                 "cache_read_input_token_cost": 0.0000003
             },
             "gpt-4": {
+                "litellm_provider": "openai",
                 "input_cost_per_token": 0.00003,
                 "output_cost_per_token": 0.00006
             },
             "anthropic/claude-opus-4-20250514": {
+                "litellm_provider": "anthropic",
                 "input_cost_per_token": 0.000015,
                 "output_cost_per_token": 0.000075,
                 "cache_creation_input_token_cost": 0.00001875,
                 "cache_read_input_token_cost": 0.0000015
             },
             "gemini/gemini-2.5-pro": {
+                "litellm_provider": "gemini",
                 "input_cost_per_token": 0.00000125,
                 "output_cost_per_token": 0.00001
             },
             "some-free-model": {
+                "litellm_provider": "openai",
                 "input_cost_per_token": 0.0,
                 "output_cost_per_token": 0.0
+            },
+            "deepseek-v3": {
+                "litellm_provider": "deepseek",
+                "input_cost_per_token": 0.000001,
+                "output_cost_per_token": 0.000002
             }
         }"#;
 
@@ -312,6 +324,8 @@ mod tests {
         assert!(!prices.contains_key("gemini/gemini-2.5-pro"));
         // Zero-cost models excluded
         assert!(!prices.contains_key("some-free-model"));
+        // Unsupported providers excluded
+        assert!(!prices.contains_key("deepseek-v3"));
     }
 
     #[test]
