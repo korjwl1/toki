@@ -740,7 +740,10 @@ fn handle_trace(config: &Config, sink_specs: &[String], output_format: toki::sin
     let mut last_pricing_refresh = std::time::Instant::now();
 
     let sink = toki::sink::create_sinks(sink_specs, output_format);
-    let reader = BufReader::new(stream);
+
+    // Non-blocking read + manual polling so Ctrl+C works immediately
+    stream.set_nonblocking(true).ok();
+    let mut reader = BufReader::new(stream);
 
     // Register SIGINT to exit cleanly
     unsafe {
@@ -749,7 +752,8 @@ fn handle_trace(config: &Config, sink_specs: &[String], output_format: toki::sin
 
     println!("[toki] Connected to daemon. Streaming events... (Ctrl+C to stop)");
 
-    for line_result in reader.lines() {
+    let mut line_buf = String::new();
+    loop {
         if !RUNNING.load(Ordering::Relaxed) {
             break;
         }
@@ -763,8 +767,17 @@ fn handle_trace(config: &Config, sink_specs: &[String], output_format: toki::sin
             last_pricing_refresh = std::time::Instant::now();
         }
 
-        let line = match line_result {
-            Ok(l) => l,
+        line_buf.clear();
+        let line = match reader.read_line(&mut line_buf) {
+            Ok(0) => {
+                eprintln!("[toki] Daemon disconnected.");
+                break;
+            }
+            Ok(_) => line_buf.trim_end().to_string(),
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                continue;
+            }
             Err(_) => {
                 eprintln!("[toki] Daemon disconnected.");
                 break;
