@@ -143,17 +143,20 @@ pub fn run_settings() -> bool {
         .child(labeled_edit("Rollup Retention", &state.rollup_retention_days, "rollup_retention_days"))
         .child(hint_text("                        Days to keep rollups (0 = forever)"));
 
-    // -- Providers section (read-only) --
-    let providers = crate::config::get_providers();
-    let provider_display = if providers.is_empty() {
-        "(none configured)".to_string()
-    } else {
-        providers.join(", ")
-    };
-    let providers_section = LinearLayout::vertical()
-        .child(field_label(&format!("  Active:  {}", provider_display)))
-        .child(DummyView.fixed_height(1))
-        .child(hint_text("  Use `toki provider add/remove` to manage"));
+    // -- Providers section (checkboxes) --
+    let enabled_providers = crate::config::get_providers();
+    let mut providers_section = LinearLayout::vertical();
+    for &pname in crate::providers::KNOWN_PROVIDERS {
+        let checked = enabled_providers.contains(&pname.to_string());
+        let display = match pname {
+            "claude_code" => "Claude Code    (~/.claude)",
+            "codex" => "Codex CLI      (~/.codex)",
+            _ => pname,
+        };
+        providers_section.add_child(
+            labeled_checkbox(display, checked, &format!("provider_{}", pname))
+        );
+    }
 
     // Assemble form with section panels
     let form = LinearLayout::vertical()
@@ -255,13 +258,24 @@ fn save_settings(siv: &mut Cursive, restart_flag: std::sync::Arc<std::sync::atom
         ("rollup_retention_days", rollup_retention.as_str()),
     ];
 
+    // Read provider checkboxes
+    let mut new_providers: Vec<String> = Vec::new();
+    for &pname in crate::providers::KNOWN_PROVIDERS {
+        let cb_name = format!("provider_{}", pname);
+        let checked = siv.call_on_name(&cb_name, |v: &mut Checkbox| v.is_checked()).unwrap_or(false);
+        if checked {
+            new_providers.push(pname.to_string());
+        }
+    }
+
     // Load old values to detect daemon-affecting changes
+    let old_providers = crate::config::get_providers();
     let daemon_keys = ["claude_code_root", "daemon_sock", "retention_days", "rollup_retention_days"];
     let old_values: Vec<(String, String)> = daemon_keys.iter()
         .map(|k| (k.to_string(), crate::config::get_setting(k).unwrap_or_default()))
         .collect();
 
-    // Save to settings file
+    // Save scalar settings
     for (key, value) in &settings {
         if let Err(e) = crate::config::set_setting(key, value) {
             siv.add_layer(Dialog::info(format!("Failed to save {}: {}", key, e)));
@@ -269,10 +283,18 @@ fn save_settings(siv: &mut Cursive, restart_flag: std::sync::Arc<std::sync::atom
         }
     }
 
+    // Save providers
+    if let Err(e) = crate::config::set_setting_array("providers", &new_providers) {
+        siv.add_layer(Dialog::info(format!("Failed to save providers: {}", e)));
+        return;
+    }
+
     // Check if any daemon-affecting setting changed
-    let daemon_changed = old_values.iter().any(|(k, old_v)| {
+    let providers_changed = old_providers != new_providers;
+    let scalar_changed = old_values.iter().any(|(k, old_v)| {
         settings.iter().any(|(sk, sv)| sk == k && sv != old_v)
     });
+    let daemon_changed = providers_changed || scalar_changed;
 
     let pidfile = crate::daemon::default_pidfile_path();
     let daemon_running = crate::daemon::daemon_status(&pidfile).is_some();
