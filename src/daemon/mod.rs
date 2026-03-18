@@ -27,14 +27,21 @@ pub fn stop_daemon(pidfile: &std::path::Path, sock: &std::path::Path) -> Result<
                 let _ = std::fs::remove_file(sock);
                 return Ok(false);
             }
-            // Send SIGTERM
+            // Send SIGTERM for graceful shutdown
             unsafe { libc::kill(pid as i32, libc::SIGTERM); }
-            // Wait for process to exit (up to 5s)
-            for _ in 0..50 {
+            // Wait for process to exit (up to 3s)
+            let mut exited = false;
+            for _ in 0..30 {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 if unsafe { libc::kill(pid as i32, 0) != 0 } {
+                    exited = true;
                     break;
                 }
+            }
+            if !exited {
+                // Force kill if still alive
+                unsafe { libc::kill(pid as i32, libc::SIGKILL); }
+                std::thread::sleep(std::time::Duration::from_millis(200));
             }
             remove_pidfile(pidfile);
             let _ = std::fs::remove_file(sock);

@@ -83,9 +83,12 @@ impl Handle {
             let _ = handle.join();
         }
 
-        // Then shutdown all writer threads
-        for rt in &mut self.runtimes {
+        // Send shutdown to all writer threads first (parallel)
+        for rt in &self.runtimes {
             let _ = rt.db_tx.send(DbOp::Shutdown);
+        }
+        // Then join all (they're already shutting down concurrently)
+        for rt in &mut self.runtimes {
             if let Some(handle) = rt.writer_handle.take() {
                 let _ = handle.join();
             }
