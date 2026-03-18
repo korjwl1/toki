@@ -92,16 +92,17 @@ fn parse_litellm_json(json_str: &str) -> HashMap<String, ModelPricing> {
             cache_read_input_token_cost: entry.cache_read_input_token_cost,
         };
 
-        // Store with original key
-        prices.entry(key.clone()).or_insert_with(|| pricing.clone());
-
-        // Also store with provider prefix stripped, so CLI-reported model names
-        // (e.g., "claude-opus-4-6" instead of "anthropic/claude-opus-4-6") match.
-        if let Some(pos) = key.find('/') {
-            let stripped = &key[pos + 1..];
-            if !stripped.is_empty() {
-                prices.entry(stripped.to_string()).or_insert(pricing);
-            }
+        // Store with cloud provider prefix stripped (azure/, vertex_ai/, bedrock/, etc.)
+        // CLI tools report bare model names (e.g., "claude-opus-4-6", "gpt-5.2-codex"),
+        // so we only need the stripped version. Nested prefixes are stripped recursively.
+        let model_name = if key.contains('/') {
+            // Take the last segment after all slashes
+            key.rsplit('/').next().unwrap_or(key)
+        } else {
+            key.as_str()
+        };
+        if !model_name.is_empty() {
+            prices.entry(model_name.to_string()).or_insert(pricing);
         }
     }
 
@@ -124,7 +125,7 @@ struct LiteLLMEntry {
 /// On-disk pricing cache format.
 /// Bump this when the parsing logic changes (e.g., adding new provider prefixes).
 /// Forces a full re-fetch even if the server returns 304 Not Modified.
-const PRICING_CACHE_VERSION: u32 = 2;
+const PRICING_CACHE_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize)]
 struct PricingCache {
@@ -287,15 +288,15 @@ mod tests {
         }"#;
 
         let prices = parse_litellm_json(json);
-        // Direct keys
+        // Direct keys (no prefix)
         assert!(prices.contains_key("claude-sonnet-4-20250514"));
         assert!(prices.contains_key("gpt-4"));
-        // Prefix-stripped keys (anthropic/ and gemini/ stripped)
+        // Prefix-stripped keys (anthropic/, gemini/ stripped)
         assert!(prices.contains_key("claude-opus-4-20250514"));
         assert!(prices.contains_key("gemini-2.5-pro"));
-        // Original prefixed keys also present
-        assert!(prices.contains_key("anthropic/claude-opus-4-20250514"));
-        assert!(prices.contains_key("gemini/gemini-2.5-pro"));
+        // Original prefixed keys NOT stored (only stripped version)
+        assert!(!prices.contains_key("anthropic/claude-opus-4-20250514"));
+        assert!(!prices.contains_key("gemini/gemini-2.5-pro"));
         // Zero-cost models excluded
         assert!(!prices.contains_key("some-free-model"));
     }
