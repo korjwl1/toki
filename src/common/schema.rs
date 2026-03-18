@@ -11,8 +11,7 @@ pub trait ProviderSchema: Send + Sync {
     fn columns(&self) -> &[TokenColumn];
     fn provider_name(&self) -> &str;
     /// Extract token values from ModelUsageSummary in column order.
-    /// Returns Vec<u64> (not a fixed-size array) because CombinedSchema has 2 columns
-    /// while provider schemas have 4. Only called during rendering (display-only, cold path).
+    /// Returns Vec<u64>. Only called during rendering (display-only, cold path).
     fn extract_tokens(&self, s: &ModelUsageSummary) -> Vec<u64>;
     /// Compute total tokens from a ModelUsageSummary.
     fn total_tokens(&self, s: &ModelUsageSummary) -> u64;
@@ -31,7 +30,7 @@ pub struct ClaudeCodeSchema;
 
 impl ProviderSchema for ClaudeCodeSchema {
     fn columns(&self) -> &[TokenColumn] { CLAUDE_CODE_COLUMNS }
-    fn provider_name(&self) -> &str { "claude_code" }
+    fn provider_name(&self) -> &str { "Claude Code" }
 
     fn extract_tokens(&self, s: &ModelUsageSummary) -> Vec<u64> {
         vec![
@@ -60,7 +59,7 @@ pub struct CodexSchema;
 
 impl ProviderSchema for CodexSchema {
     fn columns(&self) -> &[TokenColumn] { CODEX_COLUMNS }
-    fn provider_name(&self) -> &str { "codex" }
+    fn provider_name(&self) -> &str { "Codex CLI" }
 
     fn extract_tokens(&self, s: &ModelUsageSummary) -> Vec<u64> {
         // slot 3 = cache_creation_input_tokens = reasoning_output_tokens
@@ -75,28 +74,6 @@ impl ProviderSchema for CodexSchema {
 
     fn total_tokens(&self, s: &ModelUsageSummary) -> u64 {
         s.input_tokens + s.output_tokens + s.cache_read_input_tokens + s.cache_creation_input_tokens
-    }
-}
-
-// ── Combined (cross-provider merge) schema ──────────────────────────────────
-
-static COMBINED_COLUMNS: &[TokenColumn] = &[
-    TokenColumn { header: "Input",  json_key: "input_tokens" },
-    TokenColumn { header: "Output", json_key: "output_tokens" },
-];
-
-pub struct CombinedSchema;
-
-impl ProviderSchema for CombinedSchema {
-    fn columns(&self) -> &[TokenColumn] { COMBINED_COLUMNS }
-    fn provider_name(&self) -> &str { "combined" }
-
-    fn extract_tokens(&self, s: &ModelUsageSummary) -> Vec<u64> {
-        vec![s.input_tokens, s.output_tokens]
-    }
-
-    fn total_tokens(&self, s: &ModelUsageSummary) -> u64 {
-        s.input_tokens + s.output_tokens
     }
 }
 
@@ -127,12 +104,6 @@ mod tests {
         assert_eq!(schema.columns().len(), 4);
         assert_eq!(schema.columns()[2].json_key, "cached_input_tokens");
         assert_eq!(schema.columns()[3].json_key, "reasoning_output_tokens");
-    }
-
-    #[test]
-    fn test_combined_schema_columns() {
-        let schema = CombinedSchema;
-        assert_eq!(schema.columns().len(), 2);
     }
 
     #[test]
@@ -170,8 +141,8 @@ mod tests {
 
     #[test]
     fn test_schema_for_provider() {
-        assert_eq!(schema_for_provider("codex").provider_name(), "codex");
-        assert_eq!(schema_for_provider("claude_code").provider_name(), "claude_code");
-        assert_eq!(schema_for_provider("unknown").provider_name(), "claude_code");
+        assert_eq!(schema_for_provider("codex").provider_name(), "Codex CLI");
+        assert_eq!(schema_for_provider("claude_code").provider_name(), "Claude Code");
+        assert_eq!(schema_for_provider("unknown").provider_name(), "Claude Code");
     }
 }

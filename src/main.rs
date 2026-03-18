@@ -973,6 +973,13 @@ fn dispatch_result_to_sink(
                 let strings: Vec<String> = items.iter()
                     .filter_map(|v| v.as_str().map(|s| s.to_string()))
                     .collect();
+                // Show provider label if present
+                if let Some(provider) = schema {
+                    let name = provider.provider_name();
+                    if !name.is_empty() {
+                        eprintln!("[toki] {}", name);
+                    }
+                }
                 sink.emit_list(&strings, type_name);
             }
         }
