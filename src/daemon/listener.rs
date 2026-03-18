@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::BroadcastSink;
-use crate::common::schema::{self, ProviderSchema};
+use crate::common::schema::ProviderSchema;
 use crate::db::Database;
 
 /// Maximum number of concurrent report handler threads.
@@ -188,14 +188,8 @@ fn execute_report_request(request_line: &str, dbs: &[(String, Arc<Database>)]) -
         return Ok(serde_json::Value::Array(Vec::new()));
     }
 
-    // Determine schema for output formatting
-    let schema: Option<&dyn ProviderSchema> = if target_dbs.len() == 1 {
-        // Single provider (either only one configured, or filtered to one)
-        Some(schema::schema_for_provider(target_dbs[0].0))
-    } else {
-        // Multiple providers: use combined schema for merged output
-        None // Will use CombinedSchema for merge or default for single-provider
-    };
+    // Schema tag is determined by provider count — the actual ProviderSchema
+    // is resolved client-side from this tag for rendering.
 
     // Collect results from selected provider DBs
     let collector = CollectorSink::new();
@@ -218,8 +212,8 @@ fn execute_report_request(request_line: &str, dbs: &[(String, Arc<Database>)]) -
         // Cross-provider merge: only use common fields (input + output)
         merge_collected_results_combined(results)
     } else {
-        // Single provider: use provider-specific schema for JSON keys
-        remap_collected_results(results, schema)
+        // Single provider: return as-is, schema tag tells client how to render
+        results
     };
 
     // Tag each result with the schema so the CLI can reconstruct it for rendering
@@ -235,88 +229,6 @@ fn execute_report_request(request_line: &str, dbs: &[(String, Arc<Database>)]) -
     }
 
     Ok(serde_json::Value::Array(merged))
-}
-
-/// Remap collected JSON results using the given schema for field naming.
-/// Used for single-provider queries to emit provider-specific JSON keys.
-fn remap_collected_results(results: Vec<serde_json::Value>, schema: Option<&dyn ProviderSchema>) -> Vec<serde_json::Value> {
-    if schema.is_none() {
-        return results;
-    }
-    let schema = schema.unwrap();
-    let columns = schema.columns();
-
-    results.into_iter().map(|mut result| {
-        match result["type"].as_str() {
-            Some("summary") => {
-                if let Some(data) = result["data"].as_array_mut() {
-                    for entry in data.iter_mut() {
-                        remap_entry_fields(entry, columns, schema);
-                    }
-                }
-                result
-            }
-            Some(t) if t != "sessions" && t != "projects" => {
-                if let Some(data) = result["data"].as_array_mut() {
-                    for group in data.iter_mut() {
-                        if let Some(usage) = group["usage_per_models"].as_array_mut() {
-                            for entry in usage.iter_mut() {
-                                remap_entry_fields(entry, columns, schema);
-                            }
-                        }
-                    }
-                }
-                result
-            }
-            _ => result,
-        }
-    }).collect()
-}
-
-/// Remap a single JSON model entry's token fields to match the schema's json_keys.
-/// The collector stores values in DB slot order:
-///   slot 0 = input_tokens, slot 1 = output_tokens,
-///   slot 2 = cache_creation_input_tokens, slot 3 = cache_read_input_tokens
-/// The schema's extract_tokens() defines the correct mapping from slots to display columns.
-/// For Codex: column 2 = cached (slot 3), column 3 = reasoning (slot 2).
-fn remap_entry_fields(entry: &mut serde_json::Value, columns: &[crate::common::schema::TokenColumn], schema: &dyn ProviderSchema) {
-    // Build a ModelUsageSummary from the JSON entry's DB-slot values to leverage
-    // the schema's extract_tokens() for correct slot-to-column mapping.
-    let s = crate::common::types::ModelUsageSummary {
-        model: String::new(),
-        input_tokens: entry["input_tokens"].as_u64().unwrap_or(0),
-        output_tokens: entry["output_tokens"].as_u64().unwrap_or(0),
-        cache_creation_input_tokens: entry["cache_creation_input_tokens"].as_u64().unwrap_or(0),
-        cache_read_input_tokens: entry["cache_read_input_tokens"].as_u64().unwrap_or(0),
-        event_count: 0,
-        cost_usd: None,
-    };
-    let values = schema.extract_tokens(&s);
-
-    // Only remap if schema columns differ from default keys
-    let default_keys = ["input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"];
-    let needs_remap = columns.iter().enumerate().any(|(i, col)| {
-        i < default_keys.len() && col.json_key != default_keys[i]
-    });
-
-    if !needs_remap {
-        return;
-    }
-
-    // Remove old keys and write new keys in schema column order
-    if let Some(obj) = entry.as_object_mut() {
-        for key in &default_keys {
-            obj.remove(*key);
-        }
-        for (i, col) in columns.iter().enumerate() {
-            if i < values.len() {
-                obj.insert(col.json_key.to_string(), serde_json::json!(values[i]));
-            }
-        }
-        // Recompute total_tokens from the remapped values
-        let total: u64 = values.iter().sum();
-        obj.insert("total_tokens".to_string(), serde_json::json!(total));
-    }
 }
 
 /// Merge collected results from multiple provider DBs using only common fields (input + output).

@@ -984,6 +984,7 @@ fn dispatch_result_to_sink(
                 for entry in data_arr {
                     let period = entry["period"].as_str()
                         .or_else(|| entry["provider"].as_str())
+                        .or_else(|| entry["session"].as_str())
                         .unwrap_or("total").to_string();
                     if let Ok(models) = serde_json::from_value::<Vec<toki::ModelUsageSummary>>(entry["usage_per_models"].clone()) {
                         let map: std::collections::HashMap<String, toki::ModelUsageSummary> =
