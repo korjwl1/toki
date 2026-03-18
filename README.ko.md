@@ -355,7 +355,7 @@ toki settings list                             # 전체 설정 출력
 
 모든 출력에 모델별 추정 비용(USD)이 포함됩니다. 가격 데이터는 [LiteLLM](https://github.com/BerriAI/litellm) 커뮤니티 가격표에서 가져옵니다.
 
-- **최초 실행**: LiteLLM JSON 다운로드 → Claude + OpenAI 모델 가격 추출 → 파일 캐시 (`~/.config/toki/pricing.json`)
+- **최초 실행**: LiteLLM JSON 다운로드 → `litellm_provider` 기준 필터 (Anthropic, OpenAI, Gemini) → 파일 캐시 (`~/.config/toki/pricing.json`)
 - **이후 실행**: HTTP ETag 조건부 요청 → 변경 없으면 304 (바디 없이 ~50ms)
 - **오프라인**: 캐시된 데이터로 동작합니다. 캐시가 없으면 Cost 컬럼이 생략됩니다.
 - **`--no-cost`**: 가격 fetch를 건너뜁니다.

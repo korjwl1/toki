@@ -358,7 +358,7 @@ Each provider gets its own isolated database (`~/.config/toki/<provider>.fjall`)
 
 All outputs include estimated cost (USD) per model, sourced from [LiteLLM](https://github.com/BerriAI/litellm) community pricing.
 
-- **First run**: downloads LiteLLM JSON → extracts Claude + OpenAI model prices → caches to `~/.config/toki/pricing.json`
+- **First run**: downloads LiteLLM JSON → filters by `litellm_provider` (Anthropic, OpenAI, Gemini) → caches to `~/.config/toki/pricing.json`
 - **Subsequent runs**: HTTP ETag conditional request → 304 if unchanged (~50 ms, no body)
 - **Offline**: uses cached data; if no cache, cost column is omitted
 - **`--no-cost`**: skips price fetch entirely
