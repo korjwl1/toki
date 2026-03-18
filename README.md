@@ -25,49 +25,104 @@
 
 ## Performance
 
-Not just fast — **lightweight enough to forget it's running.** toki sits at 5 MB idle, near-zero CPU, and answers any report in 13 ms. ccusage and zzusage spike your CPU and memory every time you ask a question, because they re-read everything from scratch. toki doesn't. It indexes once, then gets out of your way.
+Not just fast — **lightweight enough to forget it's running.** toki sits at 5 MB idle, near-zero CPU, and answers any report in 7 ms. ccusage and zzusage spike your CPU and memory every time you ask a question, because they re-read everything from scratch. toki doesn't. It indexes once, then gets out of your way.
 
 Benchmarked against [ccusage](https://github.com/ryoppippi/ccusage) (Node.js) and [zzusage](https://github.com/joelreymont/zzusage) (Zig) on the same dataset, disk cache purged before each run.
 
-### Report Speed (indexed query vs full re-scan)
-
-toki report is **~13 ms fixed** regardless of data size (UDS query → TSDB rollup lookup).
-ccusage and zzusage re-read every file from scratch, every time.
-
-| Data Size | toki | ccusage | zzusage | vs ccusage | vs zzusage |
-|-----------|------|---------|---------|------------|------------|
-| 100 MB | **0.013 s** | 2.37 s | 0.12 s | **182x** faster | **9x** faster |
-| 500 MB | **0.013 s** | 6.05 s | 0.35 s | **465x** faster | **27x** faster |
-| 1 GB | **0.013 s** | 11.07 s | 0.65 s | **851x** faster | **50x** faster |
-| 2 GB | **0.013 s** | 21.73 s | 1.22 s | **1,672x** faster | **94x** faster |
-
 ### Cold Start (full index build)
 
-toki parses **and** indexes into a TSDB simultaneously — yet still outruns tools that only parse.
+toki parses **and** indexes into a TSDB simultaneously — **14x faster** than ccusage, **similar speed** to zzusage but with **93% less memory**.
 
-> **Note:** These benchmarks assume a fresh start with no prior data. In normal operation, toki resumes from its last checkpoint and only processes new data accumulated since the previous shutdown — so subsequent cold starts are significantly faster than shown here.
+> In normal operation, toki resumes from its last checkpoint and only processes new data — so subsequent cold starts are significantly faster.
 
-| Data Size | toki | ccusage | zzusage | vs ccusage | vs zzusage |
-|-----------|------|---------|---------|------------|------------|
-| 100 MB | 0.11 s | 2.37 s | 0.12 s | **21x** | ~1.0x |
-| 500 MB | 0.39 s | 6.05 s | 0.35 s | **16x** | ~0.9x |
-| 1 GB | 0.78 s | 11.07 s | 0.65 s | **14x** | ~0.8x |
-| 2 GB | 1.54 s | 21.73 s | 1.22 s | **14x** | ~0.8x |
+<p align="center">
+  <img src="docs/bench_cold_start.png" alt="Cold Start Benchmark" width="900" />
+</p>
 
-> **Why ~1.0x vs zzusage matters:** toki does *strictly more work* per line — TSDB writes (fjall LSM-tree inserts), rollup aggregation, checkpoint persistence, and JSON schema validation. zzusage skips all of this: no DB, no validation, just raw parsing. Despite the extra workload, toki matches zzusage in wall-clock time. The validation gap also has a practical consequence: zzusage accepts any content without structural checks, making it trivial to feed crafted JSONL that inflates or fabricates usage numbers. toki validates every record before it reaches the TSDB, so tampered data is rejected at parse time.
+<details>
+<summary>Cold Start detailed data</summary>
 
-### Memory & CPU
+#### Execution Time
 
-| Data Size | toki (cold start) | toki (idle) | ccusage | zzusage |
-|-----------|-------------------|-------------|---------|---------|
-| 500 MB | 83 MB | **5–11 MB** | 126 MB | 613 MB |
-| 2 GB | 161 MB | **5–11 MB** | 126 MB | 2,311 MB |
+| Data Size | toki | ccusage | zzusage | toki vs ccusage |
+|-----------|------|---------|---------|-----------------|
+| 100 MB | **0.11 s** | 2.38 s | 0.13 s | **21x** faster |
+| 200 MB | **0.16 s** | 3.09 s | 0.18 s | **19x** faster |
+| 300 MB | **0.27 s** | 4.47 s | 0.27 s | **16x** faster |
+| 400 MB | **0.31 s** | 5.07 s | 0.32 s | **16x** faster |
+| 500 MB | **0.39 s** | 6.06 s | 0.40 s | **15x** faster |
+| 1 GB | **0.78 s** | 10.88 s | 0.76 s | **14x** faster |
+| 2 GB | **1.54 s** | 21.53 s | 1.41 s | **14x** faster |
 
-- **toki** — rayon parallel processing across all CPU cores with mmap zero-copy and per-file streaming. Despite doing maximum parallelism, memory stays flat because each file is streamed and discarded — no accumulation. After cold start the daemon drops to 5–11 MB and ~0% CPU, watching for changes via FSEvents (kernel-level, zero polling) and only waking when Claude Code writes new lines.
-- **ccusage** — processes one file at a time, synchronous and blocking. The 126 MB looks modest on paper, but it means your terminal hangs for seconds to minutes on every invocation while Node.js chews through every file sequentially. No parallelism, no incremental processing — just a long blocking wait, every time.
-- **zzusage** — loads every event from every file into memory before doing anything. Fast parsing, but 2 GB of data means 2.3 GB of RAM consumed at once. On larger datasets it simply OOMs.
+#### Peak Memory
 
-toki is the only tool with an idle state. ccusage and zzusage pay full resource cost on every run — your editor, compiler, and AI agent all compete for the same CPU and memory. toki pays that cost once, drops to 5 MB, and stays out of the way.
+| Data Size | toki | ccusage | zzusage |
+|-----------|------|---------|---------|
+| 100 MB | 37 MB | 126 MB | 165 MB |
+| 200 MB | 38 MB | 127 MB | 246 MB |
+| 300 MB | 67 MB | 127 MB | 421 MB |
+| 400 MB | 69 MB | 127 MB | 492 MB |
+| 500 MB | 71 MB | 126 MB | 615 MB |
+| 1 GB | 119 MB | 127 MB | 1,209 MB |
+| 2 GB | 166 MB | 126 MB | **2,311 MB** |
+
+> toki matches zzusage in speed while doing strictly more work per line (TSDB writes, rollup aggregation, checkpoint persistence, JSON validation). zzusage loads everything into memory — 2 GB of data means 2.3 GB of RAM. toki streams and discards.
+
+</details>
+
+### Report Speed (indexed TSDB query vs full re-scan)
+
+toki report answers in **~7 ms** regardless of data size — **1,742x faster** than ccusage at 2 GB.
+
+<p align="center">
+  <img src="docs/bench_report.png" alt="Report Benchmark" width="900" />
+</p>
+
+<details>
+<summary>Report detailed data</summary>
+
+#### Execution Time
+
+| Data Size | toki (warm) | toki (cold disk) | ccusage | zzusage | warm vs ccusage | warm vs zzusage |
+|-----------|-------------|-----------------|---------|---------|-----------------|-----------------|
+| 100 MB | **0.007 s** | 0.16 s | 2.38 s | 0.13 s | **358x** | **20x** |
+| 200 MB | **0.007 s** | 0.15 s | 3.09 s | 0.18 s | **435x** | **25x** |
+| 300 MB | **0.007 s** | 0.15 s | 4.47 s | 0.27 s | **602x** | **37x** |
+| 400 MB | **0.008 s** | 0.14 s | 5.07 s | 0.32 s | **658x** | **41x** |
+| 500 MB | **0.008 s** | 0.16 s | 6.06 s | 0.40 s | **785x** | **51x** |
+| 1 GB | **0.009 s** | 0.15 s | 10.88 s | 0.76 s | **1,153x** | **81x** |
+| 2 GB | **0.012 s** | 0.17 s | 21.53 s | 1.41 s | **1,742x** | **114x** |
+
+#### Peak Memory
+
+| Data Size | toki (warm) | toki (cold disk) | ccusage | zzusage |
+|-----------|-------------|-----------------|---------|---------|
+| 100 MB | 5 MB | 8 MB | 126 MB | 165 MB |
+| 500 MB | 5 MB | 8 MB | 126 MB | 615 MB |
+| 1 GB | 5 MB | 8 MB | 127 MB | 1,209 MB |
+| 2 GB | **10 MB** | 10 MB | 126 MB | **2,311 MB** |
+
+#### Peak CPU
+
+| Data Size | toki (warm) | toki (cold disk) | ccusage | zzusage |
+|-----------|-------------|-----------------|---------|---------|
+| 100 MB | 0% | 14% | 101% | 20% |
+| 500 MB | 0% | 18% | 100% | 76% |
+| 1 GB | 1% | 18% | 100% | 102% |
+| 2 GB | 0% | 12% | 101% | 122% |
+
+</details>
+
+### Idle Footprint
+
+toki is the only tool with an idle state — **5 MB, ~0% CPU** after cold start.
+
+| | toki (idle) | ccusage | zzusage |
+|---|---|---|---|
+| Memory | **5 MB** | N/A (no daemon) | N/A (no daemon) |
+| CPU | **~0%** | N/A | N/A |
+
+ccusage and zzusage pay full resource cost on every run. toki pays it once, drops to 5 MB, and stays out of the way.
 
 > Measured on Apple M1 MacBook Air (8 GB RAM), macOS, power saving off.
 > Reproduce: `sudo -v && python3 benches/benchmark.py run --purge --tool all`
