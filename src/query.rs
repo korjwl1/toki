@@ -226,7 +226,7 @@ pub fn execute_parsed_query(
                     if let Some(model) = model_filter {
                         summaries.retain(|k, _| k == model);
                     }
-                    sink.emit_summary(&summaries, pricing);
+                    sink.emit_summary(&summaries, pricing, None);
                 }
                 _ => {
                     // Grouped output (bucket and/or group_by)
@@ -301,7 +301,7 @@ pub fn execute_parsed_query(
                     } else {
                         "grouped".to_string()
                     };
-                    sink.emit_grouped(&grouped, &type_name, pricing);
+                    sink.emit_grouped(&grouped, &type_name, pricing, None);
                 }
             }
         }

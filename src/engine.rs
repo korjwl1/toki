@@ -267,7 +267,7 @@ impl TrackerEngine {
         }
 
         // Emit summary
-        self.sink.emit_summary(&result_summaries, None);
+        self.sink.emit_summary(&result_summaries, None, None);
 
         // Signal writer to flush accumulated rollups, then wait for completion
         let (done_tx, done_rx) = crossbeam_channel::bounded(1);
@@ -365,7 +365,7 @@ impl TrackerEngine {
             self.checkpoints.insert(cp.file_path.clone(), cp.clone());
         }
 
-        self.sink.emit_summary(&result_summaries, None);
+        self.sink.emit_summary(&result_summaries, None, None);
 
         let (done_tx, done_rx) = crossbeam_channel::bounded(1);
         let _ = db_tx.send(DbOp::FlushBulkRollups(done_tx));

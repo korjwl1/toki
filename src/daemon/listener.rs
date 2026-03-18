@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::BroadcastSink;
+use crate::common::schema::{self, ProviderSchema};
 use crate::db::Database;
 
 /// Maximum number of concurrent report handler threads.
@@ -187,6 +188,18 @@ fn execute_report_request(request_line: &str, dbs: &[(String, Arc<Database>)]) -
         return Ok(serde_json::Value::Array(Vec::new()));
     }
 
+    // Determine schema for output formatting
+    let schema: Option<&dyn ProviderSchema> = if target_dbs.len() == 1 {
+        // Single provider: use provider-specific schema
+        Some(schema::schema_for_provider(target_dbs[0].0))
+    } else if provider_filter.is_some() {
+        // Filtered to a single provider
+        Some(schema::schema_for_provider(target_dbs[0].0))
+    } else {
+        // Multiple providers: use combined schema for merged output
+        None // Will use CombinedSchema for merge or default for single-provider
+    };
+
     // Collect results from selected provider DBs
     let collector = CollectorSink::new();
     for (provider_name, db) in &target_dbs {
@@ -204,10 +217,142 @@ fn execute_report_request(request_line: &str, dbs: &[(String, Arc<Database>)]) -
     let merged = if group_by_provider {
         // When grouping by provider, don't merge — keep results tagged by provider
         merge_collected_results_by_provider(results)
+    } else if target_dbs.len() > 1 {
+        // Cross-provider merge: only use common fields (input + output)
+        merge_collected_results_combined(results)
     } else {
-        merge_collected_results(results)
+        // Single provider: use provider-specific schema for JSON keys
+        remap_collected_results(results, schema)
     };
     Ok(serde_json::Value::Array(merged))
+}
+
+/// Remap collected JSON results using the given schema for field naming.
+/// Used for single-provider queries to emit provider-specific JSON keys.
+fn remap_collected_results(results: Vec<serde_json::Value>, schema: Option<&dyn ProviderSchema>) -> Vec<serde_json::Value> {
+    if schema.is_none() {
+        return results;
+    }
+    let schema = schema.unwrap();
+    let columns = schema.columns();
+
+    results.into_iter().map(|mut result| {
+        match result["type"].as_str() {
+            Some("summary") => {
+                if let Some(data) = result["data"].as_array_mut() {
+                    for entry in data.iter_mut() {
+                        remap_entry_fields(entry, columns);
+                    }
+                }
+                result
+            }
+            Some(t) if t != "sessions" && t != "projects" => {
+                if let Some(data) = result["data"].as_array_mut() {
+                    for group in data.iter_mut() {
+                        if let Some(usage) = group["usage_per_models"].as_array_mut() {
+                            for entry in usage.iter_mut() {
+                                remap_entry_fields(entry, columns);
+                            }
+                        }
+                    }
+                }
+                result
+            }
+            _ => result,
+        }
+    }).collect()
+}
+
+/// Remap a single JSON model entry's token fields to match the schema's json_keys.
+fn remap_entry_fields(entry: &mut serde_json::Value, columns: &[crate::common::schema::TokenColumn]) {
+    // The collector produces entries with default keys (input_tokens, output_tokens, etc.)
+    // We need to remap to the schema's json_keys.
+    // Default key order: input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens
+    let default_keys = ["input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"];
+
+    // Only remap if schema columns differ from default
+    let needs_remap = columns.iter().enumerate().any(|(i, col)| {
+        i < default_keys.len() && col.json_key != default_keys[i]
+    });
+
+    if !needs_remap {
+        return;
+    }
+
+    // Extract values using default keys, then write with schema keys
+    let values: Vec<u64> = default_keys.iter()
+        .map(|k| entry[*k].as_u64().unwrap_or(0))
+        .collect();
+
+    // Remove old keys
+    if let Some(obj) = entry.as_object_mut() {
+        for key in &default_keys {
+            obj.remove(*key);
+        }
+        // Write new keys in schema order
+        for (i, col) in columns.iter().enumerate() {
+            if i < values.len() {
+                obj.insert(col.json_key.to_string(), serde_json::json!(values[i]));
+            }
+        }
+        // Recompute total_tokens from schema perspective
+        let total: u64 = values.iter().take(columns.len()).sum();
+        obj.insert("total_tokens".to_string(), serde_json::json!(total));
+    }
+}
+
+/// Merge collected results from multiple provider DBs using only common fields (input + output).
+/// Used when querying across providers where slot 3/4 have different semantics.
+fn merge_collected_results_combined(results: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    if results.len() <= 1 {
+        // Even a single result should be remapped to combined schema
+        return results.into_iter().map(|mut r| {
+            strip_provider_specific_fields(&mut r);
+            r
+        }).collect();
+    }
+
+    let merged = merge_collected_results(results);
+    // Strip provider-specific fields, keep only input_tokens + output_tokens
+    merged.into_iter().map(|mut r| {
+        strip_provider_specific_fields(&mut r);
+        r
+    }).collect()
+}
+
+/// Remove provider-specific token fields from merged results, keeping only common ones.
+fn strip_provider_specific_fields(result: &mut serde_json::Value) {
+    let strip_entry = |entry: &mut serde_json::Value| {
+        if let Some(obj) = entry.as_object_mut() {
+            let input = obj.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            let output = obj.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+            obj.remove("cache_creation_input_tokens");
+            obj.remove("cache_read_input_tokens");
+            obj.insert("total_tokens".to_string(), serde_json::json!(input + output));
+        }
+    };
+
+    match result["type"].as_str() {
+        Some("summary") => {
+            if let Some(data) = result.get_mut("data").and_then(|d| d.as_array_mut()) {
+                for entry in data.iter_mut() {
+                    strip_entry(entry);
+                }
+            }
+        }
+        Some(t) if t != "sessions" && t != "projects" => {
+            if let Some(data) = result.get_mut("data").and_then(|d| d.as_array_mut()) {
+                for group in data.iter_mut() {
+                    if let Some(usage) = group.get_mut("usage_per_models").and_then(|u| u.as_array_mut()) {
+                        for entry in usage.iter_mut() {
+                            strip_entry(entry);
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Merge collected JSON results from multiple provider DBs.
@@ -250,8 +395,8 @@ fn merge_collected_results(results: Vec<serde_json::Value>) -> Vec<serde_json::V
                     let model = entry["model"].as_str().unwrap_or("unknown").to_string();
                     let existing = model_map.entry(model).or_insert_with(|| entry.clone());
                     if !std::ptr::eq(existing, entry) {
-                        // Merge numeric fields
-                        merge_summary_entry(existing, entry);
+                        // Merge: only sum input_tokens and output_tokens (common fields)
+                        merge_summary_entry_common(existing, entry);
                     }
                 }
             }
@@ -301,7 +446,7 @@ fn merge_collected_results(results: Vec<serde_json::Value>) -> Vec<serde_json::V
                             let model = model_entry["model"].as_str().unwrap_or("unknown").to_string();
                             let existing = models.entry(model).or_insert_with(|| model_entry.clone());
                             if !std::ptr::eq(existing, model_entry) {
-                                merge_summary_entry(existing, model_entry);
+                                merge_summary_entry_common(existing, model_entry);
                             }
                         }
                     }
@@ -408,6 +553,7 @@ fn merge_collected_results_by_provider(results: Vec<serde_json::Value>) -> Vec<s
 }
 
 /// Merge numeric fields from `src` into `dst` (both are JSON model summary entries).
+/// Used within a single provider context where all fields have the same semantics.
 fn merge_summary_entry(dst: &mut serde_json::Value, src: &serde_json::Value) {
     for field in &["input_tokens", "output_tokens", "cache_creation_input_tokens",
                     "cache_read_input_tokens", "total_tokens", "events"] {
@@ -416,6 +562,21 @@ fn merge_summary_entry(dst: &mut serde_json::Value, src: &serde_json::Value) {
         }
     }
     // Merge cost if both have it
+    if let (Some(d), Some(s)) = (dst["cost_usd"].as_f64(), src["cost_usd"].as_f64()) {
+        dst["cost_usd"] = serde_json::json!(d + s);
+    }
+}
+
+/// Merge only common fields (input_tokens, output_tokens) across providers.
+/// Other slots (cache_creation/cache_read) have different semantics per provider,
+/// so they are summed but may be stripped later by the combined schema.
+fn merge_summary_entry_common(dst: &mut serde_json::Value, src: &serde_json::Value) {
+    for field in &["input_tokens", "output_tokens", "cache_creation_input_tokens",
+                    "cache_read_input_tokens", "total_tokens", "events"] {
+        if let (Some(d), Some(s)) = (dst[*field].as_u64(), src[*field].as_u64()) {
+            dst[*field] = serde_json::json!(d + s);
+        }
+    }
     if let (Some(d), Some(s)) = (dst["cost_usd"].as_f64(), src["cost_usd"].as_f64()) {
         dst["cost_usd"] = serde_json::json!(d + s);
     }
@@ -458,13 +619,13 @@ impl CollectorSink {
 }
 
 impl crate::sink::Sink for CollectorSink {
-    fn emit_summary(&self, summaries: &std::collections::HashMap<String, crate::common::types::ModelUsageSummary>, pricing: Option<&crate::pricing::PricingTable>) {
-        let json = crate::sink::json::summaries_to_json(summaries, pricing);
+    fn emit_summary(&self, summaries: &std::collections::HashMap<String, crate::common::types::ModelUsageSummary>, pricing: Option<&crate::pricing::PricingTable>, _schema: Option<&dyn ProviderSchema>) {
+        let json = crate::sink::json::summaries_to_json(summaries, pricing, None);
         self.collected.lock().unwrap_or_else(|e| e.into_inner()).push(json);
     }
 
-    fn emit_grouped(&self, grouped: &std::collections::HashMap<String, std::collections::HashMap<String, crate::common::types::ModelUsageSummary>>, type_name: &str, pricing: Option<&crate::pricing::PricingTable>) {
-        let json = crate::sink::json::grouped_to_json(grouped, type_name, pricing);
+    fn emit_grouped(&self, grouped: &std::collections::HashMap<String, std::collections::HashMap<String, crate::common::types::ModelUsageSummary>>, type_name: &str, pricing: Option<&crate::pricing::PricingTable>, _schema: Option<&dyn ProviderSchema>) {
+        let json = crate::sink::json::grouped_to_json(grouped, type_name, pricing, None);
         self.collected.lock().unwrap_or_else(|e| e.into_inner()).push(json);
     }
 

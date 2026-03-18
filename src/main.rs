@@ -960,7 +960,7 @@ fn dispatch_result_to_sink(
             if let Ok(summaries_vec) = serde_json::from_value::<Vec<toki::ModelUsageSummary>>(item["data"].clone()) {
                 let summaries: std::collections::HashMap<String, toki::ModelUsageSummary> =
                     summaries_vec.into_iter().map(|s| (s.model.clone(), s)).collect();
-                sink.emit_summary(&summaries, pricing);
+                sink.emit_summary(&summaries, pricing, None);
             }
         }
         Some(type_name) if type_name == "sessions" || type_name == "projects" => {
@@ -984,7 +984,7 @@ fn dispatch_result_to_sink(
                         grouped.insert(period, map);
                     }
                 }
-                sink.emit_grouped(&grouped, type_name, pricing);
+                sink.emit_grouped(&grouped, type_name, pricing, None);
             }
         }
         None => {}

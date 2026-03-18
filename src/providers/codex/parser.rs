@@ -81,6 +81,7 @@ impl FileParser for CodexFileParser {
                 let input_tokens = last_usage.input_tokens?;
                 let output_tokens = last_usage.output_tokens.unwrap_or(0);
                 let cached_input_tokens = last_usage.cached_input_tokens.unwrap_or(0);
+                let reasoning_output_tokens = last_usage.reasoning_output_tokens.unwrap_or(0);
 
                 let ts = header.timestamp.unwrap_or("");
                 let ts_ms = crate::common::time::parse_ts_to_ms(ts)?;
@@ -97,11 +98,12 @@ impl FileParser for CodexFileParser {
                     model: self.last_model.clone(),
                     ts_ms,
                     // Map Codex fields to common TokenFields:
-                    // cached_input_tokens → cache_read, reasoning tokens dropped
+                    // slot 3 (cache_creation_input_tokens) = reasoning_output_tokens
+                    // slot 4 (cache_read_input_tokens) = cached_input_tokens
                     tokens: crate::common::types::TokenFields {
                         input_tokens,
                         output_tokens,
-                        cache_creation_input_tokens: 0,
+                        cache_creation_input_tokens: reasoning_output_tokens,
                         cache_read_input_tokens: cached_input_tokens,
                     },
                     project_name: self.cwd.clone(),
@@ -179,7 +181,6 @@ struct LastTokenUsage {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     cached_input_tokens: Option<u64>,
-    #[allow(dead_code)]
     reasoning_output_tokens: Option<u64>,
 }
 
@@ -263,6 +264,7 @@ impl LogParser for CodexParser {
                 let input_tokens = last_usage.input_tokens?;
                 let output_tokens = last_usage.output_tokens.unwrap_or(0);
                 let cached_input_tokens = last_usage.cached_input_tokens.unwrap_or(0);
+                let reasoning_output_tokens = last_usage.reasoning_output_tokens.unwrap_or(0);
 
                 let ts = header.timestamp.unwrap_or("");
                 let model = self.get_model(source_file);
@@ -274,8 +276,8 @@ impl LogParser for CodexParser {
                     model,
                     input_tokens,
                     output_tokens,
-                    // Map Codex fields to Claude Code schema
-                    cache_creation_input_tokens: 0,
+                    // slot 3 = reasoning_output_tokens, slot 4 = cached_input_tokens
+                    cache_creation_input_tokens: reasoning_output_tokens,
                     cache_read_input_tokens: cached_input_tokens,
                 })
             }
@@ -352,6 +354,7 @@ impl LogParserWithTs for CodexParser {
                 let input_tokens = last_usage.input_tokens?;
                 let output_tokens = last_usage.output_tokens.unwrap_or(0);
                 let cached_input_tokens = last_usage.cached_input_tokens.unwrap_or(0);
+                let reasoning_output_tokens = last_usage.reasoning_output_tokens.unwrap_or(0);
 
                 let ts = header.timestamp.unwrap_or_default().to_string();
                 let model = self.get_model(source_file);
@@ -363,7 +366,8 @@ impl LogParserWithTs for CodexParser {
                     model,
                     input_tokens,
                     output_tokens,
-                    cache_creation_input_tokens: 0,
+                    // slot 3 = reasoning_output_tokens, slot 4 = cached_input_tokens
+                    cache_creation_input_tokens: reasoning_output_tokens,
                     cache_read_input_tokens: cached_input_tokens,
                     timestamp: ts,
                 })

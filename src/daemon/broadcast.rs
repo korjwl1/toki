@@ -3,6 +3,7 @@ use std::io::{BufWriter, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::Mutex;
 
+use crate::common::schema::ProviderSchema;
 use crate::common::types::{ModelUsageSummary, UsageEvent};
 use crate::pricing::PricingTable;
 use crate::sink::Sink;
@@ -67,13 +68,13 @@ impl Sink for BroadcastSink {
         self.broadcast(&json);
     }
 
-    fn emit_summary(&self, summaries: &HashMap<String, ModelUsageSummary>, pricing: Option<&PricingTable>) {
-        let json = summaries_to_json(summaries, pricing);
+    fn emit_summary(&self, summaries: &HashMap<String, ModelUsageSummary>, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
+        let json = summaries_to_json(summaries, pricing, schema);
         self.broadcast(&json);
     }
 
-    fn emit_grouped(&self, grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>, type_name: &str, pricing: Option<&PricingTable>) {
-        let json = grouped_to_json(grouped, type_name, pricing);
+    fn emit_grouped(&self, grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>, type_name: &str, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
+        let json = grouped_to_json(grouped, type_name, pricing, schema);
         self.broadcast(&json);
     }
 
@@ -87,12 +88,12 @@ impl Sink for std::sync::Arc<BroadcastSink> {
         (**self).emit_event(event, pricing);
     }
 
-    fn emit_summary(&self, summaries: &HashMap<String, ModelUsageSummary>, pricing: Option<&PricingTable>) {
-        (**self).emit_summary(summaries, pricing);
+    fn emit_summary(&self, summaries: &HashMap<String, ModelUsageSummary>, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
+        (**self).emit_summary(summaries, pricing, schema);
     }
 
-    fn emit_grouped(&self, grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>, type_name: &str, pricing: Option<&PricingTable>) {
-        (**self).emit_grouped(grouped, type_name, pricing);
+    fn emit_grouped(&self, grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>, type_name: &str, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
+        (**self).emit_grouped(grouped, type_name, pricing, schema);
     }
 
     fn emit_list(&self, items: &[String], type_name: &str) {

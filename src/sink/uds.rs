@@ -3,6 +3,7 @@ use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::sync::Mutex;
 
+use crate::common::schema::ProviderSchema;
 use crate::common::types::{ModelUsageSummary, UsageEvent};
 use crate::pricing::PricingTable;
 use super::{Sink, json};
@@ -57,12 +58,12 @@ impl UdsSink {
 }
 
 impl Sink for UdsSink {
-    fn emit_summary(&self, summaries: &HashMap<String, ModelUsageSummary>, pricing: Option<&PricingTable>) {
-        self.send(&json::summaries_to_json(summaries, pricing));
+    fn emit_summary(&self, summaries: &HashMap<String, ModelUsageSummary>, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
+        self.send(&json::summaries_to_json(summaries, pricing, schema));
     }
 
-    fn emit_grouped(&self, grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>, type_name: &str, pricing: Option<&PricingTable>) {
-        self.send(&json::grouped_to_json(grouped, type_name, pricing));
+    fn emit_grouped(&self, grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>, type_name: &str, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
+        self.send(&json::grouped_to_json(grouped, type_name, pricing, schema));
     }
 
     fn emit_event(&self, event: &UsageEvent, pricing: Option<&PricingTable>) {

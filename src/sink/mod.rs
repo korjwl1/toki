@@ -9,14 +9,15 @@ pub use self::http::HttpSink;
 
 use std::collections::HashMap;
 
+use crate::common::schema::ProviderSchema;
 use crate::common::types::{ModelUsageSummary, UsageEvent};
 use crate::pricing::PricingTable;
 
 /// Output sink for emitting usage data.
 /// All implementations must be thread-safe (used in watch mode worker thread).
 pub trait Sink: Send + Sync {
-    fn emit_summary(&self, summaries: &HashMap<String, ModelUsageSummary>, pricing: Option<&PricingTable>);
-    fn emit_grouped(&self, grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>, type_name: &str, pricing: Option<&PricingTable>);
+    fn emit_summary(&self, summaries: &HashMap<String, ModelUsageSummary>, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>);
+    fn emit_grouped(&self, grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>, type_name: &str, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>);
     fn emit_event(&self, event: &UsageEvent, pricing: Option<&PricingTable>);
     fn emit_list(&self, items: &[String], type_name: &str);
 }
@@ -33,12 +34,12 @@ impl MultiSink {
 }
 
 impl Sink for MultiSink {
-    fn emit_summary(&self, summaries: &HashMap<String, ModelUsageSummary>, pricing: Option<&PricingTable>) {
-        for s in &self.sinks { s.emit_summary(summaries, pricing); }
+    fn emit_summary(&self, summaries: &HashMap<String, ModelUsageSummary>, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
+        for s in &self.sinks { s.emit_summary(summaries, pricing, schema); }
     }
 
-    fn emit_grouped(&self, grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>, type_name: &str, pricing: Option<&PricingTable>) {
-        for s in &self.sinks { s.emit_grouped(grouped, type_name, pricing); }
+    fn emit_grouped(&self, grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>, type_name: &str, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
+        for s in &self.sinks { s.emit_grouped(grouped, type_name, pricing, schema); }
     }
 
     fn emit_event(&self, event: &UsageEvent, pricing: Option<&PricingTable>) {
