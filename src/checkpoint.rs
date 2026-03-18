@@ -214,6 +214,8 @@ where
     // before mapping, so concurrent appends (new session data) are excluded —
     // those bytes will be picked up on the next incremental run via checkpoint.
     let mmap = unsafe { memmap2::Mmap::map(&file)? };
+    #[cfg(unix)]
+    mmap.advise(memmap2::Advice::Sequential).ok();
     let end = std::cmp::min(mmap.len(), file_size as usize);
     let data = &mmap[offset as usize..end];
 

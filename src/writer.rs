@@ -20,17 +20,21 @@ pub struct ColdStartEvent {
     pub tokens: TokenFields,
 }
 
+/// Data for a single watch-mode event write. Boxed inside DbOp to keep the
+/// enum small (~32 bytes instead of ~160), improving channel buffer cache locality.
+pub struct WriteEventData {
+    pub ts_ms: i64,
+    pub message_id: String,
+    pub model: String,
+    pub session_id: String,
+    pub source_file: String,
+    pub project_name: Option<String>,
+    pub tokens: TokenFields,
+}
+
 /// Operations sent to the writer thread via bounded channel.
 pub enum DbOp {
-    WriteEvent {
-        ts_ms: i64,
-        message_id: String,
-        model: String,
-        session_id: String,
-        source_file: String,
-        project_name: Option<String>,
-        tokens: TokenFields,
-    },
+    WriteEvent(Box<WriteEventData>),
     /// Bulk write chunk for cold start -- events from one file.
     /// Rollups are accumulated in memory until FlushBulkRollups.
     BulkWrite(Vec<ColdStartEvent>),
@@ -137,9 +141,15 @@ impl DbWriter {
     /// Handle a single operation. Returns false on Shutdown.
     fn handle_op(&mut self, op: DbOp) -> bool {
         match op {
-            DbOp::WriteEvent { ts_ms, message_id, model, session_id, source_file, project_name, tokens } => {
+            DbOp::WriteEvent(data) => {
                 self.pending_events.push(PendingEvent {
-                    ts_ms, message_id, model, session_id, source_file, project_name, tokens,
+                    ts_ms: data.ts_ms,
+                    message_id: data.message_id,
+                    model: data.model,
+                    session_id: data.session_id,
+                    source_file: data.source_file,
+                    project_name: data.project_name,
+                    tokens: data.tokens,
                 });
                 if self.pending_events.len() >= BATCH_SIZE {
                     self.flush_pending();
@@ -271,7 +281,7 @@ impl DbWriter {
             return;
         }
 
-        let events: Vec<ColdStartEvent> = self.bulk_pending.drain(..).collect();
+        let events = std::mem::take(&mut self.bulk_pending);
         let mut batch = self.db.batch();
         for event in &events {
             let model_id = self.resolve_dict_id(&mut batch, &event.model);

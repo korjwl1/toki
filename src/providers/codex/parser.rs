@@ -39,56 +39,50 @@ impl FileParser for CodexFileParser {
             return None;
         }
 
-        let parsed: CodexLine = serde_json::from_str(line).ok()?;
+        // First pass: extract only type and timestamp (zero-copy, no heap alloc for payload)
+        let header: CodexLineHeader = serde_json::from_str(line).ok()?;
 
-        match parsed.line_type {
+        match header.line_type {
             "session_meta" => {
+                // Second pass: deserialize with targeted session_meta struct
+                let parsed: CodexSessionMetaLine = serde_json::from_str(line).ok()?;
                 if let Some(payload) = &parsed.payload {
-                    if let Some(id) = payload.get("id").and_then(|v| v.as_str()) {
+                    if let Some(id) = payload.id {
                         self.session_id = Some(id.to_string());
                     }
-                    if let Some(cwd) = payload.get("cwd").and_then(|v| v.as_str()) {
+                    if let Some(cwd) = payload.cwd {
                         self.cwd = Some(cwd.to_string());
                     }
                 }
                 None
             }
             "turn_context" => {
+                // Second pass: deserialize with targeted turn_context struct
+                let parsed: CodexTurnContextLine = serde_json::from_str(line).ok()?;
                 if let Some(payload) = &parsed.payload {
-                    if let Some(model) = payload.get("model").and_then(|v| v.as_str()) {
+                    if let Some(model) = payload.model {
                         self.last_model = model.to_string();
                     }
                 }
                 None
             }
             "event_msg" => {
-                let payload = parsed.payload.as_ref()?;
-                let payload_type = payload.get("type")?.as_str()?;
-                if payload_type != "token_count" {
+                // Second pass: deserialize with targeted event_msg struct
+                let parsed: CodexEventMsgLine = serde_json::from_str(line).ok()?;
+                let payload = parsed.payload?;
+                if payload.payload_type.as_deref() != Some("token_count") {
                     return None;
                 }
 
                 // "info" can be null for the first token_count event
-                let info = match payload.get("info") {
-                    Some(serde_json::Value::Object(obj)) => obj,
-                    _ => return None,
-                };
+                let info = payload.info?;
+                let last_usage = info.last_token_usage?;
 
-                let last_usage = info.get("last_token_usage")?;
-                let input_tokens = last_usage.get("input_tokens")?.as_u64()?;
-                let output_tokens = last_usage.get("output_tokens")?.as_u64().unwrap_or(0);
-                let cached_input_tokens = last_usage
-                    .get("cached_input_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                // reasoning_output_tokens is parsed but currently dropped in TokenFields mapping.
-                // Kept for future use when per-provider DB schema is implemented.
-                let _reasoning_output_tokens = last_usage
-                    .get("reasoning_output_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
+                let input_tokens = last_usage.input_tokens?;
+                let output_tokens = last_usage.output_tokens.unwrap_or(0);
+                let cached_input_tokens = last_usage.cached_input_tokens.unwrap_or(0);
 
-                let ts = parsed.timestamp.unwrap_or("");
+                let ts = header.timestamp.unwrap_or("");
                 let ts_ms = crate::common::time::parse_ts_to_ms(ts)?;
 
                 // Build a unique event key from session_id (or timestamp) and timestamp
@@ -118,16 +112,75 @@ impl FileParser for CodexFileParser {
     }
 }
 
-/// Minimal deserialization struct for Codex JSONL lines.
-/// Uses lifetime parameter with `&'a str` for zero-copy deserialization
-/// of `line_type` and `timestamp`, similar to Claude Code's `JsonlLine<'a>`.
+/// Minimal header struct for first-pass deserialization.
+/// Only extracts `type` and `timestamp` — no heap allocation for payload.
 #[derive(Deserialize)]
-struct CodexLine<'a> {
+struct CodexLineHeader<'a> {
     #[serde(rename = "type")]
     line_type: &'a str,
     timestamp: Option<&'a str>,
+}
+
+/// Targeted deserialization for session_meta lines.
+#[derive(Deserialize)]
+struct CodexSessionMetaLine<'a> {
+    #[allow(dead_code)]
+    #[serde(rename = "type")]
+    line_type: &'a str,
+    #[allow(dead_code)]
+    timestamp: Option<&'a str>,
+    payload: Option<SessionMetaPayload<'a>>,
+}
+
+#[derive(Deserialize)]
+struct SessionMetaPayload<'a> {
+    id: Option<&'a str>,
+    cwd: Option<&'a str>,
+}
+
+/// Targeted deserialization for turn_context lines.
+#[derive(Deserialize)]
+struct CodexTurnContextLine<'a> {
+    #[allow(dead_code)]
+    #[serde(rename = "type")]
+    line_type: &'a str,
+    #[allow(dead_code)]
+    timestamp: Option<&'a str>,
+    payload: Option<TurnContextPayload<'a>>,
+}
+
+#[derive(Deserialize)]
+struct TurnContextPayload<'a> {
+    model: Option<&'a str>,
+}
+
+/// Targeted deserialization for event_msg (token_count) lines.
+/// Note: timestamp is read from the CodexLineHeader first pass, not here.
+#[derive(Deserialize)]
+struct CodexEventMsgLine {
+    payload: Option<EventMsgPayload>,
+}
+
+#[derive(Deserialize)]
+struct EventMsgPayload {
+    #[serde(rename = "type")]
+    payload_type: Option<String>,
     #[serde(default)]
-    payload: Option<serde_json::Value>,
+    info: Option<TokenCountInfo>,
+}
+
+#[derive(Deserialize)]
+struct TokenCountInfo {
+    last_token_usage: Option<LastTokenUsage>,
+}
+
+#[derive(Deserialize)]
+struct LastTokenUsage {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cached_input_tokens: Option<u64>,
+    #[allow(dead_code)]
+    reasoning_output_tokens: Option<u64>,
 }
 
 /// Shared (stateful) parser for Codex watch mode.
@@ -182,37 +235,36 @@ impl LogParser for CodexParser {
             return None;
         }
 
-        let parsed: CodexLine = serde_json::from_str(line).ok()?;
+        // First pass: extract type and timestamp only (no payload heap alloc)
+        let header: CodexLineHeader = serde_json::from_str(line).ok()?;
 
-        match parsed.line_type {
+        match header.line_type {
             "turn_context" => {
+                // Second pass: targeted turn_context deserialization
+                let parsed: CodexTurnContextLine = serde_json::from_str(line).ok()?;
                 if let Some(payload) = &parsed.payload {
-                    if let Some(model) = payload.get("model").and_then(|v| v.as_str()) {
+                    if let Some(model) = payload.model {
                         self.set_model(source_file, model);
                     }
                 }
                 None
             }
             "event_msg" => {
-                let payload = parsed.payload.as_ref()?;
-                if payload.get("type")?.as_str()? != "token_count" {
+                // Second pass: targeted event_msg deserialization
+                let parsed: CodexEventMsgLine = serde_json::from_str(line).ok()?;
+                let payload = parsed.payload?;
+                if payload.payload_type.as_deref() != Some("token_count") {
                     return None;
                 }
 
-                let info = match payload.get("info") {
-                    Some(serde_json::Value::Object(obj)) => obj,
-                    _ => return None,
-                };
+                let info = payload.info?;
+                let last_usage = info.last_token_usage?;
 
-                let last_usage = info.get("last_token_usage")?;
-                let input_tokens = last_usage.get("input_tokens")?.as_u64()?;
-                let output_tokens = last_usage.get("output_tokens")?.as_u64().unwrap_or(0);
-                let cached_input_tokens = last_usage
-                    .get("cached_input_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
+                let input_tokens = last_usage.input_tokens?;
+                let output_tokens = last_usage.output_tokens.unwrap_or(0);
+                let cached_input_tokens = last_usage.cached_input_tokens.unwrap_or(0);
 
-                let ts = parsed.timestamp.unwrap_or("");
+                let ts = header.timestamp.unwrap_or("");
                 let model = self.get_model(source_file);
                 let event_key = format!("codex:{}:{}", source_file, ts);
 
@@ -272,37 +324,36 @@ impl LogParserWithTs for CodexParser {
             return None;
         }
 
-        let parsed: CodexLine = serde_json::from_str(line).ok()?;
+        // First pass: extract type and timestamp only (no payload heap alloc)
+        let header: CodexLineHeader = serde_json::from_str(line).ok()?;
 
-        match parsed.line_type {
+        match header.line_type {
             "turn_context" => {
+                // Second pass: targeted turn_context deserialization
+                let parsed: CodexTurnContextLine = serde_json::from_str(line).ok()?;
                 if let Some(payload) = &parsed.payload {
-                    if let Some(model) = payload.get("model").and_then(|v| v.as_str()) {
+                    if let Some(model) = payload.model {
                         self.set_model(source_file, model);
                     }
                 }
                 None
             }
             "event_msg" => {
-                let payload = parsed.payload.as_ref()?;
-                if payload.get("type")?.as_str()? != "token_count" {
+                // Second pass: targeted event_msg deserialization
+                let parsed: CodexEventMsgLine = serde_json::from_str(line).ok()?;
+                let payload = parsed.payload?;
+                if payload.payload_type.as_deref() != Some("token_count") {
                     return None;
                 }
 
-                let info = match payload.get("info") {
-                    Some(serde_json::Value::Object(obj)) => obj,
-                    _ => return None,
-                };
+                let info = payload.info?;
+                let last_usage = info.last_token_usage?;
 
-                let last_usage = info.get("last_token_usage")?;
-                let input_tokens = last_usage.get("input_tokens")?.as_u64()?;
-                let output_tokens = last_usage.get("output_tokens")?.as_u64().unwrap_or(0);
-                let cached_input_tokens = last_usage
-                    .get("cached_input_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
+                let input_tokens = last_usage.input_tokens?;
+                let output_tokens = last_usage.output_tokens.unwrap_or(0);
+                let cached_input_tokens = last_usage.cached_input_tokens.unwrap_or(0);
 
-                let ts = parsed.timestamp.unwrap_or_default().to_string();
+                let ts = header.timestamp.unwrap_or_default().to_string();
                 let model = self.get_model(source_file);
                 let event_key = format!("codex:{}:{}", source_file, &ts);
 

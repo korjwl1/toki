@@ -10,7 +10,7 @@ use crate::providers::Provider;
 use chrono::{DateTime, NaiveDateTime, Weekday};
 use chrono_tz::Tz;
 use crate::sink::Sink;
-use crate::writer::{ColdStartEvent, DbOp};
+use crate::writer::{ColdStartEvent, DbOp, WriteEventData};
 
 /// Debug level:
 ///   0 = off
@@ -176,11 +176,14 @@ impl TrackerEngine {
                 if let Some(ref pn) = $parsed.project_name {
                     $parser_project_name = Some(pn.as_str().into());
                 }
-                let model_key = $parsed.model.clone();
-                let summary = $local.entry(model_key).or_insert_with(|| ModelUsageSummary {
-                    model: $parsed.model.clone(),
-                    ..Default::default()
-                });
+                // Only clone model when inserting a new entry (0 clones for existing models)
+                if !$local.contains_key(&$parsed.model) {
+                    $local.insert($parsed.model.clone(), ModelUsageSummary {
+                        model: $parsed.model.clone(),
+                        ..Default::default()
+                    });
+                }
+                let summary = $local.get_mut(&$parsed.model).unwrap();
                 let effective_project = $parser_project_name.clone()
                     .or_else(|| $path_project_name.clone());
                 $file_events.push($parsed.into_summary_and_event(
@@ -319,11 +322,14 @@ impl TrackerEngine {
             let project_name: Option<std::sync::Arc<str>> = crate::providers::claude_code::extract_project_name(path).map(|s| s.into());
             let result = process_lines_streaming(path, offset, |line| {
                 if let Some(parsed) = cs_parser.parse_for_cold_start(line) {
-                    let model_key = parsed.model.clone();
-                    let summary = local.entry(model_key).or_insert_with(|| ModelUsageSummary {
-                        model: parsed.model.clone(),
-                        ..Default::default()
-                    });
+                    // Only clone model when inserting a new entry (0 clones for existing models)
+                    if !local.contains_key(&parsed.model) {
+                        local.insert(parsed.model.clone(), ModelUsageSummary {
+                            model: parsed.model.clone(),
+                            ..Default::default()
+                        });
+                    }
+                    let summary = local.get_mut(&parsed.model).unwrap();
 
                     file_events.push(parsed.into_summary_and_event(
                         summary,
@@ -409,17 +415,20 @@ impl TrackerEngine {
         };
 
         let t_total = Instant::now();
-        let path_owned = path.to_string();
 
         if let Ok(meta) = std::fs::metadata(path) {
             let current_size = meta.len();
             if let Some(&cached_size) = self.file_sizes.get(path) {
                 if current_size == cached_size {
-                    let act = self.activity.entry(path_owned).or_insert(FileActivity {
-                        state, last_active: now, last_checked: now,
-                    });
-                    act.last_checked = now;
-                    act.state = state;
+                    // Avoid path.to_string() allocation: use get_mut for existing entries
+                    if let Some(act) = self.activity.get_mut(path) {
+                        act.last_checked = now;
+                        act.state = state;
+                    } else {
+                        self.activity.insert(path.to_string(), FileActivity {
+                            state, last_active: now, last_checked: now,
+                        });
+                    }
                     debug_log_verbose!("process_file {} -- size unchanged ({}B), {} ({}us)",
                         path, current_size,
                         if state == FileState::Active { "Active" } else { "Idle" },
@@ -428,6 +437,8 @@ impl TrackerEngine {
                 }
             }
         }
+
+        let path_owned = path.to_string();
 
         let t0 = Instant::now();
         let offset = self.determine_offset(path)?;
@@ -509,21 +520,26 @@ impl TrackerEngine {
         };
 
         let t_total = Instant::now();
-        let path_owned = path.to_string();
 
         if let Ok(meta) = std::fs::metadata(path) {
             let current_size = meta.len();
             if let Some(&cached_size) = self.file_sizes.get(path) {
                 if current_size == cached_size {
-                    let act = self.activity.entry(path_owned).or_insert(FileActivity {
-                        state, last_active: now, last_checked: now,
-                    });
-                    act.last_checked = now;
-                    act.state = state;
+                    // Avoid path.to_string() allocation: use get_mut for existing entries
+                    if let Some(act) = self.activity.get_mut(path) {
+                        act.last_checked = now;
+                        act.state = state;
+                    } else {
+                        self.activity.insert(path.to_string(), FileActivity {
+                            state, last_active: now, last_checked: now,
+                        });
+                    }
                     return Ok(Vec::new());
                 }
             }
         }
+
+        let path_owned = path.to_string();
 
         let t0 = Instant::now();
         let offset = self.determine_offset(path)?;
@@ -593,7 +609,7 @@ impl TrackerEngine {
                     let (usage, _ts) = event.into_usage_event();
                     self.sink.emit_event(&usage, None);
 
-                    let op = DbOp::WriteEvent {
+                    let op = DbOp::WriteEvent(Box::new(WriteEventData {
                         ts_ms,
                         message_id: usage.event_key,
                         model: usage.model,
@@ -606,7 +622,7 @@ impl TrackerEngine {
                             cache_creation_input_tokens: usage.cache_creation_input_tokens,
                             cache_read_input_tokens: usage.cache_read_input_tokens,
                         },
-                    };
+                    }));
                     // Use blocking send to apply backpressure instead of dropping events
                     if let Err(e) = db_tx.send(op) {
                         debug_log!("writer channel closed: {}", e);
@@ -643,7 +659,7 @@ impl TrackerEngine {
                     let (usage, _ts) = event.into_usage_event();
                     self.sink.emit_event(&usage, None);
 
-                    let op = DbOp::WriteEvent {
+                    let op = DbOp::WriteEvent(Box::new(WriteEventData {
                         ts_ms,
                         message_id: usage.event_key,
                         model: usage.model,
@@ -656,7 +672,7 @@ impl TrackerEngine {
                             cache_creation_input_tokens: usage.cache_creation_input_tokens,
                             cache_read_input_tokens: usage.cache_read_input_tokens,
                         },
-                    };
+                    }));
                     if let Some(tx) = self.channels.values().next() {
                         // Use blocking send to apply backpressure instead of dropping events
                         if let Err(e) = tx.send(op) {
