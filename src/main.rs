@@ -566,7 +566,7 @@ fn run_daemon_foreground(config: &Config) {
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 
-    eprintln!("\n[toki:daemon] Shutting down...");
+    eprintln!("\n[toki:daemon] Shutting down... (press Ctrl+C again to force)");
     let _ = listener_stop_tx.send(());
     let _ = listener_handle.join();
     handle.stop();
@@ -1064,5 +1064,9 @@ fn parse_weekday(s: &str) -> Weekday {
 }
 
 extern "C" fn sighandler(_: libc::c_int) {
+    if !RUNNING.load(Ordering::Relaxed) {
+        // Second signal — force exit immediately
+        std::process::exit(1);
+    }
     RUNNING.store(false, Ordering::Relaxed);
 }
