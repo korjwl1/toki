@@ -187,19 +187,18 @@ impl TrackerEngine {
                         parser_project_name = Some(pn.as_str().into());
                     }
 
-                    // Accumulate summary
-                    let summary = local.entry(parsed.model.clone()).or_insert_with(|| ModelUsageSummary {
+                    // Accumulate summary + build event in one pass (zero clone)
+                    let model_key = parsed.model.clone(); // clone before move for HashMap key
+                    let summary = local.entry(model_key).or_insert_with(|| ModelUsageSummary {
                         model: parsed.model.clone(),
                         ..Default::default()
                     });
-                    parsed.accumulate_summary(summary);
 
-                    // Use parser-provided project name, falling back to path-based extraction
                     let effective_project = parser_project_name.clone()
                         .or_else(|| path_project_name.clone());
 
-                    // Build ColdStartEvent
-                    file_events.push(parsed.to_cold_start_event(
+                    file_events.push(parsed.into_summary_and_event(
+                        summary,
                         std::sync::Arc::clone(&session_id),
                         std::sync::Arc::clone(&source_file),
                         effective_project,
@@ -288,13 +287,14 @@ impl TrackerEngine {
             let project_name: Option<std::sync::Arc<str>> = crate::providers::claude_code::extract_project_name(path).map(|s| s.into());
             let result = process_lines_streaming(path, offset, |line| {
                 if let Some(parsed) = cs_parser.parse_for_cold_start(line) {
-                    let summary = local.entry(parsed.model.clone()).or_insert_with(|| ModelUsageSummary {
+                    let model_key = parsed.model.clone();
+                    let summary = local.entry(model_key).or_insert_with(|| ModelUsageSummary {
                         model: parsed.model.clone(),
                         ..Default::default()
                     });
-                    parsed.accumulate_summary(summary);
 
-                    file_events.push(parsed.to_cold_start_event(
+                    file_events.push(parsed.into_summary_and_event(
+                        summary,
                         std::sync::Arc::clone(&session_id),
                         std::sync::Arc::clone(&source_file),
                         project_name.clone(),

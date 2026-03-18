@@ -334,6 +334,9 @@ def run_daemon_cold_start(toki: str, data_path: Path) -> BenchResult:
 
     Returns BenchResult with cold start timing. Daemon keeps running for report benchmarks.
     """
+    # Ensure no daemon is already running
+    stop_daemon(toki)
+
     # Reset DB and set claude_code_root to benchmark data path
     subprocess.run(
         [toki, "daemon", "reset"],
@@ -387,10 +390,11 @@ def run_daemon_cold_start(toki: str, data_path: Path) -> BenchResult:
         with open(log_path, "r") as f:
             for line in f:
                 if "cold_start" in line and "total:" in line:
-                    # Format: cold_start — ... (parse: Xµs, db_wait: Yµs, total: Zµs)
-                    m_total = re.search(r'total:\s*(\d+)µs', line)
-                    m_parse = re.search(r'parse:\s*(\d+)µs', line)
-                    m_db = re.search(r'db_wait:\s*(\d+)µs', line)
+                    # Format: cold_start[provider] -- ... (parse: Xus, db_wait: Yus, total: Zus)
+                    # Accept both µs (unicode) and us (ascii)
+                    m_total = re.search(r'total:\s*(\d+)[uµ]s', line)
+                    m_parse = re.search(r'parse:\s*(\d+)[uµ]s', line)
+                    m_db = re.search(r'db_wait:\s*(\d+)[uµ]s', line)
                     if m_total:
                         elapsed = int(m_total.group(1)) / 1_000_000
                     if m_parse:
@@ -416,20 +420,50 @@ def run_daemon_cold_start(toki: str, data_path: Path) -> BenchResult:
         **s,
     )
 
-    # DB size (default path)
-    default_db = Path.home() / ".config" / "toki" / "toki.fjall"
-    result.db_size_mb = round(get_dir_size_bytes(default_db) / 1024 / 1024, 2) if default_db.exists() else 0.0
+    # DB size (per-provider path)
+    db_dir = Path.home() / ".config" / "toki"
+    total_db_bytes = 0
+    for db_name in ["claude_code.fjall", "codex.fjall", "toki.fjall"]:
+        db_path = db_dir / db_name
+        if db_path.exists():
+            total_db_bytes += get_dir_size_bytes(db_path)
+    result.db_size_mb = round(total_db_bytes / 1024 / 1024, 2)
 
     return result
 
 
 def stop_daemon(toki: str):
-    """Stop the running daemon."""
+    """Stop the running daemon and wait for full cleanup."""
     subprocess.run(
         [toki, "daemon", "stop"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-    time.sleep(0.3)
+    # Wait for daemon to fully release lock files
+    lock_path = Path.home() / ".config" / "toki" / "toki.lock"
+    for _ in range(20):  # up to 2 seconds
+        time.sleep(0.1)
+        # Check daemon is truly gone
+        result = subprocess.run(
+            [toki, "daemon", "status"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        output = (result.stdout + result.stderr).decode()
+        if "not running" in output.lower():
+            # Also remove stale lock file if present
+            if lock_path.exists():
+                try:
+                    lock_path.unlink()
+                except OSError:
+                    pass
+            return
+    # Force kill as last resort
+    subprocess.run(["pkill", "-f", "toki daemon"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(0.5)
+    if lock_path.exists():
+        try:
+            lock_path.unlink()
+        except OSError:
+            pass
 
 
 
@@ -546,9 +580,11 @@ def cmd_run(args):
     print(f"Runs per scenario: {runs}")
 
     # Count total runs
-    # toki: cold_start × runs + len(SCENARIOS) × runs reports per data set
+    # toki: cold_start × runs + len(SCENARIOS) × runs reports (cold disk)
+    #       + len(SCENARIOS) × 3 reports (warm disk)
     # ccusage/zzusage: len(SCENARIOS) × runs per data set
-    toki_runs_per_ds = (runs + len(SCENARIOS) * runs) if toki else 0
+    warm_runs = 3
+    toki_runs_per_ds = (runs + len(SCENARIOS) * runs + len(SCENARIOS) * warm_runs) if toki else 0
     cc_runs_per_ds = (len(SCENARIOS) * runs) if ccusage else 0
     zz_scenarios = sum(1 for _, _, _, zz in SCENARIOS if zz or _ == "total")
     zz_runs_per_ds = (zz_scenarios * runs) if zzusage else 0
@@ -596,7 +632,7 @@ def cmd_run(args):
                 if i < runs:
                     stop_daemon(toki)
 
-            # Phase 2: reports while daemon is running (last cold start's daemon still up)
+            # Phase 2a: reports with disk cache purged (cold disk)
             for scenario_name, toki_args, _, _ in SCENARIOS:
                 for i in range(1, runs + 1):
                     run_idx += 1
@@ -616,6 +652,27 @@ def cmd_run(args):
 
                     status = "OK" if r2.exit_code == 0 else f"EXIT={r2.exit_code}"
                     print(f"  {r2.wall_time_s:7.3f}s  {r2.peak_rss_mb:6.1f}MB  {status}")
+
+            # Phase 2b: reports with warm disk cache (no purge, 3 runs)
+            # This measures best-case latency when TSDB pages are in OS cache.
+            warm_runs = 3
+            for scenario_name, toki_args, _, _ in SCENARIOS:
+                for i in range(1, warm_runs + 1):
+                    run_idx += 1
+                    tag = f"[{run_idx}/{total_runs}]"
+                    print(f"  {tag} toki(warm) | {label:8s} | {scenario_name:8s} | run {i}", end="", flush=True)
+
+                    cmd = [toki, "report", "--no-cost"] + toki_args
+                    r3 = run_once(cmd)
+                    r3.tool = "toki_warm"
+                    r3.data_label = label
+                    r3.data_size_mb = size_mb
+                    r3.scenario = scenario_name
+                    r3.run = i
+                    results.append(r3)
+
+                    status = "OK" if r3.exit_code == 0 else f"EXIT={r3.exit_code}"
+                    print(f"  {r3.wall_time_s:7.3f}s  {r3.peak_rss_mb:6.1f}MB  {status}")
 
             # Stop daemon
             stop_daemon(toki)
@@ -670,12 +727,6 @@ def cmd_run(args):
     # Save results
     json_path = save_results(results)
     print_summary(results)
-
-    # Auto-generate charts
-    print("\n=== Generating Charts ===")
-    charts = generate_charts(json_path)
-    if charts:
-        print(f"\n{len(charts)} chart files saved to {RESULTS_DIR / 'charts'}/")
 
 
 def save_results(results: list[BenchResult]) -> Path:
@@ -890,6 +941,9 @@ def generate_charts(json_path: Path) -> list[Path]:
         ("toki", "val"):   {"color": "#e74c3c", "ls": "-",  "marker": "o", "ms": 5, "lw": 2.2, "label": "toki"},
         ("toki", "avg"):   {"color": "#e74c3c", "ls": "-",  "marker": "o", "ms": 5, "lw": 2.2, "label": "toki avg"},
         ("toki", "peak"):  {"color": "#f5a6a0", "ls": "--", "marker": "D", "ms": 4, "lw": 1.6, "label": "toki peak"},
+        ("toki_warm", "val"):   {"color": "#c0392b", "ls": ":",  "marker": "o", "ms": 4, "lw": 1.8, "label": "toki (warm)"},
+        ("toki_warm", "avg"):   {"color": "#c0392b", "ls": ":",  "marker": "o", "ms": 4, "lw": 1.8, "label": "toki (warm) avg"},
+        ("toki_warm", "peak"):  {"color": "#d4a3a0", "ls": ":",  "marker": "D", "ms": 3, "lw": 1.4, "label": "toki (warm) peak"},
         ("ccusage", "val"):  {"color": "#3498db", "ls": "-",  "marker": "s", "ms": 5, "lw": 2.2, "label": "ccusage"},
         ("ccusage", "avg"):  {"color": "#3498db", "ls": "-",  "marker": "s", "ms": 5, "lw": 2.2, "label": "ccusage avg"},
         ("ccusage", "peak"): {"color": "#85c1e9", "ls": "--", "marker": "^", "ms": 4, "lw": 1.6, "label": "ccusage peak"},

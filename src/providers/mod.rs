@@ -120,31 +120,29 @@ impl ColdStartParsed {
         }
     }
 
-    /// Accumulate this parsed data into a ModelUsageSummary.
-    pub fn accumulate_summary(&self, summary: &mut ModelUsageSummary) {
-        let tf = self.to_token_fields();
-        summary.input_tokens += tf.input_tokens;
-        summary.output_tokens += tf.output_tokens;
-        summary.cache_creation_input_tokens += tf.cache_creation_input_tokens;
-        summary.cache_read_input_tokens += tf.cache_read_input_tokens;
-        summary.event_count += 1;
-    }
-
-    /// Build a ColdStartEvent from this parsed data.
-    pub fn to_cold_start_event(
-        &self,
+    /// Accumulate into summary and consume self to build ColdStartEvent (zero clone).
+    pub fn into_summary_and_event(
+        self,
+        summary: &mut ModelUsageSummary,
         session_id: Arc<str>,
         source_file: Arc<str>,
         project_name: Option<Arc<str>>,
     ) -> ColdStartEvent {
+        let tokens = self.to_token_fields();
+        summary.input_tokens += tokens.input_tokens;
+        summary.output_tokens += tokens.output_tokens;
+        summary.cache_creation_input_tokens += tokens.cache_creation_input_tokens;
+        summary.cache_read_input_tokens += tokens.cache_read_input_tokens;
+        summary.event_count += 1;
+
         ColdStartEvent {
             ts_ms: self.ts_ms,
-            message_id: self.event_key.clone(),
-            model: self.model.clone(),
+            message_id: self.event_key,   // move, no clone
+            model: self.model,            // move, no clone
             session_id,
             source_file,
             project_name,
-            tokens: self.to_token_fields(),
+            tokens,                       // reuse, no second to_token_fields()
         }
     }
 }
