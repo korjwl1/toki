@@ -29,20 +29,28 @@ pub fn stop_daemon(pidfile: &std::path::Path, sock: &std::path::Path) -> Result<
             }
             // Send SIGTERM for graceful shutdown
             unsafe { libc::kill(pid as i32, libc::SIGTERM); }
-            // Wait for process to exit (up to 3s)
+
+            // Wait for process to actually exit (up to 10s graceful, then SIGKILL)
             let mut exited = false;
-            for _ in 0..30 {
+            for i in 0..100 {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 if unsafe { libc::kill(pid as i32, 0) != 0 } {
                     exited = true;
                     break;
                 }
+                // After 10s, escalate to SIGKILL
+                if i == 99 {
+                    eprintln!("[toki] Graceful shutdown timed out, forcing...");
+                    unsafe { libc::kill(pid as i32, libc::SIGKILL); }
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    exited = unsafe { libc::kill(pid as i32, 0) != 0 };
+                }
             }
+
             if !exited {
-                // Force kill if still alive
-                unsafe { libc::kill(pid as i32, libc::SIGKILL); }
-                std::thread::sleep(std::time::Duration::from_millis(200));
+                eprintln!("[toki] Warning: process {} may still be alive", pid);
             }
+
             remove_pidfile(pidfile);
             let _ = std::fs::remove_file(sock);
             Ok(true)
