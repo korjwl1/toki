@@ -167,43 +167,76 @@ impl TrackerEngine {
         let cp_batch: Mutex<Vec<FileCheckpoint>> = Mutex::new(Vec::new());
         let event_count: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
+        // Macro for the per-event accumulation logic (shared across provider branches).
+        // This avoids code duplication while keeping the entire parse→emit chain generic/inlinable.
+        macro_rules! handle_parsed {
+            ($parsed:expr, $local:expr, $file_events:expr,
+             $parser_project_name:expr, $path_project_name:expr,
+             $session_id:expr, $source_file:expr) => {
+                if let Some(ref pn) = $parsed.project_name {
+                    $parser_project_name = Some(pn.as_str().into());
+                }
+                let model_key = $parsed.model.clone();
+                let summary = $local.entry(model_key).or_insert_with(|| ModelUsageSummary {
+                    model: $parsed.model.clone(),
+                    ..Default::default()
+                });
+                let effective_project = $parser_project_name.clone()
+                    .or_else(|| $path_project_name.clone());
+                $file_events.push($parsed.into_summary_and_event(
+                    summary,
+                    std::sync::Arc::clone(&$session_id),
+                    std::sync::Arc::clone(&$source_file),
+                    effective_project,
+                ));
+            };
+        }
+
+        let provider_name = provider.name().to_string();
         parallel_scan(&sessions, &self.checkpoints, |path, offset| {
             let mut local: HashMap<String, ModelUsageSummary> = HashMap::new();
             let mut file_events: Vec<ColdStartEvent> = Vec::new();
             let session_id: std::sync::Arc<str> = provider.extract_session_id(path).unwrap_or_default().into();
             let source_file: std::sync::Arc<str> = path.into();
-            // Path-based project name (used by Claude Code); Codex returns None here.
             let path_project_name: Option<std::sync::Arc<str>> = provider
                 .extract_project_name(path)
                 .map(|s| s.into());
-            // Track the last parser-provided project name (e.g., from Codex session_meta cwd).
             let mut parser_project_name: Option<std::sync::Arc<str>> = None;
 
-            // Use scan_file_cold_start which providers override with concrete types
-            // for inlining (no dyn dispatch overhead on the hot path).
-            let result = provider.scan_file_cold_start(path, offset, &mut |parsed| {
-                // Update parser-provided project name if present
-                if let Some(ref pn) = parsed.project_name {
-                    parser_project_name = Some(pn.as_str().into());
+            // Dispatch by provider name so the entire parse→emit chain is
+            // concrete/generic — no dyn dispatch anywhere in the hot path.
+            // New providers: add a branch here.
+            let result = match provider_name.as_str() {
+                "claude_code" => {
+                    let parser = crate::providers::claude_code::ClaudeCodeParser;
+                    process_lines_streaming(path, offset, |line| {
+                        if let Some(parsed) = parser.parse_for_cold_start(line) {
+                            handle_parsed!(parsed, local, file_events,
+                                parser_project_name, path_project_name,
+                                session_id, source_file);
+                        }
+                    })
                 }
-
-                // Accumulate summary + build event in one pass (zero clone)
-                let model_key = parsed.model.clone(); // clone before move for HashMap key
-                let summary = local.entry(model_key).or_insert_with(|| ModelUsageSummary {
-                    model: parsed.model.clone(),
-                    ..Default::default()
-                });
-
-                let effective_project = parser_project_name.clone()
-                    .or_else(|| path_project_name.clone());
-
-                file_events.push(parsed.into_summary_and_event(
-                    summary,
-                    std::sync::Arc::clone(&session_id),
-                    std::sync::Arc::clone(&source_file),
-                    effective_project,
-                ));
-            });
+                "codex" => {
+                    let mut parser = crate::providers::codex::parser::CodexFileParser::new();
+                    process_lines_streaming(path, offset, |line| {
+                        if let Some(parsed) = <crate::providers::codex::parser::CodexFileParser
+                            as crate::providers::FileParser>::parse_line(&mut parser, line) {
+                            handle_parsed!(parsed, local, file_events,
+                                parser_project_name, path_project_name,
+                                session_id, source_file);
+                        }
+                    })
+                }
+                _ => {
+                    // Fallback for unknown providers: dyn dispatch
+                    provider.scan_file_cold_start(path, offset, &mut |parsed| {
+                        handle_parsed!(parsed, local, file_events,
+                            parser_project_name, path_project_name,
+                            session_id, source_file);
+                    })
+                }
+            };
             if !local.is_empty() {
                 let mut s = summaries.lock().unwrap_or_else(|e| e.into_inner());
                 merge_summaries(&mut s, local);
