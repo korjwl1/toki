@@ -270,29 +270,39 @@ impl Sink for PrintSink {
         println!("{table}");
     }
 
-    fn emit_event(&self, event: &UsageEvent, pricing: Option<&PricingTable>) {
+    fn emit_event(&self, event: &UsageEvent, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
         if self.format == OutputFormat::Json {
-            let json = json::event_to_json(event, pricing);
+            let json = json::event_to_json(event, pricing, schema);
             println!("{}", serde_json::to_string(&json).unwrap_or_default());
             return;
         }
 
+        let schema = effective_schema(schema);
+        let columns = schema.columns();
         let cost = pricing.and_then(|p| p.event_cost(event));
         let label = format_source_label(&event.source_file);
+
+        // Build token summary from schema columns
+        let summary = crate::common::types::ModelUsageSummary {
+            model: event.model.clone(),
+            input_tokens: event.input_tokens,
+            output_tokens: event.output_tokens,
+            cache_creation_input_tokens: event.cache_creation_input_tokens,
+            cache_read_input_tokens: event.cache_read_input_tokens,
+            event_count: 0,
+            cost_usd: None,
+        };
+        let tokens = schema.extract_tokens(&summary);
+        let parts: Vec<String> = columns.iter().zip(tokens.iter())
+            .map(|(col, &val)| {
+                let short = col.header.replace('\n', "").chars().take(3).collect::<String>().to_lowercase();
+                format!("{}:{}", short, val)
+            })
+            .collect();
+
         match cost {
-            Some(c) => println!(
-                "[toki] {} | {} | in:{} cc:{} cr:{} out:{} | {}",
-                event.model, label,
-                event.input_tokens, event.cache_creation_input_tokens,
-                event.cache_read_input_tokens, event.output_tokens,
-                format_cost(Some(c)),
-            ),
-            None => println!(
-                "[toki] {} | {} | in:{} cc:{} cr:{} out:{}",
-                event.model, label,
-                event.input_tokens, event.cache_creation_input_tokens,
-                event.cache_read_input_tokens, event.output_tokens,
-            ),
+            Some(c) => println!("[toki] {} | {} | {} | {}", event.model, label, parts.join(" "), format_cost(Some(c))),
+            None => println!("[toki] {} | {} | {}", event.model, label, parts.join(" ")),
         }
     }
 }

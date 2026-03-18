@@ -65,21 +65,30 @@ pub(crate) fn grouped_to_json(
 }
 
 /// Build JSON payload for a single watch-mode event.
-/// TODO: Field names are hardcoded to Claude Code defaults (cache_creation_input_tokens,
-/// cache_read_input_tokens). In watch mode, events arrive one at a time from a single
-/// provider, but the schema isn't available here. Fixing this would require threading
-/// the schema through the Sink trait's emit_event, which cascades everywhere for
-/// minimal benefit since watch mode is provider-specific anyway.
-pub(crate) fn event_to_json(event: &UsageEvent, pricing: Option<&PricingTable>) -> serde_json::Value {
+pub(crate) fn event_to_json(event: &UsageEvent, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) -> serde_json::Value {
+    let schema = schema.unwrap_or(&ClaudeCodeSchema);
+    let columns = schema.columns();
+    let summary = crate::common::types::ModelUsageSummary {
+        model: event.model.clone(),
+        input_tokens: event.input_tokens,
+        output_tokens: event.output_tokens,
+        cache_creation_input_tokens: event.cache_creation_input_tokens,
+        cache_read_input_tokens: event.cache_read_input_tokens,
+        event_count: 0,
+        cost_usd: None,
+    };
+    let tokens = schema.extract_tokens(&summary);
+
     let cost = pricing.and_then(|p| p.event_cost(event));
     let mut data = serde_json::json!({
         "model": event.model,
         "source": format_source_label(&event.source_file),
-        "input_tokens": event.input_tokens,
-        "output_tokens": event.output_tokens,
-        "cache_creation_input_tokens": event.cache_creation_input_tokens,
-        "cache_read_input_tokens": event.cache_read_input_tokens,
     });
+    for (i, col) in columns.iter().enumerate() {
+        if i < tokens.len() {
+            data[col.json_key] = serde_json::json!(tokens[i]);
+        }
+    }
     if let Some(c) = cost {
         data["cost_usd"] = serde_json::json!(c);
     }

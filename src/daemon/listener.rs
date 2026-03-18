@@ -241,8 +241,8 @@ impl crate::sink::Sink for CollectorSink {
         self.collected.lock().unwrap_or_else(|e| e.into_inner()).push(json);
     }
 
-    fn emit_event(&self, event: &crate::common::types::UsageEvent, pricing: Option<&crate::pricing::PricingTable>) {
-        let json = crate::sink::json::event_to_json(event, pricing);
+    fn emit_event(&self, event: &crate::common::types::UsageEvent, pricing: Option<&crate::pricing::PricingTable>, _schema: Option<&dyn crate::common::schema::ProviderSchema>) {
+        let json = crate::sink::json::event_to_json(event, pricing, _schema);
         self.collected.lock().unwrap_or_else(|e| e.into_inner()).push(json);
     }
 

@@ -66,8 +66,8 @@ impl Sink for UdsSink {
         self.send(&json::grouped_to_json(grouped, type_name, pricing, schema));
     }
 
-    fn emit_event(&self, event: &UsageEvent, pricing: Option<&PricingTable>) {
-        self.send(&json::event_to_json(event, pricing));
+    fn emit_event(&self, event: &UsageEvent, pricing: Option<&PricingTable>, _schema: Option<&dyn ProviderSchema>) {
+        self.send(&json::event_to_json(event, pricing, _schema));
     }
 
     fn emit_list(&self, items: &[String], type_name: &str) {

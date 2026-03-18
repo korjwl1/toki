@@ -63,8 +63,8 @@ impl BroadcastSink {
 }
 
 impl Sink for BroadcastSink {
-    fn emit_event(&self, event: &UsageEvent, pricing: Option<&PricingTable>) {
-        let json = event_to_json(event, pricing);
+    fn emit_event(&self, event: &UsageEvent, pricing: Option<&PricingTable>, _schema: Option<&dyn ProviderSchema>) {
+        let json = event_to_json(event, pricing, _schema);
         self.broadcast(&json);
     }
 
@@ -84,8 +84,8 @@ impl Sink for BroadcastSink {
 }
 
 impl Sink for std::sync::Arc<BroadcastSink> {
-    fn emit_event(&self, event: &UsageEvent, pricing: Option<&PricingTable>) {
-        (**self).emit_event(event, pricing);
+    fn emit_event(&self, event: &UsageEvent, pricing: Option<&PricingTable>, _schema: Option<&dyn ProviderSchema>) {
+        (**self).emit_event(event, pricing, _schema);
     }
 
     fn emit_summary(&self, summaries: &HashMap<String, ModelUsageSummary>, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {

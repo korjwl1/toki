@@ -781,7 +781,7 @@ fn handle_trace(config: &Config, sink_specs: &[String], output_format: toki::sin
         match v["type"].as_str() {
             Some("event") => {
                 if let Ok(event) = serde_json::from_value::<toki::UsageEvent>(v["data"].take()) {
-                    sink.emit_event(&event, pricing.as_ref());
+                    sink.emit_event(&event, pricing.as_ref(), None);
                 }
             }
             Some("summary") => {

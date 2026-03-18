@@ -266,8 +266,9 @@ impl TrackerEngine {
             self.checkpoints.insert(cp.file_path.clone(), cp.clone());
         }
 
-        // Emit summary
-        self.sink.emit_summary(&result_summaries, None, None);
+        // Emit summary with provider-appropriate schema
+        let schema = crate::common::schema::schema_for_provider(provider.name());
+        self.sink.emit_summary(&result_summaries, None, Some(schema));
 
         // Signal writer to flush accumulated rollups, then wait for completion
         let (done_tx, done_rx) = crossbeam_channel::bounded(1);
@@ -592,12 +593,12 @@ impl TrackerEngine {
     }
 
     fn process_and_print_provider(&mut self, path: &str, provider: &dyn Provider, db_tx: &Sender<DbOp>) {
+        let event_schema = crate::common::schema::schema_for_provider(provider.name());
         match self.process_file_with_ts_dyn(path, provider.parser_with_ts(), provider.name()) {
             Ok(events) => {
                 let session_id = provider.extract_session_id(path).unwrap_or_default();
                 let project_name = provider.extract_project_name(path).map(|s| s.to_string());
                 for event in events {
-                    // Use fast parse_ts_to_ms (~0.1us) instead of chrono parse (~3-5us)
                     let ts_ms = crate::common::time::parse_ts_to_ms(&event.timestamp)
                         .unwrap_or_else(|| {
                             std::time::SystemTime::now()
@@ -607,7 +608,7 @@ impl TrackerEngine {
                         });
 
                     let (usage, _ts) = event.into_usage_event();
-                    self.sink.emit_event(&usage, None);
+                    self.sink.emit_event(&usage, None, Some(event_schema));
 
                     let op = DbOp::WriteEvent(Box::new(WriteEventData {
                         ts_ms,
@@ -657,7 +658,7 @@ impl TrackerEngine {
                         });
 
                     let (usage, _ts) = event.into_usage_event();
-                    self.sink.emit_event(&usage, None);
+                    self.sink.emit_event(&usage, None, None);
 
                     let op = DbOp::WriteEvent(Box::new(WriteEventData {
                         ts_ms,
