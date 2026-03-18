@@ -113,7 +113,8 @@ Pricing is loaded by the client from the file cache (`~/.config/toki/pricing.jso
 9. Wait for SIGTERM/SIGINT
 ```
 
-The daemon starts with `toki daemon start` with no additional options. Settings like socket path, Claude Code root, etc. are managed via `toki settings` TUI and applied with `toki daemon restart`.
+The daemon starts with `toki daemon start`, which detaches to the background by default. Use `--foreground` for debug logging. Settings like socket path, Claude Code root, etc. are managed via `toki settings` TUI and applied with `toki daemon restart`.
+Providers are managed with `toki settings set providers --add/--remove`.
 To rebuild the DB from scratch, use `toki daemon reset` followed by `toki daemon start`.
 
 ## Shutdown Sequence

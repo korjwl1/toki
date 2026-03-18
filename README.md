@@ -172,7 +172,7 @@ toki settings set providers --add claude_code
 toki settings set providers --add codex    # optional: add Codex CLI support
 toki settings get providers                 # show enabled providers
 
-# 1. Start the daemon (foreground, Ctrl+C to stop)
+# 1. Start the daemon (detaches to background by default)
 toki daemon start
 
 # 2. In another terminal — real-time event stream
@@ -187,7 +187,6 @@ toki report monthly
 # 4. PromQL-style queries
 toki report query 'usage{model="claude-opus-4-6"}[1h] by (model)'
 toki report query 'usage{provider="codex"} by (model)'
-toki report query 'usage by (provider)'
 toki report query 'sessions{project="myapp"}'
 ```
 
@@ -198,7 +197,8 @@ toki report query 'sessions{project="myapp"}'
 ### Daemon
 
 ```bash
-toki daemon start       # Start (foreground)
+toki daemon start       # Start (background)
+toki daemon start --foreground  # Foreground mode (for debug)
 toki daemon stop        # Stop
 toki daemon restart     # Restart (reload settings)
 toki daemon status      # Check status
@@ -231,7 +231,6 @@ toki report --provider codex daily --since 20260301
 # PromQL-style queries
 toki report query 'usage{model="claude-opus-4-6"}[1h] by (model)'
 toki report query 'usage{provider="codex"} by (model)'
-toki report query 'usage by (provider)'
 toki report query 'usage{session="4de9", since="20260301"} by (session)'
 toki report query 'sessions{project="myapp"}'
 toki report query 'projects'
@@ -272,7 +271,7 @@ metric{filters}[bucket] by (dimensions)
 | metric | `usage`, `sessions`, `projects` | `usage` |
 | filters | `key="value"` pairs, comma-separated | `{model="claude-opus-4-6", since="20260301"}` |
 | bucket | Time bucket (s/m/h/d/w) | `[1h]`, `[5m]`, `[1d]` |
-| dimensions | Group by (model/session/project/provider) | `by (model, provider)` |
+| dimensions | Group by (model/session/project) | `by (model, session)` |
 
 Filter keys: `model`, `session`, `project`, `provider`, `since`, `until`
 

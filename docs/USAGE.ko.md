@@ -14,7 +14,7 @@ toki는 데몬/클라이언트 구조로 동작한다:
 - **`daemon start`**: 서버 프로세스. cold start 후 파일 감시 + TSDB 저장
 - **`daemon stop/restart/status`**: 데몬 관리
 - **`daemon reset`**: DB 전체 삭제 및 초기화
-- **`provider add/remove/list`**: provider 관리 (Claude Code, Codex CLI 등)
+- **`settings set providers --add/--remove`**: provider 관리 (Claude Code, Codex CLI 등)
 - **`trace`**: 데몬에 연결하여 실시간 이벤트 스트림 수신
 - **`report`**: one-shot TSDB 조회. 데몬이 수집한 데이터를 조회
 
@@ -23,8 +23,11 @@ toki는 데몬/클라이언트 구조로 동작한다:
 ### daemon start
 
 ```bash
-toki daemon start
+toki daemon start              # 백그라운드로 분리 (기본)
+toki daemon start --foreground # 포그라운드 실행 (디버그용)
 ```
+
+기본적으로 백그라운드로 분리된다. 디버그할 때는 `--foreground` 옵션으로 포그라운드에서 실행한다.
 
 1. 설정된 provider의 세션 파일을 스캔 (cold start)
 2. 파싱된 이벤트를 provider별 TSDB에 저장
@@ -232,7 +235,7 @@ metric{filters}[bucket] by (dimensions)
 | `metric` | O | `usage`, `sessions`, `projects` |
 | `{filters}` | X | `key="value"` 쌍, `,`로 구분 |
 | `[bucket]` | X | 시간 버킷: `s`, `m`, `h`, `d`, `w` |
-| `by (dims)` | X | 그룹 기준: `model`, `session`, `project`, `provider` |
+| `by (dims)` | X | 그룹 기준: `model`, `session`, `project` |
 
 필터 키: `model`, `session`, `project`, `provider`, `since`, `until`
 
@@ -250,9 +253,6 @@ toki report query 'usage{since="20260301"}[1h] by (model)'
 
 # Provider 필터 + 모델별 그룹핑
 toki report query 'usage{provider="codex"} by (model)'
-
-# Provider별 그룹핑
-toki report query 'usage by (provider)'
 
 # 세션별 그룹핑 + 시간 범위
 toki report query 'usage{since="20260301", until="20260331"} by (session)'
@@ -477,6 +477,17 @@ toki trace --no-cost
 ```json
 {"type":"event","data":{"model":"claude-opus-4-6","source":"4de9291e","input_tokens":3,"output_tokens":14,"cache_creation_input_tokens":5139,"cache_read_input_tokens":9631,"cost_usd":0.0112}}
 ```
+
+### Provider별 컬럼
+
+provider마다 고유한 토큰 컬럼 스키마를 사용한다. 테이블 헤더와 JSON 키가 provider별로 다르다:
+
+| Provider | 컬럼 | JSON 키 |
+|----------|------|---------|
+| Claude Code | Input, Output, Cache Create, Cache Read | `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens` |
+| Codex CLI | Input, Output, Cached Input, Reasoning Output | `input_tokens`, `output_tokens`, `cached_input_tokens`, `reasoning_output_tokens` |
+
+리포트는 provider별로 독립된 테이블을 출력한다. 컬럼 의미가 다르므로 여러 provider의 결과를 하나의 테이블로 합치지 않는다.
 
 ### UDS/HTTP Sink
 

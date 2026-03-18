@@ -14,7 +14,7 @@ toki operates with a daemon/client architecture:
 - **`daemon start`**: Server process. Cold start followed by file watching + TSDB storage
 - **`daemon stop/restart/status`**: Daemon management
 - **`daemon reset`**: Full DB wipe and reinitialization
-- **`provider add/remove/list`**: Provider management (Claude Code, Codex CLI, etc.)
+- **`settings set providers --add/--remove`**: Provider management (Claude Code, Codex CLI, etc.)
 - **`trace`**: Connect to daemon for real-time event streaming
 - **`report`**: One-shot TSDB query. Retrieves data collected by the daemon
 
@@ -23,8 +23,11 @@ toki operates with a daemon/client architecture:
 ### daemon start
 
 ```bash
-toki daemon start
+toki daemon start              # Detaches to background (default)
+toki daemon start --foreground # Run in foreground (for debugging)
 ```
+
+Detaches to the background by default. Use `--foreground` to keep the process in the foreground for debugging.
 
 1. Scans configured providers' session files (cold start)
 2. Stores parsed events in per-provider TSDB
@@ -232,7 +235,7 @@ metric{filters}[bucket] by (dimensions)
 | `metric` | Yes | `usage`, `sessions`, `projects` |
 | `{filters}` | No | `key="value"` pairs, comma-separated |
 | `[bucket]` | No | Time bucket: `s`, `m`, `h`, `d`, `w` |
-| `by (dims)` | No | Group by: `model`, `session`, `project`, `provider` |
+| `by (dims)` | No | Group by: `model`, `session`, `project` |
 
 Filter keys: `model`, `session`, `project`, `provider`, `since`, `until`
 
@@ -250,9 +253,6 @@ toki report query 'usage{since="20260301"}[1h] by (model)'
 
 # Provider filter + model grouping
 toki report query 'usage{provider="codex"} by (model)'
-
-# Provider grouping
-toki report query 'usage by (provider)'
 
 # Session grouping + time range
 toki report query 'usage{since="20260301", until="20260331"} by (session)'
@@ -476,6 +476,17 @@ Skips pricing data fetch and hides the Cost column.
 ```json
 {"type":"event","data":{"model":"claude-opus-4-6","source":"4de9291e","input_tokens":3,"output_tokens":14,"cache_creation_input_tokens":5139,"cache_read_input_tokens":9631,"cost_usd":0.0112}}
 ```
+
+### Provider-specific Columns
+
+Each provider has its own token column schema. Table headers and JSON keys differ per provider:
+
+| Provider | Columns | JSON Keys |
+|----------|---------|-----------|
+| Claude Code | Input, Output, Cache Create, Cache Read | `input_tokens`, `output_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens` |
+| Codex CLI | Input, Output, Cached Input, Reasoning Output | `input_tokens`, `output_tokens`, `cached_input_tokens`, `reasoning_output_tokens` |
+
+Reports return per-provider tables, each with provider-specific column headers. Multi-provider results are never merged into a single table since the column semantics differ.
 
 ### UDS/HTTP Sink
 

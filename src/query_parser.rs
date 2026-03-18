@@ -179,7 +179,7 @@ impl Query {
 }
 
 const VALID_FILTER_KEYS: &[&str] = &["model", "session", "project", "since", "until", "provider"];
-const VALID_GROUP_KEYS: &[&str] = &["model", "session", "project", "provider"];
+const VALID_GROUP_KEYS: &[&str] = &["model", "session", "project"];
 
 /// Parse a PromQL-like query string.
 pub fn parse(input: &str) -> Result<Query, String> {
@@ -687,15 +687,15 @@ mod tests {
     }
 
     #[test]
-    fn test_group_by_provider() {
-        let q = parse("usage by (provider)").unwrap();
-        assert_eq!(q.group_by, vec!["provider"]);
+    fn test_group_by_provider_rejected() {
+        // "provider" is not a valid group key — per-provider results are implicit
+        assert!(parse("usage by (provider)").is_err());
     }
 
     #[test]
-    fn test_group_by_model_and_provider() {
-        let q = parse("usage by (model, provider)").unwrap();
-        assert_eq!(q.group_by, vec!["model", "provider"]);
+    fn test_group_by_model_and_provider_rejected() {
+        // "provider" is not a valid group key — per-provider results are implicit
+        assert!(parse("usage by (model, provider)").is_err());
     }
 
     #[test]

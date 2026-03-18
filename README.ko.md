@@ -169,7 +169,7 @@ toki settings set providers --add claude_code
 toki settings set providers --add codex    # 선택: Codex CLI 지원 추가
 toki settings get providers                 # 활성화된 provider 확인
 
-# 1. 데몬 시작 (foreground, Ctrl+C으로 종료)
+# 1. 데몬 시작 (기본 백그라운드 실행)
 toki daemon start
 
 # 2. 다른 터미널에서 실시간 이벤트 스트림
@@ -184,7 +184,6 @@ toki report monthly
 # 4. PromQL 스타일 쿼리
 toki report query 'usage{model="claude-opus-4-6"}[1h] by (model)'
 toki report query 'usage{provider="codex"} by (model)'
-toki report query 'usage by (provider)'
 toki report query 'sessions{project="myapp"}'
 ```
 
@@ -195,7 +194,8 @@ toki report query 'sessions{project="myapp"}'
 ### Daemon
 
 ```bash
-toki daemon start       # 데몬 시작 (foreground)
+toki daemon start       # 데몬 시작 (백그라운드)
+toki daemon start --foreground  # 포그라운드 실행 (디버그용)
 toki daemon stop        # 데몬 중지
 toki daemon restart     # 중지 + 재시작 (설정 변경 반영)
 toki daemon status      # 실행 상태 확인
@@ -228,7 +228,6 @@ toki report --provider codex daily --since 20260301
 # PromQL 스타일 쿼리
 toki report query 'usage{model="claude-opus-4-6"}[1h] by (model)'
 toki report query 'usage{provider="codex"} by (model)'
-toki report query 'usage by (provider)'
 toki report query 'usage{session="4de9", since="20260301"} by (session)'
 toki report query 'sessions{project="myapp"}'
 toki report query 'projects'
@@ -269,7 +268,7 @@ metric{filters}[bucket] by (dimensions)
 | metric | `usage`, `sessions`, `projects` | `usage` |
 | filters | `key="value"` 쌍, `,`로 구분 | `{model="claude-opus-4-6", since="20260301"}` |
 | bucket | 시간 버킷 (s/m/h/d/w) | `[1h]`, `[5m]`, `[1d]` |
-| dimensions | 그룹 기준 (model/session/project/provider) | `by (model, provider)` |
+| dimensions | 그룹 기준 (model/session/project) | `by (model, session)` |
 
 필터 키: `model`, `session`, `project`, `provider`, `since`, `until`
 
