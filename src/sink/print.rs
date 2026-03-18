@@ -125,7 +125,12 @@ impl Sink for PrintSink {
             table.add_row(row);
         }
 
-        println!("[toki] Token Usage Summary");
+        let provider_label = schema.provider_name();
+        if provider_label.is_empty() {
+            println!("[toki] Token Usage Summary");
+        } else {
+            println!("[toki] {} — Token Usage Summary", provider_label);
+        }
         println!("{table}");
     }
 
@@ -227,7 +232,12 @@ impl Sink for PrintSink {
         }
         table.add_row(total_row);
 
-        println!("[toki] Token Usage Summary");
+        let provider_label = schema.provider_name();
+        if provider_label.is_empty() {
+            println!("[toki] Token Usage Summary");
+        } else {
+            println!("[toki] {} — Token Usage Summary", provider_label);
+        }
         println!("{table}");
     }
 

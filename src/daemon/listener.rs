@@ -162,9 +162,6 @@ fn execute_report_request(request_line: &str, dbs: &[(String, Arc<Database>)]) -
     let parsed = crate::query_parser::parse(&req.query)
         .map_err(|e| format!("query parse error: {}", e))?;
 
-    // Extract provider filter — handled at DB routing level, not passed to execute_parsed_query
-    let group_by_provider = parsed.group_by.contains(&"provider".to_string());
-
     // Strip "provider" from group_by before passing to per-DB query execution
     // (provider grouping is handled at the DB routing level in the listener)
     let mut parsed = parsed;
@@ -188,330 +185,23 @@ fn execute_report_request(request_line: &str, dbs: &[(String, Arc<Database>)]) -
         return Ok(serde_json::Value::Array(Vec::new()));
     }
 
-    // Schema tag is determined by provider count — the actual ProviderSchema
-    // is resolved client-side from this tag for rendering.
+    // Collect results per provider, each tagged with its schema.
+    // Client iterates the array and renders each provider's table separately.
+    let mut all_results: Vec<serde_json::Value> = Vec::new();
 
-    // Collect results from selected provider DBs
-    let collector = CollectorSink::new();
     for (provider_name, db) in &target_dbs {
+        let collector = CollectorSink::new();
         crate::query::execute_parsed_query(db, &parsed, tz, None, &collector)?;
 
-        // If grouping by provider, tag all collected results with the provider name
-        if group_by_provider {
-            collector.tag_untagged_results(provider_name);
+        let mut provider_results = collector.take();
+        // Tag each result with this provider's schema
+        for item in &mut provider_results {
+            item["schema"] = serde_json::json!(provider_name);
         }
+        all_results.extend(provider_results);
     }
 
-    let results = collector.take();
-
-    // Merge results across providers to avoid duplicate tables
-    let mut merged = if group_by_provider {
-        // When grouping by provider, don't merge — keep results tagged by provider
-        merge_collected_results_by_provider(results)
-    } else if target_dbs.len() > 1 {
-        // Cross-provider merge: only use common fields (input + output)
-        merge_collected_results_combined(results)
-    } else {
-        // Single provider: return as-is, schema tag tells client how to render
-        results
-    };
-
-    // Tag each result with the schema so the CLI can reconstruct it for rendering
-    let schema_tag = if target_dbs.len() == 1 {
-        Some(target_dbs[0].0)
-    } else {
-        None // combined/multi-provider
-    };
-    if let Some(tag) = schema_tag {
-        for item in &mut merged {
-            item["schema"] = serde_json::json!(tag);
-        }
-    }
-
-    Ok(serde_json::Value::Array(merged))
-}
-
-/// Merge collected results from multiple provider DBs using only common fields (input + output).
-/// Used when querying across providers where slot 3/4 have different semantics.
-fn merge_collected_results_combined(results: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
-    if results.len() <= 1 {
-        // Even a single result should be remapped to combined schema
-        return results.into_iter().map(|mut r| {
-            strip_provider_specific_fields(&mut r);
-            r
-        }).collect();
-    }
-
-    let merged = merge_collected_results(results);
-    // Strip provider-specific fields, keep only input_tokens + output_tokens
-    merged.into_iter().map(|mut r| {
-        strip_provider_specific_fields(&mut r);
-        r
-    }).collect()
-}
-
-/// Remove provider-specific token fields from merged results, keeping only common ones.
-fn strip_provider_specific_fields(result: &mut serde_json::Value) {
-    let strip_entry = |entry: &mut serde_json::Value| {
-        if let Some(obj) = entry.as_object_mut() {
-            let input = obj.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-            let output = obj.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-            obj.remove("cache_creation_input_tokens");
-            obj.remove("cache_read_input_tokens");
-            obj.insert("total_tokens".to_string(), serde_json::json!(input + output));
-        }
-    };
-
-    match result["type"].as_str() {
-        Some("summary") => {
-            if let Some(data) = result.get_mut("data").and_then(|d| d.as_array_mut()) {
-                for entry in data.iter_mut() {
-                    strip_entry(entry);
-                }
-            }
-        }
-        Some(t) if t != "sessions" && t != "projects" => {
-            if let Some(data) = result.get_mut("data").and_then(|d| d.as_array_mut()) {
-                for group in data.iter_mut() {
-                    if let Some(usage) = group.get_mut("usage_per_models").and_then(|u| u.as_array_mut()) {
-                        for entry in usage.iter_mut() {
-                            strip_entry(entry);
-                        }
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Merge collected JSON results from multiple provider DBs.
-/// - "summary" results: merge ModelUsageSummary entries by model name (sum numeric fields).
-/// - "sessions"/"projects" list results: concatenate and deduplicate.
-/// - Grouped results: merge by period/bucket key, then by model name within each bucket.
-/// - Other results: pass through as-is.
-fn merge_collected_results(results: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
-    if results.len() <= 1 {
-        return results;
-    }
-
-    // Group results by type
-    let mut summaries: Vec<&serde_json::Value> = Vec::new();
-    let mut lists: std::collections::HashMap<String, Vec<&serde_json::Value>> = std::collections::HashMap::new();
-    let mut grouped: std::collections::HashMap<String, Vec<&serde_json::Value>> = std::collections::HashMap::new();
-    let mut other: Vec<serde_json::Value> = Vec::new();
-
-    for result in &results {
-        match result["type"].as_str() {
-            Some("summary") => summaries.push(result),
-            Some(t) if t == "sessions" || t == "projects" => {
-                lists.entry(t.to_string()).or_default().push(result);
-            }
-            Some(t) => {
-                grouped.entry(t.to_string()).or_default().push(result);
-            }
-            None => other.push(result.clone()),
-        }
-    }
-
-    let mut merged = Vec::new();
-
-    // Merge summary results: combine model summaries across providers
-    if !summaries.is_empty() {
-        let mut model_map: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
-        for summary in &summaries {
-            if let Some(data) = summary["data"].as_array() {
-                for entry in data {
-                    let model = entry["model"].as_str().unwrap_or("unknown").to_string();
-                    use std::collections::hash_map::Entry;
-                    match model_map.entry(model) {
-                        Entry::Vacant(e) => { e.insert(entry.clone()); }
-                        Entry::Occupied(mut e) => { merge_summary_entry_common(e.get_mut(), entry); }
-                    }
-                }
-            }
-        }
-        let mut merged_data: Vec<serde_json::Value> = model_map.into_values().collect();
-        merged_data.sort_by(|a, b| {
-            let ae = a["events"].as_u64().unwrap_or(0);
-            let be = b["events"].as_u64().unwrap_or(0);
-            be.cmp(&ae)
-        });
-        merged.push(serde_json::json!({ "type": "summary", "data": merged_data }));
-    }
-
-    // Merge list results: concatenate and deduplicate
-    for (type_name, items_list) in lists {
-        let mut all_items: Vec<String> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for item in items_list {
-            if let Some(arr) = item["items"].as_array() {
-                for v in arr {
-                    if let Some(s) = v.as_str() {
-                        if seen.insert(s.to_string()) {
-                            all_items.push(s.to_string());
-                        }
-                    }
-                }
-            }
-        }
-        all_items.sort();
-        merged.push(serde_json::json!({ "type": type_name, "items": all_items }));
-    }
-
-    // Merge grouped results: combine by period/bucket key, then merge model entries
-    for (type_name, group_list) in grouped {
-        let mut period_map: std::collections::HashMap<String, std::collections::HashMap<String, serde_json::Value>> =
-            std::collections::HashMap::new();
-        for group in &group_list {
-            if let Some(data) = group["data"].as_array() {
-                for entry in data {
-                    let period = entry["period"].as_str()
-                        .or_else(|| entry["session"].as_str())
-                        .unwrap_or("total")
-                        .to_string();
-                    let models = period_map.entry(period).or_default();
-                    if let Some(usage_arr) = entry["usage_per_models"].as_array() {
-                        for model_entry in usage_arr {
-                            let model = model_entry["model"].as_str().unwrap_or("unknown").to_string();
-                            use std::collections::hash_map::Entry;
-                            match models.entry(model) {
-                                Entry::Vacant(e) => { e.insert(model_entry.clone()); }
-                                Entry::Occupied(mut e) => { merge_summary_entry_common(e.get_mut(), model_entry); }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        let is_session = type_name == "session";
-        let json_key = if is_session { "session" } else { "period" };
-        let mut periods: Vec<String> = period_map.keys().cloned().collect();
-        periods.sort();
-        let data: Vec<serde_json::Value> = periods.into_iter().map(|period| {
-            let models = period_map.remove(&period).unwrap_or_default();
-            let mut model_list: Vec<serde_json::Value> = models.into_values().collect();
-            model_list.sort_by(|a, b| {
-                let ae = a["events"].as_u64().unwrap_or(0);
-                let be = b["events"].as_u64().unwrap_or(0);
-                be.cmp(&ae)
-            });
-            serde_json::json!({ json_key: period, "usage_per_models": model_list })
-        }).collect();
-        merged.push(serde_json::json!({ "type": type_name, "data": data }));
-    }
-
-    merged.extend(other);
-    merged
-}
-
-/// Merge collected results grouped by provider.
-/// Each result is tagged with a "provider" field; we group summaries by provider name
-/// and present them as a grouped result (like time-bucketed, but keyed by provider).
-fn merge_collected_results_by_provider(results: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
-    if results.is_empty() {
-        return results;
-    }
-
-    // Group results by provider, then by type
-    let mut provider_summaries: std::collections::HashMap<String, Vec<serde_json::Value>> = std::collections::HashMap::new();
-    let mut lists: std::collections::HashMap<String, Vec<&serde_json::Value>> = std::collections::HashMap::new();
-    let mut other: Vec<serde_json::Value> = Vec::new();
-
-    for result in &results {
-        let provider = result["provider"].as_str().unwrap_or("unknown").to_string();
-        match result["type"].as_str() {
-            Some("summary") => {
-                if let Some(data) = result["data"].as_array() {
-                    provider_summaries.entry(provider).or_default().extend(data.clone());
-                }
-            }
-            Some(t) if t == "sessions" || t == "projects" => {
-                lists.entry(t.to_string()).or_default().push(result);
-            }
-            _ => other.push(result.clone()),
-        }
-    }
-
-    let mut merged = Vec::new();
-
-    // Convert provider-grouped summaries into a grouped result (like time buckets)
-    if !provider_summaries.is_empty() {
-        let mut data: Vec<serde_json::Value> = Vec::new();
-        let mut providers: Vec<String> = provider_summaries.keys().cloned().collect();
-        providers.sort();
-        for provider in providers {
-            let mut model_map: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
-            for entry in provider_summaries.remove(&provider).unwrap_or_default() {
-                let model = entry["model"].as_str().unwrap_or("unknown").to_string();
-                use std::collections::hash_map::Entry;
-                match model_map.entry(model) {
-                    Entry::Vacant(e) => { e.insert(entry.clone()); }
-                    Entry::Occupied(mut e) => { merge_summary_entry(e.get_mut(), &entry); }
-                }
-            }
-            let mut model_list: Vec<serde_json::Value> = model_map.into_values().collect();
-            model_list.sort_by(|a, b| {
-                let ae = a["events"].as_u64().unwrap_or(0);
-                let be = b["events"].as_u64().unwrap_or(0);
-                be.cmp(&ae)
-            });
-            data.push(serde_json::json!({ "provider": provider, "usage_per_models": model_list }));
-        }
-        merged.push(serde_json::json!({ "type": "provider", "data": data }));
-    }
-
-    // Merge list results: concatenate and deduplicate
-    for (type_name, items_list) in lists {
-        let mut all_items: Vec<String> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for item in items_list {
-            if let Some(arr) = item["items"].as_array() {
-                for v in arr {
-                    if let Some(s) = v.as_str() {
-                        if seen.insert(s.to_string()) {
-                            all_items.push(s.to_string());
-                        }
-                    }
-                }
-            }
-        }
-        all_items.sort();
-        merged.push(serde_json::json!({ "type": type_name, "items": all_items }));
-    }
-
-    merged.extend(other);
-    merged
-}
-
-/// Merge numeric fields from `src` into `dst` (both are JSON model summary entries).
-/// Used within a single provider context where all fields have the same semantics.
-fn merge_summary_entry(dst: &mut serde_json::Value, src: &serde_json::Value) {
-    for field in &["input_tokens", "output_tokens", "cache_creation_input_tokens",
-                    "cache_read_input_tokens", "total_tokens", "events"] {
-        if let (Some(d), Some(s)) = (dst[*field].as_u64(), src[*field].as_u64()) {
-            dst[*field] = serde_json::json!(d + s);
-        }
-    }
-    // Merge cost if both have it
-    if let (Some(d), Some(s)) = (dst["cost_usd"].as_f64(), src["cost_usd"].as_f64()) {
-        dst["cost_usd"] = serde_json::json!(d + s);
-    }
-}
-
-/// Merge only common fields (input_tokens, output_tokens) across providers.
-/// Other slots (cache_creation/cache_read) have different semantics per provider,
-/// so they are summed but may be stripped later by the combined schema.
-fn merge_summary_entry_common(dst: &mut serde_json::Value, src: &serde_json::Value) {
-    for field in &["input_tokens", "output_tokens", "cache_creation_input_tokens",
-                    "cache_read_input_tokens", "total_tokens", "events"] {
-        if let (Some(d), Some(s)) = (dst[*field].as_u64(), src[*field].as_u64()) {
-            dst[*field] = serde_json::json!(d + s);
-        }
-    }
-    if let (Some(d), Some(s)) = (dst["cost_usd"].as_f64(), src["cost_usd"].as_f64()) {
-        dst["cost_usd"] = serde_json::json!(d + s);
-    }
+    Ok(serde_json::Value::Array(all_results))
 }
 
 /// Request payload from report client.
@@ -538,16 +228,6 @@ impl CollectorSink {
         self.collected.into_inner().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Tag all results that don't yet have a "provider" field with the given provider name.
-    /// Used when grouping by provider to attribute results to their source DB.
-    fn tag_untagged_results(&self, provider_name: &str) {
-        let mut collected = self.collected.lock().unwrap_or_else(|e| e.into_inner());
-        for result in collected.iter_mut() {
-            if result.get("provider").is_none() {
-                result["provider"] = serde_json::json!(provider_name);
-            }
-        }
-    }
 }
 
 impl crate::sink::Sink for CollectorSink {
