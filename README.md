@@ -303,7 +303,7 @@ toki settings list                             # List all
 
 | Setting | Description | Default |
 |---------|-------------|---------|
-| Providers | Enabled providers (managed via `toki provider`) | `[]` |
+| Providers | Enabled providers (`toki settings set providers --add/--remove`) | `[]` |
 | Claude Code Root | Claude Code root directory | `~/.claude` |
 | Daemon Socket | Daemon UDS socket path | `~/.config/toki/daemon.sock` |
 | Timezone | IANA timezone (empty = UTC) | *(none)* |
