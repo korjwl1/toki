@@ -122,9 +122,15 @@ struct LiteLLMEntry {
 }
 
 /// On-disk pricing cache format.
+/// Bump this when the parsing logic changes (e.g., adding new provider prefixes).
+/// Forces a full re-fetch even if the server returns 304 Not Modified.
+const PRICING_CACHE_VERSION: u32 = 2;
+
 #[derive(Serialize, Deserialize)]
 struct PricingCache {
     etag: Option<String>,
+    #[serde(default)]
+    version: u32,
     prices: HashMap<String, ModelPricing>,
 }
 
@@ -158,7 +164,14 @@ fn save_cache(path: &Path, cache: &PricingCache) {
 /// Returns (PricingTable, cached_etag).
 pub fn fetch_pricing(cache_path: &Path) -> PricingTable {
     let cached = load_cache(cache_path);
-    let cached_etag = cached.as_ref().and_then(|c| c.etag.clone());
+
+    // Invalidate cache if parser version changed (e.g., added new provider support)
+    let cache_valid = cached.as_ref().map_or(false, |c| c.version == PRICING_CACHE_VERSION);
+    let cached_etag = if cache_valid {
+        cached.as_ref().and_then(|c| c.etag.clone())
+    } else {
+        None // Force full fetch
+    };
 
     // Note: ureq's into_string() enforces a 10 MB default response size limit,
     // which is sufficient for the LiteLLM pricing JSON (~5 MB as of 2025).
@@ -192,7 +205,7 @@ pub fn fetch_pricing(cache_path: &Path) -> PricingTable {
             }
 
             eprintln!("[toki] Pricing: updated, {} models", prices.len());
-            save_cache(cache_path, &PricingCache { etag: new_etag, prices: prices.clone() });
+            save_cache(cache_path, &PricingCache { etag: new_etag, version: PRICING_CACHE_VERSION, prices: prices.clone() });
             PricingTable::new(prices)
         }
         Err(ureq::Error::Status(304, _)) => {
