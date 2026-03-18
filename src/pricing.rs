@@ -92,18 +92,31 @@ fn parse_litellm_json(json_str: &str) -> HashMap<String, ModelPricing> {
             cache_read_input_token_cost: entry.cache_read_input_token_cost,
         };
 
-        // Store with cloud provider prefix stripped (azure/, vertex_ai/, bedrock/, etc.)
-        // CLI tools report bare model names (e.g., "claude-opus-4-6", "gpt-5.2-codex"),
-        // so we only need the stripped version. Nested prefixes are stripped recursively.
+        // Strip cloud provider prefix (azure/, vertex_ai/, bedrock/, etc.)
         let model_name = if key.contains('/') {
-            // Take the last segment after all slashes
             key.rsplit('/').next().unwrap_or(key)
         } else {
             key.as_str()
         };
-        if !model_name.is_empty() {
-            prices.entry(model_name.to_string()).or_insert(pricing);
+        if model_name.is_empty() {
+            continue;
         }
+
+        // Only keep models from providers we support (or plan to support).
+        // Bump PRICING_CACHE_VERSION when adding new provider prefixes.
+        let dominated = model_name.to_lowercase();
+        let dominated = dominated.as_str();
+        let dominated = dominated.starts_with("claude")
+            || dominated.starts_with("gpt-")
+            || dominated.starts_with("o1-") || dominated.starts_with("o1")
+            || dominated.starts_with("o3-") || dominated.starts_with("o3")
+            || dominated.starts_with("o4-") || dominated.starts_with("o4")
+            || dominated.starts_with("gemini");
+        if !dominated {
+            continue;
+        }
+
+        prices.entry(model_name.to_string()).or_insert(pricing);
     }
 
     prices
@@ -125,7 +138,7 @@ struct LiteLLMEntry {
 /// On-disk pricing cache format.
 /// Bump this when the parsing logic changes (e.g., adding new provider prefixes).
 /// Forces a full re-fetch even if the server returns 304 Not Modified.
-const PRICING_CACHE_VERSION: u32 = 3;
+const PRICING_CACHE_VERSION: u32 = 4;
 
 #[derive(Serialize, Deserialize)]
 struct PricingCache {
