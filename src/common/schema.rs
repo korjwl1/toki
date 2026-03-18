@@ -4,6 +4,8 @@ use crate::common::types::ModelUsageSummary;
 pub struct TokenColumn {
     pub header: &'static str,
     pub json_key: &'static str,
+    /// Short label for compact event output (e.g., "in", "out", "cc", "cr")
+    pub short: &'static str,
 }
 
 /// Provider-specific schema for token columns and extraction.
@@ -20,10 +22,10 @@ pub trait ProviderSchema: Send + Sync {
 // ── Claude Code schema ──────────────────────────────────────────────────────
 
 static CLAUDE_CODE_COLUMNS: &[TokenColumn] = &[
-    TokenColumn { header: "Input",          json_key: "input_tokens" },
-    TokenColumn { header: "Output",         json_key: "output_tokens" },
-    TokenColumn { header: "Cache\nCreate",  json_key: "cache_creation_input_tokens" },
-    TokenColumn { header: "Cache\nRead",    json_key: "cache_read_input_tokens" },
+    TokenColumn { header: "Input",          json_key: "input_tokens",                  short: "in" },
+    TokenColumn { header: "Output",         json_key: "output_tokens",                 short: "out" },
+    TokenColumn { header: "Cache\nCreate",  json_key: "cache_creation_input_tokens",   short: "cc" },
+    TokenColumn { header: "Cache\nRead",    json_key: "cache_read_input_tokens",       short: "cr" },
 ];
 
 pub struct ClaudeCodeSchema;
@@ -49,10 +51,10 @@ impl ProviderSchema for ClaudeCodeSchema {
 // ── Codex schema ────────────────────────────────────────────────────────────
 
 static CODEX_COLUMNS: &[TokenColumn] = &[
-    TokenColumn { header: "Input",            json_key: "input_tokens" },
-    TokenColumn { header: "Output",           json_key: "output_tokens" },
-    TokenColumn { header: "Cached\nInput",    json_key: "cached_input_tokens" },
-    TokenColumn { header: "Reasoning\nOutput", json_key: "reasoning_output_tokens" },
+    TokenColumn { header: "Input",            json_key: "input_tokens",              short: "in" },
+    TokenColumn { header: "Output",           json_key: "output_tokens",             short: "out" },
+    TokenColumn { header: "Cached\nInput",    json_key: "cached_input_tokens",       short: "ci" },
+    TokenColumn { header: "Reasoning\nOutput", json_key: "reasoning_output_tokens",  short: "ro" },
 ];
 
 pub struct CodexSchema;

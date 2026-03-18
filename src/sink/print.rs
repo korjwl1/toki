@@ -294,10 +294,7 @@ impl Sink for PrintSink {
         };
         let tokens = schema.extract_tokens(&summary);
         let parts: Vec<String> = columns.iter().zip(tokens.iter())
-            .map(|(col, &val)| {
-                let short = col.header.replace('\n', "").chars().take(3).collect::<String>().to_lowercase();
-                format!("{}:{}", short, val)
-            })
+            .map(|(col, &val)| format!("{}:{}", col.short, val))
             .collect();
 
         match cost {
