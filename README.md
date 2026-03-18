@@ -6,7 +6,7 @@
 
 <p align="center">
   <b>Invisible token usage tracker for AI CLI tools</b><br>
-  Built in Rust. Daemon-powered. 5 MB idle. Reports in 13 ms. Your workflow never notices.
+  Built in Rust. Daemon-powered. 5 MB idle. Reports in 7 ms. Your workflow never notices.
 </p>
 
 <p align="center">
@@ -20,6 +20,18 @@
 ---
 
 > **Engineered, not just coded.** In the age of vibe coding, toki stands apart — every architectural decision was made by a professional systems engineer who knows exactly why each piece exists. The TSDB schema, rollup-on-write strategy, xxHash3 checkpoint recovery, 4-thread daemon model — all designed with intent, built with precision.
+
+---
+
+## Who is this for?
+
+- **Tired of ccusage freezing your terminal?** toki is 14x faster on cold start and 1,700x faster on reports. Your terminal never hangs again — reports come back in 7 ms, not 20 seconds.
+
+- **Want deeper analysis than "total tokens"?** toki gives you per-model, per-session, per-project, per-day breakdowns with PromQL-style queries. Filter by time range, group by any dimension, track costs across multiple AI tools — all from a single command.
+
+- **Don't want to set up OpenTelemetry?** No collector, no config files, no environment variables. Install toki, run it, done. It reads your existing session files directly — including months of historical data from before you installed it.
+
+- **Using multiple AI CLI tools?** toki tracks Claude Code and Codex CLI in a single unified view. Add a provider, and all your token usage is merged. Filter by `--provider` when you need per-tool breakdown.
 
 ---
 
