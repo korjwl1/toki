@@ -114,8 +114,12 @@ enum SettingsCommands {
 
 #[derive(Subcommand)]
 enum DaemonCommands {
-    /// Start the daemon (foreground). Watches files and writes to TSDB.
-    Start,
+    /// Start the daemon. Detaches to background by default.
+    Start {
+        /// Run in foreground (don't detach). Useful for debugging.
+        #[arg(long)]
+        foreground: bool,
+    },
     /// Stop a running daemon
     Stop,
     /// Restart the daemon (stop + start). Picks up settings changes.
@@ -450,6 +454,59 @@ fn stop_running_daemon(config: &Config) -> bool {
     }
 }
 
+fn start_daemon_detached() {
+    let toki_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("toki"));
+
+    // Check if already running
+    let pidfile = toki::daemon::default_pidfile_path();
+    if let Some(pid) = toki::daemon::daemon_status(&pidfile) {
+        eprintln!("[toki] Daemon already running (PID {})", pid);
+        std::process::exit(1);
+    }
+
+    // Spawn detached child with --foreground flag
+    let log_path = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".config/toki/daemon.log");
+
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .unwrap_or_else(|e| {
+            eprintln!("[toki] Failed to open log file {}: {}", log_path.display(), e);
+            std::process::exit(1);
+        });
+
+    let child = std::process::Command::new(&toki_bin)
+        .args(["daemon", "start", "--foreground"])
+        .stdin(std::process::Stdio::null())
+        .stdout(log_file.try_clone().unwrap_or_else(|_| {
+            std::fs::File::open("/dev/null").unwrap()
+        }))
+        .stderr(log_file)
+        .spawn();
+
+    match child {
+        Ok(c) => {
+            // Wait briefly to check it didn't immediately crash
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let pidfile = toki::daemon::default_pidfile_path();
+            if let Some(pid) = toki::daemon::daemon_status(&pidfile) {
+                eprintln!("[toki] Daemon started (PID {})", pid);
+                eprintln!("[toki] Log: {}", log_path.display());
+            } else {
+                eprintln!("[toki] Daemon started (PID {}) — may still be initializing", c.id());
+                eprintln!("[toki] Log: {}", log_path.display());
+            }
+        }
+        Err(e) => {
+            eprintln!("[toki] Failed to start daemon: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
 fn run_daemon_foreground(config: &Config) {
     let sock_path = config.daemon_sock.clone();
     let pidfile = toki::daemon::default_pidfile_path();
@@ -520,8 +577,12 @@ fn run_daemon_foreground(config: &Config) {
 
 fn handle_daemon(command: DaemonCommands, config: &Config) {
     match command {
-        DaemonCommands::Start => {
-            run_daemon_foreground(config);
+        DaemonCommands::Start { foreground } => {
+            if foreground {
+                run_daemon_foreground(config);
+            } else {
+                start_daemon_detached();
+            }
         }
 
         DaemonCommands::Stop => {
@@ -531,7 +592,7 @@ fn handle_daemon(command: DaemonCommands, config: &Config) {
         DaemonCommands::Restart => {
             stop_running_daemon(config);
             RUNNING.store(true, Ordering::Relaxed);
-            run_daemon_foreground(config);
+            start_daemon_detached();
         }
 
         DaemonCommands::Status => {
