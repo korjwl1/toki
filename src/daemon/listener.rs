@@ -34,32 +34,15 @@ pub fn run_listener(
         }
     };
 
-    // Use blocking accept with a read timeout so we can periodically check stop_rx.
-    // Much more efficient than non-blocking + 5ms sleep polling.
-    listener.set_nonblocking(false).ok();
-    // set_read_timeout doesn't exist for UnixListener, but we can set SO_RCVTIMEO
-    // on the underlying socket. Use a short accept timeout via the socket option.
-    use std::os::unix::io::AsRawFd;
-    let timeout = libc::timeval {
-        tv_sec: 0,
-        tv_usec: 100_000, // 100ms
-    };
-    unsafe {
-        libc::setsockopt(
-            listener.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_RCVTIMEO,
-            &timeout as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-        );
-    }
+    // Non-blocking accept with 100ms sleep between attempts.
+    // SO_RCVTIMEO does NOT affect accept() on macOS, so we use non-blocking mode.
+    listener.set_nonblocking(true).ok();
 
     eprintln!("[toki:daemon] Listening on {}", sock_path.display());
 
     let report_thread_count = Arc::new(AtomicUsize::new(0));
 
     loop {
-        // Check for stop signal
         if stop_rx.try_recv().is_ok() {
             break;
         }
@@ -69,12 +52,13 @@ pub fn run_listener(
                 stream.set_nonblocking(false).ok();
                 classify_and_handle(stream, &broadcast, &dbs, &report_thread_count);
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut => {
-                // Timeout expired, loop back to check stop_rx
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // No pending connection — sleep briefly then check stop_rx
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
             Err(e) => {
                 eprintln!("[toki:daemon] Accept error: {}", e);
+                std::thread::sleep(std::time::Duration::from_millis(100));
             }
         }
     }

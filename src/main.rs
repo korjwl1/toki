@@ -627,12 +627,19 @@ fn run_daemon_foreground(config: &Config) {
     }
 
     eprintln!("\n[toki:daemon] Shutting down... (press Ctrl+C again to force)");
+
+    let t0 = std::time::Instant::now();
     let _ = listener_stop_tx.send(());
     let _ = listener_handle.join();
+    eprintln!("[toki:daemon] Listener stopped ({}ms)", t0.elapsed().as_millis());
+
+    let t1 = std::time::Instant::now();
     handle.stop();
+    eprintln!("[toki:daemon] Engine + writers stopped ({}ms)", t1.elapsed().as_millis());
+
     toki::daemon::remove_pidfile(&pidfile);
     let _ = std::fs::remove_file(&sock_path);
-    eprintln!("[toki:daemon] Done.");
+    eprintln!("[toki:daemon] Done (total {}ms).", t0.elapsed().as_millis());
 }
 
 fn handle_daemon(command: DaemonCommands, config: &Config) {
