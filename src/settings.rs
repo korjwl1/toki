@@ -197,7 +197,17 @@ pub fn run_settings() -> bool {
         Dialog::around(main_layout)
             .title("toki settings")
             .button("Save", move |s| {
-                save_settings(s, restart_flag.clone());
+                let flag = restart_flag.clone();
+                s.add_layer(
+                    Dialog::text("Save settings?")
+                        .button("Yes", move |s| {
+                            s.pop_layer(); // close confirm dialog
+                            save_settings(s, flag.clone());
+                        })
+                        .button("No", |s| {
+                            s.pop_layer(); // close confirm dialog only
+                        })
+                );
             })
             .button("Cancel", |s| s.quit())
             .min_width(70)
@@ -320,10 +330,7 @@ fn save_settings(siv: &mut Cursive, restart_flag: std::sync::Arc<std::sync::atom
                 })
         );
     } else {
-        siv.add_layer(Dialog::info("Settings saved.").button("OK", |s| {
-            s.pop_layer();
-            s.quit();
-        }));
+        siv.quit();
     }
 }
 
