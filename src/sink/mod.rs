@@ -18,6 +18,9 @@ use crate::pricing::PricingTable;
 pub trait Sink: Send + Sync {
     fn emit_summary(&self, summaries: &HashMap<String, ModelUsageSummary>, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>);
     fn emit_grouped(&self, grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>, type_name: &str, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>);
+    /// TODO: emit_event lacks a schema parameter — field names in watch mode are hardcoded
+    /// to Claude Code defaults. Adding schema here would cascade to all Sink impls for
+    /// minimal benefit since watch mode is inherently single-provider.
     fn emit_event(&self, event: &UsageEvent, pricing: Option<&PricingTable>);
     fn emit_list(&self, items: &[String], type_name: &str);
 }

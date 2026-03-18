@@ -11,6 +11,8 @@ pub trait ProviderSchema: Send + Sync {
     fn columns(&self) -> &[TokenColumn];
     fn provider_name(&self) -> &str;
     /// Extract token values from ModelUsageSummary in column order.
+    /// Returns Vec<u64> (not a fixed-size array) because CombinedSchema has 2 columns
+    /// while provider schemas have 4. Only called during rendering (display-only, cold path).
     fn extract_tokens(&self, s: &ModelUsageSummary) -> Vec<u64>;
     /// Compute total tokens from a ModelUsageSummary.
     fn total_tokens(&self, s: &ModelUsageSummary) -> u64;

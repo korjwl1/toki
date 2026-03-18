@@ -43,7 +43,8 @@ pub(crate) fn grouped_to_json(
     schema: Option<&dyn ProviderSchema>,
 ) -> serde_json::Value {
     let is_session = type_name == "session";
-    let json_key = if is_session { "session" } else { "period" };
+    let is_provider = type_name == "provider";
+    let json_key = if is_session { "session" } else if is_provider { "provider" } else { "period" };
 
     let mut buckets: Vec<&String> = grouped.keys().collect();
     buckets.sort();
@@ -64,6 +65,11 @@ pub(crate) fn grouped_to_json(
 }
 
 /// Build JSON payload for a single watch-mode event.
+/// TODO: Field names are hardcoded to Claude Code defaults (cache_creation_input_tokens,
+/// cache_read_input_tokens). In watch mode, events arrive one at a time from a single
+/// provider, but the schema isn't available here. Fixing this would require threading
+/// the schema through the Sink trait's emit_event, which cascades everywhere for
+/// minimal benefit since watch mode is provider-specific anyway.
 pub(crate) fn event_to_json(event: &UsageEvent, pricing: Option<&PricingTable>) -> serde_json::Value {
     let cost = pricing.and_then(|p| p.event_cost(event));
     let mut data = serde_json::json!({

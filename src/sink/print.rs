@@ -148,13 +148,14 @@ impl Sink for PrintSink {
         let columns = schema.columns();
 
         let is_session = type_name == "session";
+        let is_provider = type_name == "provider";
         let has_pricing = pricing.is_some_and(|p| !p.is_empty());
         let has_precalc_cost = grouped.values().any(|m| m.values().any(|s| s.cost_usd.is_some()));
         let show_cost = has_pricing || has_precalc_cost;
         let mut buckets: Vec<&String> = grouped.keys().collect();
         buckets.sort();
 
-        let header_label = if is_session { "Session" } else { "Period" };
+        let header_label = if is_session { "Session" } else if is_provider { "Provider" } else { "Period" };
         let mut table = Table::new();
         table.load_preset(UTF8_FULL);
         table.set_content_arrangement(ContentArrangement::Dynamic);

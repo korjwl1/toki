@@ -949,18 +949,23 @@ fn send_report_query(
 }
 
 /// Dispatch a JSON result from the daemon to the local sink for display.
+/// Detects a "schema" field in the response to use the correct provider schema for rendering.
 fn dispatch_result_to_sink(
     item: &serde_json::Value,
     sink: &dyn toki::sink::Sink,
     pricing: Option<&toki::pricing::PricingTable>,
 ) {
+    // Detect schema from daemon response tag
+    let schema: Option<&dyn toki::common::schema::ProviderSchema> = item["schema"].as_str()
+        .map(toki::common::schema::schema_for_provider);
+
     match item["type"].as_str() {
         Some("summary") => {
             // data is an array of model summaries → convert to HashMap
             if let Ok(summaries_vec) = serde_json::from_value::<Vec<toki::ModelUsageSummary>>(item["data"].clone()) {
                 let summaries: std::collections::HashMap<String, toki::ModelUsageSummary> =
                     summaries_vec.into_iter().map(|s| (s.model.clone(), s)).collect();
-                sink.emit_summary(&summaries, pricing, None);
+                sink.emit_summary(&summaries, pricing, schema);
             }
         }
         Some(type_name) if type_name == "sessions" || type_name == "projects" => {
@@ -977,14 +982,16 @@ fn dispatch_result_to_sink(
                 let mut grouped: std::collections::HashMap<String, std::collections::HashMap<String, toki::ModelUsageSummary>> =
                     std::collections::HashMap::new();
                 for entry in data_arr {
-                    let period = entry["period"].as_str().unwrap_or("total").to_string();
+                    let period = entry["period"].as_str()
+                        .or_else(|| entry["provider"].as_str())
+                        .unwrap_or("total").to_string();
                     if let Ok(models) = serde_json::from_value::<Vec<toki::ModelUsageSummary>>(entry["usage_per_models"].clone()) {
                         let map: std::collections::HashMap<String, toki::ModelUsageSummary> =
                             models.into_iter().map(|s| (s.model.clone(), s)).collect();
                         grouped.insert(period, map);
                     }
                 }
-                sink.emit_grouped(&grouped, type_name, pricing, None);
+                sink.emit_grouped(&grouped, type_name, pricing, schema);
             }
         }
         None => {}

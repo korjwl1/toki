@@ -190,10 +190,7 @@ fn execute_report_request(request_line: &str, dbs: &[(String, Arc<Database>)]) -
 
     // Determine schema for output formatting
     let schema: Option<&dyn ProviderSchema> = if target_dbs.len() == 1 {
-        // Single provider: use provider-specific schema
-        Some(schema::schema_for_provider(target_dbs[0].0))
-    } else if provider_filter.is_some() {
-        // Filtered to a single provider
+        // Single provider (either only one configured, or filtered to one)
         Some(schema::schema_for_provider(target_dbs[0].0))
     } else {
         // Multiple providers: use combined schema for merged output
@@ -214,7 +211,7 @@ fn execute_report_request(request_line: &str, dbs: &[(String, Arc<Database>)]) -
     let results = collector.take();
 
     // Merge results across providers to avoid duplicate tables
-    let merged = if group_by_provider {
+    let mut merged = if group_by_provider {
         // When grouping by provider, don't merge — keep results tagged by provider
         merge_collected_results_by_provider(results)
     } else if target_dbs.len() > 1 {
@@ -224,6 +221,19 @@ fn execute_report_request(request_line: &str, dbs: &[(String, Arc<Database>)]) -
         // Single provider: use provider-specific schema for JSON keys
         remap_collected_results(results, schema)
     };
+
+    // Tag each result with the schema so the CLI can reconstruct it for rendering
+    let schema_tag = if target_dbs.len() == 1 {
+        Some(target_dbs[0].0)
+    } else {
+        None // combined/multi-provider
+    };
+    if let Some(tag) = schema_tag {
+        for item in &mut merged {
+            item["schema"] = serde_json::json!(tag);
+        }
+    }
+
     Ok(serde_json::Value::Array(merged))
 }
 
@@ -241,7 +251,7 @@ fn remap_collected_results(results: Vec<serde_json::Value>, schema: Option<&dyn 
             Some("summary") => {
                 if let Some(data) = result["data"].as_array_mut() {
                     for entry in data.iter_mut() {
-                        remap_entry_fields(entry, columns);
+                        remap_entry_fields(entry, columns, schema);
                     }
                 }
                 result
@@ -251,7 +261,7 @@ fn remap_collected_results(results: Vec<serde_json::Value>, schema: Option<&dyn 
                     for group in data.iter_mut() {
                         if let Some(usage) = group["usage_per_models"].as_array_mut() {
                             for entry in usage.iter_mut() {
-                                remap_entry_fields(entry, columns);
+                                remap_entry_fields(entry, columns, schema);
                             }
                         }
                     }
@@ -264,13 +274,27 @@ fn remap_collected_results(results: Vec<serde_json::Value>, schema: Option<&dyn 
 }
 
 /// Remap a single JSON model entry's token fields to match the schema's json_keys.
-fn remap_entry_fields(entry: &mut serde_json::Value, columns: &[crate::common::schema::TokenColumn]) {
-    // The collector produces entries with default keys (input_tokens, output_tokens, etc.)
-    // We need to remap to the schema's json_keys.
-    // Default key order: input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens
-    let default_keys = ["input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"];
+/// The collector stores values in DB slot order:
+///   slot 0 = input_tokens, slot 1 = output_tokens,
+///   slot 2 = cache_creation_input_tokens, slot 3 = cache_read_input_tokens
+/// The schema's extract_tokens() defines the correct mapping from slots to display columns.
+/// For Codex: column 2 = cached (slot 3), column 3 = reasoning (slot 2).
+fn remap_entry_fields(entry: &mut serde_json::Value, columns: &[crate::common::schema::TokenColumn], schema: &dyn ProviderSchema) {
+    // Build a ModelUsageSummary from the JSON entry's DB-slot values to leverage
+    // the schema's extract_tokens() for correct slot-to-column mapping.
+    let s = crate::common::types::ModelUsageSummary {
+        model: String::new(),
+        input_tokens: entry["input_tokens"].as_u64().unwrap_or(0),
+        output_tokens: entry["output_tokens"].as_u64().unwrap_or(0),
+        cache_creation_input_tokens: entry["cache_creation_input_tokens"].as_u64().unwrap_or(0),
+        cache_read_input_tokens: entry["cache_read_input_tokens"].as_u64().unwrap_or(0),
+        event_count: 0,
+        cost_usd: None,
+    };
+    let values = schema.extract_tokens(&s);
 
-    // Only remap if schema columns differ from default
+    // Only remap if schema columns differ from default keys
+    let default_keys = ["input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"];
     let needs_remap = columns.iter().enumerate().any(|(i, col)| {
         i < default_keys.len() && col.json_key != default_keys[i]
     });
@@ -279,24 +303,18 @@ fn remap_entry_fields(entry: &mut serde_json::Value, columns: &[crate::common::s
         return;
     }
 
-    // Extract values using default keys, then write with schema keys
-    let values: Vec<u64> = default_keys.iter()
-        .map(|k| entry[*k].as_u64().unwrap_or(0))
-        .collect();
-
-    // Remove old keys
+    // Remove old keys and write new keys in schema column order
     if let Some(obj) = entry.as_object_mut() {
         for key in &default_keys {
             obj.remove(*key);
         }
-        // Write new keys in schema order
         for (i, col) in columns.iter().enumerate() {
             if i < values.len() {
                 obj.insert(col.json_key.to_string(), serde_json::json!(values[i]));
             }
         }
-        // Recompute total_tokens from schema perspective
-        let total: u64 = values.iter().take(columns.len()).sum();
+        // Recompute total_tokens from the remapped values
+        let total: u64 = values.iter().sum();
         obj.insert("total_tokens".to_string(), serde_json::json!(total));
     }
 }
@@ -393,10 +411,10 @@ fn merge_collected_results(results: Vec<serde_json::Value>) -> Vec<serde_json::V
             if let Some(data) = summary["data"].as_array() {
                 for entry in data {
                     let model = entry["model"].as_str().unwrap_or("unknown").to_string();
-                    let existing = model_map.entry(model).or_insert_with(|| entry.clone());
-                    if !std::ptr::eq(existing, entry) {
-                        // Merge: only sum input_tokens and output_tokens (common fields)
-                        merge_summary_entry_common(existing, entry);
+                    use std::collections::hash_map::Entry;
+                    match model_map.entry(model) {
+                        Entry::Vacant(e) => { e.insert(entry.clone()); }
+                        Entry::Occupied(mut e) => { merge_summary_entry_common(e.get_mut(), entry); }
                     }
                 }
             }
@@ -444,9 +462,10 @@ fn merge_collected_results(results: Vec<serde_json::Value>) -> Vec<serde_json::V
                     if let Some(usage_arr) = entry["usage_per_models"].as_array() {
                         for model_entry in usage_arr {
                             let model = model_entry["model"].as_str().unwrap_or("unknown").to_string();
-                            let existing = models.entry(model).or_insert_with(|| model_entry.clone());
-                            if !std::ptr::eq(existing, model_entry) {
-                                merge_summary_entry_common(existing, model_entry);
+                            use std::collections::hash_map::Entry;
+                            match models.entry(model) {
+                                Entry::Vacant(e) => { e.insert(model_entry.clone()); }
+                                Entry::Occupied(mut e) => { merge_summary_entry_common(e.get_mut(), model_entry); }
                             }
                         }
                     }
@@ -513,9 +532,10 @@ fn merge_collected_results_by_provider(results: Vec<serde_json::Value>) -> Vec<s
             let mut model_map: std::collections::HashMap<String, serde_json::Value> = std::collections::HashMap::new();
             for entry in provider_summaries.remove(&provider).unwrap_or_default() {
                 let model = entry["model"].as_str().unwrap_or("unknown").to_string();
-                let existing = model_map.entry(model).or_insert_with(|| entry.clone());
-                if !std::ptr::eq(existing, &entry) {
-                    merge_summary_entry(existing, &entry);
+                use std::collections::hash_map::Entry;
+                match model_map.entry(model) {
+                    Entry::Vacant(e) => { e.insert(entry.clone()); }
+                    Entry::Occupied(mut e) => { merge_summary_entry(e.get_mut(), &entry); }
                 }
             }
             let mut model_list: Vec<serde_json::Value> = model_map.into_values().collect();
@@ -524,9 +544,9 @@ fn merge_collected_results_by_provider(results: Vec<serde_json::Value>) -> Vec<s
                 let be = b["events"].as_u64().unwrap_or(0);
                 be.cmp(&ae)
             });
-            data.push(serde_json::json!({ "period": provider, "usage_per_models": model_list }));
+            data.push(serde_json::json!({ "provider": provider, "usage_per_models": model_list }));
         }
-        merged.push(serde_json::json!({ "type": "by provider", "data": data }));
+        merged.push(serde_json::json!({ "type": "provider", "data": data }));
     }
 
     // Merge list results: concatenate and deduplicate
