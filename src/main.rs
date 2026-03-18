@@ -210,8 +210,34 @@ fn acquire_trace_lock(db_path: &std::path::Path) -> std::io::Result<std::fs::Fil
         .read(true)
         .write(true)
         .open(&lock_path)?;
-    file.try_lock_exclusive()?;
-    Ok(file)
+
+    match file.try_lock_exclusive() {
+        Ok(()) => Ok(file),
+        Err(_) => {
+            // Lock held — check if the holder is still alive via PID file
+            let pidfile = toki::daemon::default_pidfile_path();
+            let stale = match toki::daemon::daemon_status(&pidfile) {
+                Some(_pid) => false, // Process alive, lock is legit
+                None => true,        // No PID or dead process — stale lock
+            };
+
+            if stale {
+                // Remove stale lock and retry
+                drop(file);
+                let _ = std::fs::remove_file(&lock_path);
+                let file = std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .open(&lock_path)?;
+                file.try_lock_exclusive()?;
+                Ok(file)
+            } else {
+                Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "lock held by running daemon"))
+            }
+        }
+    }
 }
 
 fn resolve_output_format(config: &Config) -> toki::sink::OutputFormat {
