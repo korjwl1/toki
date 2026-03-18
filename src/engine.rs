@@ -179,31 +179,30 @@ impl TrackerEngine {
             // Track the last parser-provided project name (e.g., from Codex session_meta cwd).
             let mut parser_project_name: Option<std::sync::Arc<str>> = None;
 
-            let mut file_parser = provider.create_file_parser();
-            let result = process_lines_streaming(path, offset, |line| {
-                if let Some(parsed) = file_parser.parse_line(line) {
-                    // Update parser-provided project name if present
-                    if let Some(ref pn) = parsed.project_name {
-                        parser_project_name = Some(pn.as_str().into());
-                    }
-
-                    // Accumulate summary + build event in one pass (zero clone)
-                    let model_key = parsed.model.clone(); // clone before move for HashMap key
-                    let summary = local.entry(model_key).or_insert_with(|| ModelUsageSummary {
-                        model: parsed.model.clone(),
-                        ..Default::default()
-                    });
-
-                    let effective_project = parser_project_name.clone()
-                        .or_else(|| path_project_name.clone());
-
-                    file_events.push(parsed.into_summary_and_event(
-                        summary,
-                        std::sync::Arc::clone(&session_id),
-                        std::sync::Arc::clone(&source_file),
-                        effective_project,
-                    ));
+            // Use scan_file_cold_start which providers override with concrete types
+            // for inlining (no dyn dispatch overhead on the hot path).
+            let result = provider.scan_file_cold_start(path, offset, &mut |parsed| {
+                // Update parser-provided project name if present
+                if let Some(ref pn) = parsed.project_name {
+                    parser_project_name = Some(pn.as_str().into());
                 }
+
+                // Accumulate summary + build event in one pass (zero clone)
+                let model_key = parsed.model.clone(); // clone before move for HashMap key
+                let summary = local.entry(model_key).or_insert_with(|| ModelUsageSummary {
+                    model: parsed.model.clone(),
+                    ..Default::default()
+                });
+
+                let effective_project = parser_project_name.clone()
+                    .or_else(|| path_project_name.clone());
+
+                file_events.push(parsed.into_summary_and_event(
+                    summary,
+                    std::sync::Arc::clone(&session_id),
+                    std::sync::Arc::clone(&source_file),
+                    effective_project,
+                ));
             });
             if !local.is_empty() {
                 let mut s = summaries.lock().unwrap_or_else(|e| e.into_inner());

@@ -82,6 +82,18 @@ impl Provider for ClaudeCodeProvider {
     fn db_dir_name(&self) -> &str {
         "claude_code.fjall"
     }
+
+    /// Override: use concrete ClaudeCodeParser directly for inlining (no dyn dispatch).
+    fn scan_file_cold_start(&self, path: &str, offset: u64, emit: &mut dyn FnMut(ColdStartParsed))
+        -> std::io::Result<Option<(u64, u64, u64)>>
+    {
+        let parser = ClaudeCodeParser;
+        crate::checkpoint::process_lines_streaming(path, offset, |line| {
+            if let Some(parsed) = parser.parse_for_cold_start(line) {
+                emit(parsed);
+            }
+        })
+    }
 }
 
 /// Stateless per-file parser for Claude Code cold start.

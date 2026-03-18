@@ -36,6 +36,21 @@ pub trait Provider: Send + Sync {
     /// Each file gets its own instance (supports stateful parsing like Codex model tracking).
     fn create_file_parser(&self) -> Box<dyn FileParser>;
 
+    /// Scan a single file for cold start, calling `emit` for each parsed event.
+    /// Returns checkpoint data (bytes_consumed, last_line_len, last_line_hash) if lines were processed.
+    /// Default implementation uses `create_file_parser()` (dyn dispatch).
+    /// Providers can override this with a concrete type for inlining.
+    fn scan_file_cold_start(&self, path: &str, offset: u64, emit: &mut dyn FnMut(ColdStartParsed))
+        -> std::io::Result<Option<(u64, u64, u64)>>
+    {
+        let mut parser = self.create_file_parser();
+        crate::checkpoint::process_lines_streaming(path, offset, |line| {
+            if let Some(parsed) = parser.parse_line(line) {
+                emit(parsed);
+            }
+        })
+    }
+
     /// The LogParser implementation for watch mode.
     fn parser(&self) -> &dyn LogParser;
 

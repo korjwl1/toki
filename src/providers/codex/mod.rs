@@ -116,6 +116,18 @@ impl Provider for CodexProvider {
     fn db_dir_name(&self) -> &str {
         "codex.fjall"
     }
+
+    /// Override: use concrete CodexFileParser directly for inlining (no dyn dispatch).
+    fn scan_file_cold_start(&self, path: &str, offset: u64, emit: &mut dyn FnMut(super::ColdStartParsed))
+        -> std::io::Result<Option<(u64, u64, u64)>>
+    {
+        let mut parser = crate::providers::codex::parser::CodexFileParser::new();
+        crate::checkpoint::process_lines_streaming(path, offset, |line| {
+            if let Some(parsed) = <crate::providers::codex::parser::CodexFileParser as crate::providers::FileParser>::parse_line(&mut parser, line) {
+                emit(parsed);
+            }
+        })
+    }
 }
 
 /// Extract UUID from Codex filename format: rollout-YYYY-MM-DDTHH-MM-SS-<UUID>
