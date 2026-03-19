@@ -47,35 +47,81 @@ for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu 
 done
 ```
 
-### 5. Create tag, push, and upload release
+### 5. Create tag, push, and upload releases
 
 - Create an annotated tag: `git tag -a v{VERSION} -m "Release v{VERSION}"`
 - Show the user what will be pushed and ask for confirmation
 - Push the commit and tag: `git push origin main && git push origin v{VERSION}`
-- Create GitHub release with the archives:
+- Create GitHub release on **toki repo** (for source tracking):
   ```bash
-  gh release create v{VERSION} toki-{VERSION}-*.tar.gz --title "v{VERSION}" --generate-notes
+  gh release create v{VERSION} toki-{VERSION}-*.tar.gz --repo korjwl1/toki --title "v{VERSION}" --generate-notes
+  ```
+- Upload the same archives to **homebrew-tap repo** release (public, for brew download):
+  ```bash
+  gh release create v{VERSION} toki-{VERSION}-*.tar.gz --repo korjwl1/homebrew-tap --title "toki v{VERSION}" --notes "Release artifacts for toki v{VERSION}"
   ```
 
 ### 6. Update Homebrew tap
 
-Compute sha256 for each archive and update the tap formula:
+Compute sha256 for each archive and update the tap formula.
+
+**IMPORTANT**: Formula URLs must point to `korjwl1/homebrew-tap` releases (public), NOT `korjwl1/toki` (private).
 
 ```bash
-# Compute sha256
 SHA_AARCH64_DARWIN=$(shasum -a 256 toki-{VERSION}-aarch64-apple-darwin.tar.gz | cut -d' ' -f1)
 SHA_X86_64_DARWIN=$(shasum -a 256 toki-{VERSION}-x86_64-apple-darwin.tar.gz | cut -d' ' -f1)
 SHA_AARCH64_LINUX=$(shasum -a 256 toki-{VERSION}-aarch64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
 SHA_X86_64_LINUX=$(shasum -a 256 toki-{VERSION}-x86_64-unknown-linux-gnu.tar.gz | cut -d' ' -f1)
 ```
 
-Then clone the tap repo, update `Formula/toki.rb` with the new version and sha256 values, commit, and push:
+Clone tap repo and write the updated Formula/toki.rb:
 
 ```bash
 cd /tmp && rm -rf homebrew-tap && git clone https://github.com/korjwl1/homebrew-tap.git && cd homebrew-tap
 ```
 
-Write the updated formula with correct version, URLs, and sha256 hashes, then:
+The formula template (URLs point to homebrew-tap releases):
+
+```ruby
+class Toki < Formula
+  desc "AI CLI tool token usage tracker"
+  homepage "https://github.com/korjwl1/toki"
+  version "{VERSION}"
+  license "FSL-1.1-Apache-2.0"
+
+  on_macos do
+    on_arm do
+      url "https://github.com/korjwl1/homebrew-tap/releases/download/v{VERSION}/toki-{VERSION}-aarch64-apple-darwin.tar.gz"
+      sha256 "{SHA_AARCH64_DARWIN}"
+    end
+    on_intel do
+      url "https://github.com/korjwl1/homebrew-tap/releases/download/v{VERSION}/toki-{VERSION}-x86_64-apple-darwin.tar.gz"
+      sha256 "{SHA_X86_64_DARWIN}"
+    end
+  end
+
+  on_linux do
+    on_arm do
+      url "https://github.com/korjwl1/homebrew-tap/releases/download/v{VERSION}/toki-{VERSION}-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "{SHA_AARCH64_LINUX}"
+    end
+    on_intel do
+      url "https://github.com/korjwl1/homebrew-tap/releases/download/v{VERSION}/toki-{VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "{SHA_X86_64_LINUX}"
+    end
+  end
+
+  def install
+    bin.install "toki"
+  end
+
+  test do
+    system "#{bin}/toki", "--version"
+  end
+end
+```
+
+Commit and push:
 
 ```bash
 git add Formula/toki.rb && git commit -m "Update toki to {VERSION}" && git push
@@ -90,3 +136,7 @@ git add Formula/toki.rb && git commit -m "Update toki to {VERSION}" && git push
   brew tap korjwl1/tap
   brew install toki
   ```
+
+### Notes
+
+- When toki repo becomes public, update Formula URLs to point to `korjwl1/toki` releases instead, and stop uploading to homebrew-tap releases.
