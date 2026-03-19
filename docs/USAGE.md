@@ -104,15 +104,26 @@ trace is a client command that connects to a running daemon via UDS to receive r
 ```bash
 # Real-time JSONL output to stdout
 toki trace
+
+# Relay to UDS or HTTP
+toki trace --sink uds:///tmp/toki.sock
+toki trace --sink http://localhost:8080/events
+
+# Multi-sink (terminal + HTTP)
+toki trace --sink print --sink http://localhost:8080/events
+
+# Without cost field
+toki trace --no-cost
 ```
 
-- Always outputs JSONL to stdout regardless of `--output-format`
-- `--output-format` and `--sink` flags only apply to report, not trace
-- No `UsageEvent` deserialization on client side — raw JSON passthrough
+- Always outputs JSONL (no `--output-format` option — that applies to report only)
+- Supports `--sink` for relaying to UDS or HTTP targets
+- Includes `cost_usd` field by default (daemon loads pricing); use `--no-cost` to exclude
 - Daemon must be running (`toki daemon start` first)
 - Multiple clients can connect simultaneously (fan-out via condvar, 2 threads per client)
 - When no clients are connected, daemon Sink processing is effectively a no-op (zero overhead)
 - Exit with Ctrl+C. The daemon keeps running
+- When using `--sink uds://` or `--sink http://`, spawn `toki trace` as a child process — it auto-terminates when the parent dies (SIGPIPE)
 
 ## report
 
@@ -292,36 +303,23 @@ Settings priority: **CLI args > Settings file (settings.json) > Defaults**
 
 Environment variables are not used (except `TOKI_DEBUG`).
 
-## Client Options (report)
+## Client Options
 
-Options available for `report` commands. Daemon settings are managed via `toki settings`.
+| Option | Applies to | Description |
+|--------|-----------|-------------|
+| `--output-format table\|json` | report | Override output format |
+| `--sink <SPEC>` | trace | Output target: `print`, `uds://<path>`, `http://<url>` (repeatable) |
+| `--timezone <IANA>` / `-z` | report | Override timezone |
+| `--no-cost` | trace, report | Disable cost calculation |
 
-> **Note:** `--output-format` and `--sink` do not apply to `trace`. Trace always outputs JSONL to stdout.
-
-### --output-format
+### --output-format (report only)
 
 ```bash
 toki report --output-format table          # default
 toki report --output-format json
 ```
 
-Applies only to the `print` sink. UDS/HTTP sinks always use JSON.
-
-### --sink
-
-```bash
-# Default: terminal output
-toki report
-
-# HTTP relay (5s timeout)
-toki report --sink http://localhost:8080/report
-
-# UDS relay
-toki report --sink uds:///tmp/toki.sock
-
-# Multiple sinks (terminal + HTTP)
-toki report --sink print --sink http://localhost:8080/events
-```
+Applies only to report's `print` output.
 
 ### --timezone / -z
 
@@ -338,9 +336,11 @@ Applies to:
 
 ```bash
 toki report --no-cost
+toki trace --no-cost
 ```
 
-Skips pricing data fetch and hides the Cost column.
+For report: skips pricing data fetch and hides the Cost column.
+For trace: strips `cost_usd` field from JSONL output.
 
 ## Output Formats
 
@@ -457,10 +457,10 @@ Skips pricing data fetch and hides the Cost column.
 #### Watch Event (JSONL, one line at a time — trace output)
 
 ```json
-{"model":"claude-opus-4-6","source":"4de9291e","provider":"claude_code","timestamp":"2026-03-19T10:30:00Z","input_tokens":3,"output_tokens":14,"cache_creation_input_tokens":5139,"cache_read_input_tokens":9631,"cost_usd":0.0112}
+{"type":"event","data":{"model":"claude-opus-4-6","source":"4de9291e","provider":"Claude Code","timestamp":"2026-03-19T10:30:00.123Z","input_tokens":3,"output_tokens":14,"cache_creation_input_tokens":5139,"cache_read_input_tokens":9631,"cost_usd":0.0112}}
 ```
 
-> Trace always outputs JSONL to stdout. The `--output-format` flag does not apply to trace.
+> Trace always outputs JSONL. Use `--no-cost` to exclude the `cost_usd` field.
 
 ### Provider-specific Columns
 

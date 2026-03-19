@@ -79,6 +79,8 @@ pub struct TrackerEngine {
     dirty: HashMap<String, String>,
     /// Output sink (print, UDS, HTTP, or multi).
     sink: Box<dyn Sink>,
+    /// Pricing table for cost calculation (None = costs disabled).
+    pricing: Option<crate::pricing::PricingTable>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -117,6 +119,7 @@ impl TrackerEngine {
         channels: HashMap<String, Sender<DbOp>>,
         checkpoints: HashMap<String, FileCheckpoint>,
         sink: Box<dyn Sink>,
+        pricing: Option<crate::pricing::PricingTable>,
     ) -> Self {
         TrackerEngine {
             channels,
@@ -125,6 +128,7 @@ impl TrackerEngine {
             activity: HashMap::new(),
             dirty: HashMap::new(),
             sink,
+            pricing,
         }
     }
 
@@ -139,6 +143,7 @@ impl TrackerEngine {
             activity: HashMap::new(),
             dirty: HashMap::new(),
             sink,
+            pricing: None,
         }
     }
 
@@ -607,7 +612,7 @@ impl TrackerEngine {
                                 .as_millis() as i64
                         });
 
-                    self.sink.emit_event(&event, None, Some(event_schema));
+                    self.sink.emit_event(&event, self.pricing.as_ref(), Some(event_schema));
 
                     let (usage, _ts) = event.into_usage_event();
                     let op = DbOp::WriteEvent(Box::new(WriteEventData {
@@ -657,7 +662,7 @@ impl TrackerEngine {
                                 .as_millis() as i64
                         });
 
-                    self.sink.emit_event(&event, None, None);
+                    self.sink.emit_event(&event, self.pricing.as_ref(), None);
 
                     let (usage, _ts) = event.into_usage_event();
                     let op = DbOp::WriteEvent(Box::new(WriteEventData {

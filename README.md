@@ -281,6 +281,10 @@ Filter keys: `model`, `session`, `project`, `provider`, `since`, `until`
 
 ```bash
 toki trace                                              # JSONL stream to stdout
+toki trace --sink uds:///tmp/toki.sock                  # Relay to UDS
+toki trace --sink http://localhost:8080/events           # Relay via HTTP
+toki trace --sink print --sink http://localhost:8080     # Multi-sink
+toki trace --no-cost                                    # Without cost field
 ```
 
 ### Settings
@@ -315,16 +319,16 @@ Priority: **CLI args > settings.json > defaults**
 
 </details>
 
-### Client Options (report)
+### Client Options
 
-| Option | Description |
-|--------|-------------|
-| `--output-format table\|json` | Override output format (report only) |
-| `--sink <SPEC>` | Output target, repeatable (report only) |
-| `--timezone <IANA>` / `-z` | Override timezone |
-| `--no-cost` | Disable cost calculation |
+| Option | Applies to | Description |
+|--------|-----------|-------------|
+| `--output-format table\|json` | report | Override output format |
+| `--sink <SPEC>` | trace | Output target: `print`, `uds://<path>`, `http://<url>` (repeatable) |
+| `--timezone <IANA>` / `-z` | report | Override timezone |
+| `--no-cost` | trace, report | Disable cost calculation |
 
-> `--output-format` and `--sink` do not apply to `trace`. Trace always outputs JSONL to stdout.
+> Trace always outputs JSONL. `--output-format` does not apply to trace. When using `--sink uds://` or `--sink http://`, spawn `toki trace` as a child process — it auto-terminates when the parent dies (SIGPIPE).
 
 ---
 

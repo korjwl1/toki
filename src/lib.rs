@@ -178,8 +178,15 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
         });
     }
 
+    // Load pricing for real-time cost calculation
+    let pricing = {
+        let cache_path = pricing::default_cache_path();
+        let p = pricing::fetch_pricing(&cache_path);
+        if p.is_empty() { None } else { Some(p) }
+    };
+
     // Create engine with all channels
-    let mut engine = TrackerEngine::new(channel_map, all_checkpoints, sink);
+    let mut engine = TrackerEngine::new(channel_map, all_checkpoints, sink, pricing);
 
     // Sequential cold start per provider
     println!("[toki] Running initial scan...");

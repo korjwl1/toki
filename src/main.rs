@@ -25,13 +25,10 @@ struct Cli {
 
 /// Options shared by trace and report commands.
 #[derive(Args, Clone)]
-struct ClientOptions {
+struct ReportOptions {
     /// Output format override: table or json
     #[arg(long)]
     output_format: Option<String>,
-    /// Output sink(s): print (default), uds://<path>, http://<url>
-    #[arg(long)]
-    sink: Vec<String>,
     /// Timezone override (e.g. Asia/Seoul, US/Eastern)
     #[arg(long, short = 'z')]
     timezone: Option<String>,
@@ -47,15 +44,19 @@ enum Commands {
         #[command(subcommand)]
         command: DaemonCommands,
     },
-    /// Connect to running daemon and stream real-time events
+    /// Connect to running daemon and stream real-time events (JSONL output)
     Trace {
-        #[command(flatten)]
-        opts: ClientOptions,
+        /// Output sink(s): print (default), uds://<path>, http://<url>
+        #[arg(long)]
+        sink: Vec<String>,
+        /// Disable cost display
+        #[arg(long)]
+        no_cost: bool,
     },
     /// Report mode: one-shot summary from TSDB
     Report {
         #[command(flatten)]
-        opts: ClientOptions,
+        opts: ReportOptions,
         /// Filter start time (inclusive): YYYYMMDD or YYYYMMDDhhmmss
         #[arg(long)]
         since: Option<String>,
@@ -247,8 +248,8 @@ fn resolve_output_format(config: &Config) -> toki::sink::OutputFormat {
     }
 }
 
-/// Parse and validate ClientOptions into config overrides.
-fn parse_client_opts(opts: &ClientOptions) -> (Option<Tz>, bool, Option<&str>) {
+/// Parse and validate ReportOptions into config overrides.
+fn parse_client_opts(opts: &ReportOptions) -> (Option<Tz>, bool, Option<&str>) {
     let cli_tz: Option<Tz> = match opts.timezone.as_deref() {
         Some(name) => match name.parse::<Tz>() {
             Ok(tz) => Some(tz),
@@ -325,20 +326,20 @@ fn main() {
             let config = build_config(None, false, None);
             handle_daemon(command, &config);
         }
-        Commands::Trace { opts } => {
-            let (cli_tz, cli_no_cost, cli_output_format) = parse_client_opts(&opts);
-            let config = build_config(cli_tz, cli_no_cost, cli_output_format);
-            handle_trace(&config);
+        Commands::Trace { sink, no_cost } => {
+            let config = build_config(None, false, None);
+            let sink_specs = if sink.is_empty() {
+                vec!["print".to_string()]
+            } else {
+                sink
+            };
+            handle_trace(&config, &sink_specs, no_cost);
         }
         Commands::Report { opts, since, until, group_by_session, session_id, project, provider, command } => {
             let (cli_tz, cli_no_cost, cli_output_format) = parse_client_opts(&opts);
             let config = build_config(cli_tz, cli_no_cost, cli_output_format);
             let output_format = resolve_output_format(&config);
-            let sink_specs = if opts.sink.is_empty() {
-                vec!["print".to_string()]
-            } else {
-                opts.sink.clone()
-            };
+            let sink_specs = vec!["print".to_string()];
 
             // Validate --provider against known providers
             if let Some(ref p) = provider {
@@ -714,7 +715,7 @@ fn handle_daemon(command: DaemonCommands, config: &Config) {
 
 // ── Trace (client) ──────────────────────────────────────
 
-fn handle_trace(config: &Config) {
+fn handle_trace(config: &Config, sink_specs: &[String], no_cost: bool) {
     use std::io::Write;
     let sock_path = config.daemon_sock.clone();
 
@@ -733,13 +734,19 @@ fn handle_trace(config: &Config) {
         std::process::exit(1);
     }
 
+    // Build sinks — always JSONL output format
+    let sink = toki::sink::create_sinks(sink_specs, toki::sink::OutputFormat::Json);
+
     // BufReader + read_line — same approach as report
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+    stream.set_read_timeout(Some(std::time::Duration::from_millis(200))).ok();
     let mut reader = std::io::BufReader::new(stream);
 
-    // Register SIGINT to exit cleanly
+    // Register SIGINT without SA_RESTART so read() returns EINTR immediately
     unsafe {
-        libc::signal(libc::SIGINT, sighandler as *const () as libc::sighandler_t);
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = sighandler as usize;
+        sa.sa_flags = 0; // no SA_RESTART — read() interrupted immediately
+        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
     }
 
     println!("[toki] Connected to daemon. Streaming events... (Ctrl+C to stop)");
@@ -762,14 +769,26 @@ fn handle_trace(config: &Config) {
                     continue;
                 }
 
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if no_cost {
+                    // Strip cost_usd field
+                    if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(line) {
+                        if v["type"].as_str() == Some("event") {
+                            if let Some(data) = v.get_mut("data") {
+                                data.as_object_mut().map(|m| m.remove("cost_usd"));
+                            }
+                            let stripped = serde_json::to_string(&v).unwrap_or_default();
+                            sink.emit_raw(&stripped);
+                        }
+                    }
+                } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
                     if v["type"].as_str() == Some("event") {
-                        println!("{}", line);
+                        sink.emit_raw(line);
                     }
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut => {
+                || e.kind() == std::io::ErrorKind::TimedOut
+                || e.kind() == std::io::ErrorKind::Interrupted => {
                 continue;
             }
             Err(_) => {

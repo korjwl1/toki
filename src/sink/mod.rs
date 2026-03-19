@@ -20,6 +20,8 @@ pub trait Sink: Send + Sync {
     fn emit_grouped(&self, grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>, type_name: &str, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>);
     fn emit_event(&self, event: &UsageEventWithTs, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>);
     fn emit_list(&self, items: &[String], type_name: &str);
+    /// Emit a pre-formatted JSONL line (used by trace passthrough).
+    fn emit_raw(&self, line: &str) { println!("{}", line); }
 }
 
 /// Dispatch to multiple sinks simultaneously.
@@ -48,6 +50,10 @@ impl Sink for MultiSink {
 
     fn emit_list(&self, items: &[String], type_name: &str) {
         for s in &self.sinks { s.emit_list(items, type_name); }
+    }
+
+    fn emit_raw(&self, line: &str) {
+        for s in &self.sinks { s.emit_raw(line); }
     }
 }
 

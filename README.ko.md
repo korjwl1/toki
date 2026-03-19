@@ -277,7 +277,11 @@ metric{filters}[bucket] by (dimensions)
 ### Trace
 
 ```bash
-toki trace                                              # 실시간 JSONL 스트림 (항상 JSONL stdout 출력)
+toki trace                                              # JSONL 스트림 (stdout)
+toki trace --sink uds:///tmp/toki.sock                  # UDS로 중계
+toki trace --sink http://localhost:8080/events           # HTTP로 중계
+toki trace --sink print --sink http://localhost:8080     # 멀티 싱크
+toki trace --no-cost                                    # 비용 필드 제외
 ```
 
 ### Settings
@@ -312,14 +316,16 @@ toki settings list                             # 전체 설정 출력
 
 </details>
 
-### 클라이언트 옵션 (trace / report)
+### 클라이언트 옵션
 
-| 옵션 | 설명 |
-|------|------|
-| `--output-format table\|json` | 출력 형식 오버라이드 (report만 적용, trace는 항상 JSONL) |
-| `--sink <SPEC>` | 출력 대상, 복수 지정 가능 (report만 적용) |
-| `--timezone <IANA>` / `-z` | 타임존 오버라이드 |
-| `--no-cost` | 비용 계산 비활성화 |
+| 옵션 | 적용 대상 | 설명 |
+|------|----------|------|
+| `--output-format table\|json` | report | 출력 형식 오버라이드 |
+| `--sink <SPEC>` | trace | 출력 대상: `print`, `uds://<path>`, `http://<url>` (복수 지정 가능) |
+| `--timezone <IANA>` / `-z` | report | 타임존 오버라이드 |
+| `--no-cost` | trace, report | 비용 계산 비활성화 |
+
+> Trace는 항상 JSONL을 출력한다. `--output-format`은 trace에 적용되지 않는다. `--sink uds://` 또는 `--sink http://` 사용 시 `toki trace`를 child process로 실행하면 부모 종료 시 자동 종료된다 (SIGPIPE).
 
 ---
 

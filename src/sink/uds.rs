@@ -73,4 +73,18 @@ impl Sink for UdsSink {
     fn emit_list(&self, items: &[String], type_name: &str) {
         self.send(&serde_json::json!({ "type": type_name, "items": items }));
     }
+
+    fn emit_raw(&self, line: &str) {
+        let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref mut stream) = *conn {
+            if writeln!(stream, "{}", line).is_ok() {
+                return;
+            }
+        }
+        // Reconnect and retry
+        if let Ok(mut stream) = UnixStream::connect(&self.path) {
+            let _ = writeln!(stream, "{}", line);
+            *conn = Some(stream);
+        }
+    }
 }

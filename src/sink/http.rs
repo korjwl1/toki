@@ -61,4 +61,13 @@ impl Sink for HttpSink {
     fn emit_list(&self, items: &[String], type_name: &str) {
         self.send(&serde_json::json!({ "type": type_name, "items": items }));
     }
+
+    fn emit_raw(&self, line: &str) {
+        if let Err(e) = self.agent.post(&self.url)
+            .set("Content-Type", "application/json")
+            .send_string(line)
+        {
+            eprintln!("[toki] HTTP: send error: {}", e);
+        }
+    }
 }
