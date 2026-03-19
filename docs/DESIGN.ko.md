@@ -3,7 +3,8 @@
 ## Overview
 
 toki는 데몬/클라이언트 구조로 동작한다.
-데몬은 4개 스레드(Worker, Writer, Listener, Notify)를 운용하며,
+데몬은 기본 4개 스레드(Worker, Writer, Listener, Notify)를 운용하며,
+trace 클라이언트당 2개 스레드(receiver + writer)가 추가된다.
 fjall 임베디드 DB의 7개 keyspace에 데이터를 저장한다.
 
 ## Architecture
@@ -23,10 +24,10 @@ graph TD
         subgraph Notify["Notify Thread<br/>macOS FSEvents"]
         end
 
-        subgraph Broadcast["BroadcastSink<br/>clients: Mutex&lt;Vec&lt;Client&gt;&gt;<br/>0 clients = zero overhead"]
+        subgraph Broadcast["BroadcastSink<br/>Condvar::notify_all<br/>0 clients = zero overhead"]
         end
 
-        subgraph Listener["Listener Thread<br/>UnixListener.accept()"]
+        subgraph Listener["Listener Thread<br/>UnixListener.accept()<br/>TRACE / REPORT 커맨드 분기"]
         end
     end
 
@@ -35,53 +36,77 @@ graph TD
     Worker -->|"sink.emit_event()"| Broadcast
     Listener -->|"add_client()"| Broadcast
 
-    TraceClient["Trace Client<br/>NDJSON stream → local sinks"] -->|"UDS connect"| Daemon
-    ReportClient["Report Client<br/>TSDB query → sink output"] -->|"DB read-only open"| Daemon
+    TraceClient["Trace Client<br/>JSONL stdout 출력"] -->|"UDS connect<br/>TRACE 커맨드"| Daemon
+    ReportClient["Report Client<br/>UDS 쿼리 → sink 출력"] -->|"UDS connect<br/>REPORT 커맨드"| Daemon
 ```
 
 ### Daemon Process
 
-데몬은 4개 스레드로 구성된다:
+데몬은 기본 4개 스레드로 구성되며, trace 클라이언트당 2개 스레드가 추가된다:
 
 1. **Worker Thread**: FSEvents 파일 변경 감지 → 파싱 → Sink 출력 + TSDB 저장
 2. **Writer Thread**: DB를 단독 소유. 이벤트 배치 커밋, rollup-on-write, retention
-3. **Listener Thread**: UDS accept loop. 새 클라이언트를 BroadcastSink에 등록. 멀티 DB 쿼리 병합
+3. **Listener Thread**: UDS accept loop. 첫 줄 커맨드(`TRACE` / `REPORT`)로 분기. trace는 BroadcastSink에 등록, report는 DB 쿼리 실행
 4. **Notify Thread**: macOS FSEvents (notify 라이브러리 내부)
+
+N개 trace 클라이언트 연결 시: 4 + 2N 스레드
 
 ### BroadcastSink (Zero Overhead)
 
 `BroadcastSink`는 `Sink` trait을 구현하며, 연결된 trace 클라이언트에 이벤트를 fan-out한다.
+`Condvar::notify_all` 기반으로, Engine은 공유 state에 O(1) write만 수행한다.
+tokio 의존성 없이 순수 `std::sync`만 사용한다.
 
-- 클라이언트가 0개일 때: `emit_*` 메서드는 `Mutex::lock()` → `is_empty()` → return. 실질적 no-op.
-- 클라이언트가 있을 때: 이벤트를 JSON 직렬화 → 각 클라이언트에 NDJSON 줄 전송
-- 쓰기 실패한 클라이언트는 자동 제거 (`retain_mut`)
-- 1초 write timeout으로 느린 클라이언트가 engine thread를 block하지 않음
+- 클라이언트가 0개일 때: `emit_*` 메서드는 `client_count` atomic 확인 → 0이면 즉시 return. 실질적 no-op.
+- 클라이언트가 있을 때: 이벤트를 JSON 직렬화 → 공유 state에 write → `condvar.notify_all()`
+- 클라이언트당 2개 스레드:
+  - **Thread A (receiver)**: `condvar.wait_timeout(5s)` → msg clone → local queue push
+  - **Thread B (writer)**: queue drain → batch `write_all`
+- 죽은 클라이언트 감지: Thread A는 `wait_timeout(5s)`, Thread B는 write 시 EPIPE
+- Thread spawn 실패 시 에러 로그 + 클라이언트에 에러 전송
+
+### UDS 프로토콜
+
+클라이언트는 UDS 연결 후 첫 줄로 커맨드를 전송한다:
+
+```
+UnixStream::connect(daemon.sock)
+    → write "TRACE\n" 또는 "REPORT\n"
+    → daemon이 BufReader로 커맨드 읽고 분기 처리
+```
+
+- `TRACE`: BroadcastSink에 클라이언트 등록 → 실시간 이벤트 스트림
+- `REPORT`: JSON 쿼리 payload 수신 → DB 쿼리 실행 → JSON 응답
+
+200ms 타이밍 기반 분류는 제거되었다.
 
 ### Trace Client
 
 ```
 UnixStream::connect(daemon.sock)
-    → BufReader::lines()
-    → JSON parse → match type
-        "event" → UsageEvent 역직렬화 → local sink.emit_event()
-        "summary" → pass through
+    → write "TRACE\n"
+    → BufReader::read_line() loop
+    → JSON parse → type == "event"이면 그대로 stdout에 출력
 ```
 
-trace 클라이언트는 모든 sink 타입을 지원한다:
-- `--sink print` (기본): 터미널 table/json 출력
-- `--sink uds://...`: 다른 UDS로 중계
-- `--sink http://...`: HTTP POST로 중계
+Trace는 `--output-format`과 무관하게 항상 JSONL을 stdout에 출력한다.
+`--output-format`과 `--sink` 플래그는 report에만 적용되며, trace에는 미적용된다.
+클라이언트 측 `UsageEvent` 역직렬화 없이, daemon이 보낸 raw JSON을 그대로 패스스루한다.
+
+JSON에 포함되는 필드: `model`, `source`, `provider`, `timestamp` (세션 파일 원본), 토큰 필드, `cost_usd`
 
 ### Report Client
 
 ```
 UDS connect (daemon.sock)
+    → write "REPORT\n"
     → JSON 쿼리 전송 (PromQL 스타일)
     → daemon이 TSDB에서 실행 후 JSON 응답
     → client가 pricing 적용 + sink 출력
 ```
 
-Report는 daemon에 UDS로 쿼리를 보내고 결과를 받는다 (fjall DB lock 때문에 직접 DB open 불가).
+Report는 UDS로 daemon에 `REPORT` 커맨드 후 JSON payload를 전송하고 결과를 받는다.
+DB를 직접 열지 않는다 (fjall DB lock 때문).
 데몬이 실행 중이어야 report를 사용할 수 있다 (PID 파일로 확인).
 pricing은 client가 파일 캐시(`~/.config/toki/pricing.json`)에서 로드하여 적용한다.
 
@@ -220,9 +245,9 @@ FSEvents → event_tx → Worker thread
 
 ```
 UnixStream::connect(daemon.sock)
-    → BufReader::lines() loop
-    → JSON parse → type 분기
-        "event" → UsageEvent 역직렬화 → local sink.emit_event()
+    → write "TRACE\n"
+    → BufReader::read_line() loop
+    → JSON parse → type == "event"이면 그대로 stdout에 JSONL 출력
 ```
 
 ### Report (one-shot 조회)
@@ -232,13 +257,12 @@ daemon_status(pidfile)?
     → None: "Cannot connect to toki daemon" → exit
     → Some: continue
 
-DB open → has_any_rollups()? (O(1) 확인)
-    → No:  "No data in TSDB" (cold start 진행 중일 수 있음)
-    → Yes: 쿼리 실행
+UDS connect → write "REPORT\n" → JSON 쿼리 전송
+    → daemon이 TSDB 쿼리 실행 → JSON 응답
+    → client가 결과 수신 + sink 출력
 ```
 
-Report는 writer thread 없이 DB를 직접 읽기 전용으로 연다.
-스트리밍 콜백 패턴으로 중간 Vec 할당 없이 집계한다.
+Report는 UDS로 daemon에 쿼리를 전송하고 결과를 받는다. DB를 직접 열지 않는다.
 
 ## File Processing Pipeline
 
@@ -344,7 +368,7 @@ pub enum DbOp {
 
 ## Query Architecture
 
-Report 명령은 DB를 읽기 전용으로 열어 직접 쿼리한다 (writer thread 불필요).
+Report 명령은 UDS로 daemon에 쿼리를 전송한다. Daemon의 Listener thread가 쿼리를 수신하여 DB에서 실행한다.
 
 ### 쿼리 경로
 

@@ -99,34 +99,20 @@ After adding or removing a provider, restart the daemon if it is running.
 
 ## trace
 
-trace is a client command that connects to a running daemon via UDS to receive real-time events.
+trace is a client command that connects to a running daemon via UDS to receive real-time events. It sends the `TRACE` command to the daemon and receives a JSONL stream.
 
 ```bash
-# Default: real-time output to terminal
+# Real-time JSONL output to stdout
 toki trace
-
-# Output in JSON format
-toki --output-format json trace
-
-# Relay via HTTP
-toki trace --sink http://localhost:8080/events
-
-# Multiple sinks
-toki trace --sink print --sink http://localhost:8080/events
 ```
 
+- Always outputs JSONL to stdout regardless of `--output-format`
+- `--output-format` and `--sink` flags only apply to report, not trace
+- No `UsageEvent` deserialization on client side — raw JSON passthrough
 - Daemon must be running (`toki daemon start` first)
-- Multiple clients can connect simultaneously (fan-out)
-- When no clients are connected, daemon Sink processing is completely disabled (zero overhead)
+- Multiple clients can connect simultaneously (fan-out via condvar, 2 threads per client)
+- When no clients are connected, daemon Sink processing is effectively a no-op (zero overhead)
 - Exit with Ctrl+C. The daemon keeps running
-
-### Supported Sink Types
-
-| Sink | Description |
-|------|-------------|
-| `print` (default) | Terminal output (table/json depending on `--output-format`) |
-| `uds://<path>` | Relay NDJSON to another Unix Domain Socket |
-| `http://<url>` | Relay JSON via HTTP POST (5s timeout) |
 
 ## report
 
@@ -306,16 +292,17 @@ Settings priority: **CLI args > Settings file (settings.json) > Defaults**
 
 Environment variables are not used (except `TOKI_DEBUG`).
 
-## Client Options (trace / report)
+## Client Options (report)
 
-Options available only for `trace` and `report` commands. Daemon settings are managed via `toki settings`.
+Options available for `report` commands. Daemon settings are managed via `toki settings`.
+
+> **Note:** `--output-format` and `--sink` do not apply to `trace`. Trace always outputs JSONL to stdout.
 
 ### --output-format
 
 ```bash
 toki report --output-format table          # default
 toki report --output-format json
-toki trace --output-format json
 ```
 
 Applies only to the `print` sink. UDS/HTTP sinks always use JSON.
@@ -324,19 +311,16 @@ Applies only to the `print` sink. UDS/HTTP sinks always use JSON.
 
 ```bash
 # Default: terminal output
-toki trace
-
-# UDS relay
-toki trace --sink uds:///tmp/toki.sock
+toki report
 
 # HTTP relay (5s timeout)
-toki trace --sink http://localhost:8080/v1/events
+toki report --sink http://localhost:8080/report
+
+# UDS relay
+toki report --sink uds:///tmp/toki.sock
 
 # Multiple sinks (terminal + HTTP)
-toki trace --sink print --sink http://localhost:8080/events
-
-# Also works with report
-toki report --sink http://localhost:8080/report
+toki report --sink print --sink http://localhost:8080/events
 ```
 
 ### --timezone / -z
@@ -354,7 +338,6 @@ Applies to:
 
 ```bash
 toki report --no-cost
-toki trace --no-cost
 ```
 
 Skips pricing data fetch and hides the Cost column.
@@ -471,11 +454,13 @@ Skips pricing data fetch and hides the Cost column.
 }
 ```
 
-#### Watch Event (NDJSON, one line at a time)
+#### Watch Event (JSONL, one line at a time — trace output)
 
 ```json
-{"type":"event","data":{"model":"claude-opus-4-6","source":"4de9291e","input_tokens":3,"output_tokens":14,"cache_creation_input_tokens":5139,"cache_read_input_tokens":9631,"cost_usd":0.0112}}
+{"model":"claude-opus-4-6","source":"4de9291e","provider":"claude_code","timestamp":"2026-03-19T10:30:00Z","input_tokens":3,"output_tokens":14,"cache_creation_input_tokens":5139,"cache_read_input_tokens":9631,"cost_usd":0.0112}
 ```
+
+> Trace always outputs JSONL to stdout. The `--output-format` flag does not apply to trace.
 
 ### Provider-specific Columns
 

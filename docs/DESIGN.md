@@ -22,72 +22,77 @@ graph TD
         subgraph Notify["Notify Thread<br/>macOS FSEvents"]
         end
 
-        subgraph Broadcast["BroadcastSink<br/>clients: Mutex&lt;Vec&lt;Client&gt;&gt;<br/>0 clients = zero overhead"]
+        subgraph Broadcast["BroadcastSink<br/>shared state + Condvar<br/>0 clients = zero overhead"]
         end
 
-        subgraph Listener["Listener Thread<br/>UnixListener.accept()"]
+        subgraph Listener["Listener Thread<br/>UnixListener.accept()<br/>command dispatch: TRACE / REPORT"]
         end
     end
 
     Notify -->|"file events"| Worker
     Worker -->|"db_tx.send()"| Writer
-    Worker -->|"sink.emit_event()"| Broadcast
-    Listener -->|"add_client()"| Broadcast
+    Worker -->|"sink.emit_event(&amp;UsageEventWithTs)<br/>O(1) write + notify_all"| Broadcast
+    Listener -->|"spawn 2 threads<br/>per trace client"| Broadcast
 
-    TraceClient["Trace Client<br/>NDJSON stream → local sinks"] -->|"UDS connect"| Daemon
-    ReportClient["Report Client<br/>TSDB query → sink output"] -->|"DB read-only open"| Daemon
+    TraceClient["Trace Client<br/>JSONL passthrough → stdout"] -->|"UDS connect<br/>sends TRACE command"| Daemon
+    ReportClient["Report Client<br/>query via UDS → sink output"] -->|"UDS connect<br/>sends REPORT command"| Daemon
 ```
 
 ### Daemon Process
 
-The daemon consists of 4 threads:
+The daemon has a base of 4 threads, plus 2 threads per connected trace client (4 + 2N total):
 
 1. **Worker Thread**: Detects file changes via FSEvents → parses → Sink output + TSDB storage
 2. **Writer Thread**: Sole owner of the DB. Batch event commits, rollup-on-write, retention
-3. **Listener Thread**: UDS accept loop. Registers new clients to BroadcastSink
+3. **Listener Thread**: UDS accept loop. Reads client command (`TRACE\n` or `REPORT\n`) via BufReader, dispatches accordingly
 4. **Notify Thread**: macOS FSEvents (internal to the notify library)
+5. **Per trace client: +2 threads** (receiver thread + writer thread, see BroadcastSink below)
 
-### BroadcastSink (Zero Overhead)
+### BroadcastSink (Zero Overhead, Condvar-based)
 
-`BroadcastSink` implements the `Sink` trait and fans out events to connected trace clients.
+`BroadcastSink` implements the `Sink` trait and fans out events to connected trace clients. No tokio dependency — pure `std::sync`.
 
-- When 0 clients: `emit_*` methods are `Mutex::lock()` → `is_empty()` → return. Effectively a no-op.
-- When clients exist: serialize events to JSON → send NDJSON line to each client
-- Failed writes automatically remove the client (`retain_mut`)
-- 1-second write timeout prevents slow clients from blocking the engine thread
+- **Engine write path (O(1))**: `emit_event()` writes to shared state → `condvar.notify_all()`. The engine thread is never blocked by slow clients.
+- **When 0 clients**: effectively a no-op (shared state write + notify on empty wait set).
+- **Per client: 2 threads**:
+  - **Thread A (receiver)**: waits on condvar, clones message, pushes to a local queue
+  - **Thread B (writer)**: drains queue in batch, writes to UDS
+- **Dead client detection**:
+  - Thread A uses `wait_timeout(5s)` to detect stale connections
+  - Thread B detects `EPIPE` on write and triggers cleanup
+- **Thread spawn failure**: error is logged and the client is notified via the stream before cleanup
 
 ### Trace Client
 
 ```
 UnixStream::connect(daemon.sock)
+    → send "TRACE\n" command
     → BufReader::lines()
-    → JSON parse → match type
-        "event" → deserialize UsageEvent → local sink.emit_event()
-        "summary" → pass through
+    → JSONL passthrough to stdout
 ```
 
-Trace clients support all sink types:
-- `--sink print` (default): terminal table/json output
-- `--sink uds://...`: relay to another UDS
-- `--sink http://...`: relay via HTTP POST
+Trace always outputs JSONL to stdout regardless of `--output-format`. The `--output-format` and `--sink` flags only apply to report, not trace. No `UsageEvent` deserialization on the client side — raw JSON passthrough.
+
+Each JSONL line includes: `model`, `source`, `provider`, `timestamp` (original from session file), token fields, `cost_usd`.
 
 ### Report Client
 
 ```
-UDS connect (daemon.sock)
-    → send JSON query (PromQL-style)
+UnixStream::connect(daemon.sock)
+    → send "REPORT\n" command
+    → send JSON query payload
     → daemon executes against TSDB, returns JSON response
     → client applies pricing + sink output
 ```
 
-Report sends a query to the daemon over UDS and receives results (direct DB open is not possible due to fjall DB lock).
+Report sends a query to the daemon over UDS (sends `REPORT\n` then JSON payload) and receives results. The client does NOT open the DB directly (not possible due to fjall DB lock).
 The daemon must be running to use report (verified via PID file).
 Pricing is loaded by the client from the file cache (`~/.config/toki/pricing.json`).
 
 ## Worker Thread
 
 - Multiplexes FSEvents events, stop signal, and 30-second backup polling via `crossbeam_channel::select!`
-- File change detected → `process_file_with_ts()` → parsed events output to Sink + `DbOp::WriteEvent` sent to writer
+- File change detected → `process_file_with_ts()` → parsed events output to Sink (`emit_event(&UsageEventWithTs)`) + `DbOp::WriteEvent` sent to writer
 - Watch mode uses `send` (blocking, consistent with cold start)
 - Every 5 seconds, dirty checkpoints are batch-flushed to the writer
 
@@ -109,7 +114,7 @@ Pricing is loaded by the client from the file cache (`~/.config/toki/pricing.jso
 5. Cold start: scan all session files → store events in TSDB + output summary
 6. Watcher + Worker thread spawn
 7. Write PID file
-8. Listener thread spawn (UDS accept loop)
+8. Listener thread spawn (UDS accept loop, command-based dispatch: TRACE/REPORT)
 9. Wait for SIGTERM/SIGINT
 ```
 
@@ -216,9 +221,9 @@ FSEvents → event_tx → Worker thread
 
 ```
 UnixStream::connect(daemon.sock)
+    → send "TRACE\n" command
     → BufReader::lines() loop
-    → JSON parse → type dispatch
-        "event" → deserialize UsageEvent → local sink.emit_event()
+    → JSONL passthrough to stdout (no deserialization)
 ```
 
 ### Report (one-shot query)
@@ -228,13 +233,13 @@ daemon_status(pidfile)?
     → None: "Cannot connect to toki daemon" → exit
     → Some: continue
 
-DB open → has_any_rollups()? (O(1) check)
-    → No:  "No data in TSDB" (cold start may be in progress)
-    → Yes: execute query
+UDS connect → send "REPORT\n" + JSON query
+    → daemon executes query against TSDB
+    → returns JSON response
+    → client applies pricing + sink output
 ```
 
-Report opens the DB in read-only mode without a writer thread.
-Uses a streaming callback pattern to aggregate without intermediate Vec allocation.
+Report sends a query to the daemon over UDS. The client does NOT open the DB directly.
 
 ## File Processing Pipeline
 
@@ -339,7 +344,7 @@ pub enum DbOp {
 
 ## Query Architecture
 
-Report commands open the DB in read-only mode and query directly (no writer thread needed).
+Report queries are sent to the daemon over UDS. The daemon executes the query against the TSDB and returns the result.
 
 ### Query Paths
 

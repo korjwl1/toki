@@ -154,8 +154,8 @@ toki trace            # real-time stream    (≈ docker logs -f)
 toki report           # instant TSDB query  (≈ docker ps)
 ```
 
-- **daemon** — watches session logs from configured providers (Claude Code, Codex CLI) via FSEvents, parses events, writes to per-provider embedded TSDBs (fjall). Zero sink overhead when no trace clients are connected.
-- **trace** — connects to the daemon over UDS for real-time event streaming. Supports `print`, `uds://`, `http://` sinks.
+- **daemon** — watches session logs from configured providers (Claude Code, Codex CLI) via FSEvents, parses events, writes to per-provider embedded TSDBs (fjall). 4 base threads + 2 per connected trace client. Zero sink overhead when no trace clients are connected. UDS protocol is command-based: clients send `TRACE\n` or `REPORT\n` as the first line.
+- **trace** — connects to the daemon over UDS for real-time event streaming. Always outputs JSONL to stdout (no sink/format options).
 - **report** — sends a query to the daemon over UDS, gets merged results from all provider TSDBs. Always fast, always indexed. Filter by `--provider` to query a single provider.
 
 ---
@@ -280,8 +280,7 @@ Filter keys: `model`, `session`, `project`, `provider`, `since`, `until`
 ### Trace
 
 ```bash
-toki trace                                              # Default (print to terminal)
-toki trace --sink print --sink http://localhost:8080     # Multi-sink
+toki trace                                              # JSONL stream to stdout
 ```
 
 ### Settings
@@ -316,14 +315,16 @@ Priority: **CLI args > settings.json > defaults**
 
 </details>
 
-### Client Options (trace / report)
+### Client Options (report)
 
 | Option | Description |
 |--------|-------------|
-| `--output-format table\|json` | Override output format |
-| `--sink <SPEC>` | Output target (repeatable) |
+| `--output-format table\|json` | Override output format (report only) |
+| `--sink <SPEC>` | Output target, repeatable (report only) |
 | `--timezone <IANA>` / `-z` | Override timezone |
 | `--no-cost` | Disable cost calculation |
+
+> `--output-format` and `--sink` do not apply to `trace`. Trace always outputs JSONL to stdout.
 
 ---
 

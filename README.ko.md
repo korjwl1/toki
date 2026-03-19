@@ -151,9 +151,9 @@ toki trace            # 실시간 스트림        (≈ docker logs -f)
 toki report           # 즉시 TSDB 조회      (≈ docker ps)
 ```
 
-- **daemon** — 설정된 provider(Claude Code, Codex CLI)의 세션 로그를 FSEvents로 감시하고, 이벤트를 파싱해서 provider별 내장 TSDB(fjall)에 기록합니다. trace 클라이언트가 없으면 Sink 오버헤드는 0입니다.
-- **trace** — UDS로 데몬에 연결해서 실시간 이벤트 스트림을 받습니다. `print`, `uds://`, `http://` 모든 sink을 지원합니다.
-- **report** — UDS로 데몬에 쿼리를 보내고, 모든 provider TSDB의 결과를 병합하여 받습니다. 언제나 빠르고, 언제나 색인된 상태입니다. `--provider`로 단일 provider만 조회할 수도 있습니다.
+- **daemon** — 설정된 provider(Claude Code, Codex CLI)의 세션 로그를 FSEvents로 감시하고, 이벤트를 파싱해서 provider별 내장 TSDB(fjall)에 기록합니다. 기본 4스레드(Worker, Writer, Listener, Notify) + trace 클라이언트당 2스레드(receiver + writer). trace 클라이언트가 없으면 Sink 오버헤드는 0입니다.
+- **trace** — UDS로 데몬에 연결해서 실시간 이벤트 스트림을 받습니다. 항상 JSONL을 stdout에 출력합니다 (`--output-format`과 `--sink`는 trace에 미적용).
+- **report** — UDS로 데몬에 쿼리를 보내고 (`REPORT` 커맨드 후 JSON payload), 모든 provider TSDB의 결과를 병합하여 받습니다. DB를 직접 열지 않습니다. 언제나 빠르고, 언제나 색인된 상태입니다. `--provider`로 단일 provider만 조회할 수도 있습니다.
 
 ---
 
@@ -172,7 +172,7 @@ toki settings get providers                 # 활성화된 provider 확인
 # 1. 데몬 시작 (기본 백그라운드 실행)
 toki daemon start
 
-# 2. 다른 터미널에서 실시간 이벤트 스트림
+# 2. 다른 터미널에서 실시간 이벤트 스트림 (항상 JSONL 출력)
 toki trace
 
 # 3. 리포트 조회 (TSDB에서 즉시 조회)
@@ -277,8 +277,7 @@ metric{filters}[bucket] by (dimensions)
 ### Trace
 
 ```bash
-toki trace                                              # 기본 (터미널 출력)
-toki trace --sink print --sink http://localhost:8080     # 멀티 싱크
+toki trace                                              # 실시간 JSONL 스트림 (항상 JSONL stdout 출력)
 ```
 
 ### Settings
@@ -317,8 +316,8 @@ toki settings list                             # 전체 설정 출력
 
 | 옵션 | 설명 |
 |------|------|
-| `--output-format table\|json` | 출력 형식 오버라이드 |
-| `--sink <SPEC>` | 출력 대상, 복수 지정 가능 |
+| `--output-format table\|json` | 출력 형식 오버라이드 (report만 적용, trace는 항상 JSONL) |
+| `--sink <SPEC>` | 출력 대상, 복수 지정 가능 (report만 적용) |
 | `--timezone <IANA>` / `-z` | 타임존 오버라이드 |
 | `--no-cost` | 비용 계산 비활성화 |
 
