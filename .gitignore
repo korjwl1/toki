@@ -3,5 +3,4 @@ Cargo.lock
 .DS_Store
 __pycache__/
 *.pyc
-.claude/
-.spec-mix/
+.claude/settings.local.json
