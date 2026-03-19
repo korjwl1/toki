@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::common::schema::{ClaudeCodeSchema, ProviderSchema};
-use crate::common::types::{ModelUsageSummary, UsageEvent};
+use crate::common::types::{ModelUsageSummary, UsageEventWithTs};
 use crate::pricing::PricingTable;
 use super::format_source_label;
 
@@ -65,7 +65,7 @@ pub(crate) fn grouped_to_json(
 }
 
 /// Build JSON payload for a single watch-mode event.
-pub(crate) fn event_to_json(event: &UsageEvent, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) -> serde_json::Value {
+pub(crate) fn event_to_json(event: &UsageEventWithTs, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) -> serde_json::Value {
     let schema = schema.unwrap_or(&ClaudeCodeSchema);
     let columns = schema.columns();
     let summary = crate::common::types::ModelUsageSummary {
@@ -79,10 +79,12 @@ pub(crate) fn event_to_json(event: &UsageEvent, pricing: Option<&PricingTable>, 
     };
     let tokens = schema.extract_tokens(&summary);
 
-    let cost = pricing.and_then(|p| p.event_cost(event));
+    let cost = pricing.and_then(|p| p.event_cost_with_ts(event));
     let mut data = serde_json::json!({
         "model": event.model,
         "source": format_source_label(&event.source_file),
+        "provider": schema.provider_name(),
+        "timestamp": event.timestamp,
     });
     for (i, col) in columns.iter().enumerate() {
         if i < tokens.len() {

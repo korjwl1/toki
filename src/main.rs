@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader};
+use std::io::BufRead;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -328,13 +328,7 @@ fn main() {
         Commands::Trace { opts } => {
             let (cli_tz, cli_no_cost, cli_output_format) = parse_client_opts(&opts);
             let config = build_config(cli_tz, cli_no_cost, cli_output_format);
-            let output_format = resolve_output_format(&config);
-            let sink_specs = if opts.sink.is_empty() {
-                vec!["print".to_string()]
-            } else {
-                opts.sink.clone()
-            };
-            handle_trace(&config, &sink_specs, output_format, config.no_cost);
+            handle_trace(&config);
         }
         Commands::Report { opts, since, until, group_by_session, session_id, project, provider, command } => {
             let (cli_tz, cli_no_cost, cli_output_format) = parse_client_opts(&opts);
@@ -513,7 +507,10 @@ fn start_daemon_detached() {
         .args(["daemon", "start", "--foreground"])
         .stdin(std::process::Stdio::null())
         .stdout(log_file.try_clone().unwrap_or_else(|_| {
-            std::fs::File::open("/dev/null").unwrap()
+            std::fs::File::open("/dev/null").unwrap_or_else(|_| {
+                // Last resort: use stderr as stdout
+                unsafe { std::os::unix::io::FromRawFd::from_raw_fd(2) }
+            })
         }))
         .stderr(log_file)
         .spawn()
@@ -717,7 +714,8 @@ fn handle_daemon(command: DaemonCommands, config: &Config) {
 
 // ── Trace (client) ──────────────────────────────────────
 
-fn handle_trace(config: &Config, sink_specs: &[String], output_format: toki::sink::OutputFormat, no_cost: bool) {
+fn handle_trace(config: &Config) {
+    use std::io::Write;
     let sock_path = config.daemon_sock.clone();
 
     let stream = match UnixStream::connect(&sock_path) {
@@ -729,21 +727,15 @@ fn handle_trace(config: &Config, sink_specs: &[String], output_format: toki::sin
         }
     };
 
-    // Load pricing client-side (ETag-based fetch, file cache)
-    let pricing_cache_path = toki::pricing::default_cache_path();
-    let mut pricing = if no_cost {
-        None
-    } else {
-        let p = toki::pricing::fetch_pricing(&pricing_cache_path);
-        if p.is_empty() { None } else { Some(p) }
-    };
-    let mut last_pricing_refresh = std::time::Instant::now();
+    // Send TRACE command to identify this connection
+    if writeln!(&stream, "TRACE").is_err() {
+        eprintln!("[toki] Failed to send TRACE command");
+        std::process::exit(1);
+    }
 
-    let sink = toki::sink::create_sinks(sink_specs, output_format);
-
-    // Non-blocking read + manual polling so Ctrl+C works immediately
-    stream.set_nonblocking(true).ok();
-    let mut reader = BufReader::new(stream);
+    // BufReader + read_line — same approach as report
+    stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+    let mut reader = std::io::BufReader::new(stream);
 
     // Register SIGINT to exit cleanly
     unsafe {
@@ -758,57 +750,31 @@ fn handle_trace(config: &Config, sink_specs: &[String], output_format: toki::sin
             break;
         }
 
-        // Periodic pricing refresh (24h)
-        if !no_cost && last_pricing_refresh.elapsed() >= std::time::Duration::from_secs(86400) {
-            let p = toki::pricing::fetch_pricing(&pricing_cache_path);
-            if !p.is_empty() {
-                pricing = Some(p);
-            }
-            last_pricing_refresh = std::time::Instant::now();
-        }
-
         line_buf.clear();
-        let line = match reader.read_line(&mut line_buf) {
+        match reader.read_line(&mut line_buf) {
             Ok(0) => {
                 eprintln!("[toki] Daemon disconnected.");
                 break;
             }
-            Ok(_) => line_buf.trim_end().to_string(),
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(std::time::Duration::from_millis(50));
+            Ok(_) => {
+                let line = line_buf.trim();
+                if line.is_empty() {
+                    continue;
+                }
+
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                    if v["type"].as_str() == Some("event") {
+                        println!("{}", line);
+                    }
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut => {
                 continue;
             }
             Err(_) => {
                 eprintln!("[toki] Daemon disconnected.");
                 break;
-            }
-        };
-
-        if line.is_empty() {
-            continue;
-        }
-
-        let mut v: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(e) => {
-                if std::env::var("TOKI_DEBUG").is_ok() {
-                    eprintln!("[toki] malformed JSON from daemon: {}", e);
-                }
-                continue;
-            }
-        };
-
-        match v["type"].as_str() {
-            Some("event") => {
-                if let Ok(event) = serde_json::from_value::<toki::UsageEvent>(v["data"].take()) {
-                    sink.emit_event(&event, pricing.as_ref(), None);
-                }
-            }
-            Some("summary") => {
-                println!("{}", line);
-            }
-            _ => {
-                println!("{}", line);
             }
         }
     }
@@ -942,7 +908,8 @@ fn send_report_query(
     let mut stream = UnixStream::connect(sock_path)
         .map_err(|_| "Cannot connect to daemon. Start it first: toki daemon start".to_string())?;
 
-    // Send request
+    // Send REPORT command + JSON payload
+    writeln!(stream, "REPORT").map_err(|e| format!("Failed to send command: {}", e))?;
     let request = serde_json::json!({
         "query": query,
         "tz": tz.map(|t| t.to_string()),

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use comfy_table::{Table, ContentArrangement, Cell, Attribute, presets::UTF8_FULL};
 
 use crate::common::schema::{ClaudeCodeSchema, ProviderSchema};
-use crate::common::types::{ModelUsageSummary, UsageEvent};
+use crate::common::types::{ModelUsageSummary, UsageEventWithTs};
 use crate::pricing::{PricingTable, format_cost};
 use super::{Sink, json, format_source_label, shorten_id};
 
@@ -270,7 +270,7 @@ impl Sink for PrintSink {
         println!("{table}");
     }
 
-    fn emit_event(&self, event: &UsageEvent, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
+    fn emit_event(&self, event: &UsageEventWithTs, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
         if self.format == OutputFormat::Json {
             let json = json::event_to_json(event, pricing, schema);
             println!("{}", serde_json::to_string(&json).unwrap_or_default());
@@ -279,7 +279,7 @@ impl Sink for PrintSink {
 
         let schema = effective_schema(schema);
         let columns = schema.columns();
-        let cost = pricing.and_then(|p| p.event_cost(event));
+        let cost = pricing.and_then(|p| p.event_cost_with_ts(event));
         let label = format_source_label(&event.source_file);
 
         // Build token summary from schema columns

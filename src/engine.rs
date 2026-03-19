@@ -7,7 +7,7 @@ use crossbeam_channel::{Receiver, Sender};
 use crate::checkpoint::{find_resume_offset, process_lines_streaming};
 use crate::common::types::{FileCheckpoint, LogParser, LogParserWithTs, ModelUsageSummary, TokenFields};
 use crate::providers::Provider;
-use chrono::{DateTime, NaiveDateTime, Weekday};
+use chrono::{NaiveDateTime, Weekday};
 use chrono_tz::Tz;
 use crate::sink::Sink;
 use crate::writer::{ColdStartEvent, DbOp, WriteEventData};
@@ -607,9 +607,9 @@ impl TrackerEngine {
                                 .as_millis() as i64
                         });
 
-                    let (usage, _ts) = event.into_usage_event();
-                    self.sink.emit_event(&usage, None, Some(event_schema));
+                    self.sink.emit_event(&event, None, Some(event_schema));
 
+                    let (usage, _ts) = event.into_usage_event();
                     let op = DbOp::WriteEvent(Box::new(WriteEventData {
                         ts_ms,
                         message_id: usage.event_key,
@@ -657,9 +657,9 @@ impl TrackerEngine {
                                 .as_millis() as i64
                         });
 
-                    let (usage, _ts) = event.into_usage_event();
-                    self.sink.emit_event(&usage, None, None);
+                    self.sink.emit_event(&event, None, None);
 
+                    let (usage, _ts) = event.into_usage_event();
                     let op = DbOp::WriteEvent(Box::new(WriteEventData {
                         ts_ms,
                         message_id: usage.event_key,
@@ -916,14 +916,6 @@ pub fn extract_session_id(path: &str) -> Option<String> {
 /// limitation that can be resolved by adding project_name_id to StoredEvent.
 pub fn extract_project_name(path: &str) -> Option<&str> {
     crate::providers::claude_code::extract_project_name(path)
-}
-
-#[allow(dead_code)]
-fn parse_timestamp(ts: &str) -> Option<NaiveDateTime> {
-    if let Ok(dt) = DateTime::parse_from_rfc3339(ts) {
-        return Some(dt.naive_utc());
-    }
-    NaiveDateTime::parse_from_str(ts, "%Y-%m-%dT%H:%M:%SZ").ok()
 }
 
 #[cfg(test)]

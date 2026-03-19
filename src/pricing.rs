@@ -64,6 +64,14 @@ impl PricingTable {
             e.cache_creation_input_tokens, e.cache_read_input_tokens,
         ))
     }
+
+    /// Calculate cost for a UsageEventWithTs.
+    pub fn event_cost_with_ts(&self, e: &crate::common::types::UsageEventWithTs) -> Option<f64> {
+        self.get(&e.model).map(|p| p.cost(
+            e.input_tokens, e.output_tokens,
+            e.cache_creation_input_tokens, e.cache_read_input_tokens,
+        ))
+    }
 }
 
 /// Parse LiteLLM JSON and extract all model prices.

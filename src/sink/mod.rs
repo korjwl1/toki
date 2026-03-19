@@ -10,7 +10,7 @@ pub use self::http::HttpSink;
 use std::collections::HashMap;
 
 use crate::common::schema::ProviderSchema;
-use crate::common::types::{ModelUsageSummary, UsageEvent};
+use crate::common::types::{ModelUsageSummary, UsageEventWithTs};
 use crate::pricing::PricingTable;
 
 /// Output sink for emitting usage data.
@@ -18,7 +18,7 @@ use crate::pricing::PricingTable;
 pub trait Sink: Send + Sync {
     fn emit_summary(&self, summaries: &HashMap<String, ModelUsageSummary>, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>);
     fn emit_grouped(&self, grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>, type_name: &str, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>);
-    fn emit_event(&self, event: &UsageEvent, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>);
+    fn emit_event(&self, event: &UsageEventWithTs, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>);
     fn emit_list(&self, items: &[String], type_name: &str);
 }
 
@@ -42,7 +42,7 @@ impl Sink for MultiSink {
         for s in &self.sinks { s.emit_grouped(grouped, type_name, pricing, schema); }
     }
 
-    fn emit_event(&self, event: &UsageEvent, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
+    fn emit_event(&self, event: &UsageEventWithTs, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
         for s in &self.sinks { s.emit_event(event, pricing, schema); }
     }
 

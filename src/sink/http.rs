@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::common::schema::ProviderSchema;
-use crate::common::types::{ModelUsageSummary, UsageEvent};
+use crate::common::types::{ModelUsageSummary, UsageEventWithTs};
 use crate::pricing::PricingTable;
 use super::{Sink, json};
 
@@ -54,7 +54,7 @@ impl Sink for HttpSink {
         self.send(&json::grouped_to_json(grouped, type_name, pricing, schema));
     }
 
-    fn emit_event(&self, event: &UsageEvent, pricing: Option<&PricingTable>, _schema: Option<&dyn ProviderSchema>) {
+    fn emit_event(&self, event: &UsageEventWithTs, pricing: Option<&PricingTable>, _schema: Option<&dyn ProviderSchema>) {
         self.send(&json::event_to_json(event, pricing, _schema));
     }
 
