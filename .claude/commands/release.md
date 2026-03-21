@@ -1,4 +1,4 @@
-Release a new version of toki via local cross-compilation and Homebrew tap update.
+Release a new version of toki. macOS binaries are built locally, Linux binaries are built via GitHub Actions.
 
 ## Instructions
 
@@ -15,7 +15,6 @@ When the user runs `/release`, follow these steps:
 - Run `cargo test` to make sure tests pass
 - Check `git status` to ensure the working tree is clean (no uncommitted changes)
 - Check that the tag `v{VERSION}` doesn't already exist: `git tag -l v{VERSION}`
-- Verify `cross` and `docker` are available
 
 If any check fails, report the issue and stop.
 
@@ -25,47 +24,53 @@ If any check fails, report the issue and stop.
 - Run `cargo check` to update `Cargo.lock`
 - Commit with message: `chore: bump version to {VERSION}`
 
-### 4. Build all targets
-
-Build all 4 targets using `cargo build` for native macOS and `cross build` for Linux:
+### 4. Build macOS targets (local)
 
 ```bash
-# macOS (native, no Docker needed)
 cargo build --release --target aarch64-apple-darwin
 cargo build --release --target x86_64-apple-darwin
-
-# Linux (via cross, uses Docker)
-cross build --release --target x86_64-unknown-linux-gnu
-cross build --release --target aarch64-unknown-linux-gnu
 ```
 
-Then package each into tar.gz:
+Package into tar.gz:
 
 ```bash
-for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+for target in aarch64-apple-darwin x86_64-apple-darwin; do
   tar -czf "toki-{VERSION}-${target}.tar.gz" -C "target/${target}/release" toki
 done
 ```
 
-### 5. Create tag, push, and upload releases
+### 5. Create tag, push, and upload
 
 - Create an annotated tag: `git tag -a v{VERSION} -m "Release v{VERSION}"`
 - Show the user what will be pushed and ask for confirmation
 - Push the commit and tag: `git push origin main && git push origin v{VERSION}`
-- Create GitHub release on **toki repo** (for source tracking):
+- Tag push triggers GitHub Actions workflow (`.github/workflows/release-linux.yml`) which builds Linux x86_64 and aarch64 with jemalloc, and uploads to both toki and homebrew-tap releases
+- Create GitHub release on **toki repo** with macOS archives:
   ```bash
-  gh release create v{VERSION} toki-{VERSION}-*.tar.gz --repo korjwl1/toki --title "v{VERSION}" --generate-notes
+  gh release create v{VERSION} toki-{VERSION}-*-apple-darwin.tar.gz --repo korjwl1/toki --title "v{VERSION}" --generate-notes
   ```
-- Upload the same archives to **homebrew-tap repo** release (public, for brew download):
+- Upload macOS archives to **homebrew-tap repo** release:
   ```bash
-  gh release create v{VERSION} toki-{VERSION}-*.tar.gz --repo korjwl1/homebrew-tap --title "toki v{VERSION}" --notes "Release artifacts for toki v{VERSION}"
+  gh release create v{VERSION} toki-{VERSION}-*-apple-darwin.tar.gz --repo korjwl1/homebrew-tap --title "toki v{VERSION}" --notes "Release artifacts for toki v{VERSION}"
   ```
 
-### 6. Update Homebrew tap
+### 6. Wait for GitHub Actions
 
-Compute sha256 for each archive and update the tap formula.
+- Check the Actions run: `gh run list --repo korjwl1/toki --limit 3`
+- Wait for completion: `gh run watch --repo korjwl1/toki`
+- Once done, Linux archives will be uploaded to both repos' releases automatically
 
-**IMPORTANT**: Formula URLs must point to `korjwl1/homebrew-tap` releases (public), NOT `korjwl1/toki` (private).
+### 7. Update Homebrew tap
+
+After both macOS (local) and Linux (Actions) archives are uploaded, compute sha256 and update the tap formula.
+
+Download Linux archives from the release:
+
+```bash
+gh release download v{VERSION} --repo korjwl1/homebrew-tap --pattern "toki-{VERSION}-*-linux-*"
+```
+
+Compute sha256 for all 4 archives:
 
 ```bash
 SHA_AARCH64_DARWIN=$(shasum -a 256 toki-{VERSION}-aarch64-apple-darwin.tar.gz | cut -d' ' -f1)
@@ -80,7 +85,9 @@ Clone tap repo and write the updated Formula/toki.rb:
 cd /tmp && rm -rf homebrew-tap && git clone https://github.com/korjwl1/homebrew-tap.git && cd homebrew-tap
 ```
 
-The formula template (URLs point to homebrew-tap releases):
+**IMPORTANT**: Formula URLs must point to `korjwl1/homebrew-tap` releases (public), NOT `korjwl1/toki` (private).
+
+The formula template:
 
 ```ruby
 class Toki < Formula
@@ -127,7 +134,7 @@ Commit and push:
 git add Formula/toki.rb && git commit -m "Update toki to {VERSION}" && git push
 ```
 
-### 7. Cleanup and confirm
+### 8. Cleanup and confirm
 
 - Remove the local tar.gz files
 - Tell the user the release is complete
@@ -139,4 +146,8 @@ git add Formula/toki.rb && git commit -m "Update toki to {VERSION}" && git push
 
 ### Notes
 
+- Linux builds use jemalloc (required to prevent memory fragmentation on long-running daemons)
+- macOS builds are done locally (10x cheaper than Actions macOS runners)
+- Linux builds are done via GitHub Actions (native Linux runners, no cross-compilation issues with jemalloc)
+- GitHub Actions workflow requires `TAP_RELEASE_TOKEN` secret for uploading to homebrew-tap repo
 - When toki repo becomes public, update Formula URLs to point to `korjwl1/toki` releases instead, and stop uploading to homebrew-tap releases.

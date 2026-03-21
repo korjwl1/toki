@@ -208,7 +208,7 @@ pub fn fetch_pricing(cache_path: &Path) -> PricingTable {
     match req.call() {
         Ok(resp) => {
             if resp.status() == 304 {
-                eprintln!("[toki] Pricing: not modified");
+                // Cache hit — silent
                 return cached.map(|c| PricingTable::new(c.prices))
                     .unwrap_or_else(|| PricingTable::new(HashMap::new()));
             }
@@ -228,7 +228,7 @@ pub fn fetch_pricing(cache_path: &Path) -> PricingTable {
                 return fallback(cached);
             }
 
-            eprintln!("[toki] Pricing: updated, {} models", prices.len());
+            // Updated — silent
             save_cache(cache_path, &PricingCache { etag: new_etag, version: PRICING_CACHE_VERSION, prices: prices.clone() });
             PricingTable::new(prices)
         }
@@ -248,7 +248,7 @@ pub fn load_cached_pricing(cache_path: &Path) -> PricingTable {
     match load_cache(cache_path) {
         Some(cache) => {
             if !cache.prices.is_empty() {
-                eprintln!("[toki] Pricing: using cached data, {} models", cache.prices.len());
+                // Cached data — silent
             }
             PricingTable::new(cache.prices)
         }
@@ -260,7 +260,7 @@ fn fallback(cached: Option<PricingCache>) -> PricingTable {
     match cached {
         Some(cache) => {
             if !cache.prices.is_empty() {
-                eprintln!("[toki] Pricing: using cached data, {} models", cache.prices.len());
+                // Cached data — silent
             }
             PricingTable::new(cache.prices)
         }
