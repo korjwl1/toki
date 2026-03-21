@@ -122,6 +122,23 @@ class Toki < Formula
     bin.install "toki"
   end
 
+  def post_install
+    # Restart daemon if it was running (picks up new binary)
+    pidfile = File.expand_path("~/.config/toki/daemon.pid")
+    if File.exist?(pidfile)
+      pid = File.read(pidfile).strip.to_i
+      if pid > 0
+        begin
+          Process.kill(0, pid) # check if alive
+          ohai "Restarting toki daemon to use the new version..."
+          system bin/"toki", "daemon", "restart"
+        rescue Errno::ESRCH
+          # daemon not running, stale pidfile — nothing to do
+        end
+      end
+    end
+  end
+
   test do
     system "#{bin}/toki", "--version"
   end
