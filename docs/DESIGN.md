@@ -369,6 +369,8 @@ The data source is determined by the query's filters and grouping conditions:
 | Time grouping only (daily/weekly/...) | rollups | Fast |
 | Time grouping + session/project filter | events + dict | Event-level filtering required |
 | `sessions` / `projects` listing | idx_sessions/idx_projects or events | Index if no time filter, events scan otherwise |
+| `events` listing | events + dict | Always event-level scan |
+| `sum()`/`avg()`/`count()` aggregation | Same as base query | Post-processing: collapses model dimension |
 
 ### Streaming Callback Pattern
 

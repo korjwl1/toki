@@ -276,4 +276,17 @@ impl crate::sink::Sink for CollectorSink {
             .unwrap_or_else(|e| e.into_inner())
             .push(serde_json::json!({ "type": type_name, "items": items }));
     }
+
+    fn emit_events_batch(
+        &self,
+        events: &[crate::common::types::RawEvent],
+        pricing: Option<&crate::pricing::PricingTable>,
+        _schema: Option<&dyn ProviderSchema>,
+    ) {
+        let json = crate::sink::json::events_batch_to_json(events, pricing, None);
+        self.collected
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(json);
+    }
 }

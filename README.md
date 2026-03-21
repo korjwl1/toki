@@ -186,8 +186,8 @@ toki report monthly
 
 # 4. PromQL-style queries
 toki report query 'usage{model="claude-opus-4-6"}[1h] by (model)'
-toki report query 'usage{provider="codex"} by (model)'
-toki report query 'sessions{project="myapp"}'
+toki report query 'sum(usage{since="20260301"}[1d]) by (project)'
+toki report query 'events{since="20260320"}'
 ```
 
 ---
@@ -218,7 +218,7 @@ toki report daily --since 20260301
 toki report weekly --since 20260301 --start-of-week tue
 toki report monthly
 toki report yearly
-toki report hourly --from-beginning
+toki report hourly --since 20260301
 
 # Session/project filters
 toki report --group-by-session
@@ -230,8 +230,9 @@ toki report --provider codex daily --since 20260301
 
 # PromQL-style queries
 toki report query 'usage{model="claude-opus-4-6"}[1h] by (model)'
-toki report query 'usage{provider="codex"} by (model)'
-toki report query 'usage{session="4de9", since="20260301"} by (session)'
+toki report query 'sum(usage{since="20260301"}[1d]) by (project)'
+toki report query 'events{since="20260320"}'
+toki report query 'usage[1d] offset 7d'
 toki report query 'sessions{project="myapp"}'
 toki report query 'projects'
 
@@ -250,7 +251,6 @@ toki --no-cost report                               # skip cost
 | `query '<PROMQL>'` | PromQL-style free query |
 | `--since YYYYMMDD[hhmmss]` | Start time (inclusive, `>=`) |
 | `--until YYYYMMDD[hhmmss]` | End time (inclusive, `<=`) |
-| `--from-beginning` | Allow full grouping without `--since` |
 | `--group-by-session` | Group by session (mutually exclusive with time subcommand) |
 | `--session-id <PREFIX>` | Filter by session UUID prefix |
 | `--project <NAME>` | Filter by project directory substring |
@@ -263,14 +263,16 @@ toki --no-cost report                               # skip cost
 <summary>PromQL query syntax</summary>
 
 ```
-metric{filters}[bucket] by (dimensions)
+[agg_func(] metric{filters}[bucket] [offset duration] [)] [by (dimensions)]
 ```
 
 | Element | Description | Example |
 |---------|-------------|---------|
-| metric | `usage`, `sessions`, `projects` | `usage` |
+| metric | `usage`, `sessions`, `projects`, `events` | `usage` |
 | filters | `key="value"` pairs, comma-separated | `{model="claude-opus-4-6", since="20260301"}` |
 | bucket | Time bucket (s/m/h/d/w) | `[1h]`, `[5m]`, `[1d]` |
+| offset | Shift time window back | `offset 7d` |
+| agg_func | `sum`, `avg`, `count` — collapse models | `sum(usage[1d])` |
 | dimensions | Group by (model/session/project) | `by (model, session)` |
 
 Filter keys: `model`, `session`, `project`, `provider`, `since`, `until`

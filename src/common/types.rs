@@ -110,6 +110,19 @@ pub struct RollupValue {
     pub count: u64,
 }
 
+/// A raw event returned by the `events` query metric.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawEvent {
+    pub timestamp: String,
+    pub model: String,
+    pub session: String,
+    pub project: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+}
+
 /// Token fields for DbOp::WriteEvent.
 #[derive(Debug, Clone)]
 pub struct TokenFields {

@@ -393,6 +393,8 @@ CLI 플래그(`--session-id`, `--project`, `--since`, `--until`, `--group-by-ses
 | 시간 그룹핑만 (daily/weekly/...) | rollups | 빠름 |
 | 시간 그룹핑 + 세션/프로젝트 필터 | events + dict | 이벤트 레벨 필터링 필요 |
 | `sessions` / `projects` 리스팅 | idx_sessions/idx_projects 또는 events | 시간 필터 없으면 인덱스, 있으면 이벤트 스캔 |
+| `events` 리스팅 | events + dict | 항상 이벤트 레벨 스캔 |
+| `sum()`/`avg()`/`count()` 집계 | 기본 쿼리와 동일 | 후처리: 모델 차원 collapse |
 
 ### 스트리밍 콜백 패턴
 

@@ -3,9 +3,10 @@ use std::collections::HashMap;
 use chrono::{NaiveDateTime, TimeZone, Datelike, Weekday};
 use chrono_tz::Tz;
 
-use crate::common::types::{ModelUsageSummary, GroupedSummaryMap, SummaryMap};
+use crate::common::types::{ModelUsageSummary, RawEvent, GroupedSummaryMap, SummaryMap};
 use crate::db::Database;
 use crate::engine::{ReportFilter, ReportGroupBy};
+use crate::query_parser::{AggregationFunc, Bucket};
 
 /// Resolve (since, until) from filter into ms timestamps.
 fn filter_range(filter: ReportFilter) -> (i64, i64) {
@@ -125,6 +126,67 @@ pub fn report_by_session_from_db(
     Ok(grouped)
 }
 
+/// Apply offset to a NaiveDateTime by shifting it backward.
+fn apply_offset(dt: Option<NaiveDateTime>, offset: Option<&Bucket>) -> Option<NaiveDateTime> {
+    match (dt, offset) {
+        (Some(dt), Some(offset)) => {
+            Some(dt - chrono::Duration::seconds(offset.as_secs() as i64))
+        }
+        other => other.0,
+    }
+}
+
+/// Collapse a SummaryMap (model → summary) into a single entry based on aggregation function.
+fn apply_aggregation_flat(summaries: &mut SummaryMap, func: AggregationFunc) {
+    if summaries.is_empty() { return; }
+
+    // Sum all values
+    let mut total = ModelUsageSummary::default();
+    for s in summaries.values() {
+        total.input_tokens += s.input_tokens;
+        total.output_tokens += s.output_tokens;
+        total.cache_creation_input_tokens += s.cache_creation_input_tokens;
+        total.cache_read_input_tokens += s.cache_read_input_tokens;
+        total.event_count += s.event_count;
+    }
+
+    match func {
+        AggregationFunc::Sum => {
+            total.model = "(total)".to_string();
+        }
+        AggregationFunc::Avg => {
+            let count = total.event_count.max(1);
+            total.input_tokens /= count;
+            total.output_tokens /= count;
+            total.cache_creation_input_tokens /= count;
+            total.cache_read_input_tokens /= count;
+            total.event_count = 1;
+            total.model = "(avg/event)".to_string();
+        }
+        AggregationFunc::Count => {
+            let count = total.event_count;
+            total.input_tokens = 0;
+            total.output_tokens = 0;
+            total.cache_creation_input_tokens = 0;
+            total.cache_read_input_tokens = 0;
+            total.event_count = count;
+            total.model = "(count)".to_string();
+        }
+    }
+
+    summaries.clear();
+    summaries.insert(total.model.clone(), total);
+}
+
+/// Collapse model dimension within each group of a GroupedSummaryMap.
+fn apply_aggregation_grouped(grouped: &mut GroupedSummaryMap, func: AggregationFunc) {
+    for models in grouped.values_mut() {
+        let mut flat: SummaryMap = std::mem::take(models);
+        apply_aggregation_flat(&mut flat, func);
+        *models = flat;
+    }
+}
+
 /// Execute a parsed PromQL-style query against the TSDB.
 pub fn execute_parsed_query(
     db: &Database,
@@ -143,8 +205,8 @@ pub fn execute_parsed_query(
 
             let sessions = if has_time_or_project {
                 // Need event-level scan to filter by time range and/or project
-                let since_dt = parsed.since.as_deref().map(|s| parse_range_time(s, false, tz)).transpose()?;
-                let until_dt = parsed.until.as_deref().map(|s| parse_range_time(s, true, tz)).transpose()?;
+                let since_dt = apply_offset(parsed.since.as_deref().map(|s| parse_range_time(s, false, tz)).transpose()?, parsed.offset.as_ref());
+                let until_dt = apply_offset(parsed.until.as_deref().map(|s| parse_range_time(s, true, tz)).transpose()?, parsed.offset.as_ref());
                 let since_ms = since_dt.map(|d| d.and_utc().timestamp_millis()).unwrap_or(0);
                 let until_ms = until_dt.map(|d| d.and_utc().timestamp_millis()).unwrap_or(i64::MAX);
 
@@ -183,8 +245,8 @@ pub fn execute_parsed_query(
 
             let projects = if has_time {
                 // Event scan for time-filtered project list
-                let since_dt = parsed.since.as_deref().map(|s| parse_range_time(s, false, tz)).transpose()?;
-                let until_dt = parsed.until.as_deref().map(|s| parse_range_time(s, true, tz)).transpose()?;
+                let since_dt = apply_offset(parsed.since.as_deref().map(|s| parse_range_time(s, false, tz)).transpose()?, parsed.offset.as_ref());
+                let until_dt = apply_offset(parsed.until.as_deref().map(|s| parse_range_time(s, true, tz)).transpose()?, parsed.offset.as_ref());
                 let since_ms = since_dt.map(|d| d.and_utc().timestamp_millis()).unwrap_or(0);
                 let until_ms = until_dt.map(|d| d.and_utc().timestamp_millis()).unwrap_or(i64::MAX);
 
@@ -211,9 +273,52 @@ pub fn execute_parsed_query(
             };
             sink.emit_list(&projects, "projects");
         }
+        Metric::Events => {
+            let since_dt = apply_offset(parsed.since.as_deref().map(|s| parse_range_time(s, false, tz)).transpose()?, parsed.offset.as_ref());
+            let until_dt = apply_offset(parsed.until.as_deref().map(|s| parse_range_time(s, true, tz)).transpose()?, parsed.offset.as_ref());
+            let since_ms = since_dt.map(|d| d.and_utc().timestamp_millis()).unwrap_or(0);
+            let until_ms = until_dt.map(|d| d.and_utc().timestamp_millis()).unwrap_or(i64::MAX);
+
+            let dict = db.load_dict_reverse().map_err(|e| e.to_string())?;
+            let unknown = String::new();
+            let model_filter = parsed.filter_value("model");
+            let session_filter = parsed.filter_value("session");
+            let project_filter = parsed.filter_value("project");
+
+            let mut events: Vec<RawEvent> = Vec::new();
+            db.for_each_event(since_ms, until_ms, |ts, event| {
+                let model = dict.get(&event.model_id).unwrap_or(&unknown);
+                if let Some(mf) = model_filter {
+                    if model != mf { return; }
+                }
+                let session = dict.get(&event.session_id).unwrap_or(&unknown);
+                if let Some(sf) = session_filter {
+                    if !session.starts_with(sf) { return; }
+                }
+                let source = dict.get(&event.source_file_id).map(|s| s.as_str()).unwrap_or("");
+                let project = crate::engine::extract_project_name(source).unwrap_or("unknown");
+                if let Some(pf) = project_filter {
+                    if !project.contains(pf) { return; }
+                }
+
+                let dt = ts_to_datetime(ts, tz);
+                events.push(RawEvent {
+                    timestamp: dt.format("%Y-%m-%dT%H:%M:%S").to_string(),
+                    model: model.clone(),
+                    session: session.clone(),
+                    project: project.to_string(),
+                    input_tokens: event.input_tokens,
+                    output_tokens: event.output_tokens,
+                    cache_creation_input_tokens: event.cache_creation_input_tokens,
+                    cache_read_input_tokens: event.cache_read_input_tokens,
+                });
+            }).map_err(|e| e.to_string())?;
+
+            sink.emit_events_batch(&events, pricing, None);
+        }
         Metric::Usage => {
-            let since_dt = parsed.since.as_deref().map(|s| parse_range_time(s, false, tz)).transpose()?;
-            let until_dt = parsed.until.as_deref().map(|s| parse_range_time(s, true, tz)).transpose()?;
+            let since_dt = apply_offset(parsed.since.as_deref().map(|s| parse_range_time(s, false, tz)).transpose()?, parsed.offset.as_ref());
+            let until_dt = apply_offset(parsed.until.as_deref().map(|s| parse_range_time(s, true, tz)).transpose()?, parsed.offset.as_ref());
 
             let filter = ReportFilter { since: since_dt, until: until_dt, tz };
             let model_filter = parsed.filter_value("model");
@@ -225,6 +330,9 @@ pub fn execute_parsed_query(
                     let mut summaries = report_summary_from_db(db, filter).map_err(|e| e.to_string())?;
                     if let Some(model) = model_filter {
                         summaries.retain(|k, _| k == model);
+                    }
+                    if let Some(func) = parsed.aggregation {
+                        apply_aggregation_flat(&mut summaries, func);
                     }
                     sink.emit_summary(&summaries, pricing, None);
                 }
@@ -294,6 +402,10 @@ pub fn execute_parsed_query(
                                 });
                             accumulate_rollup(entry, &rollup);
                         }).map_err(|e| e.to_string())?;
+                    }
+
+                    if let Some(func) = parsed.aggregation {
+                        apply_aggregation_grouped(&mut grouped, func);
                     }
 
                     let type_name = if let Some(ref bucket) = parsed.bucket {

@@ -1,18 +1,37 @@
 /// Minimal PromQL-inspired query parser for toki.
 ///
 /// Grammar:
-///   query   = metric filters? bucket? group_by?
-///   metric  = "usage" | "sessions" | "projects"
+///   query   = aggregation_start? metric filters? bucket? offset? aggregation_end? group_by?
+///   aggregation_start = ("sum" | "avg" | "count") "("
+///   aggregation_end = ")"
+///   metric  = "usage" | "sessions" | "projects" | "events"
 ///   filters = "{" (filter ("," filter)*)? "}"
 ///   filter  = key "=" quoted_string
 ///   bucket  = "[" duration "]"
+///   offset  = "offset" duration
 ///   group_by = "by" "(" key ("," key)* ")"
 ///
 /// Examples:
 ///   usage{model="claude-opus-4-6"}[5m] by (model)
 ///   usage{project="myapp", since="20260301"}[1h]
+///   events{session="abc123", since="20260301"}
+///   usage[1d] offset 7d
+///   sum(usage[1d])
+///   avg(usage[1d]) by (project)
+///   count(usage{since="20260301"}[1d])
 ///   sessions{project="myapp"}
 ///   projects
+
+/// Aggregation function for collapsing model dimension.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AggregationFunc {
+    /// Sum all token fields and event counts across models.
+    Sum,
+    /// Average per event (sum / event_count).
+    Avg,
+    /// Count of events (token fields zeroed).
+    Count,
+}
 
 /// Query metric type.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -23,6 +42,8 @@ pub enum Metric {
     Sessions,
     /// List projects.
     Projects,
+    /// Raw event data (individual API calls).
+    Events,
 }
 
 /// Parsed label filter.
@@ -106,6 +127,10 @@ pub struct Query {
     pub until: Option<String>,
     /// Provider filter: if set, only query this provider's DB.
     pub provider: Option<String>,
+    /// Offset modifier: shifts the time window back by this duration.
+    pub offset: Option<Bucket>,
+    /// Aggregation function: collapses model dimension.
+    pub aggregation: Option<AggregationFunc>,
 }
 
 impl Query {
@@ -118,10 +143,18 @@ impl Query {
 
     /// Serialize back to PromQL-style query string.
     pub fn to_query_string(&self) -> String {
+        let agg_prefix = match self.aggregation {
+            Some(AggregationFunc::Sum) => "sum(",
+            Some(AggregationFunc::Avg) => "avg(",
+            Some(AggregationFunc::Count) => "count(",
+            None => "",
+        };
+
         let mut s = match self.metric {
             Metric::Usage => "usage".to_string(),
             Metric::Sessions => "sessions".to_string(),
             Metric::Projects => "projects".to_string(),
+            Metric::Events => "events".to_string(),
         };
 
         // Collect all filters (including since/until)
@@ -151,11 +184,17 @@ impl Query {
             s.push_str(&format!("[{}]", bucket));
         }
 
-        if !self.group_by.is_empty() {
-            s.push_str(&format!(" by ({})", self.group_by.join(", ")));
+        if let Some(ref offset) = self.offset {
+            s.push_str(&format!(" offset {}", offset));
         }
 
-        s
+        let agg_suffix = if self.aggregation.is_some() { ")" } else { "" };
+
+        if !self.group_by.is_empty() {
+            format!("{}{}{} by ({})", agg_prefix, s, agg_suffix, self.group_by.join(", "))
+        } else {
+            format!("{}{}{}", agg_prefix, s, agg_suffix)
+        }
     }
 
     /// Serialize with a ReportGroupBy converted to a bucket.
@@ -169,12 +208,11 @@ impl Query {
         };
 
         let base = self.to_query_string();
-        // Insert bucket before " by" or at end
-        if let Some(pos) = base.find(" by ") {
-            format!("{}{}{}", &base[..pos], bucket_str, &base[pos..])
-        } else {
-            format!("{}{}", base, bucket_str)
-        }
+        // Insert bucket before " offset" or " by" or at end
+        let insert_pos = base.find(" offset ")
+            .or_else(|| base.find(" by "))
+            .unwrap_or(base.len());
+        format!("{}{}{}", &base[..insert_pos], bucket_str, &base[insert_pos..])
     }
 }
 
@@ -185,16 +223,33 @@ const VALID_GROUP_KEYS: &[&str] = &["model", "session", "project"];
 pub fn parse(input: &str) -> Result<Query, String> {
     let mut p = Parser::new(input);
 
+    // Optional aggregation function: sum( / avg( / count(
+    p.skip_ws();
+    let aggregation = if p.consume_literal("sum") {
+        p.expect_char('(')?;
+        Some(AggregationFunc::Sum)
+    } else if p.consume_literal("avg") {
+        p.expect_char('(')?;
+        Some(AggregationFunc::Avg)
+    } else if p.consume_literal("count") {
+        p.expect_char('(')?;
+        Some(AggregationFunc::Count)
+    } else {
+        None
+    };
+
     // Parse metric name
     p.skip_ws();
     let metric = if p.consume_literal("usage") {
         Metric::Usage
+    } else if p.consume_literal("events") {
+        Metric::Events
     } else if p.consume_literal("sessions") {
         Metric::Sessions
     } else if p.consume_literal("projects") {
         Metric::Projects
     } else {
-        return Err("query must start with 'usage', 'sessions', or 'projects'".into());
+        return Err("query must start with 'usage', 'events', 'sessions', or 'projects'".into());
     };
 
     // Optional filters: { ... }
@@ -216,6 +271,19 @@ pub fn parse(input: &str) -> Result<Query, String> {
         None
     };
 
+    // Optional offset: offset <duration>
+    p.skip_ws();
+    let offset = if p.consume_literal("offset") {
+        Some(p.parse_duration()?)
+    } else {
+        None
+    };
+
+    // Close aggregation: )
+    if aggregation.is_some() {
+        p.expect_char(')')?;
+    }
+
     // Optional group_by: by ( ... )
     p.skip_ws();
     let group_by = if p.consume_literal("by") {
@@ -229,7 +297,7 @@ pub fn parse(input: &str) -> Result<Query, String> {
         return Err(format!("unexpected trailing input: '{}'", p.remaining()));
     }
 
-    // Validate: sessions/projects don't support bucket or group_by
+    // Validate: sessions/projects/events don't support bucket or group_by
     if metric != Metric::Usage {
         if bucket.is_some() {
             return Err(format!("{:?} does not support time buckets", metric));
@@ -237,9 +305,12 @@ pub fn parse(input: &str) -> Result<Query, String> {
         if !group_by.is_empty() {
             return Err(format!("{:?} does not support group by", metric));
         }
+        if aggregation.is_some() {
+            return Err(format!("{:?} does not support aggregation functions", metric));
+        }
     }
 
-    Ok(Query { metric, filters: raw_filters, bucket, group_by, since, until, provider })
+    Ok(Query { metric, filters: raw_filters, bucket, group_by, since, until, provider, offset, aggregation })
 }
 
 /// Extract and remove a filter by key, returning its value if present.
@@ -391,23 +462,21 @@ impl<'a> Parser<'a> {
         Ok(filters)
     }
 
-    fn parse_bucket(&mut self) -> Result<Bucket, String> {
-        self.expect_char('[')?;
+    /// Parse a bare duration: number + unit (e.g. "5m", "1d", "7d").
+    fn parse_duration(&mut self) -> Result<Bucket, String> {
         self.skip_ws();
-
         let start = self.pos;
         while self.pos < self.input.len() && self.input.as_bytes()[self.pos].is_ascii_digit() {
             self.pos += 1;
         }
         if self.pos == start {
-            return Err("expected number in bucket".into());
+            return Err("expected number in duration".into());
         }
         let num: u64 = self.input[start..self.pos].parse()
-            .map_err(|_| "invalid bucket number")?;
+            .map_err(|_| "invalid duration number")?;
         if num == 0 {
-            return Err("bucket duration must be > 0".into());
+            return Err("duration must be > 0".into());
         }
-
         let unit = match self.input[self.pos..].chars().next() {
             Some('s') => { self.pos += 1; 1u64 }
             Some('m') => { self.pos += 1; 60 }
@@ -417,10 +486,15 @@ impl<'a> Parser<'a> {
             Some(c) => return Err(format!("unknown duration unit '{}' (use s/m/h/d/w)", c)),
             None => return Err("expected duration unit".into()),
         };
-
-        self.expect_char(']')?;
-        let secs = num.checked_mul(unit).ok_or("bucket duration too large")?;
+        let secs = num.checked_mul(unit).ok_or("duration too large")?;
         Ok(Bucket(secs))
+    }
+
+    fn parse_bucket(&mut self) -> Result<Bucket, String> {
+        self.expect_char('[')?;
+        let result = self.parse_duration()?;
+        self.expect_char(']')?;
+        Ok(result)
     }
 
     fn parse_group_by(&mut self) -> Result<Vec<String>, String> {
@@ -704,5 +778,179 @@ mod tests {
         let s = q.to_query_string();
         assert!(s.contains(r#"provider="claude_code""#));
         assert!(s.contains(r#"model="opus""#));
+    }
+
+    // ── events metric ──
+
+    #[test]
+    fn test_events_metric() {
+        let q = parse("events").unwrap();
+        assert_eq!(q.metric, Metric::Events);
+        assert!(q.filters.is_empty());
+    }
+
+    #[test]
+    fn test_events_with_filters() {
+        let q = parse(r#"events{session="abc123", since="20260301"}"#).unwrap();
+        assert_eq!(q.metric, Metric::Events);
+        assert_eq!(q.filter_value("session"), Some("abc123"));
+        assert_eq!(q.since, Some("20260301".to_string()));
+    }
+
+    #[test]
+    fn test_events_rejects_bucket() {
+        assert!(parse("events[5m]").is_err());
+    }
+
+    #[test]
+    fn test_events_rejects_group_by() {
+        assert!(parse("events by (model)").is_err());
+    }
+
+    #[test]
+    fn test_events_with_offset() {
+        let q = parse("events offset 1d").unwrap();
+        assert_eq!(q.metric, Metric::Events);
+        assert_eq!(q.offset, Some(Bucket(86400)));
+    }
+
+    #[test]
+    fn test_events_serialization() {
+        let q = parse(r#"events{model="opus", since="20260301"}"#).unwrap();
+        let s = q.to_query_string();
+        assert!(s.starts_with("events{"));
+        assert!(s.contains(r#"model="opus""#));
+    }
+
+    // ── offset modifier ──
+
+    #[test]
+    fn test_offset_with_bucket() {
+        let q = parse("usage[1h] offset 1d").unwrap();
+        assert_eq!(q.bucket, Some(Bucket(3600)));
+        assert_eq!(q.offset, Some(Bucket(86400)));
+    }
+
+    #[test]
+    fn test_offset_without_bucket() {
+        let q = parse("usage offset 7d").unwrap();
+        assert!(q.bucket.is_none());
+        assert_eq!(q.offset, Some(Bucket(604800)));
+    }
+
+    #[test]
+    fn test_offset_with_group_by() {
+        let q = parse("usage[1d] offset 7d by (model)").unwrap();
+        assert_eq!(q.bucket, Some(Bucket(86400)));
+        assert_eq!(q.offset, Some(Bucket(604800)));
+        assert_eq!(q.group_by, vec!["model"]);
+    }
+
+    #[test]
+    fn test_offset_serialization() {
+        let q = parse("usage[1h] offset 1d").unwrap();
+        let s = q.to_query_string();
+        assert_eq!(s, "usage[1h] offset 1d");
+    }
+
+    #[test]
+    fn test_offset_serialization_with_group_by() {
+        let q = parse("usage[1d] offset 7d by (model)").unwrap();
+        let s = q.to_query_string();
+        assert_eq!(s, "usage[1d] offset 1w by (model)");
+    }
+
+    #[test]
+    fn test_to_query_string_with_bucket_preserves_offset() {
+        let q = parse(r#"usage{since="20260301"} offset 7d"#).unwrap();
+        let s = q.to_query_string_with_bucket(crate::engine::ReportGroupBy::Date);
+        // bucket should be inserted before offset; 7d displays as 1w
+        assert!(s.contains("[1d] offset 1w"));
+    }
+
+    // ── aggregation functions ──
+
+    #[test]
+    fn test_sum_aggregation() {
+        let q = parse("sum(usage[1d])").unwrap();
+        assert_eq!(q.metric, Metric::Usage);
+        assert_eq!(q.aggregation, Some(super::AggregationFunc::Sum));
+        assert_eq!(q.bucket, Some(Bucket(86400)));
+    }
+
+    #[test]
+    fn test_avg_aggregation() {
+        let q = parse("avg(usage[1d])").unwrap();
+        assert_eq!(q.aggregation, Some(super::AggregationFunc::Avg));
+    }
+
+    #[test]
+    fn test_count_aggregation() {
+        let q = parse("count(usage[1d])").unwrap();
+        assert_eq!(q.aggregation, Some(super::AggregationFunc::Count));
+    }
+
+    #[test]
+    fn test_aggregation_with_filters() {
+        let q = parse(r#"sum(usage{since="20260301"}[1d])"#).unwrap();
+        assert_eq!(q.aggregation, Some(super::AggregationFunc::Sum));
+        assert_eq!(q.since, Some("20260301".to_string()));
+        assert_eq!(q.bucket, Some(Bucket(86400)));
+    }
+
+    #[test]
+    fn test_aggregation_with_group_by() {
+        let q = parse("sum(usage[1d]) by (project)").unwrap();
+        assert_eq!(q.aggregation, Some(super::AggregationFunc::Sum));
+        assert_eq!(q.group_by, vec!["project"]);
+    }
+
+    #[test]
+    fn test_aggregation_with_offset() {
+        let q = parse("sum(usage[1d] offset 7d)").unwrap();
+        assert_eq!(q.aggregation, Some(super::AggregationFunc::Sum));
+        assert_eq!(q.offset, Some(Bucket(604800)));
+    }
+
+    #[test]
+    fn test_aggregation_bare_usage() {
+        let q = parse("sum(usage)").unwrap();
+        assert_eq!(q.aggregation, Some(super::AggregationFunc::Sum));
+        assert!(q.bucket.is_none());
+    }
+
+    #[test]
+    fn test_aggregation_rejects_sessions() {
+        assert!(parse("sum(sessions)").is_err());
+    }
+
+    #[test]
+    fn test_aggregation_rejects_events() {
+        assert!(parse("count(events)").is_err());
+    }
+
+    #[test]
+    fn test_no_aggregation() {
+        let q = parse("usage[1d]").unwrap();
+        assert_eq!(q.aggregation, None);
+    }
+
+    #[test]
+    fn test_sum_serialization() {
+        let q = parse("sum(usage[1d])").unwrap();
+        assert_eq!(q.to_query_string(), "sum(usage[1d])");
+    }
+
+    #[test]
+    fn test_avg_serialization_with_group_by() {
+        let q = parse("avg(usage[1d]) by (project)").unwrap();
+        assert_eq!(q.to_query_string(), "avg(usage[1d]) by (project)");
+    }
+
+    #[test]
+    fn test_count_serialization_with_offset() {
+        let q = parse("count(usage[1d] offset 7d)").unwrap();
+        let s = q.to_query_string();
+        assert_eq!(s, "count(usage[1d] offset 1w)");
     }
 }

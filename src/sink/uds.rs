@@ -74,6 +74,10 @@ impl Sink for UdsSink {
         self.send(&serde_json::json!({ "type": type_name, "items": items }));
     }
 
+    fn emit_events_batch(&self, events: &[crate::common::types::RawEvent], pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
+        self.send(&json::events_batch_to_json(events, pricing, schema));
+    }
+
     fn emit_raw(&self, line: &str) {
         let mut conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ref mut stream) = *conn {

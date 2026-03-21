@@ -9,7 +9,7 @@ use crate::common::schema::ProviderSchema;
 use crate::common::types::{ModelUsageSummary, UsageEventWithTs};
 use crate::pricing::PricingTable;
 use crate::sink::Sink;
-use crate::sink::json::{event_to_json, grouped_to_json, summaries_to_json};
+use crate::sink::json::{event_to_json, events_batch_to_json, grouped_to_json, summaries_to_json};
 
 /// Maximum local queue size per client. If exceeded, client is disconnected.
 const MAX_QUEUE_SIZE: usize = 1024;
@@ -218,6 +218,10 @@ impl Sink for BroadcastSink {
     fn emit_list(&self, items: &[String], type_name: &str) {
         self.broadcast(&serde_json::json!({ "type": type_name, "items": items }));
     }
+
+    fn emit_events_batch(&self, events: &[crate::common::types::RawEvent], pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
+        self.broadcast(&events_batch_to_json(events, pricing, schema));
+    }
 }
 
 impl Sink for Arc<BroadcastSink> {
@@ -235,5 +239,9 @@ impl Sink for Arc<BroadcastSink> {
 
     fn emit_list(&self, items: &[String], type_name: &str) {
         (**self).emit_list(items, type_name);
+    }
+
+    fn emit_events_batch(&self, events: &[crate::common::types::RawEvent], pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
+        (**self).emit_events_batch(events, pricing, schema);
     }
 }

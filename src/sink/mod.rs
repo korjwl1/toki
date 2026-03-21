@@ -10,7 +10,7 @@ pub use self::http::HttpSink;
 use std::collections::HashMap;
 
 use crate::common::schema::ProviderSchema;
-use crate::common::types::{ModelUsageSummary, UsageEventWithTs};
+use crate::common::types::{ModelUsageSummary, RawEvent, UsageEventWithTs};
 use crate::pricing::PricingTable;
 
 /// Output sink for emitting usage data.
@@ -20,6 +20,8 @@ pub trait Sink: Send + Sync {
     fn emit_grouped(&self, grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>, type_name: &str, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>);
     fn emit_event(&self, event: &UsageEventWithTs, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>);
     fn emit_list(&self, items: &[String], type_name: &str);
+    /// Emit a batch of raw events (from `events` metric query).
+    fn emit_events_batch(&self, events: &[RawEvent], pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>);
     /// Emit a pre-formatted JSONL line (used by trace passthrough).
     fn emit_raw(&self, line: &str) { println!("{}", line); }
 }
@@ -50,6 +52,10 @@ impl Sink for MultiSink {
 
     fn emit_list(&self, items: &[String], type_name: &str) {
         for s in &self.sinks { s.emit_list(items, type_name); }
+    }
+
+    fn emit_events_batch(&self, events: &[RawEvent], pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
+        for s in &self.sinks { s.emit_events_batch(events, pricing, schema); }
     }
 
     fn emit_raw(&self, line: &str) {

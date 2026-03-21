@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::common::schema::{ClaudeCodeSchema, ProviderSchema};
-use crate::common::types::{ModelUsageSummary, UsageEventWithTs};
+use crate::common::types::{ModelUsageSummary, RawEvent, UsageEventWithTs};
 use crate::pricing::PricingTable;
 use super::format_source_label;
 
@@ -95,4 +95,46 @@ pub(crate) fn event_to_json(event: &UsageEventWithTs, pricing: Option<&PricingTa
         data["cost_usd"] = serde_json::json!(c);
     }
     serde_json::json!({ "type": "event", "data": data })
+}
+
+/// Build JSON payload for a batch of raw events.
+pub(crate) fn events_batch_to_json(
+    events: &[RawEvent],
+    pricing: Option<&PricingTable>,
+    schema: Option<&dyn ProviderSchema>,
+) -> serde_json::Value {
+    let schema: &dyn ProviderSchema = schema.unwrap_or(&ClaudeCodeSchema);
+    let columns = schema.columns();
+
+    let data: Vec<serde_json::Value> = events.iter().map(|e| {
+        let summary = ModelUsageSummary {
+            model: e.model.clone(),
+            input_tokens: e.input_tokens,
+            output_tokens: e.output_tokens,
+            cache_creation_input_tokens: e.cache_creation_input_tokens,
+            cache_read_input_tokens: e.cache_read_input_tokens,
+            event_count: 0,
+            cost_usd: None,
+        };
+        let tokens = schema.extract_tokens(&summary);
+        let total = schema.total_tokens(&summary);
+
+        let mut entry = serde_json::json!({
+            "timestamp": e.timestamp,
+            "model": e.model,
+            "session": e.session,
+            "project": e.project,
+        });
+        for (i, col) in columns.iter().enumerate() {
+            entry[col.json_key] = serde_json::json!(tokens[i]);
+        }
+        entry["total_tokens"] = serde_json::json!(total);
+
+        if let Some(cost) = pricing.and_then(|p| p.summary_cost(&summary)) {
+            entry["cost_usd"] = serde_json::json!(cost);
+        }
+        entry
+    }).collect();
+
+    serde_json::json!({ "type": "events", "data": data })
 }

@@ -139,15 +139,15 @@ struct ReportFilterArgs {
     /// Filter end time (inclusive): YYYYMMDD or YYYYMMDDhhmmss
     #[arg(long)]
     until: Option<String>,
-    /// Allow full scan without --since (for hourly/daily/weekly)
-    #[arg(long)]
-    from_beginning: bool,
     /// Filter by session ID prefix
     #[arg(long = "session-id")]
     session_id: Option<String>,
     /// Filter by project name (substring match)
     #[arg(long)]
     project: Option<String>,
+    /// Filter by provider (e.g. claude_code, codex)
+    #[arg(long)]
+    provider: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -174,7 +174,7 @@ enum ReportCommands {
         #[command(flatten)]
         filter: ReportFilterArgs,
     },
-    /// Execute a PromQL-style query (e.g. 'usage{model="claude-opus-4-6"}[1h] by (model)')
+    /// Execute a PromQL-style query (e.g. 'sum(usage[1d]) by (project)', 'events{since="20260301"}')
     Query {
         /// Query string
         query: String,
@@ -857,28 +857,24 @@ fn handle_report(
             let eff_until = filter_args.until.or(until.clone());
             let eff_session = filter_args.session_id.or(session_id.clone());
             let eff_project = filter_args.project.or(project.clone());
+            let eff_provider = filter_args.provider.or(provider.clone());
+
+            if let Some(ref p) = eff_provider {
+                if !toki::providers::KNOWN_PROVIDERS.contains(&p.as_str()) {
+                    eprintln!("[toki] Unknown provider: {}", p);
+                    eprintln!("[toki] Known providers: {}", toki::providers::KNOWN_PROVIDERS.join(", "));
+                    std::process::exit(1);
+                }
+            }
 
             let since_dt = parse_opt_range(&eff_since, false, tz);
             let until_dt = parse_opt_range(&eff_until, true, tz);
             validate_range(since_dt, until_dt);
 
-            let requires_range = matches!(
-                group_by,
-                toki::engine::ReportGroupBy::Hour
-                    | toki::engine::ReportGroupBy::Date
-                    | toki::engine::ReportGroupBy::Week { .. }
-            );
-            if requires_range && !filter_args.from_beginning && since_dt.is_none() {
-                eprintln!("[toki] hourly/daily/weekly requires a date range.");
-                eprintln!("[toki] Usage: toki report daily --since 20250101");
-                eprintln!("[toki]        toki report daily --from-beginning");
-                std::process::exit(1);
-            }
-
             // Convert to PromQL-style query string
             build_query_from_flags(
                 &eff_since, &eff_until, eff_session.as_deref(), eff_project.as_deref(),
-                provider.as_deref(),
+                eff_provider.as_deref(),
                 &[], // group_by handled via bucket
             ).to_query_string_with_bucket(group_by)
         } else {
@@ -974,6 +970,11 @@ fn dispatch_result_to_sink(
                 sink.emit_summary(&summaries, pricing, schema);
             }
         }
+        Some("events") => {
+            if let Ok(events) = serde_json::from_value::<Vec<toki::common::types::RawEvent>>(item["data"].clone()) {
+                sink.emit_events_batch(&events, pricing, schema);
+            }
+        }
         Some(type_name) if type_name == "sessions" || type_name == "projects" => {
             if let Some(items) = item["items"].as_array() {
                 let strings: Vec<String> = items.iter()
@@ -1037,6 +1038,8 @@ fn build_query_from_flags(
         since: since.clone(),
         until: until.clone(),
         provider: provider.map(|s| s.to_string()),
+        offset: None,
+        aggregation: None,
     }
 }
 

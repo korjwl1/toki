@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use comfy_table::{Table, ContentArrangement, Cell, Attribute, presets::UTF8_FULL};
 
 use crate::common::schema::{ClaudeCodeSchema, ProviderSchema};
-use crate::common::types::{ModelUsageSummary, UsageEventWithTs};
+use crate::common::types::{ModelUsageSummary, RawEvent, UsageEventWithTs};
 use crate::pricing::{PricingTable, format_cost};
 use super::{Sink, json, format_source_label, shorten_id};
 
@@ -301,6 +301,70 @@ impl Sink for PrintSink {
             Some(c) => println!("[toki] {} | {} | {} | {}", event.model, label, parts.join(" "), format_cost(Some(c))),
             None => println!("[toki] {} | {} | {}", event.model, label, parts.join(" ")),
         }
+    }
+
+    fn emit_events_batch(&self, events: &[RawEvent], pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
+        if self.format == OutputFormat::Json {
+            let json = json::events_batch_to_json(events, pricing, schema);
+            println!("{}", serde_json::to_string(&json).unwrap_or_default());
+            return;
+        }
+
+        let schema = effective_schema(schema);
+        let columns = schema.columns();
+
+        let mut table = Table::new();
+        table.load_preset(UTF8_FULL);
+        table.set_content_arrangement(ContentArrangement::Dynamic);
+
+        // Build header
+        let mut header = vec![
+            Cell::new("Timestamp").add_attribute(Attribute::Bold),
+            Cell::new("Model").add_attribute(Attribute::Bold),
+            Cell::new("Session").add_attribute(Attribute::Bold),
+            Cell::new("Project").add_attribute(Attribute::Bold),
+        ];
+        for col in columns {
+            header.push(Cell::new(col.header).add_attribute(Attribute::Bold));
+        }
+        header.push(Cell::new("Total").add_attribute(Attribute::Bold));
+        if pricing.is_some() {
+            header.push(Cell::new("Cost").add_attribute(Attribute::Bold));
+        }
+        table.set_header(header);
+
+        for e in events {
+            let summary = ModelUsageSummary {
+                model: e.model.clone(),
+                input_tokens: e.input_tokens,
+                output_tokens: e.output_tokens,
+                cache_creation_input_tokens: e.cache_creation_input_tokens,
+                cache_read_input_tokens: e.cache_read_input_tokens,
+                event_count: 0,
+                cost_usd: None,
+            };
+            let tokens = schema.extract_tokens(&summary);
+            let total = schema.total_tokens(&summary);
+            let cost = pricing.and_then(|p| p.summary_cost(&summary));
+
+            let mut row = vec![
+                Cell::new(&e.timestamp),
+                Cell::new(&e.model),
+                Cell::new(shorten_id(&e.session)),
+                Cell::new(&e.project),
+            ];
+            for &val in &tokens {
+                row.push(Cell::new(format_number(val)));
+            }
+            row.push(Cell::new(format_number(total)));
+            if pricing.is_some() {
+                row.push(Cell::new(format_cost(cost)));
+            }
+            table.add_row(row);
+        }
+
+        println!("[toki] events ({})", events.len());
+        println!("{table}");
     }
 }
 

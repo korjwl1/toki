@@ -146,24 +146,22 @@ By default, results from all active providers are merged. Use `--provider` to fi
 
 ```bash
 toki report daily --since 20260301
-toki report daily --from-beginning
 toki report weekly --since 20260301
 toki report weekly --since 20260301 --start-of-week tue
 toki report monthly
 toki report yearly
 toki report hourly --since 20260301
-toki report hourly --from-beginning
 ```
 
-| Subcommand | `--since` required | `--from-beginning` allowed | Note |
-|------------|-------------------|---------------------------|------|
-| `hourly` | Yes | Yes | |
-| `daily` | Yes | Yes | |
-| `weekly` | Yes | Yes | `--start-of-week` available |
-| `monthly` | No | Yes | |
-| `yearly` | No | Yes | |
+| Subcommand | `--since` required | Note |
+|------------|-------------------|------|
+| `hourly` | Yes | |
+| `daily` | Yes | |
+| `weekly` | Yes | `--start-of-week` available |
+| `monthly` | No | |
+| `yearly` | No | |
 
-`hourly`, `daily`, `weekly` may produce large output, so `--since` or `--from-beginning` is required.
+`hourly`, `daily`, `weekly` may produce large output, so `--since` is required.
 
 ### --since / --until Format
 
@@ -224,15 +222,17 @@ Use the `report query` subcommand for PromQL-inspired free queries.
 #### Syntax
 
 ```
-metric{filters}[bucket] by (dimensions)
+[agg_func(] metric{filters}[bucket] [offset duration] [)] [by (dimensions)]
 ```
 
 | Element | Required | Description |
 |---------|----------|-------------|
-| `metric` | Yes | `usage`, `sessions`, `projects` |
+| `metric` | Yes | `usage`, `sessions`, `projects`, `events` |
 | `{filters}` | No | `key="value"` pairs, comma-separated |
-| `[bucket]` | No | Time bucket: `s`, `m`, `h`, `d`, `w` |
-| `by (dims)` | No | Group by: `model`, `session`, `project` |
+| `[bucket]` | No | Time bucket: `s`, `m`, `h`, `d`, `w` (usage only) |
+| `offset <dur>` | No | Shift time window back (e.g. `offset 7d`) |
+| `sum\|avg\|count()` | No | Aggregation: collapse model dimension (usage only) |
+| `by (dims)` | No | Group by: `model`, `session`, `project` (usage only) |
 
 Filter keys: `model`, `session`, `project`, `provider`, `since`, `until`
 
@@ -260,6 +260,20 @@ toki report query 'usage{project="myapp"} by (project)'
 # Multi-dimension grouping
 toki report query 'usage[1d] by (model, session)'
 
+# Offset modifier — compare with previous period
+toki report query 'usage[1d] offset 7d'
+
+# Aggregation functions — collapse model dimension
+toki report query 'sum(usage[1d])'                                    # daily total
+toki report query 'avg(usage[1d])'                                    # per-event average
+toki report query 'count(usage[1d])'                                  # event count only
+toki report query 'sum(usage{since="20260301"}[1d]) by (project)'     # per-project daily sum
+
+# Raw events
+toki report query 'events{since="20260320"}'
+toki report query 'events{model="claude-opus-4-6", since="20260301"}'
+toki report query 'events{session="abc123"}'
+
 # Session listing
 toki report query 'sessions'
 toki report query 'sessions{project="myapp"}'
@@ -268,6 +282,39 @@ toki report query 'sessions{since="20260301"}'
 # Project listing
 toki report query 'projects'
 toki report query 'projects{project="myapp"}'
+```
+
+#### Aggregation Semantics
+
+| Function | Token Fields | Event Count | Cost | Model Name |
+|----------|-------------|-------------|------|------------|
+| `sum()` | Sum across all models | Sum | Sum | `(total)` |
+| `avg()` | Sum / event_count | 1 | Sum / count | `(avg/event)` |
+| `count()` | 0 | Sum | 0 | `(count)` |
+
+Without aggregation, results are broken down per model (default behavior).
+
+#### Events Output
+
+The `events` metric returns individual API call records:
+
+```json
+{
+  "type": "events",
+  "data": [
+    {
+      "timestamp": "2026-03-20T10:30:00",
+      "model": "claude-opus-4-6",
+      "session": "4de9291e-...",
+      "project": "myapp",
+      "input_tokens": 100,
+      "output_tokens": 50,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cost_usd": 0.003
+    }
+  ]
+}
 ```
 
 ## settings
@@ -325,7 +372,7 @@ Applies only to report's `print` output.
 
 ```bash
 toki report -z Asia/Seoul daily --since 20260301
-toki report -z US/Eastern weekly --from-beginning
+toki report -z US/Eastern weekly --since 20260101
 ```
 
 Applies to:

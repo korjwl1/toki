@@ -149,24 +149,22 @@ toki report --since 20260301 --until 20260331
 
 ```bash
 toki report daily --since 20260301
-toki report daily --from-beginning
 toki report weekly --since 20260301
 toki report weekly --since 20260301 --start-of-week tue
 toki report monthly
 toki report yearly
 toki report hourly --since 20260301
-toki report hourly --from-beginning
 ```
 
-| 서브커맨드 | `--since` 필수 | `--from-beginning` 가능 | 비고 |
-|-----------|----------------|------------------------|------|
-| `hourly` | O | O | |
-| `daily` | O | O | |
-| `weekly` | O | O | `--start-of-week` 사용 가능 |
-| `monthly` | X | O | |
-| `yearly` | X | O | |
+| 서브커맨드 | `--since` 필수 | 비고 |
+|-----------|----------------|------|
+| `hourly` | O | |
+| `daily` | O | |
+| `weekly` | O | `--start-of-week` 사용 가능 |
+| `monthly` | X | |
+| `yearly` | X | |
 
-`hourly`, `daily`, `weekly`는 데이터 양이 많을 수 있으므로 `--since` 또는 `--from-beginning`을 필수로 요구한다.
+`hourly`, `daily`, `weekly`는 데이터 양이 많을 수 있으므로 `--since`를 필수로 요구한다.
 
 ### --since / --until 형식
 
@@ -227,15 +225,17 @@ toki report daily --since 20260301 --session-id abc
 #### 문법
 
 ```
-metric{filters}[bucket] by (dimensions)
+[집계함수(] metric{filters}[bucket] [offset duration] [)] [by (dimensions)]
 ```
 
 | 요소 | 필수 | 설명 |
 |------|------|------|
-| `metric` | O | `usage`, `sessions`, `projects` |
+| `metric` | O | `usage`, `sessions`, `projects`, `events` |
 | `{filters}` | X | `key="value"` 쌍, `,`로 구분 |
-| `[bucket]` | X | 시간 버킷: `s`, `m`, `h`, `d`, `w` |
-| `by (dims)` | X | 그룹 기준: `model`, `session`, `project` |
+| `[bucket]` | X | 시간 버킷: `s`, `m`, `h`, `d`, `w` (usage 전용) |
+| `offset <dur>` | X | 시간 윈도우를 과거로 이동 (예: `offset 7d`) |
+| `sum\|avg\|count()` | X | 집계: 모델 차원 collapse (usage 전용) |
+| `by (dims)` | X | 그룹 기준: `model`, `session`, `project` (usage 전용) |
 
 필터 키: `model`, `session`, `project`, `provider`, `since`, `until`
 
@@ -263,6 +263,20 @@ toki report query 'usage{project="myapp"} by (project)'
 # 복합 그룹핑
 toki report query 'usage[1d] by (model, session)'
 
+# offset 수정자 — 이전 기간과 비교
+toki report query 'usage[1d] offset 7d'
+
+# 집계 함수 — 모델 차원 collapse
+toki report query 'sum(usage[1d])'                                    # 일별 전체 합산
+toki report query 'avg(usage[1d])'                                    # 이벤트당 평균
+toki report query 'count(usage[1d])'                                  # 이벤트 수만
+toki report query 'sum(usage{since="20260301"}[1d]) by (project)'     # 프로젝트별 일별 합산
+
+# raw 이벤트
+toki report query 'events{since="20260320"}'
+toki report query 'events{model="claude-opus-4-6", since="20260301"}'
+toki report query 'events{session="abc123"}'
+
 # 세션 리스팅
 toki report query 'sessions'
 toki report query 'sessions{project="myapp"}'
@@ -271,6 +285,39 @@ toki report query 'sessions{since="20260301"}'
 # 프로젝트 리스팅
 toki report query 'projects'
 toki report query 'projects{project="myapp"}'
+```
+
+#### 집계 함수 의미
+
+| 함수 | 토큰 필드 | 이벤트 수 | 비용 | 모델명 |
+|------|----------|----------|------|--------|
+| `sum()` | 전체 모델 합산 | 합산 | 합산 | `(total)` |
+| `avg()` | 합산 / event_count | 1 | 합산/count | `(avg/event)` |
+| `count()` | 0 | 합산 | 0 | `(count)` |
+
+집계 없이 사용하면 기존 동작대로 모델별 분리 출력.
+
+#### Events 출력
+
+`events` 메트릭은 개별 API 호출 레코드를 반환한다:
+
+```json
+{
+  "type": "events",
+  "data": [
+    {
+      "timestamp": "2026-03-20T10:30:00",
+      "model": "claude-opus-4-6",
+      "session": "4de9291e-...",
+      "project": "myapp",
+      "input_tokens": 100,
+      "output_tokens": 50,
+      "cache_creation_input_tokens": 0,
+      "cache_read_input_tokens": 0,
+      "cost_usd": 0.003
+    }
+  ]
+}
 ```
 
 ## settings
@@ -329,7 +376,7 @@ report의 `print` 출력에만 적용된다.
 
 ```bash
 toki report -z Asia/Seoul daily --since 20260301
-toki report -z US/Eastern weekly --from-beginning
+toki report -z US/Eastern weekly --since 20260101
 ```
 
 적용 범위:

@@ -183,8 +183,8 @@ toki report monthly
 
 # 4. PromQL 스타일 쿼리
 toki report query 'usage{model="claude-opus-4-6"}[1h] by (model)'
-toki report query 'usage{provider="codex"} by (model)'
-toki report query 'sessions{project="myapp"}'
+toki report query 'sum(usage{since="20260301"}[1d]) by (project)'
+toki report query 'events{since="20260320"}'
 ```
 
 ---
@@ -215,7 +215,7 @@ toki report daily --since 20260301
 toki report weekly --since 20260301 --start-of-week tue
 toki report monthly
 toki report yearly
-toki report hourly --from-beginning
+toki report hourly --since 20260301
 
 # 세션/프로젝트 필터
 toki report --group-by-session
@@ -227,8 +227,9 @@ toki report --provider codex daily --since 20260301
 
 # PromQL 스타일 쿼리
 toki report query 'usage{model="claude-opus-4-6"}[1h] by (model)'
-toki report query 'usage{provider="codex"} by (model)'
-toki report query 'usage{session="4de9", since="20260301"} by (session)'
+toki report query 'sum(usage{since="20260301"}[1d]) by (project)'
+toki report query 'events{since="20260320"}'
+toki report query 'usage[1d] offset 7d'
 toki report query 'sessions{project="myapp"}'
 toki report query 'projects'
 
@@ -247,7 +248,6 @@ toki --no-cost report                               # 비용 표시 없이
 | `query '<PROMQL>'` | PromQL 스타일 자유 쿼리 |
 | `--since YYYYMMDD[hhmmss]` | 시작 시점 (inclusive, `>=`) |
 | `--until YYYYMMDD[hhmmss]` | 종료 시점 (inclusive, `<=`) |
-| `--from-beginning` | `--since` 없이 전체 그룹핑 허용 |
 | `--group-by-session` | 세션별 그룹핑 (시간 서브커맨드와 동시 사용 불가) |
 | `--session-id <PREFIX>` | 세션 UUID 접두사 필터 |
 | `--project <NAME>` | 프로젝트 디렉토리 서브스트링 필터 |
@@ -260,14 +260,16 @@ toki --no-cost report                               # 비용 표시 없이
 <summary>PromQL 쿼리 문법</summary>
 
 ```
-metric{filters}[bucket] by (dimensions)
+[집계함수(] metric{filters}[bucket] [offset duration] [)] [by (dimensions)]
 ```
 
 | 요소 | 설명 | 예시 |
 |------|------|------|
-| metric | `usage`, `sessions`, `projects` | `usage` |
+| metric | `usage`, `sessions`, `projects`, `events` | `usage` |
 | filters | `key="value"` 쌍, `,`로 구분 | `{model="claude-opus-4-6", since="20260301"}` |
 | bucket | 시간 버킷 (s/m/h/d/w) | `[1h]`, `[5m]`, `[1d]` |
+| offset | 시간 윈도우를 과거로 이동 | `offset 7d` |
+| 집계함수 | `sum`, `avg`, `count` — 모델 차원 collapse | `sum(usage[1d])` |
 | dimensions | 그룹 기준 (model/session/project) | `by (model, session)` |
 
 필터 키: `model`, `session`, `project`, `provider`, `since`, `until`
