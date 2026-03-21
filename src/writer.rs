@@ -102,6 +102,8 @@ impl DbWriter {
             Err(e) => eprintln!("[toki:writer] retention error: {}", e),
         }
 
+        // Periodic flush: commit pending events even if batch isn't full (1s interval)
+        let flush_tick = crossbeam_channel::tick(std::time::Duration::from_secs(1));
         // Daily retention tick
         let retention_tick = crossbeam_channel::tick(std::time::Duration::from_secs(86400));
 
@@ -122,6 +124,9 @@ impl DbWriter {
                             return;
                         }
                     }
+                }
+                recv(flush_tick) -> _ => {
+                    self.flush_pending();
                 }
                 recv(retention_tick) -> _ => {
                     match run_retention(&self.db, &self.retention) {

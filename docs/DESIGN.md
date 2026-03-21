@@ -99,7 +99,7 @@ Pricing is loaded by the client from the file cache (`~/.config/toki/pricing.jso
 ## Writer Thread
 
 - Sole owner of `Database` — no Send issues, single-thread access
-- Receives `DbOp` → accumulates in pending → batch commit when 64 events reached
+- Receives `DbOp` → accumulates in pending → batch commit when 64 events reached or every 1 second
 - Maintains dictionary cache in memory (plain HashMap, no DashMap needed)
 - Daily retention tick automatically deletes old data
 - On shutdown, flushes remaining pending events before exit
@@ -175,7 +175,7 @@ For daily/monthly time grouping in reports, only the rollup keyspace needs scann
 
 ### Batch Transaction
 
-The writer thread accumulates 64 events and commits them in a single `OwnedWriteBatch`:
+The writer thread accumulates up to 64 events (or flushes every 1 second) and commits them in a single `OwnedWriteBatch`:
 
 ```
 1. Drain pending_events
