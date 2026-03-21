@@ -14,10 +14,9 @@ pub struct CodexProvider {
 }
 
 impl CodexProvider {
-    pub fn new() -> Self {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    pub fn new(root: String) -> Self {
         CodexProvider {
-            root: home.join(".codex").to_string_lossy().to_string(),
+            root,
             parser: CodexParser::new(),
         }
     }

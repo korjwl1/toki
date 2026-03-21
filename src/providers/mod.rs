@@ -126,7 +126,9 @@ pub fn create_providers(names: &[String], config: &crate::Config) -> Vec<Box<dyn
                     config.claude_code_root.clone(),
                 )) as Box<dyn Provider>,
             ),
-            "codex" => Some(Box::new(codex::CodexProvider::new()) as Box<dyn Provider>),
+            "codex" => Some(Box::new(codex::CodexProvider::new(
+                config.codex_root.clone(),
+            )) as Box<dyn Provider>),
             _ => {
                 eprintln!("[toki] Unknown provider: {}", name);
                 None

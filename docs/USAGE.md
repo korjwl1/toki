@@ -1,105 +1,83 @@
 # toki Usage Guide
 
-## Build from Source
+## 📦 Installation
+
+Installing via Homebrew is the fastest and recommended method.
 
 ```bash
-cargo build --release
-# Binary: target/release/toki
-# Add to PATH or run directly
+brew tap korjwl1/tap
+brew install toki
 ```
 
-## Commands
+*(To build from source, use `cargo build --release`. The binary will be located at `target/release/toki`.)*
 
-toki operates with a daemon/client architecture:
-- **`daemon start`**: Server process. Cold start followed by file watching + TSDB storage
-- **`daemon stop/restart/status`**: Daemon management
-- **`daemon reset`**: Full DB wipe and reinitialization
-- **`settings set providers --add/--remove`**: Provider management (Claude Code, Codex CLI, etc.)
-- **`trace`**: Connect to daemon for real-time event streaming
-- **`report`**: One-shot TSDB query. Retrieves data collected by the daemon
+---
 
-## daemon
+## 🛠 Main Commands
 
-### daemon start
+toki is designed with a **Daemon-Client** architecture for maximum efficiency and zero impact on your workflow.
+
+- **`daemon`**: The engine that monitors logs and indexes them in the background.
+- **`report`**: A reporting tool that queries collected data instantly.
+- **`trace`**: Streams real-time token usage events as they happen.
+- **`settings`**: Manages providers and other configurations.
+
+---
+
+## 🐇 Daemon Management
+
+### Starting the Daemon
+Starting the daemon initiates automatic log scanning and real-time monitoring.
 
 ```bash
-toki daemon start              # Detaches to background (default)
-toki daemon start --foreground # Run in foreground (for debugging)
+toki daemon start              # Run in background (recommended)
+toki daemon start --foreground # Run in foreground for debugging
 ```
 
-Detaches to the background by default. Use `--foreground` to keep the process in the foreground for debugging.
+> **💡 Cold Start Note**: When running for the first time or processing large amounts of legacy data, toki utilizes all CPU cores for the fastest possible indexing. While CPU usage may temporarily spike, this is **intentional behavior designed to process months of history in seconds**. Once indexing is complete, CPU usage will drop to near 0%, and subsequent updates will be handled incrementally and efficiently.
 
-1. Scans configured providers' session files (cold start)
-2. Stores parsed events in per-provider TSDB
-3. Outputs total token usage summary
-4. Enters FSEvents watch mode
-5. Starts UDS listener (awaits trace client connections)
-
-Daemon settings (socket path, Claude Code root, etc.) are managed via `toki settings`.
-
-Only one daemon per DB path is allowed.
-If already running, exits with `Daemon already running (PID xxx)`.
-
-### daemon stop
+### Stopping & Restarting
 
 ```bash
-toki daemon stop
+toki daemon stop      # Gracefully shut down the daemon
+toki daemon restart   # Apply configuration changes immediately
+toki daemon status    # Check daemon status and PID
 ```
 
-Sends SIGTERM to the running daemon for graceful shutdown.
-Cleans up PID file and socket file.
-
-### daemon restart
+### Resetting
 
 ```bash
-toki daemon restart
+toki daemon reset     # Clear all DB data and indexes
 ```
 
-Stops the running daemon and restarts it.
-Use this command to apply settings changes from `toki settings`.
+---
 
-### daemon status
+## 🔍 Provider Configuration
 
-```bash
-toki daemon status
-```
+toki supports Claude Code (`~/.claude`) and Codex CLI (`~/.codex`). On first run, toki auto-detects installed tools and enables them automatically—no configuration needed in most cases.
 
-Shows daemon running status and PID.
-
-### daemon reset
+To manage providers manually, use the TUI or CLI:
 
 ```bash
-toki daemon reset
-```
+# Select providers via interactive TUI
+toki settings
 
-If the daemon is running, stops it first, then completely deletes the TSDB database.
-All events, rollups, checkpoints, and settings are reset.
-After deletion, use `toki daemon start` to collect data from scratch.
-
-## Provider Management
-
-Use `settings set providers --add/--remove` to manage which AI CLI tools to track. At least one provider must be added before first run.
-
-```bash
-# Enable Claude Code tracking
+# Or manage via CLI
 toki settings set providers --add claude_code
-
-# Enable Codex CLI tracking
 toki settings set providers --add codex
-
-# Disable a provider
 toki settings set providers --remove codex
 
-# List all providers + status
+# Check registered providers
 toki settings get providers
 ```
 
-Each provider has an independent database (`~/.config/toki/<provider>.fjall`).
-After adding or removing a provider, restart the daemon if it is running.
+*(Note: `toki daemon restart` is required after changing provider settings.)*
 
-## trace
+---
 
-trace is a client command that connects to a running daemon via UDS to receive real-time events. It sends the `TRACE` command to the daemon and receives a JSONL stream.
+## 📡 Trace
+
+`trace` is a client command that connects to the running daemon via UDS to stream real-time token usage events. It sends the `TRACE` command and outputs a JSONL stream.
 
 ```bash
 # Real-time JSONL output to stdout
@@ -125,10 +103,14 @@ toki trace --no-cost
 - Exit with Ctrl+C. The daemon keeps running
 - When using `--sink uds://` or `--sink http://`, spawn `toki trace` as a child process — it auto-terminates when the parent dies (SIGPIPE)
 
-## report
+---
 
-The daemon must be running. If the daemon is down, shows "Cannot connect to toki daemon" with instructions to start it.
-If the daemon is running but has no data yet (cold start in progress), shows "No data in TSDB".
+## 📊 Reports
+
+The core value of toki is its **unrivaled report speed**. Since it queries pre-indexed data from a TSDB, you get instant results even with gigabytes of logs.
+
+The daemon must be running. If the daemon is down, it shows "Cannot connect to toki daemon" with instructions to start it.
+If the daemon is running but has no data yet (cold start in progress), it shows "No data in TSDB".
 
 ### Full Summary
 
@@ -327,17 +309,19 @@ toki settings
 
 # Non-interactive CLI
 toki settings set claude_code_root ~/.claude
+toki settings set codex_root ~/.codex
 toki settings set timezone Asia/Seoul
 toki settings get timezone
 toki settings list
 ```
 
-When daemon-affecting settings (`claude_code_root`, `daemon_sock`, `retention_days`, `rollup_retention_days`) are changed and the daemon is running, you'll be prompted to restart.
+When daemon-affecting settings (`claude_code_root`, `codex_root`, `daemon_sock`, `retention_days`, `rollup_retention_days`) are changed and the daemon is running, you'll be prompted to restart.
 
 | Setting | Key | Default | Daemon Effect |
 |---------|-----|---------|---------------|
 | Providers | `providers` | `[]` | Yes |
 | Claude Code Root | `claude_code_root` | `~/.claude` | Yes |
+| Codex CLI Root | `codex_root` | `~/.codex` | Yes |
 | Daemon Socket | `daemon_sock` | `~/.config/toki/daemon.sock` | Yes |
 | Timezone | `timezone` | (empty = UTC) | No |
 | Output Format | `output_format` | `table` | No |

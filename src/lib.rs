@@ -286,7 +286,16 @@ fn create_provider_instance(name: &str, root_dir: Option<String>) -> Result<Box<
             });
             Ok(Box::new(providers::claude_code::ClaudeCodeProvider::new(root)))
         }
-        "codex" => Ok(Box::new(providers::codex::CodexProvider::new())),
+        "codex" => {
+            let root = root_dir.unwrap_or_else(|| {
+                dirs::home_dir()
+                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                    .join(".codex")
+                    .to_string_lossy()
+                    .to_string()
+            });
+            Ok(Box::new(providers::codex::CodexProvider::new(root)))
+        }
         _ => Err(format!("unknown provider '{}'", name)),
     }
 }

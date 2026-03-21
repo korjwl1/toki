@@ -12,6 +12,7 @@ use cursive::views::{
 
 struct SettingsState {
     claude_code_root: String,
+    codex_root: String,
     daemon_sock: String,
     timezone: String,
     output_format: String,
@@ -30,6 +31,7 @@ impl SettingsState {
 
         SettingsState {
             claude_code_root: get("claude_code_root", &home.join(".claude").to_string_lossy()),
+            codex_root: get("codex_root", &home.join(".codex").to_string_lossy()),
             daemon_sock: get("daemon_sock", &home.join(".config/toki/daemon.sock").to_string_lossy()),
             timezone: get("timezone", ""),
             output_format: get("output_format", "table"),
@@ -122,6 +124,8 @@ pub fn run_settings() -> bool {
     let paths_section = LinearLayout::vertical()
         .child(labeled_edit("Claude Code Root", &state.claude_code_root, "claude_code_root"))
         .child(DummyView.fixed_height(1))
+        .child(labeled_edit("Codex CLI Root", &state.codex_root, "codex_root"))
+        .child(DummyView.fixed_height(1))
         .child(labeled_edit("Daemon Socket", &state.daemon_sock, "daemon_sock"));
 
     // -- Display section --
@@ -149,12 +153,12 @@ pub fn run_settings() -> bool {
     for &pname in crate::providers::KNOWN_PROVIDERS {
         let checked = enabled_providers.contains(&pname.to_string());
         let display = match pname {
-            "claude_code" => "Claude Code    (~/.claude)",
-            "codex" => "Codex CLI      (~/.codex)",
-            _ => pname,
+            "claude_code" => format!("Claude Code    ({})", tilde_path(&state.claude_code_root)),
+            "codex" => format!("Codex CLI      ({})", tilde_path(&state.codex_root)),
+            _ => pname.to_string(),
         };
         providers_section.add_child(
-            labeled_checkbox(display, checked, &format!("provider_{}", pname))
+            labeled_checkbox(&display, checked, &format!("provider_{}", pname))
         );
     }
 
@@ -223,6 +227,7 @@ pub fn run_settings() -> bool {
 
 fn save_settings(siv: &mut Cursive, restart_flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
     let claude_root = get_edit(siv, "claude_code_root");
+    let codex_root = get_edit(siv, "codex_root");
     let daemon_sock = get_edit(siv, "daemon_sock");
     let timezone = get_edit(siv, "timezone");
     let retention = get_edit(siv, "retention_days");
@@ -259,6 +264,7 @@ fn save_settings(siv: &mut Cursive, restart_flag: std::sync::Arc<std::sync::atom
 
     let settings = [
         ("claude_code_root", claude_root.as_str()),
+        ("codex_root", codex_root.as_str()),
         ("daemon_sock", daemon_sock.as_str()),
         ("timezone", timezone.as_str()),
         ("output_format", output_format.as_str()),
@@ -280,7 +286,7 @@ fn save_settings(siv: &mut Cursive, restart_flag: std::sync::Arc<std::sync::atom
 
     // Load old values to detect daemon-affecting changes
     let old_providers = crate::config::get_providers();
-    let daemon_keys = ["claude_code_root", "daemon_sock", "retention_days", "rollup_retention_days"];
+    let daemon_keys = ["claude_code_root", "codex_root", "daemon_sock", "retention_days", "rollup_retention_days"];
     let old_values: Vec<(String, String)> = daemon_keys.iter()
         .map(|k| (k.to_string(), crate::config::get_setting(k).unwrap_or_default()))
         .collect();
@@ -338,4 +344,15 @@ fn get_edit(siv: &mut Cursive, name: &str) -> String {
     siv.call_on_name(name, |v: &mut EditView| {
         v.get_content().to_string()
     }).unwrap_or_default()
+}
+
+/// Collapse home directory prefix to ~ for display.
+fn tilde_path(path: &str) -> String {
+    if let Some(home) = dirs::home_dir() {
+        let home_str = home.to_string_lossy();
+        if path.starts_with(home_str.as_ref()) {
+            return format!("~{}", &path[home_str.len()..]);
+        }
+    }
+    path.to_string()
 }

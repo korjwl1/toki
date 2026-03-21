@@ -8,6 +8,7 @@ use chrono_tz::Tz;
 pub struct Config {
     pub providers: Vec<String>,
     pub claude_code_root: String,
+    pub codex_root: String,
     pub db_path: PathBuf,
     pub db_base_dir: PathBuf,
     pub tz: Option<Tz>,
@@ -30,9 +31,13 @@ impl Config {
         let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
         let config_dir = home.join(".config").join("toki");
 
+        let claude_code_root = home.join(".claude").to_string_lossy().to_string();
+        let codex_root = home.join(".codex").to_string_lossy().to_string();
+
         let mut config = Config {
             providers: vec![],
-            claude_code_root: home.join(".claude").to_string_lossy().to_string(),
+            claude_code_root,
+            codex_root,
             db_path: config_dir.join("toki.fjall"),
             db_base_dir: config_dir.clone(),
             tz: None,
@@ -64,16 +69,17 @@ impl Config {
         let settings = match load_settings_file() {
             Some(s) => s,
             None => {
-                // No settings file: default to claude_code if ~/.claude exists
-                if std::path::Path::new(&self.claude_code_root).exists() {
-                    self.providers = vec!["claude_code".to_string()];
-                }
+                // No settings file: auto-detect installed providers
+                self.providers = self.detect_installed_providers();
                 return;
             }
         };
 
         if let Some(v) = settings.get("claude_code_root").and_then(|v| v.as_str()) {
             self.claude_code_root = v.to_string();
+        }
+        if let Some(v) = settings.get("codex_root").and_then(|v| v.as_str()) {
+            self.codex_root = v.to_string();
         }
 
         // Load providers list
@@ -85,11 +91,8 @@ impl Config {
                     .collect();
             }
         } else {
-            // Backward compat: no "providers" key.
-            // If claude_code_root exists (explicitly set or default), default to ["claude_code"].
-            if std::path::Path::new(&self.claude_code_root).exists() {
-                self.providers = vec!["claude_code".to_string()];
-            }
+            // No "providers" key in settings: auto-detect installed providers
+            self.providers = self.detect_installed_providers();
         }
 
         if let Some(v) = settings.get("retention_days").and_then(|v| v.as_str()) {
@@ -121,6 +124,18 @@ impl Config {
                 self.start_of_week = w;
             }
         }
+    }
+
+    /// Auto-detect installed providers by checking if their root directories exist.
+    fn detect_installed_providers(&self) -> Vec<String> {
+        let mut providers = Vec::new();
+        if std::path::Path::new(&self.claude_code_root).exists() {
+            providers.push("claude_code".to_string());
+        }
+        if std::path::Path::new(&self.codex_root).exists() {
+            providers.push("codex".to_string());
+        }
+        providers
     }
 }
 
@@ -268,6 +283,7 @@ mod tests {
         let config = Config {
             providers: vec![],
             claude_code_root: "~/.claude".to_string(),
+            codex_root: "~/.codex".to_string(),
             db_path: PathBuf::from("toki.fjall"),
             db_base_dir: PathBuf::from("."),
             tz: None,
@@ -289,6 +305,7 @@ mod tests {
         let mut config = Config {
             providers: vec![],
             claude_code_root: String::new(),
+            codex_root: String::new(),
             db_path: PathBuf::new(),
             db_base_dir: PathBuf::new(),
             tz: None,

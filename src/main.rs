@@ -359,14 +359,14 @@ fn main() {
 // ── Settings (non-interactive) ──────────────────────────
 
 const VALID_SETTINGS: &[&str] = &[
-    "claude_code_root", "daemon_sock", "timezone", "output_format",
+    "claude_code_root", "codex_root", "daemon_sock", "timezone", "output_format",
     "start_of_week", "no_cost", "retention_days", "rollup_retention_days",
     "providers",
 ];
 
 /// Settings that require daemon restart to take effect.
 const DAEMON_SETTINGS: &[&str] = &[
-    "claude_code_root", "daemon_sock", "retention_days", "rollup_retention_days",
+    "claude_code_root", "codex_root", "daemon_sock", "retention_days", "rollup_retention_days",
     "providers",
 ];
 

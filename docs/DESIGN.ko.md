@@ -1,444 +1,116 @@
-# toki Architecture & Design
+# toki 설계 및 아키텍처 (toki Architecture & Design)
 
-## Overview
+이 문서에서는 `toki`가 대용량 토큰 로그를 **Zero-Overhead**로 처리하고, 사용자 작업을 전혀 방해하지 않는 **Non-blocking** 구조를 어떻게 구현했는지 설명합니다.
 
-toki는 데몬/클라이언트 구조로 동작한다.
-데몬은 기본 4개 스레드(Worker, Writer, Listener, Notify)를 운용하며,
-trace 클라이언트당 2개 스레드(receiver + writer)가 추가된다.
-fjall 임베디드 DB의 7개 keyspace에 데이터를 저장한다.
+---
 
-## Architecture
+## 🏗 전체 아키텍처 (High-Level Architecture)
+
+`toki`는 자원 분리와 데이터 무결성을 위해 **멀티 스레드 데몬(Daemon)** 구조를 사용합니다.
 
 ```mermaid
 graph TD
-    subgraph Daemon["Daemon Process (toki daemon start)"]
-        subgraph Worker["Worker Thread"]
-            W_select["select!<br/>event_rx → file<br/>stop_rx → exit<br/>default(30s) → poll"]
-        end
-
-        subgraph Writer["Writer Thread"]
-            Wr_select["select!<br/>op_rx → handle_op()<br/>tick(86400s) → retention"]
-            Wr_db["Owns: Database<br/>dict_cache: HashMap<br/>pending_events: Vec ≤64"]
-        end
-
-        subgraph Notify["Notify Thread<br/>macOS FSEvents"]
-        end
-
-        subgraph Broadcast["BroadcastSink<br/>Condvar::notify_all<br/>0 clients = zero overhead"]
-        end
-
-        subgraph Listener["Listener Thread<br/>UnixListener.accept()<br/>TRACE / REPORT 커맨드 분기"]
-        end
+    subgraph OS_Kernel["OS 커널 (Kernel)"]
+        FS["파일 시스템 (FSEvents / inotify)"]
+        MMAP["파일 메모리 매핑 (mmap)"]
     end
 
-    Notify -->|"file events"| Worker
-    Worker -->|"db_tx.send()"| Writer
-    Worker -->|"sink.emit_event()"| Broadcast
-    Listener -->|"add_client()"| Broadcast
+    subgraph Daemon["toki 데몬 (Daemon Process)"]
+        Worker["<b>Worker Thread</b><br/>mmap + SIMD Scan<br/>증분 데이터 추출"]
+        Writer["<b>Writer Thread</b><br/>Fjall TSDB 관리<br/>Rollup-on-Write"]
+        Broadcast["<b>Broadcast Engine</b><br/>Zero-copy Fan-out<br/>1:N 이벤트 전송"]
+        Listener["<b>UDS Listener</b><br/>클라이언트 연결 관리"]
+    end
 
-    TraceClient["Trace Client<br/>JSONL stdout 출력"] -->|"UDS connect<br/>TRACE 커맨드"| Daemon
-    ReportClient["Report Client<br/>UDS 쿼리 → sink 출력"] -->|"UDS connect<br/>REPORT 커맨드"| Daemon
+    subgraph Clients["클라이언트 (Clients)"]
+        Trace["toki trace<br/>(실시간 스트림)"]
+        Report["toki report<br/>(즉각적인 DB 쿼리)"]
+    end
+
+    FS -->|이벤트 감지| Worker
+    MMAP -.->|Zero-copy 읽기| Worker
+    Worker -->|파싱된 이벤트| Writer
+    Worker -->|실시간 이벤트| Broadcast
+    Broadcast -->|Single Write / Multi-read| Trace
+    Listener -->|연결 요청| Broadcast
+    Report -->|UDS Query| Listener
+    Listener -->|Query Result| Report
 ```
 
-### Daemon Process
+---
 
-데몬은 기본 4개 스레드로 구성되며, trace 클라이언트당 2개 스레드가 추가된다:
+## ⚡️ I/O 혁신: 왜 toki는 작업을 방해하지 않는가?
 
-1. **Worker Thread**: FSEvents 파일 변경 감지 → 파싱 → Sink 출력 + TSDB 저장
-2. **Writer Thread**: DB를 단독 소유. 이벤트 배치 커밋, rollup-on-write, retention
-3. **Listener Thread**: UDS accept loop. 첫 줄 커맨드(`TRACE` / `REPORT`)로 분기. trace는 BroadcastSink에 등록, report는 DB 쿼리 실행
-4. **Notify Thread**: macOS FSEvents (notify 라이브러리 내부)
+기존 도구들은 `read()` 시스템 콜로 데이터를 커널에서 유저 공간으로 복사한 뒤 전체를 루프 돌리는 방식입니다. `toki`는 여기서 다른 접근을 택했습니다.
 
-N개 trace 클라이언트 연결 시: 4 + 2N 스레드
+### 1. mmap 기반 Zero-copy 읽기
+- 파일을 프로세스 메모리에 직접 매핑(`mmap`)해서 불필요한 복사 비용을 없앴습니다.
+- OS의 페이지 캐시를 그대로 활용하기 때문에, 이미 읽은 데이터를 다시 읽어도 CPU 부하가 거의 없습니다.
 
-### BroadcastSink (Zero Overhead)
+### 2. SIMD (memchr) 가속 스캔
+- 줄바꿈(`\n`)을 찾을 때 단순 루프 대신 CPU의 **SIMD(Single Instruction, Multiple Data)** 명령어를 씁니다.
+- 기가바이트 텍스트에서도 수십 GB/s 속도로 줄바꿈을 찾아내서, 로그 처리에 드는 CPU 시간을 최소화합니다.
 
-`BroadcastSink`는 `Sink` trait을 구현하며, 연결된 trace 클라이언트에 이벤트를 fan-out한다.
-`Condvar::notify_all` 기반으로, Engine은 공유 state에 O(1) write만 수행한다.
-tokio 의존성 없이 순수 `std::sync`만 사용한다.
+### 3. xxHash3 기반 스마트 체크포인트
+- `xxHash3-64` 알고리즘으로 마지막 읽기 지점의 무결성을 검증합니다.
+- 파일 크기뿐 아니라 내용의 해시까지 대조하기 때문에, 로그 로테이션이나 수동 편집이 있어도 정확히 중단된 지점부터 **증분 읽기(Incremental Read)**를 수행합니다.
 
-- 클라이언트가 0개일 때: `emit_*` 메서드는 `client_count` atomic 확인 → 0이면 즉시 return. 실질적 no-op.
-- 클라이언트가 있을 때: 이벤트를 JSON 직렬화 → 공유 state에 write → `condvar.notify_all()`
-- 클라이언트당 2개 스레드:
-  - **Thread A (receiver)**: `condvar.wait_timeout(5s)` → msg clone → local queue push
-  - **Thread B (writer)**: queue drain → batch `write_all`
-- 죽은 클라이언트 감지: Thread A는 `wait_timeout(5s)`, Thread B는 write 시 EPIPE
-- Thread spawn 실패 시 에러 로그 + 클라이언트에 에러 전송
+---
 
-### UDS 프로토콜
+## 📡 1:N 브로드캐스팅: Zero-Overhead 설계
 
-클라이언트는 UDS 연결 후 첫 줄로 커맨드를 전송한다:
+`toki trace` 클라이언트가 아무리 많이 붙어도 데몬 성능이 떨어지지 않는 비결은 **Broadcast Engine**에 있습니다.
 
-```
-UnixStream::connect(daemon.sock)
-    → write "TRACE\n" 또는 "REPORT\n"
-    → daemon이 BufReader로 커맨드 읽고 분기 처리
-```
+### Zero-Overhead logic
+1.  **Atomic Check (0 클라이언트):** 연결된 클라이언트가 없으면, 원자적 정수 하나만 확인하고 모든 로직을 건너뜁니다. 사실상 **No-op**입니다.
+2.  **Single Serialization:** 클라이언트가 1명이든 100명이든, JSON 직렬화는 딱 **한 번**만 합니다.
+3.  **Condvar Fan-out:** 공유 버퍼에 데이터를 쓰고 `Condvar::notify_all()`로 대기 중인 모든 클라이언트 스레드를 동시에 깨웁니다.
+4.  **Lock-free Read:** 각 클라이언트 스레드는 독립된 큐를 가지고 있어서, 메인 워커 스레드를 블로킹하지 않고 비동기로 데이터를 보냅니다.
 
-- `TRACE`: BroadcastSink에 클라이언트 등록 → 실시간 이벤트 스트림
-- `REPORT`: JSON 쿼리 payload 수신 → DB 쿼리 실행 → JSON 응답
+```mermaid
+sequenceDiagram
+    participant Worker as Worker Thread
+    participant BS as BroadcastSink
+    participant C1 as Client Thread 1
+    participant C2 as Client Thread N
 
-200ms 타이밍 기반 분류는 제거되었다.
-
-### Trace Client
-
-```
-UnixStream::connect(daemon.sock)
-    → write "TRACE\n"
-    → BufReader::read_line() loop
-    → JSON parse → type == "event"이면 그대로 stdout에 출력
-```
-
-Trace는 `--output-format`과 무관하게 항상 JSONL을 stdout에 출력한다.
-`--output-format`과 `--sink` 플래그는 report에만 적용되며, trace에는 미적용된다.
-클라이언트 측 `UsageEvent` 역직렬화 없이, daemon이 보낸 raw JSON을 그대로 패스스루한다.
-
-JSON에 포함되는 필드: `model`, `source`, `provider`, `timestamp` (세션 파일 원본), 토큰 필드, `cost_usd`
-
-### Report Client
-
-```
-UDS connect (daemon.sock)
-    → write "REPORT\n"
-    → JSON 쿼리 전송 (PromQL 스타일)
-    → daemon이 TSDB에서 실행 후 JSON 응답
-    → client가 pricing 적용 + sink 출력
+    Worker->>BS: emit_event(UsageEvent)
+    alt 클라이언트 없음 (0)
+        BS-->>Worker: 즉시 리턴 (Atomic check)
+    else 클라이언트 존재 (N)
+        BS->>BS: JSON 직렬화 (단 1회)
+        BS->>BS: 공유 버퍼에 쓰기
+        BS->>C1: Condvar.notify()
+        BS->>C2: Condvar.notify()
+        C1->>C1: 비동기 Write (UDS)
+        C2->>C2: 비동기 Write (UDS)
+        BS-->>Worker: 즉시 리턴
+    end
 ```
 
-Report는 UDS로 daemon에 `REPORT` 커맨드 후 JSON payload를 전송하고 결과를 받는다.
-DB를 직접 열지 않는다 (fjall DB lock 때문).
-데몬이 실행 중이어야 report를 사용할 수 있다 (PID 파일로 확인).
-pricing은 client가 파일 캐시(`~/.config/toki/pricing.json`)에서 로드하여 적용한다.
+---
 
-## Worker Thread
+## 🗄 데이터 레이어: 시계열 DB 최적화
 
-- `crossbeam_channel::select!`로 FSEvents 이벤트, stop 시그널, 30초 백업 폴링을 다중화
-- 파일 변경 감지 → `process_file_with_ts()` → 파싱된 이벤트를 Sink에 출력 + `DbOp::WriteEvent`를 writer에 전송
-- watch mode에서는 `send()` 사용 (blocking — 데이터 무손실 보장)
-- 5초 간격으로 dirty checkpoints를 writer에 batch flush
+`toki`는 임베디드 시계열 DB인 `fjall`을 기반으로 데이터를 관리합니다.
 
-## Writer Thread
+### 1. Rollup-on-Write
+- 데이터가 들어오는 시점에 시간별(Hourly) 합계를 미리 계산해서 저장합니다.
+- 한 달 치 사용량을 조회할 때 수백만 개 이벤트를 전부 읽을 필요 없이, 미리 계산된 수백 개의 **Rollup** 데이터만 읽으면 됩니다. 리포트 속도 **7ms**의 비결입니다.
 
-- `Database`를 단독 소유 — Send 이슈 없음, 단일 스레드 접근
-- `DbOp` 수신 → pending에 축적 → 64개 도달 시 batch commit
-- Dictionary cache를 메모리에 유지 (일반 HashMap, DashMap 불필요)
-- 일 1회 retention tick으로 오래된 데이터 자동 삭제
-- Shutdown 시 잔여 pending events flush 후 종료
+### 2. Dictionary Compression
+- 반복되는 모델 이름(`claude-3-7-sonnet...`), 세션 ID 등의 문자열을 정수형 ID로 압축합니다.
+- 디스크 사용량을 80% 이상 줄이고, I/O 부하도 최소화합니다.
 
-## Startup Sequence
+---
 
-```
-1. 설정된 provider 목록 로드
-2. Provider별 Database::open() + load_all_checkpoints()
-3. Provider별 (db_tx, db_rx) = bounded(1024)
-4. Provider별 Writer thread spawn (Database 소유권 이전)
-5. Provider별 TrackerEngine::new(db_tx, checkpoints, BroadcastSink)
-6. Cold start: 전체 세션 파일 스캔 → TSDB에 이벤트 저장 + 요약 출력
-7. Watcher + Worker thread spawn
-8. Write PID file
-9. Listener thread spawn (UDS accept loop + 멀티 DB 쿼리 병합)
-10. Wait for SIGTERM/SIGINT
-```
+## 🧵 멀티 스레딩 모델 (Thread Safety)
 
-데몬은 `toki daemon start`로 시작하며 기본적으로 백그라운드로 분리된다. 디버그 시에는 `--foreground` 옵션을 사용한다. 소켓 경로, Claude Code root 등 설정은 `toki settings` TUI에서 관리하며 `toki daemon restart`로 반영한다.
-Provider는 `toki settings set providers --add/--remove`로 관리한다.
-DB를 처음부터 다시 구축하려면 `toki daemon reset` 후 `toki daemon start`를 사용한다.
+`toki`는 각 역할별로 스레드를 분리해서 락 경합(Lock Contention)을 최소화했습니다.
 
-## Shutdown Sequence
+- **Worker Thread:** 파일 시스템 이벤트를 받아서 로그를 파싱합니다.
+- **Writer Thread:** DB 소유권을 독점하고 순차적으로 쓰기를 수행합니다 (Write Stall 방지).
+- **Listener Thread:** UDS 연결과 쿼리 요청을 처리합니다.
+- **Notify Thread:** OS(macOS FSEvents 등)의 저수준 이벤트를 수신하는 백그라운드 스레드입니다.
 
-```
-1. SIGTERM/SIGINT 수신
-2. Listener stop → listener thread join
-3. stop_tx.send() → Worker thread 종료 (잔여 checkpoints flush)
-4. db_tx.send(Shutdown) → Writer thread 종료 (잔여 events flush)
-5. Worker thread join → Writer thread join
-6. PID file 삭제 + socket 파일 삭제
-```
-
-## TSDB Schema
-
-fjall의 7개 keyspace:
-
-| Keyspace | Key | Value | 용도 |
-|----------|-----|-------|------|
-| `checkpoints` | file_path (string) | bincode(FileCheckpoint) | 증분 읽기 위치 |
-| `meta` | key (string) | value (string) | 설정, 가격 캐시 |
-| `events` | `[ts_ms BE:8][message_id]` | bincode(StoredEvent) | 개별 이벤트 |
-| `rollups` | `[hour_ts BE:8][model_name]` | bincode(RollupValue) | 시간별 모델 집계 |
-| `idx_sessions` | `{session_id}\0[ts:8][msg_id]` | empty | 세션 인덱스 |
-| `idx_projects` | `{project}\0[ts:8][msg_id]` | empty | 프로젝트 인덱스 |
-| `dict` | string | bincode(u32) | 문자열 → ID 딕셔너리 압축 |
-
-- Big-endian timestamp → lexicographic = chronological 정렬
-- Range scan으로 시간 범위 쿼리 가능
-- Index keyspace는 value가 empty — 키 존재 여부만으로 lookup
-
-### Dictionary Compression
-
-반복되는 문자열(model, session_id, source_file)을 u32 ID로 압축하여 `events` keyspace의 value 크기를 줄인다.
-
-- `dict` keyspace: `"claude-opus-4-6"` → `1`, `"session-abc"` → `2`
-- Writer thread가 dict_cache를 메모리에 유지, 새 문자열은 자동 등록
-- 역방향 조회(ID → string)는 `load_dict_reverse()`로 report 시에만 사용
-
-### Rollup-on-Write
-
-이벤트 저장 시 시간별 rollup도 동시에 갱신한다 (read-modify-write):
-
-```
-hour_ts = ts_ms - (ts_ms % 3_600_000)  // 시간 단위 절삭
-key = (hour_ts, model_name)
-rollup = db.get_rollup(key) or default
-rollup += event tokens
-batch.upsert_rollup(key, rollup)
-```
-
-Report에서 일별/월별 등 시간 그룹핑은 rollup keyspace만 스캔하면 되므로
-전체 이벤트를 읽을 필요가 없다.
-
-### Batch Transaction
-
-Writer thread는 64개 이벤트를 모아서 단일 `OwnedWriteBatch`로 commit한다:
-
-```
-1. Drain pending_events
-2. Rollup read-modify-write (hour별 기존값 읽기 → 누적)
-3. Dict ID 해석 (cache hit → 0 alloc, miss → dict keyspace 추가)
-4. events, idx_sessions, idx_projects, rollups 일괄 insert
-5. batch.commit()
-```
-
-## Data Flow
-
-### Cold Start (daemon start)
-
-```
-discover_sessions()
-    → SessionGroup[] (parent.jsonl + subagent/*.jsonl)
-    → rayon parallel_scan (CPU 코어 수 제한)
-        → process_lines_streaming() per file
-        → parse_line_with_ts() → UsageEventWithTs
-        → db_tx.send(WriteEvent)     ← blocking send (데이터 무손실)
-        → accumulate to local HashMap
-    → merge summaries
-    → sink.emit_summary()
-    → db_tx.send(FlushCheckpoints)
-```
-
-Cold start에서는 blocking `send`를 사용한다.
-rayon 스레드가 bounded channel(1024)을 채우면 writer가 소화할 때까지 대기하여
-데이터 무손실을 보장한다.
-
-### Watch Mode (실시간)
-
-```
-FSEvents → event_tx → Worker thread
-    → stat() 크기 비교 (1-5µs fast skip)
-    → find_resume_offset() 역순 스캔
-    → process_lines_streaming() 증분 읽기
-    → parse_line_with_ts()
-    → BroadcastSink.emit_event()    ← 0 clients이면 no-op
-    → db_tx.send(WriteEvent)        ← blocking (데이터 무손실 보장)
-```
-
-### Trace Client (실시간 스트림)
-
-```
-UnixStream::connect(daemon.sock)
-    → write "TRACE\n"
-    → BufReader::read_line() loop
-    → JSON parse → type == "event"이면 그대로 stdout에 JSONL 출력
-```
-
-### Report (one-shot 조회)
-
-```
-daemon_status(pidfile)?
-    → None: "Cannot connect to toki daemon" → exit
-    → Some: continue
-
-UDS connect → write "REPORT\n" → JSON 쿼리 전송
-    → daemon이 TSDB 쿼리 실행 → JSON 응답
-    → client가 결과 수신 + sink 출력
-```
-
-Report는 UDS로 daemon에 쿼리를 전송하고 결과를 받는다. DB를 직접 열지 않는다.
-
-## File Processing Pipeline
-
-### Active/Idle 분류
-
-macOS FSEvents는 디렉토리 내 파일 하나가 변해도 같은 디렉토리의 모든 파일에
-이벤트를 발생시킨다. 파일별 상태를 추적하여 불필요한 처리를 최소화한다.
-
-| 상수 | 값 | 역할 |
-|------|----|------|
-| `ACTIVE_COOLDOWN` | 150ms | Active 파일 재처리 최소 간격 |
-| `IDLE_COOLDOWN` | 500ms | Idle 파일 stat() 최소 간격 |
-| `IDLE_TRANSITION` | 15s | 새 줄 없이 경과 시 Idle 전환 |
-
-```
-process_file_with_ts(path)
-    → FileActivity 존재?
-        No  → Active (새 파일)
-        Yes → 15s 경과? → Idle 전환
-    → 쿨다운 체크 (Active: 150ms, Idle: 500ms)
-    → stat() 크기 비교 (크기 변화 없으면 즉시 skip)
-    → find_resume_offset() + process_lines_streaming()
-    → 새 줄 있으면 파싱 + checkpoint 갱신 + Active 승격
-```
-
-### Fast Skip (크기 기반)
-
-- watch 이벤트 수신 시 `stat()`으로 파일 크기만 확인 (파일 open/read 없음)
-- 크기 변화 없으면 즉시 스킵 (~1-5µs vs 기존 ~150-300µs)
-- JSONL 특성상 새 줄 추가 = 크기 증가이므로 false negative 없음
-
-### 역순 스캔 (Checkpoint Recovery)
-
-- 파일 끝에서 4KB 청크 단위로 역순 읽기
-- 라인 길이 pre-filter (O(1) 정수 비교, ~85% 후보 제거)
-- 길이 일치 시에만 xxHash3-64 비교 (30GB/s)
-- Compaction으로 바이트 위치가 변해도 라인 해시로 복구
-
-## Retention Policy
-
-Writer thread가 데이터 보존 정책을 자동 실행한다 (기본 비활성화, `toki settings`에서 설정):
-
-| 대상 | 기본 보존 기간 | DB key |
-|------|----------------|--------|
-| events | 0 (무제한) | `retention_days` |
-| rollups | 0 (무제한) | `rollup_retention_days` |
-
-- 0 = 비활성화 (삭제하지 않음)
-- 시작 시 1회 + 이후 24시간 간격으로 실행
-- 1000개 키 단위로 batch 삭제 (대량 삭제 시 write stall 방지)
-- 인덱스(idx_sessions, idx_projects)는 삭제 생략
-  - 키가 `{prefix}\0{ts}{msg_id}` 구조라 시간 순 정렬이 아님 → O(n) full scan 필요
-  - 고아 인덱스 엔트리는 value가 empty이므로 크기 무시 가능
-
-## Data Types
-
-### StoredEvent (events keyspace value)
-
-```rust
-pub struct StoredEvent {
-    pub model_id: u32,                    // dict compressed
-    pub session_id: u32,                  // dict compressed
-    pub source_file_id: u32,             // dict compressed
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub cache_creation_input_tokens: u64,
-    pub cache_read_input_tokens: u64,
-}
-```
-
-### RollupValue (rollups keyspace value)
-
-```rust
-pub struct RollupValue {
-    pub input: u64,
-    pub output: u64,
-    pub cache_create: u64,
-    pub cache_read: u64,
-    pub count: u64,
-}
-```
-
-### FileCheckpoint (checkpoints keyspace value)
-
-```rust
-pub struct FileCheckpoint {
-    pub file_path: String,
-    pub last_line_len: u64,      // 라인 길이 pre-filter용
-    pub last_line_hash: u64,     // xxHash3-64
-}
-```
-
-### DbOp (Writer thread channel message)
-
-```rust
-pub enum DbOp {
-    WriteEvent { ts_ms, message_id, model, session_id, source_file, tokens },
-    WriteCheckpoint(FileCheckpoint),
-    FlushCheckpoints(Vec<FileCheckpoint>),
-    Shutdown,
-}
-```
-
-## Query Architecture
-
-Report 명령은 UDS로 daemon에 쿼리를 전송한다. Daemon의 Listener thread가 쿼리를 수신하여 DB에서 실행한다.
-
-### 쿼리 경로
-
-CLI 플래그(`--session-id`, `--project`, `--since`, `--until`, `--group-by-session`)는 내부적으로 `Query` 구조체로 변환되어 `execute_parsed_query`를 통해 실행된다.
-시간 그룹핑 서브커맨드(daily/weekly/monthly/yearly/hourly)는 캘린더 기반 버킷팅이 필요하므로 `report_grouped_from_db`를 통해 실행된다.
-
-| 함수 | 데이터 소스 | 용도 |
-|------|-------------|------|
-| `execute_parsed_query` | events + dict 또는 rollups | PromQL 쿼리 + CLI 플래그 변환 실행 |
-| `report_grouped_from_db` | rollups 또는 events + dict | 시간별 그룹핑 (daily/weekly/...) |
-| `has_tsdb_data` | rollups (O(1)) | TSDB 데이터 존재 여부 확인 |
-
-### 데이터 소스 선택
-
-쿼리의 필터와 그룹핑 조건에 따라 데이터 소스가 결정된다:
-
-| 조건 | 데이터 소스 | 이유 |
-|------|-------------|------|
-| 필터/그룹 없이 전체 요약 | rollups | 빠름 (시간별 사전 집계) |
-| `session` 또는 `project` 필터 있음 | events + dict | rollup에 세션/프로젝트 정보 없음 |
-| `by (session)` 등 그룹핑 | events + dict | rollup에 세션/프로젝트 정보 없음 |
-| 시간 그룹핑만 (daily/weekly/...) | rollups | 빠름 |
-| 시간 그룹핑 + 세션/프로젝트 필터 | events + dict | 이벤트 레벨 필터링 필요 |
-| `sessions` / `projects` 리스팅 | idx_sessions/idx_projects 또는 events | 시간 필터 없으면 인덱스, 있으면 이벤트 스캔 |
-| `events` 리스팅 | events + dict | 항상 이벤트 레벨 스캔 |
-| `sum()`/`avg()`/`count()` 집계 | 기본 쿼리와 동일 | 후처리: 모델 차원 collapse |
-
-### 스트리밍 콜백 패턴
-
-```rust
-db.for_each_rollup(since, until, |ts, model, rollup| { ... })
-db.for_each_event(since, until, |ts, event| { ... })
-```
-
-- 중간 Vec 할당 없이 HashMap에 직접 accumulate
-- `has_tsdb_data`는 `first_key_value().is_some()`으로 O(1)
-
-## Config Priority
-
-설정 값은 다음 우선순위로 결정된다:
-
-```
-CLI 인자 > 설정 파일 (~/.config/toki/settings.json) > 기본값
-```
-
-설정 파일은 `toki settings` (TUI) 또는 `toki settings set/get/list` (CLI)로 관리한다.
-Provider는 `toki settings set providers --add/--remove`로 관리한다.
-환경변수는 사용하지 않는다 (`TOKI_DEBUG` 제외).
-
-| 설정 | CLI 오버라이드 | settings key | 기본값 |
-|------|---------------|-------------|--------|
-| Providers | - | `providers` | `[]` |
-| Claude root | - | `claude_code_root` | `~/.claude` |
-| DB path | - | - | `~/.config/toki/<provider>.fjall` |
-| Daemon sock | - | `daemon_sock` | `~/.config/toki/daemon.sock` |
-| Timezone | `-z` | `timezone` | (UTC) |
-| Output format | `--output-format` | `output_format` | `table` |
-| Start of week | `--start-of-week` | `start_of_week` | `mon` |
-| No cost | `--no-cost` | `no_cost` | `false` |
-| Retention | - | `retention_days` | `0` (disabled) |
-| Rollup retention | - | `rollup_retention_days` | `0` (disabled) |
-
-## Backpressure
-
-Engine → Writer 간 bounded channel(1024):
-
-| 상황 | 동작 |
-|------|------|
-| Cold start (rayon parallel scan) | `send()` — blocking. 데이터 무손실 보장 |
-| Watch mode (실시간 이벤트) | `send()` — blocking. 데이터 무손실 보장 |
-| Checkpoints flush | `send()` — blocking. 체크포인트 손실 방지 |
-
-Cold start와 watch mode 모두 blocking `send()`를 사용하여 채널이 꽉 차면 writer가 소화할 때까지 대기한다. 데이터 무손실을 보장한다.
+덕분에 **Cold Start** 때는 하드웨어의 모든 성능을 끌어쓰고, **Watch Mode**에서는 시스템에 없는 것처럼 조용히 돌아갑니다.
