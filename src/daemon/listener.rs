@@ -137,7 +137,7 @@ fn handle_report_client(mut stream: UnixStream, request_line: &str, dbs: &[(Stri
     stream.set_read_timeout(None).ok();
 
     let response = match execute_report_request(request_line, dbs) {
-        Ok(data) => serde_json::json!({ "ok": true, "data": data }),
+        Ok((data, meta)) => serde_json::json!({ "ok": true, "data": data, "meta": meta }),
         Err(e) => serde_json::json!({ "ok": false, "error": e }),
     };
 
@@ -147,10 +147,11 @@ fn handle_report_client(mut stream: UnixStream, request_line: &str, dbs: &[(Stri
 }
 
 /// Parse and execute a report request against all provider DBs, merging results.
+/// Returns (data, meta) where meta contains query metadata for the information block.
 fn execute_report_request(
     request_line: &str,
     dbs: &[(String, Arc<Database>)],
-) -> Result<serde_json::Value, String> {
+) -> Result<(serde_json::Value, serde_json::Value), String> {
     let req: ReportRequest =
         serde_json::from_str(request_line).map_err(|e| format!("invalid request: {}", e))?;
 
@@ -162,6 +163,10 @@ fn execute_report_request(
 
     let mut parsed =
         crate::query_parser::parse(&req.query).map_err(|e| format!("query parse error: {}", e))?;
+
+    // Query metadata — will be enriched with actual DB range below
+    let query_since = parsed.since.clone();
+    let query_until = parsed.until.clone();
 
     // Strip "provider" from group_by (handled at DB routing level)
     parsed.group_by.retain(|k| k != "provider");
@@ -180,7 +185,13 @@ fn execute_report_request(
     };
 
     if target_dbs.is_empty() {
-        return Ok(serde_json::Value::Array(Vec::new()));
+        let meta = serde_json::json!({
+            "since": query_since,
+            "until": query_until,
+            "data_since": serde_json::Value::Null,
+            "data_until": serde_json::Value::Null,
+        });
+        return Ok((serde_json::Value::Array(Vec::new()), meta));
     }
 
     let mut all_results: Vec<serde_json::Value> = Vec::new();
@@ -196,7 +207,24 @@ fn execute_report_request(
         all_results.extend(provider_results);
     }
 
-    Ok(serde_json::Value::Array(all_results))
+    // Get actual data range from all queried DBs (O(1) per DB — B-tree first/last)
+    let mut global_min: Option<i64> = None;
+    let mut global_max: Option<i64> = None;
+    for (_, db) in &target_dbs {
+        if let Some((min_ts, max_ts)) = db.data_range() {
+            global_min = Some(global_min.map_or(min_ts, |v: i64| v.min(min_ts)));
+            global_max = Some(global_max.map_or(max_ts, |v: i64| v.max(max_ts)));
+        }
+    }
+
+    let meta = serde_json::json!({
+        "since": query_since,
+        "until": query_until,
+        "data_since": global_min,
+        "data_until": global_max,
+    });
+
+    Ok((serde_json::Value::Array(all_results), meta))
 }
 
 /// Request payload from report client.

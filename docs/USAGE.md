@@ -9,7 +9,7 @@ brew tap korjwl1/tap
 brew install toki
 ```
 
-*(To build from source, use `cargo build --release`. The binary will be located at `target/release/toki`.)*
+*(To build from source, clone the repo and run `cargo build --release`.)*
 
 ---
 
@@ -428,48 +428,80 @@ For trace: strips `cost_usd` field from JSONL output.
 
 ### JSON (`--output-format json`)
 
+All JSON report output is wrapped in a top-level structure with `information` (query metadata) and `providers` (per-provider data keyed by provider name).
+
 #### Summary
 
 ```json
 {
-  "type": "summary",
-  "data": [
-    {
-      "model": "claude-opus-4-6",
-      "input_tokens": 1234,
-      "output_tokens": 4321,
-      "cache_creation_input_tokens": 56789,
-      "cache_read_input_tokens": 98765,
-      "total_tokens": 161109,
-      "events": 42,
-      "cost_usd": 1.2345
-    }
-  ]
+  "information": {
+    "type": "summary",
+    "since": "2026-01-15T00:00:00Z",
+    "until": "2026-03-21T14:00:00Z",
+    "query_since": null,
+    "query_until": null,
+    "timezone": null,
+    "start_of_week": "mon",
+    "generated_at": "2026-03-21T15:30:00Z"
+  },
+  "providers": {
+    "claude_code": [
+      {
+        "model": "claude-opus-4-6",
+        "input_tokens": 1234,
+        "output_tokens": 4321,
+        "cache_creation_input_tokens": 56789,
+        "cache_read_input_tokens": 98765,
+        "total_tokens": 161109,
+        "events": 42,
+        "cost_usd": 1.2345
+      }
+    ]
+  }
 }
 ```
+
+| Field | Description |
+|-------|-------------|
+| `since` / `until` | Actual data range in TSDB (earliest/latest rollup timestamp) |
+| `query_since` / `query_until` | User-specified `--since`/`--until` filter (null if not set) |
+| `timezone` | Timezone used for interpretation (null = UTC) |
+| `start_of_week` | Week start day for weekly grouping |
+| `generated_at` | When the report was generated |
 
 #### Grouped
 
 ```json
 {
-  "type": "daily",
-  "data": [
-    {
-      "period": "2026-03-01",
-      "usage_per_models": [
-        {
-          "model": "claude-opus-4-6",
-          "input_tokens": 1234,
-          "output_tokens": 4321,
-          "cache_creation_input_tokens": 56789,
-          "cache_read_input_tokens": 98765,
-          "total_tokens": 161109,
-          "events": 42,
-          "cost_usd": 1.2345
-        }
-      ]
-    }
-  ]
+  "information": {
+    "type": "daily",
+    "since": "2026-01-15T00:00:00Z",
+    "until": "2026-03-21T14:00:00Z",
+    "query_since": "20260301",
+    "query_until": null,
+    "timezone": "Asia/Seoul",
+    "start_of_week": "mon",
+    "generated_at": "2026-03-21T15:30:00Z"
+  },
+  "providers": {
+    "claude_code": [
+      {
+        "period": "2026-03-01",
+        "usage_per_models": [
+          {
+            "model": "claude-opus-4-6",
+            "input_tokens": 1234,
+            "output_tokens": 4321,
+            "cache_creation_input_tokens": 56789,
+            "cache_read_input_tokens": 98765,
+            "total_tokens": 161109,
+            "events": 42,
+            "cost_usd": 1.2345
+          }
+        ]
+      }
+    ]
+  }
 }
 ```
 
@@ -477,11 +509,22 @@ For trace: strips `cost_usd` field from JSONL output.
 
 ```json
 {
-  "type": "sessions",
-  "items": [
-    "4de9291e-061e-414a-85cb-de615826aded",
-    "db7cd31e-fdb1-4767-a6a2-f2f3dc68a74b"
-  ]
+  "information": {
+    "type": "sessions",
+    "since": "2026-01-15T00:00:00Z",
+    "until": "2026-03-21T14:00:00Z",
+    "query_since": null,
+    "query_until": null,
+    "timezone": null,
+    "start_of_week": "mon",
+    "generated_at": "2026-03-21T15:30:00Z"
+  },
+  "providers": {
+    "claude_code": [
+      "4de9291e-061e-414a-85cb-de615826aded",
+      "db7cd31e-fdb1-4767-a6a2-f2f3dc68a74b"
+    ]
+  }
 }
 ```
 

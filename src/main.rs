@@ -900,9 +900,13 @@ fn handle_report(
     };
 
     match response {
-        Ok(data) => {
-            for item in data.as_array().unwrap_or(&vec![]) {
-                dispatch_result_to_sink(item, sink.as_ref(), pricing.as_ref());
+        Ok(resp) => {
+            if output_format == toki::sink::OutputFormat::Json {
+                emit_json_report(&resp, &config, pricing.as_ref());
+            } else {
+                for item in resp.data.as_array().unwrap_or(&vec![]) {
+                    dispatch_result_to_sink(item, sink.as_ref(), pricing.as_ref());
+                }
             }
         }
         Err(e) => {
@@ -912,12 +916,129 @@ fn handle_report(
     }
 }
 
+/// Build the wrapped JSON report output with information + providers structure.
+fn emit_json_report(
+    resp: &ReportResponse,
+    config: &Config,
+    pricing: Option<&toki::pricing::PricingTable>,
+) {
+    let items = resp.data.as_array().cloned().unwrap_or_default();
+
+    // Detect type from first item (all items share the same type within a query)
+    let report_type = items.first()
+        .and_then(|item| item["type"].as_str())
+        .unwrap_or("summary");
+
+    // Build information block
+    let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let generated_at = chrono::DateTime::from_timestamp(now_secs as i64, 0)
+        .unwrap().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    // Convert data range epoch ms to ISO 8601
+    let data_since = resp.meta.get("data_since").and_then(|v| v.as_i64())
+        .and_then(|ms| chrono::DateTime::from_timestamp(ms / 1000, 0))
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+    let data_until = resp.meta.get("data_until").and_then(|v| v.as_i64())
+        .and_then(|ms| chrono::DateTime::from_timestamp(ms / 1000, 0))
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+
+    let information = serde_json::json!({
+        "type": report_type,
+        "since": data_since,
+        "until": data_until,
+        "query_since": resp.meta.get("since").and_then(|v| v.as_str()),
+        "query_until": resp.meta.get("until").and_then(|v| v.as_str()),
+        "timezone": config.tz.map(|t| t.to_string()),
+        "start_of_week": config.start_of_week.to_string().to_lowercase(),
+        "generated_at": generated_at,
+    });
+
+    // Group items by provider (schema field)
+    let mut provider_map: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+
+    for item in &items {
+        let schema_name = item["schema"].as_str().unwrap_or("claude_code");
+        let schema = toki::common::schema::schema_for_provider(schema_name);
+
+        // Re-process data with pricing and correct schema
+        let processed = reprocess_item_data(item, pricing, Some(schema));
+        provider_map.insert(schema_name.to_string(), processed);
+    }
+
+    let output = serde_json::json!({
+        "information": information,
+        "providers": provider_map,
+    });
+
+    println!("{}", serde_json::to_string_pretty(&output).unwrap_or_default());
+}
+
+/// Re-process a daemon response item's data with pricing applied.
+/// Returns the provider's data array (or string array for sessions/projects).
+fn reprocess_item_data(
+    item: &serde_json::Value,
+    pricing: Option<&toki::pricing::PricingTable>,
+    schema: Option<&dyn toki::common::schema::ProviderSchema>,
+) -> serde_json::Value {
+    match item["type"].as_str() {
+        Some("summary") => {
+            if let Ok(summaries_vec) = serde_json::from_value::<Vec<toki::ModelUsageSummary>>(item["data"].clone()) {
+                let data: Vec<serde_json::Value> = summaries_vec.iter()
+                    .map(|s| toki::sink::json::summary_to_json(s, pricing, schema))
+                    .collect();
+                serde_json::Value::Array(data)
+            } else {
+                serde_json::Value::Array(vec![])
+            }
+        }
+        Some("events") => {
+            if let Ok(events) = serde_json::from_value::<Vec<toki::common::types::RawEvent>>(item["data"].clone()) {
+                let json = toki::sink::json::events_batch_to_json(&events, pricing, schema);
+                json["data"].clone()
+            } else {
+                serde_json::Value::Array(vec![])
+            }
+        }
+        Some(type_name) if type_name == "sessions" || type_name == "projects" => {
+            item["items"].clone()
+        }
+        Some(_) => {
+            // Grouped data (daily, weekly, etc.)
+            if let Some(data_arr) = item["data"].as_array() {
+                let mut grouped: std::collections::HashMap<String, std::collections::HashMap<String, toki::ModelUsageSummary>> =
+                    std::collections::HashMap::new();
+                for entry in data_arr {
+                    let period = entry["period"].as_str()
+                        .or_else(|| entry["session"].as_str())
+                        .unwrap_or("total").to_string();
+                    if let Ok(models) = serde_json::from_value::<Vec<toki::ModelUsageSummary>>(entry["usage_per_models"].clone()) {
+                        let map: std::collections::HashMap<String, toki::ModelUsageSummary> =
+                            models.into_iter().map(|s| (s.model.clone(), s)).collect();
+                        grouped.insert(period, map);
+                    }
+                }
+                let json = toki::sink::json::grouped_to_json(&grouped, item["type"].as_str().unwrap_or(""), pricing, schema);
+                json["data"].clone()
+            } else {
+                serde_json::Value::Array(vec![])
+            }
+        }
+        None => serde_json::Value::Array(vec![]),
+    }
+}
+
+/// Response from daemon containing data and query metadata.
+struct ReportResponse {
+    data: serde_json::Value,
+    meta: serde_json::Value,
+}
+
 /// Send a report query to the daemon via UDS and return the response.
 fn send_report_query(
     sock_path: &std::path::Path,
     query: &str,
     tz: Option<chrono_tz::Tz>,
-) -> Result<serde_json::Value, String> {
+) -> Result<ReportResponse, String> {
     use std::io::{BufRead, Write};
 
     let mut stream = UnixStream::connect(sock_path)
@@ -944,7 +1065,10 @@ fn send_report_query(
         .map_err(|e| format!("Invalid response: {}", e))?;
 
     if resp["ok"].as_bool() == Some(true) {
-        Ok(resp["data"].clone())
+        Ok(ReportResponse {
+            data: resp["data"].clone(),
+            meta: resp["meta"].clone(),
+        })
     } else {
         Err(resp["error"].as_str().unwrap_or("Unknown error").to_string())
     }

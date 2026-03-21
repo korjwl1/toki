@@ -9,7 +9,7 @@ brew tap korjwl1/tap
 brew install toki
 ```
 
-*(소스에서 직접 빌드하려면 `cargo build --release`를 사용하세요. 바이너리는 `target/release/toki`에 생성됩니다.)*
+*(소스에서 직접 빌드하려면 저장소를 클론한 뒤 `cargo build --release`를 실행하세요.)*
 
 ---
 
@@ -431,48 +431,80 @@ trace: JSONL 출력에서 `cost_usd` 필드를 제거합니다.
 
 ### JSON (`--output-format json`)
 
+모든 JSON 리포트 출력은 `information`(쿼리 메타데이터)과 `providers`(provider별 데이터)로 감싸져 있습니다. provider 키로 바로 접근할 수 있습니다.
+
 #### Summary
 
 ```json
 {
-  "type": "summary",
-  "data": [
-    {
-      "model": "claude-opus-4-6",
-      "input_tokens": 1234,
-      "output_tokens": 4321,
-      "cache_creation_input_tokens": 56789,
-      "cache_read_input_tokens": 98765,
-      "total_tokens": 161109,
-      "events": 42,
-      "cost_usd": 1.2345
-    }
-  ]
+  "information": {
+    "type": "summary",
+    "since": "2026-01-15T00:00:00Z",
+    "until": "2026-03-21T14:00:00Z",
+    "query_since": null,
+    "query_until": null,
+    "timezone": null,
+    "start_of_week": "mon",
+    "generated_at": "2026-03-21T15:30:00Z"
+  },
+  "providers": {
+    "claude_code": [
+      {
+        "model": "claude-opus-4-6",
+        "input_tokens": 1234,
+        "output_tokens": 4321,
+        "cache_creation_input_tokens": 56789,
+        "cache_read_input_tokens": 98765,
+        "total_tokens": 161109,
+        "events": 42,
+        "cost_usd": 1.2345
+      }
+    ]
+  }
 }
 ```
+
+| 필드 | 설명 |
+|------|------|
+| `since` / `until` | TSDB에 있는 실제 데이터 범위 (rollup 첫/마지막 타임스탬프) |
+| `query_since` / `query_until` | 사용자가 `--since`/`--until`로 지정한 필터 (미지정 시 null) |
+| `timezone` | 시간 해석에 사용된 타임존 (null = UTC) |
+| `start_of_week` | 주간 그룹핑 시 주의 시작 요일 |
+| `generated_at` | 리포트 생성 시각 |
 
 #### Grouped
 
 ```json
 {
-  "type": "daily",
-  "data": [
-    {
-      "period": "2026-03-01",
-      "usage_per_models": [
-        {
-          "model": "claude-opus-4-6",
-          "input_tokens": 1234,
-          "output_tokens": 4321,
-          "cache_creation_input_tokens": 56789,
-          "cache_read_input_tokens": 98765,
-          "total_tokens": 161109,
-          "events": 42,
-          "cost_usd": 1.2345
-        }
-      ]
-    }
-  ]
+  "information": {
+    "type": "daily",
+    "since": "2026-01-15T00:00:00Z",
+    "until": "2026-03-21T14:00:00Z",
+    "query_since": "20260301",
+    "query_until": null,
+    "timezone": "Asia/Seoul",
+    "start_of_week": "mon",
+    "generated_at": "2026-03-21T15:30:00Z"
+  },
+  "providers": {
+    "claude_code": [
+      {
+        "period": "2026-03-01",
+        "usage_per_models": [
+          {
+            "model": "claude-opus-4-6",
+            "input_tokens": 1234,
+            "output_tokens": 4321,
+            "cache_creation_input_tokens": 56789,
+            "cache_read_input_tokens": 98765,
+            "total_tokens": 161109,
+            "events": 42,
+            "cost_usd": 1.2345
+          }
+        ]
+      }
+    ]
+  }
 }
 ```
 
@@ -480,11 +512,22 @@ trace: JSONL 출력에서 `cost_usd` 필드를 제거합니다.
 
 ```json
 {
-  "type": "sessions",
-  "items": [
-    "4de9291e-061e-414a-85cb-de615826aded",
-    "db7cd31e-fdb1-4767-a6a2-f2f3dc68a74b"
-  ]
+  "information": {
+    "type": "sessions",
+    "since": "2026-01-15T00:00:00Z",
+    "until": "2026-03-21T14:00:00Z",
+    "query_since": null,
+    "query_until": null,
+    "timezone": null,
+    "start_of_week": "mon",
+    "generated_at": "2026-03-21T15:30:00Z"
+  },
+  "providers": {
+    "claude_code": [
+      "4de9291e-061e-414a-85cb-de615826aded",
+      "db7cd31e-fdb1-4767-a6a2-f2f3dc68a74b"
+    ]
+  }
 }
 ```
 

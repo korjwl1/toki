@@ -288,6 +288,21 @@ impl Database {
         self.rollups.first_key_value().is_some()
     }
 
+    /// Get the actual data time range from rollups (O(1) each — B-tree first/last key).
+    /// Returns (earliest_ms, latest_ms) or None if no data.
+    pub fn data_range(&self) -> Option<(i64, i64)> {
+        let extract_ts = |guard: fjall::Guard| -> Option<i64> {
+            let kv = guard.into_inner().ok()?;
+            let key = &kv.0;
+            if key.len() < 8 { return None; }
+            Some(i64::from_be_bytes(key[..8].try_into().ok()?))
+        };
+
+        let first_ts = extract_ts(self.rollups.first_key_value()?)?;
+        let last_ts = extract_ts(self.rollups.last_key_value()?)?;
+        Some((first_ts, last_ts))
+    }
+
     /// Iterate rollups in [since_ms, until_ms] range, calling `f` for each.
     /// Avoids allocating a Vec when only aggregation is needed.
     pub fn for_each_rollup<F>(&self, since_ms: i64, until_ms: i64, mut f: F) -> Result<(), fjall::Error>

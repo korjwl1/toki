@@ -1,4 +1,4 @@
-pub(crate) mod json;
+pub mod json;
 mod print;
 mod uds;
 mod http;

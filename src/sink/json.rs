@@ -6,7 +6,7 @@ use crate::pricing::PricingTable;
 use super::format_source_label;
 
 /// Build a JSON entry for a single model summary.
-pub(crate) fn summary_to_json(s: &ModelUsageSummary, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) -> serde_json::Value {
+pub fn summary_to_json(s: &ModelUsageSummary, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) -> serde_json::Value {
     let schema: &dyn ProviderSchema = schema.unwrap_or(&ClaudeCodeSchema);
     let columns = schema.columns();
     let tokens = schema.extract_tokens(s);
@@ -28,7 +28,7 @@ pub(crate) fn summary_to_json(s: &ModelUsageSummary, pricing: Option<&PricingTab
 }
 
 /// Build JSON payload for a flat summary.
-pub(crate) fn summaries_to_json(summaries: &HashMap<String, ModelUsageSummary>, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) -> serde_json::Value {
+pub fn summaries_to_json(summaries: &HashMap<String, ModelUsageSummary>, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) -> serde_json::Value {
     let mut sorted: Vec<_> = summaries.values().collect();
     sorted.sort_by(|a, b| b.event_count.cmp(&a.event_count));
     let data: Vec<_> = sorted.iter().map(|s| summary_to_json(s, pricing, schema)).collect();
@@ -36,7 +36,7 @@ pub(crate) fn summaries_to_json(summaries: &HashMap<String, ModelUsageSummary>, 
 }
 
 /// Build JSON payload for a grouped summary.
-pub(crate) fn grouped_to_json(
+pub fn grouped_to_json(
     grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>,
     type_name: &str,
     pricing: Option<&PricingTable>,
@@ -65,7 +65,7 @@ pub(crate) fn grouped_to_json(
 }
 
 /// Build JSON payload for a single watch-mode event.
-pub(crate) fn event_to_json(event: &UsageEventWithTs, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) -> serde_json::Value {
+pub fn event_to_json(event: &UsageEventWithTs, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) -> serde_json::Value {
     let schema = schema.unwrap_or(&ClaudeCodeSchema);
     let columns = schema.columns();
     let summary = crate::common::types::ModelUsageSummary {
@@ -98,7 +98,7 @@ pub(crate) fn event_to_json(event: &UsageEventWithTs, pricing: Option<&PricingTa
 }
 
 /// Build JSON payload for a batch of raw events.
-pub(crate) fn events_batch_to_json(
+pub fn events_batch_to_json(
     events: &[RawEvent],
     pricing: Option<&PricingTable>,
     schema: Option<&dyn ProviderSchema>,
