@@ -147,23 +147,33 @@ pub fn run_settings() -> bool {
         .child(labeled_edit("Rollup Retention", &state.rollup_retention_days, "rollup_retention_days"))
         .child(hint_text("                        Days to keep rollups (0 = forever)"));
 
-    // -- Providers section (checkboxes) --
+    // -- Providers section (popup multi-select) --
     let enabled_providers = crate::config::get_providers();
-    let mut providers_section = LinearLayout::vertical();
-    for &pname in crate::providers::KNOWN_PROVIDERS {
-        let checked = enabled_providers.contains(&pname.to_string());
-        let display = match pname {
-            "claude_code" => format!("Claude Code    ({})", tilde_path(&state.claude_code_root)),
-            "codex" => format!("Codex CLI      ({})", tilde_path(&state.codex_root)),
-            _ => pname.to_string(),
-        };
-        providers_section.add_child(
-            labeled_checkbox(&display, checked, &format!("provider_{}", pname))
+    let providers_display = format_providers_display(&enabled_providers);
+
+    let providers_section = LinearLayout::vertical()
+        .child(LinearLayout::horizontal()
+            .child(field_label(&format!("{:<22}", "Selected")))
+            .child(TextView::new(providers_display).with_name("providers_display"))
+        )
+        .child(DummyView.fixed_height(1))
+        .child(hint_text("                        Press Enter on [Change] to select providers"))
+        .child(
+            cursive::views::Button::new("Change Providers", move |s| {
+                show_providers_popup(s);
+            })
         );
-    }
+
+    // Hidden storage for provider selection (comma-separated internal names)
+    let providers_data = EditView::new()
+        .content(enabled_providers.join(","))
+        .with_name("providers_data")
+        .fixed_width(0)
+        .fixed_height(0);
 
     // Assemble form with section panels
     let form = LinearLayout::vertical()
+        .child(providers_data)
         .child(Panel::new(PaddedView::new(Margins::lrtb(1, 1, 1, 0), providers_section)).title("Providers"))
         .child(DummyView.fixed_height(1))
         .child(Panel::new(PaddedView::new(Margins::lrtb(1, 1, 1, 0), paths_section)).title("Paths"))
@@ -274,15 +284,15 @@ fn save_settings(siv: &mut Cursive, restart_flag: std::sync::Arc<std::sync::atom
         ("rollup_retention_days", rollup_retention.as_str()),
     ];
 
-    // Read provider checkboxes
-    let mut new_providers: Vec<String> = Vec::new();
-    for &pname in crate::providers::KNOWN_PROVIDERS {
-        let cb_name = format!("provider_{}", pname);
-        let checked = siv.call_on_name(&cb_name, |v: &mut Checkbox| v.is_checked()).unwrap_or(false);
-        if checked {
-            new_providers.push(pname.to_string());
+    // Read providers from hidden storage (set by popup)
+    let new_providers: Vec<String> = siv.call_on_name("providers_data", |v: &mut EditView| {
+        let content = v.get_content().to_string();
+        if content.is_empty() {
+            Vec::new()
+        } else {
+            content.split(',').map(|s| s.to_string()).collect()
         }
-    }
+    }).unwrap_or_default();
 
     // Load old values to detect daemon-affecting changes
     let old_providers = crate::config::get_providers();
@@ -344,6 +354,69 @@ fn get_edit(siv: &mut Cursive, name: &str) -> String {
     siv.call_on_name(name, |v: &mut EditView| {
         v.get_content().to_string()
     }).unwrap_or_default()
+}
+
+/// Format enabled providers for display in the main TUI.
+fn format_providers_display(providers: &[String]) -> String {
+    if providers.is_empty() {
+        "(none)".to_string()
+    } else {
+        providers.iter().map(|p| match p.as_str() {
+            "claude_code" => "Claude Code",
+            "codex" => "Codex CLI",
+            _ => p.as_str(),
+        }).collect::<Vec<_>>().join(", ")
+    }
+}
+
+/// Show a popup dialog with checkboxes for provider selection.
+fn show_providers_popup(siv: &mut Cursive) {
+    // Read current selection from hidden storage
+    let current: Vec<String> = siv.call_on_name("providers_data", |v: &mut EditView| {
+        let content = v.get_content().to_string();
+        if content.is_empty() { Vec::new() }
+        else { content.split(',').map(|s| s.to_string()).collect() }
+    }).unwrap_or_default();
+
+    let mut layout = LinearLayout::vertical();
+    for &pname in crate::providers::KNOWN_PROVIDERS {
+        let checked = current.contains(&pname.to_string());
+        let display = match pname {
+            "claude_code" => "Claude Code",
+            "codex" => "Codex CLI",
+            _ => pname,
+        };
+        layout.add_child(
+            LinearLayout::horizontal()
+                .child(Checkbox::new().with_checked(checked).with_name(format!("popup_provider_{}", pname)))
+                .child(TextView::new(format!("  {}", display)))
+        );
+    }
+
+    siv.add_layer(
+        Dialog::around(PaddedView::lrtb(1, 1, 1, 1, layout))
+            .title("Select Providers")
+            .button("OK", |s| {
+                // Read checkboxes and update hidden storage + display
+                let mut selected: Vec<String> = Vec::new();
+                for &pname in crate::providers::KNOWN_PROVIDERS {
+                    let cb_name = format!("popup_provider_{}", pname);
+                    let checked = s.call_on_name(&cb_name, |v: &mut Checkbox| v.is_checked()).unwrap_or(false);
+                    if checked {
+                        selected.push(pname.to_string());
+                    }
+                }
+                let display = format_providers_display(&selected);
+                s.call_on_name("providers_data", |v: &mut EditView| {
+                    v.set_content(selected.join(","));
+                });
+                s.call_on_name("providers_display", |v: &mut TextView| {
+                    v.set_content(display);
+                });
+                s.pop_layer();
+            })
+            .button("Cancel", |s| { s.pop_layer(); })
+    );
 }
 
 /// Collapse home directory prefix to ~ for display.
