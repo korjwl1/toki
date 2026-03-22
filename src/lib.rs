@@ -41,8 +41,8 @@ struct ProviderRuntime {
 pub struct Handle {
     stop_tx: Option<crossbeam_channel::Sender<()>>,
     worker_handle: Option<JoinHandle<()>>,
-    // Keep watcher alive -- dropping it stops file watching
-    _watcher: notify::RecommendedWatcher,
+    // Keep watchers alive -- dropping them stops file watching
+    _watchers: Vec<notify::RecommendedWatcher>,
     /// Provider runtimes (for shutdown ordering and DB access).
     runtimes: Vec<ProviderRuntimeHandle>,
     /// Primary DB handle for report queries (read-only from listener thread).
@@ -200,16 +200,19 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
         }
     }
 
-    // Set up file watcher
+    // Set up file watchers — one per provider to avoid FSEvents stream
+    // restart issues in notify where adding a second directory to an
+    // existing FsEventsWatcher can silently fail to deliver events.
     let (event_tx, event_rx) = crossbeam_channel::unbounded::<String>();
-    let mut watcher = platform::create_watcher(event_tx)?;
+    let mut watchers: Vec<notify::RecommendedWatcher> = Vec::new();
 
-    // Watch dirs from all providers
     for rt in &runtimes {
         for dir in rt.provider.watch_dirs() {
             if std::path::Path::new(&dir).exists() {
+                let mut watcher = platform::create_watcher(event_tx.clone())?;
                 platform::watch_directory(&mut watcher, &dir)?;
                 println!("[toki] Watching: {} ({})", dir, rt.provider.display_name());
+                watchers.push(watcher);
             }
         }
     }
@@ -265,7 +268,7 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
     Ok(Handle {
         stop_tx: Some(stop_tx),
         worker_handle: Some(worker_handle),
-        _watcher: watcher,
+        _watchers: watchers,
         runtimes: runtime_handles,
         db: primary_db,
         provider_dbs,

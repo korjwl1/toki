@@ -15,19 +15,30 @@ use std::path::Path;
 pub fn create_watcher(
     tx: Sender<String>,
 ) -> notify::Result<RecommendedWatcher> {
+    let debug = std::env::var("TOKI_DEBUG").map_or(false, |v| v == "1" || v == "2" || v == "true");
     let watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-        if let Ok(event) = res {
-            match event.kind {
-                EventKind::Create(_) | EventKind::Modify(_) => {
-                    for path in event.paths {
-                        if let Some(path_str) = path.to_str() {
-                            if path_str.ends_with(".jsonl") {
-                                let _ = tx.send(path_str.to_string());
+        match &res {
+            Ok(event) => {
+                if debug {
+                    eprintln!("[toki:watcher] event: kind={:?} paths={:?}", event.kind, event.paths);
+                }
+                match event.kind {
+                    EventKind::Create(_) | EventKind::Modify(_) => {
+                        for path in &event.paths {
+                            if let Some(path_str) = path.to_str() {
+                                if path_str.ends_with(".jsonl") {
+                                    let _ = tx.send(path_str.to_string());
+                                }
                             }
                         }
                     }
+                    _ => {}
                 }
-                _ => {}
+            }
+            Err(e) => {
+                if debug {
+                    eprintln!("[toki:watcher] error: {:?}", e);
+                }
             }
         }
     })?;
