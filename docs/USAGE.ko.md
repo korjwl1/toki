@@ -233,7 +233,7 @@ toki report daily --since 20260301 --session-id abc
 |------|------|------|
 | `metric` | O | `usage`, `sessions`, `projects`, `events` |
 | `{filters}` | X | `key="value"` 쌍, `,`로 구분 |
-| `[bucket]` | X | 시간 버킷: `s`, `m`, `h`, `d`, `w` (usage 전용) |
+| `[bucket]` | X | 시간 버킷: `s`, `m`, `h`, `d`, `w` — 복합 가능: `2h30m` (usage 전용). 데이터가 있는 버킷만 반환하며, 빈 구간은 zero-fill하지 않음. |
 | `offset <dur>` | X | 시간 윈도우를 과거로 이동 (예: `offset 7d`) |
 | `sum\|avg\|count()` | X | 집계: 모델 차원 collapse (usage 전용) |
 | `by (dims)` | X | 그룹 기준: `model`, `session`, `project` (usage 전용) |

@@ -230,7 +230,7 @@ Use the `report query` subcommand for PromQL-inspired free queries.
 |---------|----------|-------------|
 | `metric` | Yes | `usage`, `sessions`, `projects`, `events` |
 | `{filters}` | No | `key="value"` pairs, comma-separated |
-| `[bucket]` | No | Time bucket: `s`, `m`, `h`, `d`, `w` (usage only) |
+| `[bucket]` | No | Time bucket: `s`, `m`, `h`, `d`, `w` — compound ok: `2h30m` (usage only). Returns only buckets with data; empty intervals are not zero-filled. |
 | `offset <dur>` | No | Shift time window back (e.g. `offset 7d`) |
 | `sum\|avg\|count()` | No | Aggregation: collapse model dimension (usage only) |
 | `by (dims)` | No | Group by: `model`, `session`, `project` (usage only) |

@@ -270,7 +270,7 @@ toki --no-cost report                               # skip cost
 |---------|-------------|---------|
 | metric | `usage`, `sessions`, `projects`, `events` | `usage` |
 | filters | `key="value"` pairs, comma-separated | `{model="claude-opus-4-6", since="20260301"}` |
-| bucket | Time bucket (s/m/h/d/w) | `[1h]`, `[5m]`, `[1d]` |
+| bucket | Time bucket (s/m/h/d/w, compound: `2h30m`) | `[1h]`, `[5m]`, `[2h30m]` |
 | offset | Shift time window back | `offset 7d` |
 | agg_func | `sum`, `avg`, `count` — collapse models | `sum(usage[1d])` |
 | dimensions | Group by (model/session/project) | `by (model, session)` |

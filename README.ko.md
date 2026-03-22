@@ -267,7 +267,7 @@ toki --no-cost report                               # 비용 표시 없이
 |------|------|------|
 | metric | `usage`, `sessions`, `projects`, `events` | `usage` |
 | filters | `key="value"` 쌍, `,`로 구분 | `{model="claude-opus-4-6", since="20260301"}` |
-| bucket | 시간 버킷 (s/m/h/d/w) | `[1h]`, `[5m]`, `[1d]` |
+| bucket | 시간 버킷 (s/m/h/d/w, 복합: `2h30m`) | `[1h]`, `[5m]`, `[2h30m]` |
 | offset | 시간 윈도우를 과거로 이동 | `offset 7d` |
 | 집계함수 | `sum`, `avg`, `count` — 모델 차원 collapse | `sum(usage[1d])` |
 | dimensions | 그룹 기준 (model/session/project) | `by (model, session)` |
