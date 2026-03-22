@@ -99,18 +99,20 @@ impl Bucket {
 
 impl std::fmt::Display for Bucket {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = self.0;
-        if s >= 604800 && s % 604800 == 0 {
-            write!(f, "{}w", s / 604800)
-        } else if s >= 86400 && s % 86400 == 0 {
-            write!(f, "{}d", s / 86400)
-        } else if s >= 3600 && s % 3600 == 0 {
-            write!(f, "{}h", s / 3600)
-        } else if s >= 60 && s % 60 == 0 {
-            write!(f, "{}m", s / 60)
-        } else {
-            write!(f, "{}s", s)
+        let mut s = self.0;
+        let mut wrote = false;
+        for &(unit, label) in &[(604800, "w"), (86400, "d"), (3600, "h"), (60, "m")] {
+            if s >= unit {
+                let n = s / unit;
+                s %= unit;
+                write!(f, "{}{}", n, label)?;
+                wrote = true;
+            }
         }
+        if s > 0 || !wrote {
+            write!(f, "{}s", s)?;
+        }
+        Ok(())
     }
 }
 
@@ -462,32 +464,64 @@ impl<'a> Parser<'a> {
         Ok(filters)
     }
 
-    /// Parse a bare duration: number + unit (e.g. "5m", "1d", "7d").
+    /// Parse a duration: single (e.g. "5m", "1d") or compound (e.g. "2h30m", "1d12h").
+    /// Units must appear in descending order (w > d > h > m > s) with no duplicates.
     fn parse_duration(&mut self) -> Result<Bucket, String> {
         self.skip_ws();
-        let start = self.pos;
-        while self.pos < self.input.len() && self.input.as_bytes()[self.pos].is_ascii_digit() {
+
+        fn unit_rank(c: char) -> Option<(u64, u8)> {
+            match c {
+                'w' => Some((604800, 5)),
+                'd' => Some((86400, 4)),
+                'h' => Some((3600, 3)),
+                'm' => Some((60, 2)),
+                's' => Some((1, 1)),
+                _ => None,
+            }
+        }
+
+        let mut total_secs: u64 = 0;
+        let mut last_rank: u8 = u8::MAX;
+        let mut parsed_any = false;
+
+        loop {
+            // Try to parse a number
+            let start = self.pos;
+            while self.pos < self.input.len() && self.input.as_bytes()[self.pos].is_ascii_digit() {
+                self.pos += 1;
+            }
+            if self.pos == start {
+                if !parsed_any {
+                    return Err("expected number in duration".into());
+                }
+                break;
+            }
+            let num: u64 = self.input[start..self.pos].parse()
+                .map_err(|_| "invalid duration number")?;
+            if num == 0 && !parsed_any {
+                return Err("duration must be > 0".into());
+            }
+
+            // Parse unit
+            let c = self.input[self.pos..].chars().next()
+                .ok_or("expected duration unit (w/d/h/m/s)")?;
+            let (multiplier, rank) = unit_rank(c)
+                .ok_or_else(|| format!("unknown duration unit '{}' (use w/d/h/m/s)", c))?;
+            if rank >= last_rank {
+                return Err(format!("duration units must be in descending order, got '{}' after smaller/equal unit", c));
+            }
             self.pos += 1;
+            last_rank = rank;
+
+            let secs = num.checked_mul(multiplier).ok_or("duration too large")?;
+            total_secs = total_secs.checked_add(secs).ok_or("duration too large")?;
+            parsed_any = true;
         }
-        if self.pos == start {
-            return Err("expected number in duration".into());
-        }
-        let num: u64 = self.input[start..self.pos].parse()
-            .map_err(|_| "invalid duration number")?;
-        if num == 0 {
+
+        if total_secs == 0 {
             return Err("duration must be > 0".into());
         }
-        let unit = match self.input[self.pos..].chars().next() {
-            Some('s') => { self.pos += 1; 1u64 }
-            Some('m') => { self.pos += 1; 60 }
-            Some('h') => { self.pos += 1; 3600 }
-            Some('d') => { self.pos += 1; 86400 }
-            Some('w') => { self.pos += 1; 604800 }
-            Some(c) => return Err(format!("unknown duration unit '{}' (use s/m/h/d/w)", c)),
-            None => return Err("expected duration unit".into()),
-        };
-        let secs = num.checked_mul(unit).ok_or("duration too large")?;
-        Ok(Bucket(secs))
+        Ok(Bucket(total_secs))
     }
 
     fn parse_bucket(&mut self) -> Result<Bucket, String> {
@@ -644,7 +678,7 @@ mod tests {
         assert_eq!(Bucket(3600).to_string(), "1h");
         assert_eq!(Bucket(86400).to_string(), "1d");
         assert_eq!(Bucket(604800).to_string(), "1w");
-        assert_eq!(Bucket(90).to_string(), "90s");
+        assert_eq!(Bucket(90).to_string(), "1m30s");
         assert_eq!(Bucket(7200).to_string(), "2h");
     }
 
@@ -952,5 +986,42 @@ mod tests {
         let q = parse("count(usage[1d] offset 7d)").unwrap();
         let s = q.to_query_string();
         assert_eq!(s, "count(usage[1d] offset 1w)");
+    }
+
+    // ── compound duration ──
+
+    #[test]
+    fn test_compound_duration() {
+        assert_eq!(parse("usage[2h30m]").unwrap().bucket, Some(Bucket(9000)));
+        assert_eq!(parse("usage[1d12h]").unwrap().bucket, Some(Bucket(129600)));
+        assert_eq!(parse("usage[1h30s]").unwrap().bucket, Some(Bucket(3630)));
+        assert_eq!(parse("usage[1w2d]").unwrap().bucket, Some(Bucket(777600)));
+        assert_eq!(parse("usage[1d6h30m]").unwrap().bucket, Some(Bucket(109800)));
+    }
+
+    #[test]
+    fn test_compound_duration_display() {
+        assert_eq!(Bucket(9000).to_string(), "2h30m");
+        assert_eq!(Bucket(129600).to_string(), "1d12h");
+        assert_eq!(Bucket(3630).to_string(), "1h30s");
+        assert_eq!(Bucket(109800).to_string(), "1d6h30m");
+    }
+
+    #[test]
+    fn test_compound_duration_wrong_order() {
+        assert!(parse("usage[30m2h]").is_err());
+        assert!(parse("usage[1s30m]").is_err());
+        assert!(parse("usage[1h2d]").is_err());
+    }
+
+    #[test]
+    fn test_compound_duration_duplicate_unit() {
+        assert!(parse("usage[1h2h]").is_err());
+    }
+
+    #[test]
+    fn test_compound_duration_roundtrip() {
+        let q = parse("usage[2h30m]").unwrap();
+        assert_eq!(q.to_query_string(), "usage[2h30m]");
     }
 }

@@ -341,7 +341,12 @@ pub fn execute_parsed_query(
                     let (since, until) = filter_range(filter);
                     let mut grouped: GroupedSummaryMap = HashMap::new();
 
-                    if session_filter.is_some() || !parsed.group_by.is_empty() {
+                    // Use event-level scan when:
+                    // - session filter or group_by needs per-event data, OR
+                    // - bucket is not an exact multiple of the 1-hour rollup granularity
+                    let bucket_needs_event_scan = parsed.bucket.as_ref()
+                        .map_or(false, |b| b.0 < 3600 || b.0 % 3600 != 0);
+                    if session_filter.is_some() || !parsed.group_by.is_empty() || bucket_needs_event_scan {
                         // Need event-level access for session/group_by
                         let dict = db.load_dict_reverse().map_err(|e| e.to_string())?;
                         let unknown = String::new();
