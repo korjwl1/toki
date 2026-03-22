@@ -463,9 +463,13 @@ impl TrackerEngine {
 
         match result {
             None => {
-                if let Ok(meta) = std::fs::metadata(path) {
-                    self.file_sizes.insert(path_owned.clone(), meta.len());
-                }
+                // Do NOT cache file size here. process_lines_streaming found no
+                // complete lines, but the file may have grown since it was opened
+                // (concurrent writes). Caching meta.len() now would record a size
+                // larger than what was actually processed, causing the next watch
+                // event to skip the file via the current_size == cached_size check.
+                // By leaving file_sizes un-cached, the next event will re-read and
+                // re-attempt processing.
                 let act = self.activity.entry(path_owned).or_insert(FileActivity {
                     state, last_active: now, last_checked: now,
                 });
@@ -564,9 +568,8 @@ impl TrackerEngine {
 
         match result {
             None => {
-                if let Ok(meta) = std::fs::metadata(path) {
-                    self.file_sizes.insert(path_owned.clone(), meta.len());
-                }
+                // Do NOT cache file size here — same race condition as the legacy
+                // path above. See comment there for details.
                 let act = self.activity.entry(path_owned).or_insert(FileActivity {
                     state, last_active: now, last_checked: now,
                 });
