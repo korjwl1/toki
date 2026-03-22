@@ -26,6 +26,13 @@ pub trait Provider: Send + Sync {
     /// Directories to register with the file watcher.
     fn watch_dirs(&self) -> Vec<String>;
 
+    /// Directories to scan via periodic polling, in addition to the native file watcher.
+    /// Returns Some for providers where FSEvents misses writes to long-lived open fds (e.g. Codex on macOS).
+    /// Returns None (default) for providers whose native watcher already catches all writes.
+    fn poll_dirs(&self) -> Option<Vec<String>> {
+        None
+    }
+
     /// Whether this provider owns a given file path.
     fn owns_path(&self, path: &str) -> bool;
 

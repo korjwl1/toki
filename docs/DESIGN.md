@@ -11,7 +11,7 @@ The daemon runs 4 threads (Worker, Writer, Listener, Notify) and stores data in 
 graph TD
     subgraph Daemon["Daemon Process (toki daemon start)"]
         subgraph Worker["Worker Thread"]
-            W_select["select!<br/>event_rx → file<br/>stop_rx → exit<br/>default(30s) → poll"]
+            W_select["select!<br/>event_rx → FSEvents/inotify file<br/>poll_tick(1s) → polling providers<br/>flush_tick(5s) → checkpoint flush<br/>stop_rx → exit"]
         end
 
         subgraph Writer["Writer Thread"]
@@ -42,7 +42,7 @@ graph TD
 
 The daemon has a base of 4 threads, plus 2 threads per connected trace client (4 + 2N total):
 
-1. **Worker Thread**: Detects file changes via FSEvents → parses → Sink output + TSDB storage
+1. **Worker Thread**: Detects file changes via FSEvents (all providers) + 1-second polling (providers that keep fds open, e.g. Codex on macOS) → parses → Sink output + TSDB storage
 2. **Writer Thread**: Sole owner of the DB. Batch event commits, rollup-on-write, retention
 3. **Listener Thread**: UDS accept loop. Reads client command (`TRACE\n` or `REPORT\n`) via BufReader, dispatches accordingly
 4. **Notify Thread**: macOS FSEvents (internal to the notify library)
@@ -91,9 +91,10 @@ Pricing is loaded by the client from the file cache (`~/.config/toki/pricing.jso
 
 ## Worker Thread
 
-- Multiplexes FSEvents events, stop signal, and 30-second backup polling via `crossbeam_channel::select!`
-- File change detected → `process_file_with_ts()` → parsed events output to Sink (`emit_event(&UsageEventWithTs)`) + `DbOp::WriteEvent` sent to writer
-- Watch mode uses `send` (blocking, consistent with cold start)
+- Multiplexes FSEvents events, per-provider poll tick, flush tick, and stop signal via `crossbeam_channel::select!`
+- **FSEvents path**: file change detected → `process_and_print_provider()` → parsed events output to Sink + `DbOp::WriteEvent` sent to writer
+- **Poll tick path (1s, macOS Codex only)**: globs `poll_dirs()` → stat-based size comparison via existing `file_sizes` cache → processes only files that have grown. `crossbeam_channel::never()` when no provider needs polling (zero overhead on Linux/Windows or Claude-only setups)
+- Watch mode uses blocking `send` (consistent with cold start, zero data loss)
 - Every 5 seconds, dirty checkpoints are batch-flushed to the writer
 
 ## Writer Thread
@@ -208,6 +209,7 @@ When rayon threads fill the bounded channel (1024), they wait until the writer c
 ### Watch Mode (real-time)
 
 ```
+[FSEvents path — all providers]
 FSEvents → event_tx → Worker thread
     → stat() size comparison (1-5µs fast skip)
     → find_resume_offset() reverse scan
@@ -215,7 +217,16 @@ FSEvents → event_tx → Worker thread
     → parse_line_with_ts()
     → BroadcastSink.emit_event()    ← no-op if 0 clients
     → db_tx.send(WriteEvent)        ← blocking (zero data loss)
+
+[Poll tick path — macOS only, providers with poll_dirs()]
+poll_tick(1s) → Worker thread
+    → glob poll_dirs()/**/*.jsonl
+    → stat() size comparison via file_sizes cache (fast skip if unchanged)
+    → same processing pipeline as FSEvents path above
+    → crossbeam_channel::never() on Linux/Windows (zero overhead)
 ```
+
+**Why polling for Codex on macOS**: macOS FSEvents fires `FSE_CONTENT_MODIFIED` only in `vn_close()`. Codex holds a single `tokio::fs::File` open for the entire session and only flushes between turns — never closes. Result: zero FSEvents during an active session, one event on exit. Claude Code closes and reopens its session file per turn, so FSEvents works correctly for it. On Linux, inotify `IN_MODIFY` fires per-write regardless of fd state, so polling is not needed on any provider.
 
 ### Trace Client (real-time stream)
 
@@ -245,7 +256,7 @@ Report sends a query to the daemon over UDS. The client does NOT open the DB dir
 
 ### Active/Idle Classification
 
-macOS FSEvents fires events for all files in a directory when even one file changes. Per-file state tracking minimizes unnecessary processing.
+Per-file state tracking minimizes unnecessary processing, particularly during 1-second poll ticks where unchanged files are stat-checked on every cycle.
 
 | Constant | Value | Role |
 |----------|-------|------|

@@ -761,6 +761,19 @@ impl TrackerEngine {
         let flush_tick = crossbeam_channel::tick(FLUSH_INTERVAL);
         let prune_tick = crossbeam_channel::tick(Duration::from_secs(60));
 
+        // Collect providers that need periodic polling (e.g. Codex on macOS where FSEvents
+        // only fires on fd close). poll_tick is never() when no provider needs polling,
+        // so there is zero overhead on platforms/configurations where polling is unnecessary.
+        let poll_entries: Vec<(Vec<String>, &Box<dyn Provider>, &Sender<DbOp>)> = providers
+            .iter()
+            .filter_map(|(p, tx)| p.poll_dirs().map(|dirs| (dirs, p, tx)))
+            .collect();
+        let poll_tick = if poll_entries.is_empty() {
+            crossbeam_channel::never()
+        } else {
+            crossbeam_channel::tick(Duration::from_secs(1))
+        };
+
         loop {
             crossbeam_channel::select! {
                 recv(stop_rx) -> _ => {
@@ -803,6 +816,20 @@ impl TrackerEngine {
                 }
                 recv(flush_tick) -> _ => {
                     self.flush_dirty();
+                }
+                recv(poll_tick) -> _ => {
+                    for (dirs, provider, db_tx) in &poll_entries {
+                        for dir in dirs {
+                            let pattern = format!("{}/**/*.jsonl", dir);
+                            if let Ok(paths) = glob::glob(&pattern) {
+                                for entry in paths.flatten() {
+                                    if let Some(path_str) = entry.to_str() {
+                                        self.process_and_print_provider(path_str, provider.as_ref(), db_tx);
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

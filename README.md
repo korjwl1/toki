@@ -133,7 +133,7 @@ After cold start, toki vanishes from your system's resource radar. Zero burden, 
 |-----|--------|---------|
 | **~0%** | **5 MB** | **~3% of source data** (2 GB sessions → 64 MB TSDB) |
 
-- **toki** — rayon parallel processing across all CPU cores with mmap zero-copy and per-file streaming. Despite doing maximum parallelism, memory stays flat because each file is streamed and discarded — no accumulation. After cold start the daemon drops to 5 MB and ~0% CPU, watching for changes via FSEvents (kernel-level, zero polling) and only waking when new lines are written.
+- **toki** — rayon parallel processing across all CPU cores with mmap zero-copy and per-file streaming. Despite doing maximum parallelism, memory stays flat because each file is streamed and discarded — no accumulation. After cold start the daemon drops to 5 MB and ~0% CPU. File changes are detected via FSEvents (kernel-level push) for Claude Code, and additionally via 1-second polling for Codex CLI on macOS — where FSEvents only fires on fd close but Codex keeps its session file open for the entire session duration.
 - **ccusage** — processes one file at a time, synchronous and blocking. The 126 MB looks modest on paper, but it means your terminal hangs for seconds to minutes on every invocation while Node.js chews through every file sequentially. No parallelism, no incremental processing — just a long blocking wait, every time.
 - **zzusage** — loads every event from every file into memory before doing anything. Fast parsing, but 2 GB of data means 2.3 GB of RAM consumed at once. On larger datasets it simply OOMs.
 
@@ -154,7 +154,7 @@ toki trace            # real-time stream    (≈ docker logs -f)
 toki report           # instant TSDB query  (≈ docker ps)
 ```
 
-- **daemon** — watches session logs from configured providers (Claude Code, Codex CLI) via FSEvents, parses events, writes to per-provider embedded TSDBs (fjall). 4 base threads + 2 per connected trace client. Zero sink overhead when no trace clients are connected. UDS protocol is command-based: clients send `TRACE\n` or `REPORT\n` as the first line.
+- **daemon** — watches session logs from configured providers (Claude Code, Codex CLI), parses events, writes to per-provider embedded TSDBs (fjall). Claude Code uses FSEvents (kernel push, fires per turn). Codex CLI on macOS uses 1-second polling in addition to FSEvents — macOS FSEvents only fires on fd close, but Codex holds its session file open for the entire session. On Linux/Windows, the native watcher (inotify/ReadDirectoryChangesW) fires per write for all providers. 4 base threads + 2 per connected trace client. Zero sink overhead when no trace clients are connected. UDS protocol is command-based: clients send `TRACE\n` or `REPORT\n` as the first line.
 - **trace** — connects to the daemon over UDS for real-time event streaming. Always outputs JSONL to stdout (no sink/format options).
 - **report** — sends a query to the daemon over UDS, gets merged results from all provider TSDBs. Always fast, always indexed. Filter by `--provider` to query a single provider.
 
@@ -392,7 +392,7 @@ This is fundamentally different from OpenTelemetry-based monitoring, where the O
 | Database | fjall 3.x | Pure Rust LSM-tree, fits TSDB keyspace model |
 | Concurrency | std::thread + crossbeam-channel | No async runtime conflicts, library-safe |
 | Parallel scan | rayon | Cold start parallel file processing |
-| File watching | notify 6.x | macOS FSEvents integration |
+| File watching | notify 6.x | FSEvents (macOS), inotify (Linux), polling fallback per provider |
 | Serialization | bincode (DB), serde_json (JSONL) | Minimal binary overhead |
 | Hashing | xxhash-rust 0.8 (xxh3) | Checkpoint line identification (30 GB/s) |
 | HTTP | ureq 2.x | Synchronous, ETag conditional requests |
@@ -437,7 +437,7 @@ src/
 │   └── codex/                      # Codex CLI JSONL parser
 │       ├── mod.rs                  # CodexProvider impl
 │       └── parser.rs              # Stateful parser (model tracking)
-└── platform/macos/mod.rs           # macOS FSEvents watcher
+└── platform/mod.rs                 # FSEvents watcher + per-provider polling strategy
 ```
 
 ---

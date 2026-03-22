@@ -130,7 +130,7 @@ cold start가 끝나면 toki는 시스템에서 사라집니다.
 |-----|--------|---------|
 | **~0%** | **5 MB** | **세션 데이터의 ~3%** (2GB 세션 → 64MB TSDB) |
 
-- **toki** — rayon 병렬 처리 + mmap zero-copy + 파일별 스트리밍. cold start가 끝나면 5MB, CPU 0%로 내려갑니다. FSEvents(커널 레벨, 폴링 없음)로 감시하고, 새 로그가 쓰일 때만 깨어납니다.
+- **toki** — rayon 병렬 처리 + mmap zero-copy + 파일별 스트리밍. cold start가 끝나면 5MB, CPU 0%로 내려갑니다. Claude Code는 FSEvents(커널 레벨 push)로 감시합니다. Codex CLI는 macOS에서 FSEvents에 추가로 1초 폴링을 병행합니다 — macOS FSEvents는 fd가 닫힐 때만 이벤트를 발화하지만, Codex는 세션 내내 파일 fd를 열어둔 채 쓰기만 하기 때문입니다. Linux/Windows는 기본 watcher(inotify/ReadDirectoryChangesW)가 write마다 발화하므로 폴링 없이 동작합니다.
 - **ccusage** — 파일 하나씩 동기 블로킹. 매번 전체 파일을 순서대로 읽는 동안 터미널이 멈춥니다.
 - **zzusage** — 모든 이벤트를 메모리에 올린 뒤 처리. 2GB면 2.3GB RAM. 더 크면 OOM.
 
@@ -151,7 +151,7 @@ toki trace            # 실시간 스트림        (≈ docker logs -f)
 toki report           # 즉시 TSDB 조회      (≈ docker ps)
 ```
 
-- **daemon** — 설정된 provider(Claude Code, Codex CLI)의 세션 로그를 FSEvents로 감시하고, 이벤트를 파싱해서 provider별 내장 TSDB(fjall)에 기록합니다. 기본 4스레드(Worker, Writer, Listener, Notify) + trace 클라이언트당 2스레드(receiver + writer). trace 클라이언트가 없으면 Sink 오버헤드는 0입니다.
+- **daemon** — 설정된 provider(Claude Code, Codex CLI)의 세션 로그를 감시하고, 이벤트를 파싱해서 provider별 내장 TSDB(fjall)에 기록합니다. Claude Code는 FSEvents(turn마다 발화), Codex CLI는 macOS에서 FSEvents + 1초 폴링 병행(FSEvents가 fd close에서만 발화하는 macOS 커널 제약 때문). 기본 4스레드(Worker, Writer, Listener, Notify) + trace 클라이언트당 2스레드. trace 클라이언트가 없으면 Sink 오버헤드는 0입니다.
 - **trace** — UDS로 데몬에 연결해서 실시간 이벤트 스트림을 받습니다. 항상 JSONL을 stdout에 출력합니다 (`--output-format`과 `--sink`는 trace에 미적용).
 - **report** — UDS로 데몬에 쿼리를 보내고 (`REPORT` 커맨드 후 JSON payload), 모든 provider TSDB의 결과를 병합하여 받습니다. DB를 직접 열지 않습니다. 언제나 빠르고, 언제나 색인된 상태입니다. `--provider`로 단일 provider만 조회할 수도 있습니다.
 
@@ -389,7 +389,7 @@ toki는 정책이 아닌 **아키텍처로 프라이버시를 보장**하도록 
 | DB | fjall 3.x | Pure Rust LSM-tree, TSDB keyspace 구조에 적합 |
 | 동시성 | std::thread + crossbeam-channel | 런타임 충돌 없음, 라이브러리 안전 |
 | 병렬 스캔 | rayon | cold start 세션 파일 병렬 처리 |
-| 파일 감시 | notify 6.x | macOS FSEvents 자동 사용 |
+| 파일 감시 | notify 6.x | FSEvents (macOS), inotify (Linux), provider별 폴링 전략 |
 | 직렬화 | bincode (DB), serde_json (JSONL) | 바이너리 최소 오버헤드 |
 | 해시 | xxhash-rust 0.8 (xxh3) | 체크포인트 줄 식별 (30GB/s) |
 | HTTP | ureq 2.x | 동기 HTTP, ETag 조건부 요청 |
@@ -434,7 +434,7 @@ src/
 │   └── codex/                      # Codex CLI JSONL 파서
 │       ├── mod.rs                  # CodexProvider impl
 │       └── parser.rs              # Stateful 파서 (model tracking)
-└── platform/macos/mod.rs           # macOS FSEvents 감시
+└── platform/mod.rs                 # FSEvents 감시 + provider별 폴링 전략
 ```
 
 ---

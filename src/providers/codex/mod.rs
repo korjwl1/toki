@@ -112,6 +112,24 @@ impl Provider for CodexProvider {
         None
     }
 
+    fn poll_dirs(&self) -> Option<Vec<String>> {
+        // macOS: FSEvents only fires FSE_CONTENT_MODIFIED on vn_close(). Codex holds a single
+        // tokio::fs::File open for the entire session and only flushes — never closes — between
+        // turns. Result: zero FSEvents during an active session; one event on session exit.
+        // Poll the sessions directory every second to catch writes to open fds.
+        //
+        // Linux/Windows: inotify IN_MODIFY / ReadDirectoryChangesW fire per write regardless
+        // of fd close, so the native watcher already handles this correctly.
+        #[cfg(target_os = "macos")]
+        {
+            return Some(self.watch_dirs());
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    }
+
     fn db_dir_name(&self) -> &str {
         "codex.fjall"
     }
