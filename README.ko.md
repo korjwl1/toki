@@ -266,9 +266,22 @@ toki settings list                             # 전체 설정 출력
 
 ---
 
-## Toki Monitor
+## Toki Monitor — 시각화 동반 앱
 
-[Toki Monitor](https://github.com/korjwl1/toki-monitor)는 toki 위에서 동작하는 macOS 메뉴바 앱입니다. 터미널을 열지 않아도 실시간 토큰 사용량을 볼 수 있습니다 — 토끼 캐릭터 애니메이션, 스파크라인 그래프, 프로젝트별 대시보드, 속도 기반 이상 감지 알림을 제공합니다. toki 데몬은 자동으로 함께 설치됩니다.
+<p align="center">
+  <a href="https://github.com/korjwl1/toki-monitor">
+    <img src="https://raw.githubusercontent.com/korjwl1/toki-monitor/main/docs/images/dashboard.png" alt="Toki Monitor 대시보드" width="720" />
+  </a>
+</p>
+
+**[Toki Monitor](https://github.com/korjwl1/toki-monitor)**는 toki 데몬 위에서 동작하는 macOS 메뉴바 앱입니다. 터미널 없이 모든 걸 시각적으로 확인할 수 있습니다.
+
+- **메뉴바 인디케이터** — 토큰 속도에 따라 빨라지는 토끼 애니메이션, 숫자 표시, 스파크라인 그래프
+- **대시보드** — 시계열 차트, 프로젝트별 파이 차트, PromQL 쿼리로 커스텀 패널 구성
+- **이상 감지 알림** — $/min이 임계치를 넘으면 속도 기반 알림
+- **사용량 윈도우** — provider별 5시간 / 7일 사용량 추적, 리셋 카운트다운
+
+toki 데몬은 자동으로 함께 설치됩니다. 설치하면 바로 사용 가능합니다.
 
 ```bash
 brew tap korjwl1/tap

@@ -269,9 +269,22 @@ Each provider gets its own isolated database (`~/.config/toki/<provider>.fjall`)
 
 ---
 
-## Toki Monitor
+## Toki Monitor — Visual Companion App
 
-[Toki Monitor](https://github.com/korjwl1/toki-monitor) is a macOS menu bar app built on top of toki. It gives you real-time token usage visualization without opening a terminal — animated rabbit character, sparkline graphs, dashboard with per-project charts, and velocity-based anomaly alerts. Installs the toki daemon automatically.
+<p align="center">
+  <a href="https://github.com/korjwl1/toki-monitor">
+    <img src="https://raw.githubusercontent.com/korjwl1/toki-monitor/main/docs/images/dashboard.png" alt="Toki Monitor Dashboard" width="720" />
+  </a>
+</p>
+
+**[Toki Monitor](https://github.com/korjwl1/toki-monitor)** is a macOS menu bar app that sits on top of the toki daemon. No terminal needed — everything is visual.
+
+- **Menu bar indicator** — animated rabbit that runs faster as token rate increases, numeric rate display, or sparkline graph
+- **Dashboard** — time-series charts, per-project pie charts, PromQL queries with custom panels
+- **Anomaly alerts** — velocity-based detection when $/min spikes above threshold
+- **Usage rate windows** — 5-hour and 7-day usage tracking with reset countdowns per provider
+
+Installs the toki daemon automatically. Just install and go.
 
 ```bash
 brew tap korjwl1/tap
