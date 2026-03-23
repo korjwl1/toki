@@ -76,10 +76,14 @@ impl Config {
         };
 
         if let Some(v) = settings.get("claude_code_root").and_then(|v| v.as_str()) {
-            self.claude_code_root = v.to_string();
+            if !v.is_empty() {
+                self.claude_code_root = v.to_string();
+            }
         }
         if let Some(v) = settings.get("codex_root").and_then(|v| v.as_str()) {
-            self.codex_root = v.to_string();
+            if !v.is_empty() {
+                self.codex_root = v.to_string();
+            }
         }
 
         // Load providers list
