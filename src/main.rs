@@ -828,13 +828,26 @@ fn handle_report(
         std::process::exit(1);
     }
 
-    if group_by_session && command.is_some() {
+    if group_by_session && command.is_some() && !matches!(command, Some(ReportCommands::Query { .. })) {
         eprintln!("[toki] --group-by-session cannot be used with time-based subcommands");
         std::process::exit(1);
     }
 
     // Build query string from CLI arguments
     let query_str = if let Some(ReportCommands::Query { ref query }) = command {
+        // Warn if user passed filter flags that query mode ignores
+        let ignored: Vec<&str> = [
+            since.as_ref().map(|_| "--since"),
+            until.as_ref().map(|_| "--until"),
+            session_id.as_ref().map(|_| "--session-id"),
+            project.as_ref().map(|_| "--project"),
+            provider.as_ref().map(|_| "--provider"),
+            if group_by_session { Some("--group-by-session") } else { None },
+        ].into_iter().flatten().collect();
+        if !ignored.is_empty() {
+            eprintln!("[toki] Warning: {} ignored in query mode. Use query syntax instead (e.g. usage{{since=\"20260301\"}})",
+                ignored.join(", "));
+        }
         query.clone()
     } else {
         let query = if let Some(cmd) = command {
