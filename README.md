@@ -344,6 +344,13 @@ Priority: **CLI args > settings.json > defaults**
 
 Each provider gets its own isolated database (`~/.config/toki/<provider>.fjall`). Reports merge results across all enabled providers by default, or filter to a single provider with `--provider`.
 
+## Planned Features
+
+| Feature | Description | Status |
+|---------|-------------|--------|
+| Gemini CLI | Google Gemini CLI provider support | Planned |
+| `toki-sync` | Multi-device support — sync usage data across machines | Planned |
+
 ---
 
 ## Documentation

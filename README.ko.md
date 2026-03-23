@@ -341,6 +341,13 @@ toki settings list                             # 전체 설정 출력
 
 각 provider는 독립된 데이터베이스(`~/.config/toki/<provider>.fjall`)를 가집니다. 리포트는 기본적으로 모든 활성 provider의 결과를 병합하며, `--provider`로 단일 provider만 필터링할 수 있습니다.
 
+## 예정된 기능
+
+| 기능 | 설명 | 상태 |
+|------|------|------|
+| Gemini CLI | Google Gemini CLI provider 지원 | 예정 |
+| `toki-sync` | 멀티 디바이스 지원 — 여러 기기 간 사용량 데이터 동기화 | 예정 |
+
 ---
 
 ## 문서
