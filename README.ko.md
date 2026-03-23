@@ -31,13 +31,12 @@
 - [누가 쓰면 좋을까?](#누가-쓰면-좋을까)
 - [동작 방식](#동작-방식)
 - [성능](#성능)
+- [프라이버시 & 보안](#프라이버시--보안)
 - [명령어](#명령어)
 - [비용 계산](#비용-계산)
 - [지원 Provider](#지원-provider)
 - [예정된 기능](#예정된-기능)
-- [프라이버시 & 보안](#프라이버시--보안)
-- [문서](#문서)
-- [기술 스택](#기술-스택)
+- [후원](#후원)
 - [라이선스](#라이선스)
 
 ---
@@ -199,6 +198,17 @@ idle 상태가 있는 건 toki뿐입니다. 나머지는 실행할 때마다 전
 
 ---
 
+## 프라이버시 & 보안
+
+toki는 정책이 아닌 아키텍처로 프라이버시를 보장합니다.
+
+- **프롬프트 접근 없음**: JSONL 파서는 `"assistant"` 라인에서 토큰 수와 모델명만 추출합니다. 프롬프트, 응답, 파일 내용, thinking 블록은 메모리에 로드되지 않습니다 — serde가 힙 할당 없이 건너뜁니다.
+- **데이터 전송 없음**: 모든 처리는 로컬에서 이루어집니다. 유일한 외부 요청은 LiteLLM 가격표 fetch뿐입니다 (`--no-cost`로 비활성화).
+- **대화 내용 로깅 없음**: TSDB에는 타임스탬프, 모델명, 세션 ID, 소스 파일 경로, 프로젝트명, 토큰 수 정수만 저장됩니다.
+- **읽기 전용 접근**: toki는 세션 파일을 읽기만 합니다. CLI 도구의 데이터를 수정하거나 삭제하지 않습니다.
+
+---
+
 ## 명령어
 
 ### Daemon
@@ -287,30 +297,6 @@ toki settings list                             # 전체 설정 출력
 
 기능 요청이나 버그 리포트는 [이슈](https://github.com/korjwl1/toki/issues)에 남겨주세요.
 
----
-
-## 프라이버시 & 보안
-
-toki는 정책이 아닌 아키텍처로 프라이버시를 보장합니다.
-
-- **프롬프트 접근 없음**: JSONL 파서는 `"assistant"` 라인에서 토큰 수와 모델명만 추출합니다. 프롬프트, 응답, 파일 내용, thinking 블록은 메모리에 로드되지 않습니다 — serde가 힙 할당 없이 건너뜁니다.
-- **데이터 전송 없음**: 모든 처리는 로컬에서 이루어집니다. 유일한 외부 요청은 LiteLLM 가격표 fetch뿐입니다 (`--no-cost`로 비활성화).
-- **대화 내용 로깅 없음**: TSDB에는 타임스탬프, 모델명, 세션 ID, 소스 파일 경로, 프로젝트명, 토큰 수 정수만 저장됩니다.
-- **읽기 전용 접근**: toki는 세션 파일을 읽기만 합니다. CLI 도구의 데이터를 수정하거나 삭제하지 않습니다.
-
----
-
-## 후원
-
-<a href="https://github.com/sponsors/korjwl1">
-  <img src="https://img.shields.io/badge/Sponsor-%E2%9D%A4-pink?style=for-the-badge&logo=github" alt="Sponsor" />
-</a>
-
-toki가 도움이 됐다면 후원으로 개발을 지원해주세요.
-
-유료 제품에 toki를 사용하시려면 후원 또는 [연락](mailto:korjwl1@gmail.com)을 부탁드립니다.
-
----
 
 ## 문서
 
@@ -381,6 +367,18 @@ src/
 │       └── parser.rs              # Stateful 파서 (model tracking)
 └── platform/mod.rs                 # FSEvents 감시 + provider별 폴링 전략
 ```
+
+---
+
+## 후원
+
+<a href="https://github.com/sponsors/korjwl1">
+  <img src="https://img.shields.io/badge/Sponsor-%E2%9D%A4-pink?style=for-the-badge&logo=github" alt="Sponsor" />
+</a>
+
+toki가 도움이 됐다면 후원으로 개발을 지원해주세요.
+
+유료 제품에 toki를 사용하시려면 후원 또는 [연락](mailto:korjwl1@gmail.com)을 부탁드립니다.
 
 ---
 

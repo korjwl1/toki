@@ -31,13 +31,12 @@
 - [Who is this for?](#who-is-this-for)
 - [How It Works](#how-it-works)
 - [Performance](#performance)
+- [Privacy & Security](#privacy--security)
 - [Commands](#commands)
 - [Cost Calculation](#cost-calculation)
 - [Supported Providers](#supported-providers)
 - [Planned Features](#planned-features)
-- [Privacy & Security](#privacy--security)
-- [Documentation](#documentation)
-- [Tech Stack](#tech-stack)
+- [Sponsor](#sponsor)
 - [License](#license)
 
 ---
@@ -200,6 +199,16 @@ toki is the only tool here with a persistent idle state. The others pay full res
 > Measured on Apple M1 MacBook Air (8 GB RAM), macOS, power saving off.
 > Reproduce: `sudo -v && python3 benches/benchmark.py run --purge --tool all`
 
+
+## Privacy & Security
+
+toki is privacy-safe by architecture, not by policy.
+
+- **No prompt access**: the JSONL parser only deserializes token counts and model name from `"assistant"` lines. Prompts, responses, file contents, and thinking blocks are never loaded into memory — serde skips them without allocation.
+- **No network transmission of your data**: all processing is local. The only outbound request is an optional pricing fetch from the public LiteLLM repo (`--no-cost` to disable).
+- **No conversation logging**: the TSDB stores only timestamp, model name, session ID, source file path, project name, and token count integers.
+- **Read-only access**: toki only reads session files. It never writes to or modifies any CLI tool's data.
+
 ---
 
 ## Commands
@@ -291,30 +300,6 @@ Each provider gets its own isolated database (`~/.config/toki/<provider>.fjall`)
 Have a feature request or found a bug? [Open an issue](https://github.com/korjwl1/toki/issues).
 
 ---
-
-## Privacy & Security
-
-toki is privacy-safe by architecture, not by policy.
-
-- **No prompt access**: the JSONL parser only deserializes token counts and model name from `"assistant"` lines. Prompts, responses, file contents, and thinking blocks are never loaded into memory — serde skips them without allocation.
-- **No network transmission of your data**: all processing is local. The only outbound request is an optional pricing fetch from the public LiteLLM repo (`--no-cost` to disable).
-- **No conversation logging**: the TSDB stores only timestamp, model name, session ID, source file path, project name, and token count integers.
-- **Read-only access**: toki only reads session files. It never writes to or modifies any CLI tool's data.
-
----
-
-## Sponsor
-
-<a href="https://github.com/sponsors/korjwl1">
-  <img src="https://img.shields.io/badge/Sponsor-%E2%9D%A4-pink?style=for-the-badge&logo=github" alt="Sponsor" />
-</a>
-
-If toki is useful to you, consider sponsoring to support development.
-
-For commercial use in paid products, please sponsor or [reach out](mailto:korjwl1@gmail.com).
-
----
-
 ## Documentation
 
 | Document | Description |
@@ -384,6 +369,16 @@ src/
 │       └── parser.rs              # Stateful parser (model tracking)
 └── platform/mod.rs                 # FSEvents watcher + per-provider polling strategy
 ```
+
+## Sponsor
+
+<a href="https://github.com/sponsors/korjwl1">
+  <img src="https://img.shields.io/badge/Sponsor-%E2%9D%A4-pink?style=for-the-badge&logo=github" alt="Sponsor" />
+</a>
+
+If toki is useful to you, consider sponsoring to support development.
+
+For commercial use in paid products, please sponsor or [reach out](mailto:korjwl1@gmail.com).
 
 ---
 
