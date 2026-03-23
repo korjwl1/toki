@@ -348,6 +348,8 @@ toki settings list                             # 전체 설정 출력
 | Gemini CLI | Google Gemini CLI provider 지원 | 예정 |
 | `toki-sync` | 멀티 디바이스 지원 — 여러 기기 간 사용량 데이터 동기화 | 예정 |
 
+기능 요청이나 버그 리포트는 [이슈](https://github.com/korjwl1/toki/issues)에 남겨주세요.
+
 ---
 
 ## 문서

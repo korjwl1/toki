@@ -351,6 +351,8 @@ Each provider gets its own isolated database (`~/.config/toki/<provider>.fjall`)
 | Gemini CLI | Google Gemini CLI provider support | Planned |
 | `toki-sync` | Multi-device support — sync usage data across machines | Planned |
 
+Have a feature request or found a bug? [Open an issue](https://github.com/korjwl1/toki/issues).
+
 ---
 
 ## Documentation
