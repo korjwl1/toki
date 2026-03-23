@@ -21,7 +21,7 @@
   <img src="assets/demo.gif" alt="toki 데모" width="900" />
 </p>
 
-> **GUI가 필요하신가요?** [Toki Monitor](https://github.com/korjwl1/toki-monitor)는 실시간 대시보드, RunCat 스타일 토끼 애니메이션, 이상 감지 알림을 제공하는 macOS 메뉴바 앱입니다. toki 데몬 위에서 동작합니다.
+> **GUI가 필요하신가요?** [Toki Monitor](https://github.com/korjwl1/toki-monitor)는 실시간 대시보드, 토큰 속도에 반응하는 토끼 애니메이션, 이상 감지 알림을 제공하는 macOS 메뉴바 앱입니다. toki 데몬 위에서 동작합니다.
 
 ---
 

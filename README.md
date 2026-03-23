@@ -21,7 +21,7 @@
   <img src="assets/demo.gif" alt="toki demo" width="900" />
 </p>
 
-> **Looking for a GUI?** [Toki Monitor](https://github.com/korjwl1/toki-monitor) is a macOS menu bar app with a real-time dashboard, RunCat-style animated rabbit, and anomaly alerts — built on the toki daemon.
+> **Looking for a GUI?** [Toki Monitor](https://github.com/korjwl1/toki-monitor) is a macOS menu bar app with a real-time dashboard, animated rabbit indicator, and anomaly alerts — built on the toki daemon.
 
 ---
 
