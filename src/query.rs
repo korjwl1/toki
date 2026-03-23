@@ -67,11 +67,8 @@ pub fn report_grouped_from_db(
                 if !session.starts_with(sf) { return; }
             }
             if let Some(pf) = project_filter {
-                let source = dict.get(&event.source_file_id).map(|s| s.as_str()).unwrap_or("");
-                match crate::engine::extract_project_name(source) {
-                    Some(p) if p.contains(pf) => {}
-                    _ => return,
-                }
+                let project = resolve_project(&dict, &event);
+                if !project.contains(pf) { return; }
             }
             let dt = ts_to_datetime(ts, filter.tz);
             let bucket = bucket_from_datetime(dt, group_by);
@@ -218,11 +215,8 @@ pub fn execute_parsed_query(
                         if !session.starts_with(prefix) { return; }
                     }
                     if let Some(proj) = project_filter {
-                        let source = dict.get(&event.source_file_id).map(|s| s.as_str()).unwrap_or("");
-                        match crate::engine::extract_project_name(source) {
-                            Some(p) if p.contains(proj) => {}
-                            _ => return,
-                        }
+                        let project = resolve_project(&dict, &event);
+                        if !project.contains(proj) { return; }
                     }
                     set.insert(session.to_string());
                 }).map_err(|e| e.to_string())?;
@@ -253,13 +247,12 @@ pub fn execute_parsed_query(
                 let dict = db.load_dict_reverse().map_err(|e| e.to_string())?;
                 let mut set = std::collections::HashSet::new();
                 db.for_each_event(since_ms, until_ms, |_ts, event| {
-                    let source = dict.get(&event.source_file_id).map(|s| s.as_str()).unwrap_or("");
-                    if let Some(p) = crate::engine::extract_project_name(source) {
-                        if let Some(substr) = project_filter {
-                            if !p.contains(substr) { return; }
-                        }
-                        set.insert(p.to_string());
+                    let project = resolve_project(&dict, &event);
+                    if project == "unknown" { return; }
+                    if let Some(substr) = project_filter {
+                        if !project.contains(substr) { return; }
                     }
+                    set.insert(project.to_string());
                 }).map_err(|e| e.to_string())?;
                 let mut list: Vec<String> = set.into_iter().collect();
                 list.sort();
@@ -295,8 +288,7 @@ pub fn execute_parsed_query(
                 if let Some(sf) = session_filter {
                     if !session.starts_with(sf) { return; }
                 }
-                let source = dict.get(&event.source_file_id).map(|s| s.as_str()).unwrap_or("");
-                let project = crate::engine::extract_project_name(source).unwrap_or("unknown");
+                let project = resolve_project(&dict, &event);
                 if let Some(pf) = project_filter {
                     if !project.contains(pf) { return; }
                 }
@@ -426,6 +418,20 @@ pub fn execute_parsed_query(
     Ok(())
 }
 
+/// Resolve the project name for a StoredEvent.
+/// Prefers project_name_id (dictionary lookup); falls back to source_file path extraction
+/// for backward compatibility with events stored before project_name_id was added.
+fn resolve_project<'a>(dict: &'a HashMap<u32, String>, event: &crate::common::types::StoredEvent) -> &'a str {
+    if event.project_name_id != 0 {
+        if let Some(name) = dict.get(&event.project_name_id) {
+            return name.as_str();
+        }
+    }
+    // Fallback: extract from source file path (works for Claude Code)
+    let source = dict.get(&event.source_file_id).map(|s| s.as_str()).unwrap_or("");
+    crate::engine::extract_project_name(source).unwrap_or("unknown")
+}
+
 fn build_group_key(
     group_by: &[String],
     model: &str,
@@ -442,8 +448,7 @@ fn build_group_key(
             "model" => model,
             "session" => session,
             "project" => {
-                let source = dict.get(&event.source_file_id).map(|s| s.as_str()).unwrap_or("");
-                crate::engine::extract_project_name(source).unwrap_or("unknown")
+                resolve_project(dict, event)
             }
             _ => "",
         }
@@ -633,7 +638,7 @@ mod tests {
         batch.commit().unwrap();
 
         let event = StoredEvent {
-            model_id: 1, session_id: 2, source_file_id: 3,
+            model_id: 1, session_id: 2, source_file_id: 3, project_name_id: 0,
             input_tokens: 100, output_tokens: 50,
             cache_creation_input_tokens: 10, cache_read_input_tokens: 20,
         };

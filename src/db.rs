@@ -562,6 +562,7 @@ mod tests {
             model_id: 1,
             session_id: 2,
             source_file_id: 3,
+            project_name_id: 0,
             input_tokens: 100,
             output_tokens: 50,
             cache_creation_input_tokens: 10,
@@ -623,7 +624,7 @@ mod tests {
         let (db, _dir) = temp_db();
 
         let event = StoredEvent {
-            model_id: 1, session_id: 1, source_file_id: 1,
+            model_id: 1, session_id: 1, source_file_id: 1, project_name_id: 0,
             input_tokens: 10, output_tokens: 5,
             cache_creation_input_tokens: 0, cache_read_input_tokens: 0,
         };

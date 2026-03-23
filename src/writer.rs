@@ -222,11 +222,16 @@ impl DbWriter {
             let model_id = self.resolve_dict_id(&mut batch, &event.model);
             let session_id = self.resolve_dict_id(&mut batch, &event.session_id);
             let source_file_id = self.resolve_dict_id(&mut batch, &event.source_file);
+            let project_name_id = match event.project_name.as_deref() {
+                Some(p) if !p.is_empty() => self.resolve_dict_id(&mut batch, p),
+                _ => 0,
+            };
 
             let stored = StoredEvent {
                 model_id,
                 session_id,
                 source_file_id,
+                project_name_id,
                 input_tokens: event.tokens.input_tokens,
                 output_tokens: event.tokens.output_tokens,
                 cache_creation_input_tokens: event.tokens.cache_creation_input_tokens,
@@ -292,11 +297,16 @@ impl DbWriter {
             let model_id = self.resolve_dict_id(&mut batch, &event.model);
             let session_id = self.resolve_dict_id(&mut batch, &event.session_id);
             let source_file_id = self.resolve_dict_id(&mut batch, &event.source_file);
+            let project_name_id = match event.project_name.as_deref() {
+                Some(p) if !p.is_empty() => self.resolve_dict_id(&mut batch, p),
+                _ => 0,
+            };
 
             let stored = StoredEvent {
                 model_id,
                 session_id,
                 source_file_id,
+                project_name_id,
                 input_tokens: event.tokens.input_tokens,
                 output_tokens: event.tokens.output_tokens,
                 cache_creation_input_tokens: event.tokens.cache_creation_input_tokens,

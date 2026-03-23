@@ -72,7 +72,7 @@ mod tests {
         let recent_ts = now_ms - 10 * 86_400_000; // 10 days ago
 
         let event = StoredEvent {
-            model_id: 1, session_id: 1, source_file_id: 1,
+            model_id: 1, session_id: 1, source_file_id: 1, project_name_id: 0,
             input_tokens: 10, output_tokens: 5,
             cache_creation_input_tokens: 0, cache_read_input_tokens: 0,
         };

@@ -943,12 +943,9 @@ pub fn extract_session_id(path: &str) -> Option<String> {
 }
 
 /// Extract project directory name from a source file path.
-/// Currently only works for Claude Code paths (which contain `/projects/<name>/`).
-/// Codex events don't encode the project in the file path; instead, project_name
-/// is extracted from session_meta.cwd during cold start and stored in the project index.
-/// Event-level project filtering for Codex will fall through (return None) and
-/// those events won't match project filters in bucketed queries — this is a known
-/// limitation that can be resolved by adding project_name_id to StoredEvent.
+/// Only works for Claude Code paths (which contain `/projects/<name>/`).
+/// Used as fallback in query resolution for events stored before project_name_id
+/// was added to StoredEvent. For Codex, project_name_id is set from session_meta.cwd.
 pub fn extract_project_name(path: &str) -> Option<&str> {
     crate::providers::claude_code::extract_project_name(path)
 }

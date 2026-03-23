@@ -88,12 +88,13 @@ impl ModelUsageSummary {
 }
 
 /// A stored event in the TSDB (events keyspace).
-/// Uses dictionary-compressed IDs for repeated strings (model, session, source_file).
+/// Uses dictionary-compressed IDs for repeated strings (model, session, source_file, project).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredEvent {
     pub model_id: u32,
     pub session_id: u32,
     pub source_file_id: u32,
+    pub project_name_id: u32,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_creation_input_tokens: u64,

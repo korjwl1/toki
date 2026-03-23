@@ -313,6 +313,7 @@ pub struct StoredEvent {
     pub model_id: u32,                    // dict compressed
     pub session_id: u32,                  // dict compressed
     pub source_file_id: u32,             // dict compressed
+    pub project_name_id: u32,            // dict compressed (0 = unknown)
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_creation_input_tokens: u64,
