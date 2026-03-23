@@ -391,7 +391,11 @@ src/
 
 ## 후원
 
-toki가 도움이 됐다면 [후원](https://github.com/sponsors/korjwl1)으로 개발을 지원해주세요.
+<a href="https://github.com/sponsors/korjwl1">
+  <img src="https://img.shields.io/badge/Sponsor-%E2%9D%A4-pink?style=for-the-badge&logo=github" alt="Sponsor" />
+</a>
+
+toki가 도움이 됐다면 후원으로 개발을 지원해주세요.
 
 ---
 
