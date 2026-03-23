@@ -32,12 +32,11 @@
 - [동작 방식](#동작-방식)
 - [성능](#성능)
 - [명령어](#명령어)
-- [지원 Provider](#지원-provider)
-- [Toki Monitor](#toki-monitor)
-- [예정된 기능](#예정된-기능)
-- [문서](#문서)
 - [비용 계산](#비용-계산)
+- [지원 Provider](#지원-provider)
+- [예정된 기능](#예정된-기능)
 - [프라이버시 & 보안](#프라이버시--보안)
+- [문서](#문서)
 - [기술 스택](#기술-스택)
 - [라이선스](#라이선스)
 
@@ -256,6 +255,17 @@ toki settings list                             # 전체 설정 출력
 
 ---
 
+## 비용 계산
+
+모든 출력에 모델별 추정 비용(USD)이 포함됩니다. 가격 데이터는 [LiteLLM](https://github.com/BerriAI/litellm) 커뮤니티 가격표에서 가져옵니다.
+
+- **최초 실행**: LiteLLM JSON 다운로드 → `litellm_provider` 기준 필터 (Anthropic, OpenAI, Gemini) → 파일 캐시 (`~/.config/toki/pricing.json`)
+- **이후 실행**: HTTP ETag 조건부 요청 → 변경 없으면 304 (바디 없이 ~50ms)
+- **오프라인**: 캐시된 데이터로 동작. 캐시가 없으면 Cost 컬럼 생략
+- **`--no-cost`**: 가격 fetch를 건너뜁니다
+
+---
+
 ## 지원 Provider
 
 | Provider | CLI 도구 | 데이터 형식 | 상태 |
@@ -268,22 +278,6 @@ toki settings list                             # 전체 설정 출력
 
 ---
 
-## Toki Monitor
-
-**[Toki Monitor](https://github.com/korjwl1/toki-monitor)** — toki 데몬 위에서 동작하는 macOS 메뉴바 앱.
-
-- 메뉴바 인디케이터 (토끼 애니메이션 / 숫자 표시 / 스파크라인)
-- 대시보드 — 시계열 차트, 프로젝트별 분석, PromQL 커스텀 패널
-- 속도 기반 이상 감지 알림
-- provider별 5시간 / 7일 사용량 윈도우, 리셋 카운트다운
-
-```bash
-brew tap korjwl1/tap
-brew install --cask toki-monitor
-```
-
----
-
 ## 예정된 기능
 
 | 기능 | 설명 | 상태 |
@@ -292,6 +286,29 @@ brew install --cask toki-monitor
 | `toki-sync` | 멀티 디바이스 지원 — 여러 기기 간 사용량 데이터 동기화 | 예정 |
 
 기능 요청이나 버그 리포트는 [이슈](https://github.com/korjwl1/toki/issues)에 남겨주세요.
+
+---
+
+## 프라이버시 & 보안
+
+toki는 정책이 아닌 아키텍처로 프라이버시를 보장합니다.
+
+- **프롬프트 접근 없음**: JSONL 파서는 `"assistant"` 라인에서 토큰 수와 모델명만 추출합니다. 프롬프트, 응답, 파일 내용, thinking 블록은 메모리에 로드되지 않습니다 — serde가 힙 할당 없이 건너뜁니다.
+- **데이터 전송 없음**: 모든 처리는 로컬에서 이루어집니다. 유일한 외부 요청은 LiteLLM 가격표 fetch뿐입니다 (`--no-cost`로 비활성화).
+- **대화 내용 로깅 없음**: TSDB에는 타임스탬프, 모델명, 세션 ID, 소스 파일 경로, 프로젝트명, 토큰 수 정수만 저장됩니다.
+- **읽기 전용 접근**: toki는 세션 파일을 읽기만 합니다. CLI 도구의 데이터를 수정하거나 삭제하지 않습니다.
+
+---
+
+## 후원
+
+<a href="https://github.com/sponsors/korjwl1">
+  <img src="https://img.shields.io/badge/Sponsor-%E2%9D%A4-pink?style=for-the-badge&logo=github" alt="Sponsor" />
+</a>
+
+toki가 도움이 됐다면 후원으로 개발을 지원해주세요.
+
+유료 제품에 toki를 사용하시려면 후원 또는 [연락](mailto:korjwl1@gmail.com)을 부탁드립니다.
 
 ---
 
@@ -307,28 +324,6 @@ brew install --cask toki-monitor
 | **[Gemini CLI 분석](docs/gemini-cli-analysis.md)** | Gemini CLI 로컬 데이터 형식 분석 (향후 provider) |
 | **[왜 OpenTelemetry가 아닌가?](docs/why-not-otel.md)** | toki가 OTEL 데이터 대신 로컬 파일을 파싱하는 이유 |
 | **[OTEL 비교](docs/otel-comparison.md)** | OpenTelemetry 구현 상세: Claude Code vs Gemini CLI vs toki |
-
----
-
-## 비용 계산
-
-모든 출력에 모델별 추정 비용(USD)이 포함됩니다. 가격 데이터는 [LiteLLM](https://github.com/BerriAI/litellm) 커뮤니티 가격표에서 가져옵니다.
-
-- **최초 실행**: LiteLLM JSON 다운로드 → `litellm_provider` 기준 필터 (Anthropic, OpenAI, Gemini) → 파일 캐시 (`~/.config/toki/pricing.json`)
-- **이후 실행**: HTTP ETag 조건부 요청 → 변경 없으면 304 (바디 없이 ~50ms)
-- **오프라인**: 캐시된 데이터로 동작. 캐시가 없으면 Cost 컬럼 생략
-- **`--no-cost`**: 가격 fetch를 건너뜁니다
-
----
-
-## 프라이버시 & 보안
-
-toki는 정책이 아닌 아키텍처로 프라이버시를 보장합니다.
-
-- **프롬프트 접근 없음**: JSONL 파서는 `"assistant"` 라인에서 토큰 수와 모델명만 추출합니다. 프롬프트, 응답, 파일 내용, thinking 블록은 메모리에 로드되지 않습니다 — serde가 힙 할당 없이 건너뜁니다.
-- **데이터 전송 없음**: 모든 처리는 로컬에서 이루어집니다. 유일한 외부 요청은 LiteLLM 가격표 fetch뿐입니다 (`--no-cost`로 비활성화).
-- **대화 내용 로깅 없음**: TSDB에는 타임스탬프, 모델명, 세션 ID, 소스 파일 경로, 프로젝트명, 토큰 수 정수만 저장됩니다.
-- **읽기 전용 접근**: toki는 세션 파일을 읽기만 합니다. CLI 도구의 데이터를 수정하거나 삭제하지 않습니다.
 
 ---
 
@@ -386,18 +381,6 @@ src/
 │       └── parser.rs              # Stateful 파서 (model tracking)
 └── platform/mod.rs                 # FSEvents 감시 + provider별 폴링 전략
 ```
-
----
-
-## 후원
-
-<a href="https://github.com/sponsors/korjwl1">
-  <img src="https://img.shields.io/badge/Sponsor-%E2%9D%A4-pink?style=for-the-badge&logo=github" alt="Sponsor" />
-</a>
-
-toki가 도움이 됐다면 후원으로 개발을 지원해주세요.
-
-유료 제품에 toki를 사용하시려면 후원 또는 [연락](mailto:korjwl1@gmail.com)을 부탁드립니다.
 
 ---
 

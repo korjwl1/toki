@@ -32,12 +32,11 @@
 - [How It Works](#how-it-works)
 - [Performance](#performance)
 - [Commands](#commands)
-- [Supported Providers](#supported-providers)
-- [Toki Monitor](#toki-monitor)
-- [Planned Features](#planned-features)
-- [Documentation](#documentation)
 - [Cost Calculation](#cost-calculation)
+- [Supported Providers](#supported-providers)
+- [Planned Features](#planned-features)
 - [Privacy & Security](#privacy--security)
+- [Documentation](#documentation)
 - [Tech Stack](#tech-stack)
 - [License](#license)
 
@@ -259,6 +258,17 @@ toki settings list                             # List all
 
 ---
 
+## Cost Calculation
+
+All outputs include estimated cost (USD) per model, sourced from [LiteLLM](https://github.com/BerriAI/litellm) community pricing.
+
+- **First run**: downloads LiteLLM JSON → filters by `litellm_provider` (Anthropic, OpenAI, Gemini) → caches to `~/.config/toki/pricing.json`
+- **Subsequent runs**: HTTP ETag conditional request → 304 if unchanged (~50 ms, no body)
+- **Offline**: uses cached data; if no cache, cost column is omitted
+- **`--no-cost`**: skips price fetch entirely
+
+---
+
 ## Supported Providers
 
 | Provider | CLI Tool | Data Format | Status |
@@ -271,22 +281,6 @@ Each provider gets its own isolated database (`~/.config/toki/<provider>.fjall`)
 
 ---
 
-## Toki Monitor
-
-**[Toki Monitor](https://github.com/korjwl1/toki-monitor)** — macOS menu bar app built on the toki daemon.
-
-- Menu bar indicator (animated rabbit / numeric rate / sparkline)
-- Dashboard with time-series charts, per-project breakdown, custom PromQL panels
-- Velocity-based anomaly alerts
-- 5-hour / 7-day usage windows with reset countdowns
-
-```bash
-brew tap korjwl1/tap
-brew install --cask toki-monitor
-```
-
----
-
 ## Planned Features
 
 | Feature | Description | Status |
@@ -295,6 +289,29 @@ brew install --cask toki-monitor
 | `toki-sync` | Multi-device support — sync usage data across machines | Planned |
 
 Have a feature request or found a bug? [Open an issue](https://github.com/korjwl1/toki/issues).
+
+---
+
+## Privacy & Security
+
+toki is privacy-safe by architecture, not by policy.
+
+- **No prompt access**: the JSONL parser only deserializes token counts and model name from `"assistant"` lines. Prompts, responses, file contents, and thinking blocks are never loaded into memory — serde skips them without allocation.
+- **No network transmission of your data**: all processing is local. The only outbound request is an optional pricing fetch from the public LiteLLM repo (`--no-cost` to disable).
+- **No conversation logging**: the TSDB stores only timestamp, model name, session ID, source file path, project name, and token count integers.
+- **Read-only access**: toki only reads session files. It never writes to or modifies any CLI tool's data.
+
+---
+
+## Sponsor
+
+<a href="https://github.com/sponsors/korjwl1">
+  <img src="https://img.shields.io/badge/Sponsor-%E2%9D%A4-pink?style=for-the-badge&logo=github" alt="Sponsor" />
+</a>
+
+If toki is useful to you, consider sponsoring to support development.
+
+For commercial use in paid products, please sponsor or [reach out](mailto:korjwl1@gmail.com).
 
 ---
 
@@ -310,28 +327,6 @@ Have a feature request or found a bug? [Open an issue](https://github.com/korjwl
 | **[Gemini CLI Analysis](docs/gemini-cli-analysis.md)** | Gemini CLI local data format analysis (future provider) |
 | **[Why Not OpenTelemetry?](docs/why-not-otel.md)** | Why toki parses local files instead of receiving OTEL data |
 | **[OTEL Comparison](docs/otel-comparison.md)** | OpenTelemetry implementation details: Claude Code vs Gemini CLI vs toki |
-
----
-
-## Cost Calculation
-
-All outputs include estimated cost (USD) per model, sourced from [LiteLLM](https://github.com/BerriAI/litellm) community pricing.
-
-- **First run**: downloads LiteLLM JSON → filters by `litellm_provider` (Anthropic, OpenAI, Gemini) → caches to `~/.config/toki/pricing.json`
-- **Subsequent runs**: HTTP ETag conditional request → 304 if unchanged (~50 ms, no body)
-- **Offline**: uses cached data; if no cache, cost column is omitted
-- **`--no-cost`**: skips price fetch entirely
-
----
-
-## Privacy & Security
-
-toki is privacy-safe by architecture, not by policy.
-
-- **No prompt access**: the JSONL parser only deserializes token counts and model name from `"assistant"` lines. Prompts, responses, file contents, and thinking blocks are never loaded into memory — serde skips them without allocation.
-- **No network transmission of your data**: all processing is local. The only outbound request is an optional pricing fetch from the public LiteLLM repo (`--no-cost` to disable).
-- **No conversation logging**: the TSDB stores only timestamp, model name, session ID, source file path, project name, and token count integers.
-- **Read-only access**: toki only reads session files. It never writes to or modifies any CLI tool's data.
 
 ---
 
@@ -389,18 +384,6 @@ src/
 │       └── parser.rs              # Stateful parser (model tracking)
 └── platform/mod.rs                 # FSEvents watcher + per-provider polling strategy
 ```
-
----
-
-## Sponsor
-
-<a href="https://github.com/sponsors/korjwl1">
-  <img src="https://img.shields.io/badge/Sponsor-%E2%9D%A4-pink?style=for-the-badge&logo=github" alt="Sponsor" />
-</a>
-
-If toki is useful to you, consider sponsoring to support development.
-
-For commercial use in paid products, please sponsor or [reach out](mailto:korjwl1@gmail.com).
 
 ---
 
