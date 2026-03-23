@@ -389,6 +389,12 @@ src/
 
 ---
 
+## 후원
+
+toki가 도움이 됐다면 [후원](https://github.com/sponsors/korjwl1)으로 개발을 지원해주세요.
+
+---
+
 ## 라이선스
 
 [FSL-1.1-Apache-2.0](LICENSE)

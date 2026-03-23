@@ -392,6 +392,12 @@ src/
 
 ---
 
+## Sponsor
+
+If toki is useful to you, consider [sponsoring](https://github.com/sponsors/korjwl1) to support development.
+
+---
+
 ## License
 
 [FSL-1.1-Apache-2.0](LICENSE)
