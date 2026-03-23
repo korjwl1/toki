@@ -19,33 +19,90 @@
 
 ---
 
-> **Engineered, not just coded.** In the age of vibe coding, toki stands apart — every architectural decision was made by a professional systems engineer who knows exactly why each piece exists. The TSDB schema, rollup-on-write strategy, xxHash3 checkpoint recovery, 4-thread daemon model — all designed with intent, built with precision.
+## Table of Contents
+
+- [Quick Start](#quick-start)
+- [Who is this for?](#who-is-this-for)
+- [How It Works](#how-it-works)
+- [Performance](#performance)
+- [Commands](#commands)
+- [Supported Providers](#supported-providers)
+- [Toki Monitor](#toki-monitor)
+- [Planned Features](#planned-features)
+- [Documentation](#documentation)
+- [Cost Calculation](#cost-calculation)
+- [Privacy & Security](#privacy--security)
+- [Tech Stack](#tech-stack)
+- [License](#license)
+
+---
+
+## Quick Start
+
+```bash
+# Install (macOS)
+brew tap korjwl1/tap
+brew install toki
+
+# toki auto-detects ~/.claude and ~/.codex. No config needed.
+
+# 1. Start the daemon
+toki daemon start
+
+# 2. Real-time event stream (in another terminal)
+toki trace
+
+# 3. Reports
+toki report daily --since 20260301
+toki report --provider claude_code
+toki report monthly
+
+# 4. PromQL-style queries
+toki report query 'sum(usage{since="20260301"}[1d]) by (project)'
+toki report query 'events{since="20260320"}'
+```
 
 ---
 
 ## Who is this for?
 
-- **Tired of ccusage freezing your terminal?** toki is 14x faster on cold start and 1,700x faster on reports. Your terminal never hangs again — reports come back in 7 ms, not 20 seconds.
+- **Your terminal freezes on every token report?** toki is 14x faster on cold start and 1,700x faster on reports. Even 2 GB of data comes back in 7 ms.
 
-- **Want deeper analysis than "total tokens"?** toki gives you per-model, per-session, per-project, per-day breakdowns with PromQL-style queries. Filter by time range, group by any dimension, track costs across multiple AI tools — all from a single command.
+- **Need more than "total tokens"?** Per-model, per-session, per-project, per-day breakdowns with PromQL-style queries. Filter by time range, group by any dimension, track costs — all in one command.
 
-- **Don't want to set up OpenTelemetry?** No collector, no config files, no environment variables. Install toki, run it, done. It reads your existing session files directly — including months of historical data from before you installed it.
+- **Don't want to set up OpenTelemetry?** No collector, no config files, no environment variables. Install toki, run it, done. It reads your existing session files directly — including months of history from before you installed it.
 
-- **Using multiple AI CLI tools?** toki tracks Claude Code and Codex CLI in a single unified view. Add a provider, and all your token usage is merged. Filter by `--provider` when you need per-tool breakdown.
+- **Using multiple AI CLI tools?** toki tracks Claude Code and Codex CLI in a single unified view. Filter by `--provider` when you need per-tool breakdown.
+
+---
+
+## How It Works
+
+Docker-like daemon/client architecture:
+
+```
+toki daemon start     # always-on server   (≈ dockerd)
+toki trace            # real-time stream    (≈ docker logs -f)
+toki report           # instant TSDB query  (≈ docker ps)
+```
+
+- **daemon** — watches session logs from configured providers (Claude Code, Codex CLI), parses events, writes to per-provider embedded TSDBs (fjall). 4 base threads + 2 per connected trace client. Zero overhead when no trace clients are connected.
+- **trace** — connects to the daemon over UDS for real-time JSONL event streaming. Supports multiple sinks (`--sink uds://`, `--sink http://`) for relaying to other services.
+- **report** — sends a query to the daemon, gets merged results from all provider TSDBs. Always fast, always indexed. Filter by `--provider` to query a single provider.
 
 ---
 
 ## Performance
 
-Not just fast — **lightweight enough to forget it's running.** toki sits at 5 MB idle, near-zero CPU, and answers any report in 7 ms. ccusage and zzusage spike your CPU and memory every time you ask a question, because they re-read everything from scratch. toki doesn't. It indexes once, then gets out of your way.
+toki sits at 5 MB idle, near-zero CPU, and answers any report in 7 ms. Most alternatives re-read everything from scratch on every invocation — toki indexes once, then gets out of your way.
 
 Benchmarked against [ccusage](https://github.com/ryoppippi/ccusage) (Node.js) and [zzusage](https://github.com/joelreymont/zzusage) (Zig) on the same dataset, disk cache purged before each run.
 
 ### Cold Start (full index build)
 
-toki parses **and** indexes into a TSDB simultaneously — **14x faster** than ccusage, **similar speed** to zzusage but with **93% less memory**.
+**14x faster** than ccusage, similar speed to zzusage but with **93% less memory**.
 
-> In normal operation, toki resumes from its last checkpoint and only processes new data — so subsequent cold starts are significantly faster.
+> In normal operation, toki resumes from its last checkpoint — only new data gets indexed.
 
 <p align="center">
   <img src="docs/bench_cold_start.png" alt="Cold Start Benchmark" width="900" />
@@ -78,13 +135,13 @@ toki parses **and** indexes into a TSDB simultaneously — **14x faster** than c
 | 1 GB | 119 MB | 127 MB | 1,209 MB |
 | 2 GB | 166 MB | 126 MB | **2,311 MB** |
 
-> **Why ~1.0x vs zzusage matters:** toki does *strictly more work* per line — TSDB writes (fjall LSM-tree inserts), rollup aggregation, checkpoint persistence, and JSON schema validation. zzusage skips all of this: no DB, no validation, just raw parsing. Despite the extra workload, toki matches zzusage in wall-clock time. The validation gap also has a practical consequence: zzusage accepts any content without structural checks, making it trivial to feed crafted JSONL that inflates or fabricates usage numbers. toki validates every record before it reaches the TSDB, so tampered data is rejected at parse time.
+> **Why does matching zzusage matter?** toki does strictly more work per line — TSDB writes, rollup aggregation, checkpoint persistence, and schema validation. zzusage skips all of this. Despite the extra workload, toki matches zzusage in wall-clock time.
 
 </details>
 
 ### Report Speed (indexed TSDB query vs full re-scan)
 
-toki report answers in **~7 ms** regardless of data size — **1,742x faster** than ccusage at 2 GB.
+**~7 ms** regardless of data size — **1,742x faster** than ccusage at 2 GB.
 
 <p align="center">
   <img src="docs/bench_report.png" alt="Report Benchmark" width="900" />
@@ -127,68 +184,16 @@ toki report answers in **~7 ms** regardless of data size — **1,742x faster** t
 
 ### Idle Footprint
 
-After cold start, toki vanishes from your system's resource radar. Zero burden, always ready.
+After cold start, toki drops to background-level resource usage.
 
 | CPU | Memory | DB Size |
 |-----|--------|---------|
 | **~0%** | **5 MB** | **~3% of source data** (2 GB sessions → 64 MB TSDB) |
 
-- **toki** — rayon parallel processing across all CPU cores with mmap zero-copy and per-file streaming. Despite doing maximum parallelism, memory stays flat because each file is streamed and discarded — no accumulation. After cold start the daemon drops to 5 MB and ~0% CPU. File changes are detected via FSEvents (kernel-level push) for Claude Code, and additionally via 1-second polling for Codex CLI on macOS — where FSEvents only fires on fd close but Codex keeps its session file open for the entire session duration.
-- **ccusage** — processes one file at a time, synchronous and blocking. The 126 MB looks modest on paper, but it means your terminal hangs for seconds to minutes on every invocation while Node.js chews through every file sequentially. No parallelism, no incremental processing — just a long blocking wait, every time.
-- **zzusage** — loads every event from every file into memory before doing anything. Fast parsing, but 2 GB of data means 2.3 GB of RAM consumed at once. On larger datasets it simply OOMs.
-
-toki is the only tool with an idle state. ccusage and zzusage pay full resource cost on every run — your editor, compiler, and AI agent all compete for the same CPU and memory. toki pays that cost once, drops to 5 MB, and stays out of the way.
+toki is the only tool here with a persistent idle state. The others pay full resource cost on every invocation.
 
 > Measured on Apple M1 MacBook Air (8 GB RAM), macOS, power saving off.
 > Reproduce: `sudo -v && python3 benches/benchmark.py run --purge --tool all`
-
----
-
-## How It Works
-
-Docker-like daemon/client architecture:
-
-```
-toki daemon start     # always-on server   (≈ dockerd)
-toki trace            # real-time stream    (≈ docker logs -f)
-toki report           # instant TSDB query  (≈ docker ps)
-```
-
-- **daemon** — watches session logs from configured providers (Claude Code, Codex CLI), parses events, writes to per-provider embedded TSDBs (fjall). Claude Code uses FSEvents (kernel push, fires per turn). Codex CLI on macOS uses 1-second polling in addition to FSEvents — macOS FSEvents only fires on fd close, but Codex holds its session file open for the entire session. On Linux/Windows, the native watcher (inotify/ReadDirectoryChangesW) fires per write for all providers. 4 base threads + 2 per connected trace client. Zero sink overhead when no trace clients are connected. UDS protocol is command-based: clients send `TRACE\n` or `REPORT\n` as the first line.
-- **trace** — connects to the daemon over UDS for real-time event streaming. Always outputs JSONL to stdout (no sink/format options).
-- **report** — sends a query to the daemon over UDS, gets merged results from all provider TSDBs. Always fast, always indexed. Filter by `--provider` to query a single provider.
-
----
-
-## Quick Start
-
-```bash
-# Install (macOS)
-brew tap korjwl1/tap
-brew install toki
-
-# toki auto-detects ~/.claude and ~/.codex. No config needed.
-# To manage providers manually: toki settings (TUI) or CLI:
-# toki settings set providers --add claude_code
-# toki settings set providers --add codex
-
-# 1. Start the daemon (detaches to background by default)
-toki daemon start
-
-# 2. In another terminal — real-time event stream
-toki trace
-
-# 3. Reports (instant TSDB queries)
-toki report                                   # all providers merged
-toki report --provider claude_code            # single provider
-toki report daily --since 20260301
-toki report monthly
-
-# 4. PromQL-style queries
-toki report query 'usage{model="claude-opus-4-6"}[1h] by (model)'
-toki report query 'sum(usage{since="20260301"}[1d]) by (project)'
-toki report query 'events{since="20260320"}'
-```
 
 ---
 
@@ -197,140 +202,54 @@ toki report query 'events{since="20260320"}'
 ### Daemon
 
 ```bash
-toki daemon start       # Start (background)
-toki daemon start --foreground  # Foreground mode (for debug)
-toki daemon stop        # Stop
-toki daemon restart     # Restart (reload settings)
-toki daemon status      # Check status
-toki daemon reset       # Wipe DB + reinitialize
+toki daemon start                # Start (background)
+toki daemon start --foreground   # Foreground (for debug)
+toki daemon stop                 # Stop
+toki daemon restart              # Restart (reload settings)
+toki daemon status               # Check status
+toki daemon reset                # Wipe DB + reinitialize
 ```
 
 ### Report
 
 ```bash
 # Summary
-toki report                                         # all providers
-toki report --provider claude_code                  # single provider
+toki report
+toki report --provider claude_code
 toki report --since 20260301 --until 20260331
 
 # Time grouping
 toki report daily --since 20260301
-toki report weekly --since 20260301 --start-of-week tue
+toki report weekly --start-of-week tue
 toki report monthly
-toki report yearly
-toki report hourly --since 20260301
 
 # Session/project filters
 toki report --group-by-session
 toki report --project toki
-toki report --session-id 4de9291e
-
-# Provider filter
-toki report --provider codex daily --since 20260301
 
 # PromQL-style queries
-toki report query 'usage{model="claude-opus-4-6"}[1h] by (model)'
-toki report query 'sum(usage{since="20260301"}[1d]) by (project)'
+toki report query 'sum(usage[1d]) by (project)'
 toki report query 'events{since="20260320"}'
 toki report query 'usage[1d] offset 7d'
-toki report query 'sessions{project="myapp"}'
-toki report query 'projects'
-
-# Options
-toki -z Asia/Seoul report daily --since 20260301   # timezone
-toki --no-cost report                               # skip cost
 ```
 
-<details>
-<summary>Report options reference</summary>
-
-| Option | Description |
-|--------|-------------|
-| *(no subcommand)* | Total summary (`--since`/`--until` optional) |
-| `daily\|weekly\|monthly\|yearly\|hourly` | Time-based grouping |
-| `query '<PROMQL>'` | PromQL-style free query |
-| `--since YYYYMMDD[hhmmss]` | Start time (inclusive, `>=`) |
-| `--until YYYYMMDD[hhmmss]` | End time (inclusive, `<=`) |
-| `--group-by-session` | Group by session (mutually exclusive with time subcommand) |
-| `--session-id <PREFIX>` | Filter by session UUID prefix |
-| `--project <NAME>` | Filter by project directory substring |
-| `--provider <NAME>` | Filter by provider (`claude_code`, `codex`) |
-| `--start-of-week mon\|tue\|...\|sun` | Only for `weekly` |
-
-</details>
-
-<details>
-<summary>PromQL query syntax</summary>
-
-```
-[agg_func(] metric{filters}[bucket] [offset duration] [)] [by (dimensions)]
-```
-
-| Element | Description | Example |
-|---------|-------------|---------|
-| metric | `usage`, `sessions`, `projects`, `events` | `usage` |
-| filters | `key="value"` pairs, comma-separated | `{model="claude-opus-4-6", since="20260301"}` |
-| bucket | Time bucket (s/m/h/d/w, compound: `2h30m`) | `[1h]`, `[5m]`, `[2h30m]` |
-| offset | Shift time window back | `offset 7d` |
-| agg_func | `sum`, `avg`, `count` — collapse models | `sum(usage[1d])` |
-| dimensions | Group by (model/session/project) | `by (model, session)` |
-
-Filter keys: `model`, `session`, `project`, `provider`, `since`, `until`
-
-</details>
+For the full command reference, query syntax, and settings options, see the **[Usage Guide](docs/USAGE.md)**.
 
 ### Trace
 
 ```bash
-toki trace                                              # JSONL stream to stdout
-toki trace --sink uds:///tmp/toki.sock                  # Relay to UDS
-toki trace --sink http://localhost:8080/events           # Relay via HTTP
-toki trace --sink print --sink http://localhost:8080     # Multi-sink
-toki trace --no-cost                                    # Without cost field
+toki trace                                          # JSONL stream to stdout
+toki trace --sink uds:///tmp/toki.sock              # Relay to UDS
+toki trace --sink http://localhost:8080/events       # Relay via HTTP
 ```
 
 ### Settings
 
 ```bash
-toki settings                                  # Open TUI (cursive)
-toki settings set claude_code_root /path       # Set individual value
-toki settings set providers --add claude_code  # Add a provider
-toki settings set providers --add codex        # Add another provider
-toki settings set providers --remove codex     # Remove a provider
-toki settings get providers                     # List providers + status
-toki settings get timezone                     # Get value
+toki settings                                  # Open TUI
+toki settings set providers --add codex        # Add a provider
 toki settings list                             # List all
 ```
-
-<details>
-<summary>Settings reference</summary>
-
-| Setting | Description | Default |
-|---------|-------------|---------|
-| Providers | Enabled providers (`toki settings set providers --add/--remove`) | `[]` |
-| Claude Code Root | Claude Code root directory | `~/.claude` |
-| Daemon Socket | Daemon UDS socket path | `~/.config/toki/daemon.sock` |
-| Timezone | IANA timezone (empty = UTC) | *(none)* |
-| Output Format | Default output format | `table` |
-| Start of Week | Weekly report start day | `mon` |
-| No Cost | Disable cost calculation | `false` |
-| Retention Days | Event retention (0 = unlimited) | `0` |
-| Rollup Retention Days | Rollup retention (0 = unlimited) | `0` |
-
-Priority: **CLI args > settings.json > defaults**
-
-</details>
-
-### Client Options
-
-| Option | Applies to | Description |
-|--------|-----------|-------------|
-| `--output-format table\|json` | report | Override output format |
-| `--sink <SPEC>` | trace | Output target: `print`, `uds://<path>`, `http://<url>` (repeatable) |
-| `--timezone <IANA>` / `-z` | report | Override timezone |
-| `--no-cost` | trace, report | Disable cost calculation |
-
-> Trace always outputs JSONL. `--output-format` does not apply to trace. When using `--sink uds://` or `--sink http://`, spawn `toki trace` as a child process — it auto-terminates when the parent dies (SIGPIPE).
 
 ---
 
@@ -343,6 +262,19 @@ Priority: **CLI args > settings.json > defaults**
 | *(gemini)* | [Gemini CLI](https://github.com/google-gemini/gemini-cli) | JSON (full rewrite) | Planned |
 
 Each provider gets its own isolated database (`~/.config/toki/<provider>.fjall`). Reports merge results across all enabled providers by default, or filter to a single provider with `--provider`.
+
+---
+
+## Toki Monitor
+
+[Toki Monitor](https://github.com/korjwl1/toki-monitor) is a macOS menu bar app built on top of toki. It gives you real-time token usage visualization without opening a terminal — animated rabbit character, sparkline graphs, dashboard with per-project charts, and velocity-based anomaly alerts. Installs the toki daemon automatically.
+
+```bash
+brew tap korjwl1/tap
+brew install --cask toki-monitor
+```
+
+---
 
 ## Planned Features
 
@@ -383,14 +315,12 @@ All outputs include estimated cost (USD) per model, sourced from [LiteLLM](https
 
 ## Privacy & Security
 
-toki is designed to be **privacy-safe by architecture**, not by policy.
+toki is privacy-safe by architecture, not by policy.
 
-- **No prompt access**: toki's JSONL parser only deserializes the `"assistant"` type lines and extracts the `usage` object (token counts) and `model` field. User prompts, assistant responses, file contents, and thinking blocks are **never loaded into memory** — serde skips over them entirely without heap allocation.
-- **No network transmission of your data**: all processing happens locally. toki never sends your data anywhere. The only outbound request is an optional pricing table fetch from the public LiteLLM repository (disable with `--no-cost`).
-- **No logs of conversation content**: the TSDB stores only: timestamp, model name, session ID, source file path, and four token count integers. Nothing else.
-- **Read-only access**: toki only reads session files. It never writes to, modifies, or deletes any CLI tool's data.
-
-This is fundamentally different from OpenTelemetry-based monitoring, where the OTEL SDK runs inside the CLI process and may include prompts, tool calls, or API request bodies in log events depending on configuration. toki operates externally and sees only what it chooses to parse — which is strictly token metadata.
+- **No prompt access**: the JSONL parser only deserializes token counts and model name from `"assistant"` lines. Prompts, responses, file contents, and thinking blocks are never loaded into memory — serde skips them without allocation.
+- **No network transmission of your data**: all processing is local. The only outbound request is an optional pricing fetch from the public LiteLLM repo (`--no-cost` to disable).
+- **No conversation logging**: the TSDB stores only timestamp, model name, session ID, source file path, project name, and token count integers.
+- **Read-only access**: toki only reads session files. It never writes to or modifies any CLI tool's data.
 
 ---
 

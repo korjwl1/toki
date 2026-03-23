@@ -19,25 +19,82 @@
 
 ---
 
-> **설계된 소프트웨어입니다.** 바이브 코딩 시대에, toki는 다릅니다 — 모든 아키텍처 결정은 각 구성요소가 왜 필요한지 정확히 아는 전문 시스템 엔지니어가 내렸습니다. TSDB 스키마, rollup-on-write 전략, xxHash3 체크포인트 복구, 4스레드 데몬 모델까지 전부 의도를 가지고 설계하고, 정밀하게 구현했습니다.
+## 목차
+
+- [Quick Start](#quick-start)
+- [누가 쓰면 좋을까?](#누가-쓰면-좋을까)
+- [동작 방식](#동작-방식)
+- [성능](#성능)
+- [명령어](#명령어)
+- [지원 Provider](#지원-provider)
+- [Toki Monitor](#toki-monitor)
+- [예정된 기능](#예정된-기능)
+- [문서](#문서)
+- [비용 계산](#비용-계산)
+- [프라이버시 & 보안](#프라이버시--보안)
+- [기술 스택](#기술-스택)
+- [라이선스](#라이선스)
+
+---
+
+## Quick Start
+
+```bash
+# 설치 (macOS)
+brew tap korjwl1/tap
+brew install toki
+
+# toki는 ~/.claude, ~/.codex를 자동 감지합니다. 별도 설정 불필요.
+
+# 1. 데몬 시작
+toki daemon start
+
+# 2. 실시간 이벤트 스트림 (다른 터미널에서)
+toki trace
+
+# 3. 리포트 조회
+toki report daily --since 20260301
+toki report --provider claude_code
+toki report monthly
+
+# 4. PromQL 스타일 쿼리
+toki report query 'sum(usage{since="20260301"}[1d]) by (project)'
+toki report query 'events{since="20260320"}'
+```
 
 ---
 
 ## 누가 쓰면 좋을까?
 
-- **ccusage 때문에 터미널이 멈추는 분.** toki는 cold start에서 14배, 리포트에서 1,700배 빠릅니다. 2GB 데이터를 조회해도 7ms. 터미널이 멈추는 일은 없습니다.
+- **토큰 리포트 볼 때마다 터미널이 멈추는 분.** toki는 cold start 14배, 리포트 1,700배 빠릅니다. 2GB 데이터도 7ms면 나옵니다.
 
-- **"총 토큰" 이상의 분석이 필요한 분.** 모델별, 세션별, 프로젝트별, 날짜별 분석을 PromQL 스타일 쿼리로 자유롭게. 시간 범위 필터, 다차원 그룹핑, 비용 추적까지 한 줄이면 됩니다.
+- **"총 토큰" 이상의 분석이 필요한 분.** 모델별, 세션별, 프로젝트별, 날짜별 분석을 PromQL 스타일로 자유롭게. 시간 범위 필터, 다차원 그룹핑, 비용 추적까지 한 줄이면 됩니다.
 
-- **OpenTelemetry 설정이 귀찮은 분.** Collector도, 환경변수도, 설정 파일 수정도 필요 없습니다. toki를 실행하면 이미 디스크에 있는 세션 로그를 바로 읽습니다. 설치 전에 쌓인 수개월치 데이터도 즉시 분석됩니다.
+- **OpenTelemetry 설정이 귀찮은 분.** Collector도, 환경변수도, 설정 파일 수정도 필요 없습니다. toki를 설치하고 실행하면 디스크에 있는 세션 로그를 바로 읽습니다. 설치 전에 쌓인 수개월치 데이터도 즉시 분석됩니다.
 
-- **여러 AI CLI 도구를 쓰는 분.** Claude Code와 Codex CLI를 하나의 통합 뷰로. `--provider`로 도구별 필터링도 됩니다.
+- **여러 AI CLI 도구를 쓰는 분.** Claude Code와 Codex CLI를 하나의 통합 뷰로 볼 수 있습니다. `--provider`로 도구별 필터링도 됩니다.
+
+---
+
+## 동작 방식
+
+Docker처럼 데몬/클라이언트 구조입니다:
+
+```
+toki daemon start     # 항상 실행되는 서버   (≈ dockerd)
+toki trace            # 실시간 스트림        (≈ docker logs -f)
+toki report           # 즉시 TSDB 조회      (≈ docker ps)
+```
+
+- **daemon** — 설정된 provider(Claude Code, Codex CLI)의 세션 로그를 감시하고, 이벤트를 파싱해서 provider별 내장 TSDB(fjall)에 기록합니다. 기본 4스레드 + trace 클라이언트당 2스레드. trace 클라이언트가 없으면 Sink 오버헤드는 0입니다.
+- **trace** — UDS로 데몬에 연결해서 실시간 JSONL 이벤트 스트림을 받습니다. `--sink` 옵션으로 UDS나 HTTP로 다른 서비스에 중계할 수도 있습니다.
+- **report** — 데몬에 쿼리를 보내고, 모든 provider TSDB의 결과를 병합하여 받습니다. 언제나 빠르고, 언제나 색인된 상태. `--provider`로 단일 provider만 조회할 수도 있습니다.
 
 ---
 
 ## 성능
 
-빠르기만 한 게 아닙니다 — **돌아가고 있는지 눈치채기 어려울 만큼 가볍습니다.** idle 5MB, CPU 0%, 리포트 7ms. ccusage와 zzusage는 물어볼 때마다 전체 파일을 처음부터 다시 읽습니다. toki는 한 번 색인하고, 그 뒤로는 사라집니다.
+idle 5MB, CPU 0%, 리포트 7ms. 대부분의 대안은 실행할 때마다 전체 파일을 처음부터 다시 읽습니다. toki는 한 번 색인하고 그 뒤로는 사라집니다.
 
 [ccusage](https://github.com/ryoppippi/ccusage) (Node.js), [zzusage](https://github.com/joelreymont/zzusage) (Zig)와 동일 데이터셋, `sudo purge` 후 측정.
 
@@ -75,13 +132,13 @@ ccusage보다 **14배 빠르고**, zzusage와 비슷한 속도에 **메모리는
 | 1 GB | 119 MB | 127 MB | 1,209 MB |
 | 2 GB | 166 MB | 126 MB | **2,311 MB** |
 
-> **zzusage와 속도가 비슷한데 의미가 있나?** toki는 라인마다 더 많은 일을 합니다 — TSDB 쓰기, rollup 집계, 체크포인트 저장, JSON 스키마 검증. zzusage는 이걸 전부 생략하고 순수 파싱만 합니다. 그런데도 wall-clock 시간은 거의 같습니다. 그리고 zzusage는 구조 검사가 없어서, 조작된 JSONL로 사용량을 위조하는 게 가능합니다. toki는 TSDB에 넣기 전에 전부 검증합니다.
+> **zzusage와 속도가 비슷한데 의미가 있나?** toki는 라인마다 더 많은 일을 합니다 — TSDB 쓰기, rollup 집계, 체크포인트 저장, 스키마 검증. zzusage는 이걸 전부 생략하고 순수 파싱만 합니다. 그런데도 실행 시간은 거의 같습니다.
 
 </details>
 
 ### 리포트 속도 (색인 TSDB 조회 vs 전체 재스캔)
 
-toki report는 데이터 크기와 무관하게 **~7ms**. 2GB 기준 ccusage보다 **1,742배** 빠릅니다.
+데이터 크기와 무관하게 **~7ms**. 2GB 기준 ccusage보다 **1,742배** 빠릅니다.
 
 <p align="center">
   <img src="docs/bench_report.png" alt="리포트 벤치마크" width="900" />
@@ -130,62 +187,10 @@ cold start가 끝나면 toki는 시스템에서 사라집니다.
 |-----|--------|---------|
 | **~0%** | **5 MB** | **세션 데이터의 ~3%** (2GB 세션 → 64MB TSDB) |
 
-- **toki** — rayon 병렬 처리 + mmap zero-copy + 파일별 스트리밍. cold start가 끝나면 5MB, CPU 0%로 내려갑니다. Claude Code는 FSEvents(커널 레벨 push)로 감시합니다. Codex CLI는 macOS에서 FSEvents에 추가로 1초 폴링을 병행합니다 — macOS FSEvents는 fd가 닫힐 때만 이벤트를 발화하지만, Codex는 세션 내내 파일 fd를 열어둔 채 쓰기만 하기 때문입니다. Linux/Windows는 기본 watcher(inotify/ReadDirectoryChangesW)가 write마다 발화하므로 폴링 없이 동작합니다.
-- **ccusage** — 파일 하나씩 동기 블로킹. 매번 전체 파일을 순서대로 읽는 동안 터미널이 멈춥니다.
-- **zzusage** — 모든 이벤트를 메모리에 올린 뒤 처리. 2GB면 2.3GB RAM. 더 크면 OOM.
-
 idle 상태가 있는 건 toki뿐입니다. 나머지는 실행할 때마다 전체 비용을 지불합니다.
 
 > 측정 환경: Apple M1 MacBook Air (8GB RAM), macOS, 절전 모드 off.
 > 재현: `sudo -v && python3 benches/benchmark.py run --purge --tool all`
-
----
-
-## 동작 방식
-
-Docker처럼 데몬/클라이언트 구조로 동작합니다:
-
-```
-toki daemon start     # 항상 실행되는 서버   (≈ dockerd)
-toki trace            # 실시간 스트림        (≈ docker logs -f)
-toki report           # 즉시 TSDB 조회      (≈ docker ps)
-```
-
-- **daemon** — 설정된 provider(Claude Code, Codex CLI)의 세션 로그를 감시하고, 이벤트를 파싱해서 provider별 내장 TSDB(fjall)에 기록합니다. Claude Code는 FSEvents(turn마다 발화), Codex CLI는 macOS에서 FSEvents + 1초 폴링 병행(FSEvents가 fd close에서만 발화하는 macOS 커널 제약 때문). 기본 4스레드(Worker, Writer, Listener, Notify) + trace 클라이언트당 2스레드. trace 클라이언트가 없으면 Sink 오버헤드는 0입니다.
-- **trace** — UDS로 데몬에 연결해서 실시간 이벤트 스트림을 받습니다. 항상 JSONL을 stdout에 출력합니다 (`--output-format`과 `--sink`는 trace에 미적용).
-- **report** — UDS로 데몬에 쿼리를 보내고 (`REPORT` 커맨드 후 JSON payload), 모든 provider TSDB의 결과를 병합하여 받습니다. DB를 직접 열지 않습니다. 언제나 빠르고, 언제나 색인된 상태입니다. `--provider`로 단일 provider만 조회할 수도 있습니다.
-
----
-
-## Quick Start
-
-```bash
-# 설치 (macOS)
-brew tap korjwl1/tap
-brew install toki
-
-# toki는 ~/.claude, ~/.codex를 자동 감지합니다. 별도 설정 불필요.
-# 수동으로 provider를 관리하려면: toki settings (TUI) 또는 아래 CLI 사용
-# toki settings set providers --add claude_code
-# toki settings set providers --add codex
-
-# 1. 데몬 시작 (기본 백그라운드 실행)
-toki daemon start
-
-# 2. 다른 터미널에서 실시간 이벤트 스트림 (항상 JSONL 출력)
-toki trace
-
-# 3. 리포트 조회 (TSDB에서 즉시 조회)
-toki report                                   # 전체 provider 병합
-toki report --provider claude_code            # 단일 provider
-toki report daily --since 20260301
-toki report monthly
-
-# 4. PromQL 스타일 쿼리
-toki report query 'usage{model="claude-opus-4-6"}[1h] by (model)'
-toki report query 'sum(usage{since="20260301"}[1d]) by (project)'
-toki report query 'events{since="20260320"}'
-```
 
 ---
 
@@ -194,140 +199,54 @@ toki report query 'events{since="20260320"}'
 ### Daemon
 
 ```bash
-toki daemon start       # 데몬 시작 (백그라운드)
-toki daemon start --foreground  # 포그라운드 실행 (디버그용)
-toki daemon stop        # 데몬 중지
-toki daemon restart     # 중지 + 재시작 (설정 변경 반영)
-toki daemon status      # 실행 상태 확인
-toki daemon reset       # DB 전체 삭제 + 초기화
+toki daemon start                # 데몬 시작 (백그라운드)
+toki daemon start --foreground   # 포그라운드 실행 (디버그용)
+toki daemon stop                 # 데몬 중지
+toki daemon restart              # 중지 + 재시작 (설정 변경 반영)
+toki daemon status               # 실행 상태 확인
+toki daemon reset                # DB 전체 삭제 + 초기화
 ```
 
 ### Report
 
 ```bash
 # 전체 요약
-toki report                                         # 전체 provider
-toki report --provider claude_code                  # 단일 provider
+toki report
+toki report --provider claude_code
 toki report --since 20260301 --until 20260331
 
 # 시간별 그룹핑
 toki report daily --since 20260301
-toki report weekly --since 20260301 --start-of-week tue
+toki report weekly --start-of-week tue
 toki report monthly
-toki report yearly
-toki report hourly --since 20260301
 
 # 세션/프로젝트 필터
 toki report --group-by-session
 toki report --project toki
-toki report --session-id 4de9291e
-
-# Provider 필터
-toki report --provider codex daily --since 20260301
 
 # PromQL 스타일 쿼리
-toki report query 'usage{model="claude-opus-4-6"}[1h] by (model)'
-toki report query 'sum(usage{since="20260301"}[1d]) by (project)'
+toki report query 'sum(usage[1d]) by (project)'
 toki report query 'events{since="20260320"}'
 toki report query 'usage[1d] offset 7d'
-toki report query 'sessions{project="myapp"}'
-toki report query 'projects'
-
-# 옵션
-toki -z Asia/Seoul report daily --since 20260301   # 타임존 지정
-toki --no-cost report                               # 비용 표시 없이
 ```
 
-<details>
-<summary>리포트 옵션 레퍼런스</summary>
-
-| 옵션 | 설명 |
-|------|------|
-| *(서브커맨드 없음)* | 전체 총합 (`--since`/`--until` 선택적) |
-| `daily\|weekly\|monthly\|yearly\|hourly` | 시간별 그룹핑 |
-| `query '<PROMQL>'` | PromQL 스타일 자유 쿼리 |
-| `--since YYYYMMDD[hhmmss]` | 시작 시점 (inclusive, `>=`) |
-| `--until YYYYMMDD[hhmmss]` | 종료 시점 (inclusive, `<=`) |
-| `--group-by-session` | 세션별 그룹핑 (시간 서브커맨드와 동시 사용 불가) |
-| `--session-id <PREFIX>` | 세션 UUID 접두사 필터 |
-| `--project <NAME>` | 프로젝트 디렉토리 서브스트링 필터 |
-| `--provider <NAME>` | provider 필터 (`claude_code`, `codex`) |
-| `--start-of-week mon\|tue\|...\|sun` | `weekly`에서만 사용 |
-
-</details>
-
-<details>
-<summary>PromQL 쿼리 문법</summary>
-
-```
-[집계함수(] metric{filters}[bucket] [offset duration] [)] [by (dimensions)]
-```
-
-| 요소 | 설명 | 예시 |
-|------|------|------|
-| metric | `usage`, `sessions`, `projects`, `events` | `usage` |
-| filters | `key="value"` 쌍, `,`로 구분 | `{model="claude-opus-4-6", since="20260301"}` |
-| bucket | 시간 버킷 (s/m/h/d/w, 복합: `2h30m`) | `[1h]`, `[5m]`, `[2h30m]` |
-| offset | 시간 윈도우를 과거로 이동 | `offset 7d` |
-| 집계함수 | `sum`, `avg`, `count` — 모델 차원 collapse | `sum(usage[1d])` |
-| dimensions | 그룹 기준 (model/session/project) | `by (model, session)` |
-
-필터 키: `model`, `session`, `project`, `provider`, `since`, `until`
-
-</details>
+전체 명령어 레퍼런스, 쿼리 문법, 설정 옵션은 **[사용법 가이드](docs/USAGE.ko.md)**를 참고하세요.
 
 ### Trace
 
 ```bash
-toki trace                                              # JSONL 스트림 (stdout)
-toki trace --sink uds:///tmp/toki.sock                  # UDS로 중계
-toki trace --sink http://localhost:8080/events           # HTTP로 중계
-toki trace --sink print --sink http://localhost:8080     # 멀티 싱크
-toki trace --no-cost                                    # 비용 필드 제외
+toki trace                                          # JSONL 스트림 (stdout)
+toki trace --sink uds:///tmp/toki.sock              # UDS로 중계
+toki trace --sink http://localhost:8080/events       # HTTP로 중계
 ```
 
 ### Settings
 
 ```bash
-toki settings                                  # TUI 열기 (cursive)
-toki settings set claude_code_root /path       # 개별 설정 변경
-toki settings set providers --add claude_code  # Provider 추가
+toki settings                                  # TUI 열기
 toki settings set providers --add codex        # Provider 추가
-toki settings set providers --remove codex     # Provider 제거
-toki settings get providers                     # Provider 목록 + 상태 확인
-toki settings get timezone                     # 설정 조회
 toki settings list                             # 전체 설정 출력
 ```
-
-<details>
-<summary>설정 레퍼런스</summary>
-
-| 설정 항목 | 설명 | 기본값 |
-|-----------|------|--------|
-| Providers | 활성화된 provider (`toki settings set providers --add/--remove`로 관리) | `[]` |
-| Claude Code Root | Claude Code 루트 디렉토리 | `~/.claude` |
-| Daemon Socket | 데몬 UDS 소켓 경로 | `~/.config/toki/daemon.sock` |
-| Timezone | IANA 타임존 (빈값=UTC) | *(없음)* |
-| Output Format | 기본 출력 형식 | `table` |
-| Start of Week | 주간 리포트 시작 요일 | `mon` |
-| No Cost | 비용 계산 비활성화 | `false` |
-| Retention Days | 이벤트 보존 기간 (0=무제한) | `0` |
-| Rollup Retention Days | Rollup 보존 기간 (0=무제한) | `0` |
-
-우선순위: **CLI 인자 > settings.json > 기본값**
-
-</details>
-
-### 클라이언트 옵션
-
-| 옵션 | 적용 대상 | 설명 |
-|------|----------|------|
-| `--output-format table\|json` | report | 출력 형식 오버라이드 |
-| `--sink <SPEC>` | trace | 출력 대상: `print`, `uds://<path>`, `http://<url>` (복수 지정 가능) |
-| `--timezone <IANA>` / `-z` | report | 타임존 오버라이드 |
-| `--no-cost` | trace, report | 비용 계산 비활성화 |
-
-> Trace는 항상 JSONL을 출력한다. `--output-format`은 trace에 적용되지 않는다. `--sink uds://` 또는 `--sink http://` 사용 시 `toki trace`를 child process로 실행하면 부모 종료 시 자동 종료된다 (SIGPIPE).
 
 ---
 
@@ -340,6 +259,19 @@ toki settings list                             # 전체 설정 출력
 | *(gemini)* | [Gemini CLI](https://github.com/google-gemini/gemini-cli) | JSON (full rewrite) | 예정 |
 
 각 provider는 독립된 데이터베이스(`~/.config/toki/<provider>.fjall`)를 가집니다. 리포트는 기본적으로 모든 활성 provider의 결과를 병합하며, `--provider`로 단일 provider만 필터링할 수 있습니다.
+
+---
+
+## Toki Monitor
+
+[Toki Monitor](https://github.com/korjwl1/toki-monitor)는 toki 위에서 동작하는 macOS 메뉴바 앱입니다. 터미널을 열지 않아도 실시간 토큰 사용량을 볼 수 있습니다 — 토끼 캐릭터 애니메이션, 스파크라인 그래프, 프로젝트별 대시보드, 속도 기반 이상 감지 알림을 제공합니다. toki 데몬은 자동으로 함께 설치됩니다.
+
+```bash
+brew tap korjwl1/tap
+brew install --cask toki-monitor
+```
+
+---
 
 ## 예정된 기능
 
@@ -373,21 +305,19 @@ toki settings list                             # 전체 설정 출력
 
 - **최초 실행**: LiteLLM JSON 다운로드 → `litellm_provider` 기준 필터 (Anthropic, OpenAI, Gemini) → 파일 캐시 (`~/.config/toki/pricing.json`)
 - **이후 실행**: HTTP ETag 조건부 요청 → 변경 없으면 304 (바디 없이 ~50ms)
-- **오프라인**: 캐시된 데이터로 동작합니다. 캐시가 없으면 Cost 컬럼이 생략됩니다.
-- **`--no-cost`**: 가격 fetch를 건너뜁니다.
+- **오프라인**: 캐시된 데이터로 동작. 캐시가 없으면 Cost 컬럼 생략
+- **`--no-cost`**: 가격 fetch를 건너뜁니다
 
 ---
 
 ## 프라이버시 & 보안
 
-toki는 정책이 아닌 **아키텍처로 프라이버시를 보장**하도록 설계되었습니다.
+toki는 정책이 아닌 아키텍처로 프라이버시를 보장합니다.
 
-- **프롬프트 접근 없음**: toki의 JSONL 파서는 `"assistant"` 타입 줄만 역직렬화하고, `usage` 객체(토큰 수)와 `model` 필드만 추출합니다. 사용자 프롬프트, 어시스턴트 응답, 파일 내용, thinking 블록은 **메모리에 절대 로드되지 않습니다** — serde가 힙 할당 없이 건너뜁니다.
-- **데이터 네트워크 전송 없음**: 모든 처리는 로컬에서 이루어집니다. toki는 데이터를 어디에도 보내지 않습니다. 유일한 외부 요청은 공개 LiteLLM 레포지토리에서 가격표를 가져오는 선택적 요청뿐입니다 (`--no-cost`로 비활성화).
-- **대화 내용 로깅 없음**: TSDB에는 타임스탬프, 모델명, 세션 ID, 소스 파일 경로, 4개의 토큰 수 정수만 저장됩니다. 그 외에는 아무것도 없습니다.
-- **읽기 전용 접근**: toki는 세션 파일을 읽기만 합니다. CLI 도구의 데이터를 수정, 쓰기, 삭제하지 않습니다.
-
-이는 OpenTelemetry 기반 모니터링과 근본적으로 다릅니다. OTEL SDK는 CLI 프로세스 내부에서 실행되며, 설정에 따라 프롬프트, 도구 호출, API 요청 본문이 로그 이벤트에 포함될 수 있습니다. toki는 외부에서 동작하며 파싱 대상으로 선택한 것만 봅니다 — 그것은 엄밀히 토큰 메타데이터뿐입니다.
+- **프롬프트 접근 없음**: JSONL 파서는 `"assistant"` 라인에서 토큰 수와 모델명만 추출합니다. 프롬프트, 응답, 파일 내용, thinking 블록은 메모리에 로드되지 않습니다 — serde가 힙 할당 없이 건너뜁니다.
+- **데이터 전송 없음**: 모든 처리는 로컬에서 이루어집니다. 유일한 외부 요청은 LiteLLM 가격표 fetch뿐입니다 (`--no-cost`로 비활성화).
+- **대화 내용 로깅 없음**: TSDB에는 타임스탬프, 모델명, 세션 ID, 소스 파일 경로, 프로젝트명, 토큰 수 정수만 저장됩니다.
+- **읽기 전용 접근**: toki는 세션 파일을 읽기만 합니다. CLI 도구의 데이터를 수정하거나 삭제하지 않습니다.
 
 ---
 
