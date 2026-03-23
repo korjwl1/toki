@@ -400,6 +400,8 @@ src/
 
 If toki is useful to you, consider sponsoring to support development.
 
+For commercial use in paid products, please sponsor or [reach out](mailto:korjwl1@gmail.com).
+
 ---
 
 ## License
