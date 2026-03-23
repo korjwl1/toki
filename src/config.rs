@@ -78,11 +78,16 @@ impl Config {
         if let Some(v) = settings.get("claude_code_root").and_then(|v| v.as_str()) {
             if !v.is_empty() {
                 self.claude_code_root = v.to_string();
+            } else {
+                // Backfill default into settings file so `toki settings list` shows it
+                let _ = set_setting("claude_code_root", &self.claude_code_root);
             }
         }
         if let Some(v) = settings.get("codex_root").and_then(|v| v.as_str()) {
             if !v.is_empty() {
                 self.codex_root = v.to_string();
+            } else {
+                let _ = set_setting("codex_root", &self.codex_root);
             }
         }
 
