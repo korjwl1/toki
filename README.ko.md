@@ -17,6 +17,10 @@
   <a href="README.md">🇺🇸 English</a>
 </p>
 
+<p align="center">
+  <img src="assets/demo.gif" alt="toki 데모" width="900" />
+</p>
+
 ---
 
 ## 목차
