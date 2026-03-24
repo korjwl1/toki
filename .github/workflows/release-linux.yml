@@ -49,20 +49,7 @@ jobs:
           tar -czf toki-${VERSION}-${{ matrix.target }}.tar.gz \
             -C target/${{ matrix.target }}/release toki
 
-      - name: Upload to GitHub Release (toki repo)
+      - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: toki-*.tar.gz
-
-      - name: Upload to Homebrew tap release
-        env:
-          GH_TOKEN: ${{ secrets.TAP_RELEASE_TOKEN }}
-        run: |
-          VERSION=${GITHUB_REF_NAME#v}
-          ARCHIVE="toki-${VERSION}-${{ matrix.target }}.tar.gz"
-          # Create release on tap repo if it doesn't exist, then upload
-          gh release view "${GITHUB_REF_NAME}" --repo korjwl1/homebrew-tap 2>/dev/null \
-            || gh release create "${GITHUB_REF_NAME}" --repo korjwl1/homebrew-tap \
-                 --title "toki ${GITHUB_REF_NAME}" \
-                 --notes "Release artifacts for toki ${GITHUB_REF_NAME}"
-          gh release upload "${GITHUB_REF_NAME}" "${ARCHIVE}" --repo korjwl1/homebrew-tap --clobber

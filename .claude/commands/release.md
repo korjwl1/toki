@@ -44,30 +44,26 @@ done
 - Create an annotated tag: `git tag -a v{VERSION} -m "Release v{VERSION}"`
 - Show the user what will be pushed and ask for confirmation
 - Push the commit and tag: `git push origin main && git push origin v{VERSION}`
-- Tag push triggers GitHub Actions workflow (`.github/workflows/release-linux.yml`) which builds Linux x86_64 and aarch64 with jemalloc, and uploads to both toki and homebrew-tap releases
+- Tag push triggers GitHub Actions workflow (`.github/workflows/release-linux.yml`) which builds Linux x86_64 and aarch64 with jemalloc, and uploads to the toki release
 - Create GitHub release on **toki repo** with macOS archives:
   ```bash
   gh release create v{VERSION} toki-{VERSION}-*-apple-darwin.tar.gz --repo korjwl1/toki --title "v{VERSION}" --generate-notes
-  ```
-- Upload macOS archives to **homebrew-tap repo** release:
-  ```bash
-  gh release create v{VERSION} toki-{VERSION}-*-apple-darwin.tar.gz --repo korjwl1/homebrew-tap --title "toki v{VERSION}" --notes "Release artifacts for toki v{VERSION}"
   ```
 
 ### 6. Wait for GitHub Actions
 
 - Check the Actions run: `gh run list --repo korjwl1/toki --limit 3`
 - Wait for completion: `gh run watch --repo korjwl1/toki`
-- Once done, Linux archives will be uploaded to both repos' releases automatically
+- Once done, Linux archives will be uploaded to the toki release automatically
 
 ### 7. Update Homebrew tap
 
 After both macOS (local) and Linux (Actions) archives are uploaded, compute sha256 and update the tap formula.
 
-Download Linux archives from the release:
+Download Linux archives from the toki release:
 
 ```bash
-gh release download v{VERSION} --repo korjwl1/homebrew-tap --pattern "toki-{VERSION}-*-linux-*"
+gh release download v{VERSION} --repo korjwl1/toki --pattern "toki-{VERSION}-*-linux-*"
 ```
 
 Compute sha256 for all 4 archives:
@@ -85,7 +81,7 @@ Clone tap repo and write the updated Formula/toki.rb:
 cd /tmp && rm -rf homebrew-tap && git clone https://github.com/korjwl1/homebrew-tap.git && cd homebrew-tap
 ```
 
-**IMPORTANT**: Formula URLs must point to `korjwl1/homebrew-tap` releases (public), NOT `korjwl1/toki` (private).
+Formula URLs point to `korjwl1/toki` releases (public repo).
 
 The formula template:
 
@@ -98,22 +94,22 @@ class Toki < Formula
 
   on_macos do
     on_arm do
-      url "https://github.com/korjwl1/homebrew-tap/releases/download/v{VERSION}/toki-{VERSION}-aarch64-apple-darwin.tar.gz"
+      url "https://github.com/korjwl1/toki/releases/download/v{VERSION}/toki-{VERSION}-aarch64-apple-darwin.tar.gz"
       sha256 "{SHA_AARCH64_DARWIN}"
     end
     on_intel do
-      url "https://github.com/korjwl1/homebrew-tap/releases/download/v{VERSION}/toki-{VERSION}-x86_64-apple-darwin.tar.gz"
+      url "https://github.com/korjwl1/toki/releases/download/v{VERSION}/toki-{VERSION}-x86_64-apple-darwin.tar.gz"
       sha256 "{SHA_X86_64_DARWIN}"
     end
   end
 
   on_linux do
     on_arm do
-      url "https://github.com/korjwl1/homebrew-tap/releases/download/v{VERSION}/toki-{VERSION}-aarch64-unknown-linux-gnu.tar.gz"
+      url "https://github.com/korjwl1/toki/releases/download/v{VERSION}/toki-{VERSION}-aarch64-unknown-linux-gnu.tar.gz"
       sha256 "{SHA_AARCH64_LINUX}"
     end
     on_intel do
-      url "https://github.com/korjwl1/homebrew-tap/releases/download/v{VERSION}/toki-{VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+      url "https://github.com/korjwl1/toki/releases/download/v{VERSION}/toki-{VERSION}-x86_64-unknown-linux-gnu.tar.gz"
       sha256 "{SHA_X86_64_LINUX}"
     end
   end
@@ -166,5 +162,4 @@ git add Formula/toki.rb && git commit -m "Update toki to {VERSION}" && git push
 - Linux builds use jemalloc (required to prevent memory fragmentation on long-running daemons)
 - macOS builds are done locally (10x cheaper than Actions macOS runners)
 - Linux builds are done via GitHub Actions (native Linux runners, no cross-compilation issues with jemalloc)
-- GitHub Actions workflow requires `TAP_RELEASE_TOKEN` secret for uploading to homebrew-tap repo
-- When toki repo becomes public, update Formula URLs to point to `korjwl1/toki` releases instead, and stop uploading to homebrew-tap releases.
+- All release artifacts are hosted on `korjwl1/toki` releases (public repo)
