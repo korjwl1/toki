@@ -506,6 +506,15 @@ fn start_daemon_detached() {
         .write(true)
         .truncate(true)
         .open(&log_path)
+        .or_else(|_| {
+            // macOS quarantine (com.apple.provenance) can block reopening.
+            // Delete and recreate the file.
+            std::fs::remove_file(&log_path).ok();
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(&log_path)
+        })
         .unwrap_or_else(|e| {
             eprintln!("[toki] Failed to open log file {}: {}", log_path.display(), e);
             std::process::exit(1);
