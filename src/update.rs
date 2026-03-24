@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 const GITHUB_LATEST_URL: &str = "https://api.github.com/repos/korjwl1/toki/releases/latest";
 /// Only check once per this interval (seconds).
-const CHECK_INTERVAL_SECS: u64 = 3600; // 1 hour
+const CHECK_INTERVAL_SECS: u64 = 86400; // 24 hours
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct UpdateCache {
