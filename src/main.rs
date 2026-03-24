@@ -129,6 +129,10 @@ enum DaemonCommands {
     Status,
     /// Delete all data and reset the database
     Reset,
+    /// Enable auto-start on login
+    Enable,
+    /// Disable auto-start on login
+    Disable,
 }
 
 #[derive(Args, Clone)]
@@ -361,7 +365,7 @@ fn main() {
 const VALID_SETTINGS: &[&str] = &[
     "claude_code_root", "codex_root", "daemon_sock", "timezone", "output_format",
     "start_of_week", "no_cost", "retention_days", "rollup_retention_days",
-    "providers",
+    "providers", "daemon_autostart",
 ];
 
 /// Settings that require daemon restart to take effect.
@@ -709,6 +713,32 @@ fn handle_daemon(command: DaemonCommands, config: &Config) {
                 println!("[toki] No databases found in {}", config.db_base_dir.display());
             }
             println!("[toki] Reset complete. Start the daemon to rebuild: toki daemon start");
+        }
+
+        DaemonCommands::Enable => {
+            match toki::platform::enable_autostart() {
+                Ok(()) => {
+                    let _ = toki::config::set_setting("daemon_autostart", "true");
+                    println!("[toki] Auto-start enabled. toki daemon will start on login.");
+                }
+                Err(e) => {
+                    eprintln!("[toki] Failed to enable auto-start: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+
+        DaemonCommands::Disable => {
+            match toki::platform::disable_autostart() {
+                Ok(()) => {
+                    let _ = toki::config::set_setting("daemon_autostart", "false");
+                    println!("[toki] Auto-start disabled.");
+                }
+                Err(e) => {
+                    eprintln!("[toki] Failed to disable auto-start: {}", e);
+                    std::process::exit(1);
+                }
+            }
         }
     }
 }

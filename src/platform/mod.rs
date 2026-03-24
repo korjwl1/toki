@@ -7,6 +7,36 @@ pub mod windows;
 #[cfg(target_os = "linux")]
 pub mod linux;
 
+/// Enable auto-start on login (platform-specific).
+pub fn enable_autostart() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    { return macos::enable_autostart(); }
+    #[cfg(target_os = "linux")]
+    { return linux::enable_autostart(); }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    { Err("auto-start not supported on this platform".to_string()) }
+}
+
+/// Disable auto-start on login (platform-specific).
+pub fn disable_autostart() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    { return macos::disable_autostart(); }
+    #[cfg(target_os = "linux")]
+    { return linux::disable_autostart(); }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    { Err("auto-start not supported on this platform".to_string()) }
+}
+
+/// Check if auto-start is enabled (platform-specific).
+pub fn is_autostart_enabled() -> bool {
+    #[cfg(target_os = "macos")]
+    { return macos::is_autostart_enabled(); }
+    #[cfg(target_os = "linux")]
+    { return linux::is_autostart_enabled(); }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    { false }
+}
+
 use crossbeam_channel::Sender;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::Path;
