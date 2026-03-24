@@ -12,6 +12,7 @@ pub mod query_parser;
 pub mod retention;
 pub mod settings;
 pub mod sink;
+pub mod update;
 pub mod writer;
 
 pub use common::types::{UsageEvent, UsageEventWithTs, ModelUsageSummary, SessionGroup, TokiError};

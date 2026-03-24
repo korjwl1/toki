@@ -675,6 +675,7 @@ fn handle_daemon(command: DaemonCommands, config: &Config) {
                 Some(pid) => {
                     println!("[toki] Daemon is running (PID {})", pid);
                     println!("[toki] Socket: {}", config.daemon_sock.display());
+                    print_update_hint();
                 }
                 None => {
                     println!("[toki] Daemon is not running.");
@@ -836,6 +837,12 @@ fn handle_trace(config: &Config, sink_specs: &[String], no_cost: bool) {
     println!("[toki] Disconnected.");
 }
 
+fn print_update_hint() {
+    if let Some(latest) = toki::update::check_for_update(&toki::update::default_cache_path()) {
+        eprintln!("[toki] Update available: v{} → brew upgrade toki", latest);
+    }
+}
+
 // ── Report ──────────────────────────────────────────────
 
 fn handle_report(
@@ -955,6 +962,8 @@ fn handle_report(
                 for item in resp.data.as_array().unwrap_or(&vec![]) {
                     dispatch_result_to_sink(item, sink.as_ref(), pricing.as_ref());
                 }
+                // Check for updates (table output only)
+                print_update_hint();
             }
         }
         Err(e) => {
