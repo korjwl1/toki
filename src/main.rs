@@ -450,6 +450,8 @@ fn handle_settings_get(key: &str) {
         return;
     }
 
+    // Trigger Config load to backfill missing defaults into settings.json
+    let _ = Config::new();
     match toki::config::get_setting(key) {
         Some(v) => println!("{}", v),
         None => println!("(not set)"),
@@ -457,6 +459,7 @@ fn handle_settings_get(key: &str) {
 }
 
 fn handle_settings_list() {
+    let _ = Config::new();
     let settings = toki::config::list_settings();
     for key in VALID_SETTINGS {
         let value = settings.get(*key).map(|s| s.as_str()).unwrap_or("(not set)");
