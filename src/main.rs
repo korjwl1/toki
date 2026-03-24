@@ -660,6 +660,8 @@ fn handle_daemon(command: DaemonCommands, config: &Config) {
 
         DaemonCommands::Restart => {
             stop_running_daemon(config);
+            // Brief pause to ensure DB file locks are fully released by the OS
+            std::thread::sleep(std::time::Duration::from_millis(500));
             RUNNING.store(true, Ordering::Relaxed);
             start_daemon_detached();
         }
