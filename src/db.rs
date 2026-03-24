@@ -16,10 +16,36 @@ pub struct Database {
     dict: Keyspace,
 }
 
+/// Schema version. Increment when StoredEvent, RollupValue, or keyspace layout changes.
+/// Mismatched version triggers automatic DB reset + cold start rebuild.
+pub const SCHEMA_VERSION: u32 = 2;
+
 impl Database {
     pub fn open(path: &Path) -> Result<Self, fjall::Error> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
+        }
+
+        // Check schema version; wipe and recreate if mismatched
+        if path.exists() {
+            if let Ok(db) = FjallDatabase::builder(path).open() {
+                let opts = || KeyspaceCreateOptions::default();
+                if let Ok(meta) = db.keyspace("meta", opts) {
+                    let stored_version = meta.get("schema_version")
+                        .ok()
+                        .flatten()
+                        .and_then(|b| String::from_utf8_lossy(&b).parse::<u32>().ok())
+                        .unwrap_or(0);
+
+                    if stored_version != SCHEMA_VERSION {
+                        eprintln!("[toki] Schema version changed ({} → {}), resetting database...",
+                            stored_version, SCHEMA_VERSION);
+                        drop(meta);
+                        drop(db);
+                        std::fs::remove_dir_all(path).ok();
+                    }
+                }
+            }
         }
 
         let db = FjallDatabase::builder(path)
@@ -33,6 +59,9 @@ impl Database {
         let idx_sessions = db.keyspace("idx_sessions", opts)?;
         let idx_projects = db.keyspace("idx_projects", opts)?;
         let dict = db.keyspace("dict", opts)?;
+
+        // Write current schema version
+        meta.insert("schema_version", SCHEMA_VERSION.to_string().as_bytes())?;
 
         Ok(Database { db, checkpoints, meta, events, rollups, idx_sessions, idx_projects, dict })
     }
