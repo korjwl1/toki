@@ -18,6 +18,10 @@
 </p>
 
 <p align="center">
+  <em>Not just vibe-coded — carefully architected by a professional developer.</em>
+</p>
+
+<p align="center">
   <img src="assets/demo.gif" alt="toki demo" width="900" />
 </p>
 

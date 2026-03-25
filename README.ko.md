@@ -18,6 +18,10 @@
 </p>
 
 <p align="center">
+  <em>단순한 바이브 코딩이 아닌, 전문 개발자가 세심하게 설계한 프로그램입니다.</em>
+</p>
+
+<p align="center">
   <img src="assets/demo.gif" alt="toki 데모" width="900" />
 </p>
 

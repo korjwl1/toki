@@ -501,22 +501,25 @@ fn start_daemon_detached() {
         std::fs::create_dir_all(parent).ok();
     }
 
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&log_path)
+    // Always remove old log first — avoids macOS quarantine (com.apple.provenance)
+    // and prevents stale "Listening" content from causing false readiness detection.
+    let _ = std::fs::remove_file(&log_path);
+
+    let log_file = std::fs::File::create(&log_path)
         .or_else(|_| {
-            // macOS quarantine (com.apple.provenance) can block reopening.
-            // Delete and recreate the file.
-            std::fs::remove_file(&log_path).ok();
-            std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .open(&log_path)
+            // quarantine xattr may still block; clear all xattrs and retry
+            #[cfg(target_os = "macos")]
+            {
+                let _ = std::process::Command::new("xattr")
+                    .args(["-c"])
+                    .arg(&log_path)
+                    .output();
+            }
+            let _ = std::fs::remove_file(&log_path);
+            std::fs::File::create(&log_path)
         })
         .unwrap_or_else(|e| {
-            eprintln!("[toki] Failed to open log file {}: {}", log_path.display(), e);
+            eprintln!("[toki] Failed to create log file {}: {}", log_path.display(), e);
             std::process::exit(1);
         });
 
