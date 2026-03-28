@@ -1592,15 +1592,17 @@ fn rpassword_read() -> String {
         let _ = std::io::stderr().flush();
         // Use /dev/tty directly for password input
         if let Ok(mut tty) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
+            use std::os::unix::io::AsRawFd;
+            let tty_fd = tty.as_raw_fd();
             let original = unsafe {
                 let mut t = std::mem::zeroed::<libc::termios>();
-                libc::tcgetattr(libc::STDIN_FILENO, &mut t);
+                libc::tcgetattr(tty_fd, &mut t);
                 t
             };
             // Disable echo
             let mut raw = original;
             raw.c_lflag &= !libc::ECHO;
-            unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw); }
+            unsafe { libc::tcsetattr(tty_fd, libc::TCSANOW, &raw); }
 
             let mut pw = String::new();
             use std::io::BufRead;
@@ -1608,7 +1610,7 @@ fn rpassword_read() -> String {
             let _ = reader.lines().next().map(|l| pw = l.unwrap_or_default());
 
             // Restore echo
-            unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &original); }
+            unsafe { libc::tcsetattr(tty_fd, libc::TCSANOW, &original); }
             eprintln!(); // newline after hidden password
             return pw;
         }

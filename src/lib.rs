@@ -286,6 +286,9 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
         })
         .collect();
 
+    // Check credentials file permissions before starting sync
+    crate::sync::credentials::check_file_permissions();
+
     // Start sync threads — one per provider (no-op if sync not configured)
     let mut sync_stops: Vec<crossbeam_channel::Sender<()>> = Vec::new();
     let mut sync_threads: Vec<Option<JoinHandle<()>>> = Vec::new();

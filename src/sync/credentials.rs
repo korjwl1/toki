@@ -114,14 +114,23 @@ fn save_to_file(json: &str) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("create dir: {e}"))?;
     }
-    std::fs::write(&path, json).map_err(|e| format!("write credentials: {e}"))?;
 
-    // chmod 600
+    use std::io::Write;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(&path, perms).map_err(|e| format!("chmod 600: {e}"))?;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .map_err(|e| format!("open credentials: {e}"))?;
+        file.write_all(json.as_bytes()).map_err(|e| format!("write credentials: {e}"))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&path, json).map_err(|e| format!("write credentials: {e}"))?;
     }
 
     Ok(())

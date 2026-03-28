@@ -246,7 +246,7 @@ fn sync_new_events(
     let since_ms = server_last_ts;
 
     // Query events newer than cursor (since_ms + 1 to exclude already-synced events at exactly since_ms)
-    let events = db.query_events_range(since_ms + 1, i64::MAX)
+    let events = db.query_events_range(since_ms.saturating_add(1), i64::MAX)
         .map_err(|e| format!("query_events_range failed: {e}"))?;
 
     if events.is_empty() {
