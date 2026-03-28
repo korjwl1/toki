@@ -1595,7 +1595,7 @@ fn handle_oidc_login(http_base: &str, auth_url_path: &str, headless: bool) -> (S
         std::process::exit(1);
     });
     let local_port = listener.local_addr().unwrap().port();
-    let redirect_uri = format!("http://localhost:{}/callback", local_port);
+    let redirect_uri = format!("http://127.0.0.1:{}/callback", local_port);
 
     // Build the full authorization URL with our redirect_uri
     let full_auth_url = if auth_url_path.starts_with("http") {
@@ -1628,14 +1628,28 @@ fn handle_oidc_login(http_base: &str, auth_url_path: &str, headless: bool) -> (S
     #[cfg(target_os = "linux")]
     { let _ = std::process::Command::new("xdg-open").arg(&full_auth_url).spawn(); }
 
-    // Wait for callback (single connection)
-    eprintln!("[toki] Waiting for authentication callback...");
-    listener.set_nonblocking(false).ok();
+    // Wait for callback (single connection) with 5-minute timeout
+    eprintln!("[toki] Waiting for authentication callback (5 min timeout)...");
+    listener.set_nonblocking(true).ok();
 
-    let (mut stream, _) = listener.accept().unwrap_or_else(|e| {
-        eprintln!("[toki] Failed to accept callback connection: {}", e);
-        std::process::exit(1);
-    });
+    let timeout = std::time::Duration::from_secs(300);
+    let start = std::time::Instant::now();
+    let (mut stream, _) = loop {
+        match listener.accept() {
+            Ok(conn) => break conn,
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if start.elapsed() > timeout {
+                    eprintln!("[toki] OIDC login timed out (5 minutes). Please try again.");
+                    std::process::exit(1);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(e) => {
+                eprintln!("[toki] Failed to accept callback connection: {}", e);
+                std::process::exit(1);
+            }
+        }
+    };
 
     // Read the HTTP request
     let mut buf = vec![0u8; 8192];
