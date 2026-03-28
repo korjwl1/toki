@@ -1,5 +1,6 @@
 pub mod backoff;
 pub mod client;
+pub mod credentials;
 pub mod protocol;
 pub mod thread;
 

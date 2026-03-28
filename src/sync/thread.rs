@@ -17,6 +17,11 @@ pub struct SyncConfig {
 }
 
 impl SyncConfig {
+    /// Returns the default device name (hostname or "unknown").
+    pub fn default_device_name() -> String {
+        gethostname()
+    }
+
     /// Load from toki settings DB. Returns None if sync is not configured.
     pub fn load(provider: &str) -> Option<Self> {
         let enabled = crate::config::get_setting("sync_enabled")?;

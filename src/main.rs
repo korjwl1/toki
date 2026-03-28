@@ -86,6 +86,11 @@ enum Commands {
         #[command(subcommand)]
         command: Option<SettingsCommands>,
     },
+    /// Multi-device sync: enable, disable, status, devices
+    Sync {
+        #[command(subcommand)]
+        command: SyncCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -111,6 +116,31 @@ enum SettingsCommands {
     },
     /// List all settings
     List,
+}
+
+#[derive(Subcommand)]
+enum SyncCommands {
+    /// Enable sync: log in to a toki-sync server and store credentials
+    Enable {
+        /// TCP sync address (host:port), e.g. sync.example.com:9090
+        #[arg(long)]
+        server: String,
+        /// HTTP base URL for API calls (default: http://<host>:9091)
+        #[arg(long)]
+        http_url: Option<String>,
+        /// Username for login
+        #[arg(long, short = 'u')]
+        username: String,
+        /// Password (prompted if omitted)
+        #[arg(long)]
+        password: Option<String>,
+    },
+    /// Disable sync and remove stored credentials
+    Disable,
+    /// Show sync connection status
+    Status,
+    /// List devices registered with this account
+    Devices,
 }
 
 #[derive(Subcommand)]
@@ -326,6 +356,9 @@ fn main() {
                 }
             }
         }
+        Commands::Sync { command } => {
+            handle_sync(command);
+        }
         Commands::Daemon { command } => {
             let config = build_config(None, false, None);
             handle_daemon(command, &config);
@@ -366,6 +399,7 @@ const VALID_SETTINGS: &[&str] = &[
     "claude_code_root", "codex_root", "daemon_sock", "timezone", "output_format",
     "start_of_week", "no_cost", "retention_days", "rollup_retention_days",
     "providers", "daemon_autostart",
+    "sync_enabled", "sync_server", "sync_access_token", "sync_device_name",
 ];
 
 /// Settings that require daemon restart to take effect.
@@ -1325,6 +1359,251 @@ fn validate_range(since: Option<NaiveDateTime>, until: Option<NaiveDateTime>) {
             std::process::exit(1);
         }
     }
+}
+
+// ── Sync commands ────────────────────────────────────────────────────────────
+
+fn handle_sync(command: SyncCommands) {
+    // Warn if credentials file has bad permissions (Linux only)
+    toki::sync::credentials::check_file_permissions();
+
+    match command {
+        SyncCommands::Enable { server, http_url, username, password } => {
+            handle_sync_enable(server, http_url, username, password);
+        }
+        SyncCommands::Disable => {
+            handle_sync_disable();
+        }
+        SyncCommands::Status => {
+            handle_sync_status();
+        }
+        SyncCommands::Devices => {
+            handle_sync_devices();
+        }
+    }
+}
+
+fn handle_sync_enable(
+    server: String,
+    http_url: Option<String>,
+    username: String,
+    password: Option<String>,
+) {
+    // Derive HTTP URL from server address if not provided
+    let http_base = http_url.unwrap_or_else(|| {
+        let host = server.split(':').next().unwrap_or(&server);
+        format!("http://{}:9091", host)
+    });
+
+    // Prompt for password if not provided
+    let pw = password.unwrap_or_else(|| {
+        eprint!("Password: ");
+        rpassword_read()
+    });
+
+    // GET /auth-method — verify server is reachable
+    let url = format!("{}/auth-method", http_base);
+    match ureq::post(&url)
+        .send_json(serde_json::json!({ "username": username }))
+    {
+        Err(e) => {
+            eprintln!("[toki] Cannot reach sync server at {}: {}", http_base, e);
+            std::process::exit(1);
+        }
+        Ok(_) => {}
+    }
+
+    // POST /login
+    let login_url = format!("{}/login", http_base);
+    let resp = match ureq::post(&login_url)
+        .send_json(serde_json::json!({
+            "username": username,
+            "password": pw,
+        }))
+    {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            eprintln!("[toki] Login failed (HTTP {}): {}", code, body.trim());
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("[toki] Login error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let body: serde_json::Value = match resp.into_json() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[toki] Invalid login response: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let access_token = body["access_token"].as_str().unwrap_or("").to_string();
+    let refresh_token = body["refresh_token"].as_str().unwrap_or("").to_string();
+
+    if access_token.is_empty() {
+        eprintln!("[toki] Login response missing access_token");
+        std::process::exit(1);
+    }
+
+    // Save credentials
+    let creds = toki::sync::credentials::Credentials {
+        server_addr: server.clone(),
+        http_url: http_base,
+        access_token: access_token.clone(),
+        refresh_token,
+    };
+    if let Err(e) = toki::sync::credentials::save(&creds) {
+        eprintln!("[toki] Failed to save credentials: {}", e);
+        std::process::exit(1);
+    }
+
+    // Update settings so the daemon picks up sync on next start
+    let device_name = toki::sync::thread::SyncConfig::default_device_name();
+    let _ = toki::config::set_setting("sync_enabled", "true");
+    let _ = toki::config::set_setting("sync_server", &server);
+    let _ = toki::config::set_setting("sync_access_token", &access_token);
+    let _ = toki::config::set_setting("sync_device_name", &device_name);
+
+    println!("[toki] Sync enabled.");
+    println!("[toki] Server:  {}", server);
+    println!("[toki] Device:  {}", device_name);
+
+    // Prompt daemon restart
+    let pidfile = toki::daemon::default_pidfile_path();
+    if toki::daemon::daemon_status(&pidfile).is_some() {
+        eprintln!("[toki] Restart daemon to start syncing: toki daemon restart");
+    }
+}
+
+fn handle_sync_disable() {
+    if let Err(e) = toki::sync::credentials::delete() {
+        eprintln!("[toki] Failed to delete credentials: {}", e);
+    }
+    let _ = toki::config::set_setting("sync_enabled", "false");
+    println!("[toki] Sync disabled.");
+
+    let pidfile = toki::daemon::default_pidfile_path();
+    if toki::daemon::daemon_status(&pidfile).is_some() {
+        eprintln!("[toki] Restart daemon to stop sync thread: toki daemon restart");
+    }
+}
+
+fn handle_sync_status() {
+    let enabled = toki::config::get_setting("sync_enabled")
+        .map(|v| v == "true").unwrap_or(false);
+    let server = toki::config::get_setting("sync_server").unwrap_or_else(|| "(not set)".to_string());
+    let device = toki::config::get_setting("sync_device_name").unwrap_or_else(|| "(not set)".to_string());
+    let last_ts: i64 = toki::config::get_setting("sync_last_ts")
+        .and_then(|s| s.parse().ok()).unwrap_or(0);
+
+    println!("Sync status:");
+    println!("  enabled:    {}", if enabled { "yes" } else { "no" });
+    println!("  server:     {}", server);
+    println!("  device:     {}", device);
+    if last_ts > 0 {
+        let last_dt = chrono::DateTime::from_timestamp_millis(last_ts)
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+            .unwrap_or_else(|| last_ts.to_string());
+        println!("  last sync:  {}", last_dt);
+    } else {
+        println!("  last sync:  (never)");
+    }
+
+    // Check if credentials are present
+    let has_creds = toki::sync::credentials::load().is_some();
+    println!("  credentials: {}", if has_creds { "stored" } else { "not found" });
+}
+
+fn handle_sync_devices() {
+    let creds = match toki::sync::credentials::load() {
+        Some(c) => c,
+        None => {
+            eprintln!("[toki] Not configured. Run: toki sync enable --server <addr> --username <user>");
+            std::process::exit(1);
+        }
+    };
+
+    let url = format!("{}/me/devices", creds.http_url);
+    let resp = match ureq::get(&url)
+        .set("Authorization", &format!("Bearer {}", creds.access_token))
+        .call()
+    {
+        Ok(r) => r,
+        Err(ureq::Error::Status(401, _)) => {
+            eprintln!("[toki] Token expired. Re-enable sync: toki sync enable ...");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("[toki] Request failed: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let body: serde_json::Value = match resp.into_json() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[toki] Invalid response: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let devices = body["devices"].as_array().cloned().unwrap_or_default();
+    if devices.is_empty() {
+        println!("No devices registered.");
+        return;
+    }
+
+    println!("{:<36}  {:<24}  {}", "Device ID", "Name", "Last Seen");
+    println!("{}", "-".repeat(80));
+    for d in &devices {
+        let id        = d["id"].as_str().unwrap_or("-");
+        let name      = d["name"].as_str().unwrap_or("-");
+        let last_seen = d["last_seen_at"].as_i64()
+            .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
+            .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
+            .unwrap_or_else(|| "-".to_string());
+        println!("{:<36}  {:<24}  {}", id, name, last_seen);
+    }
+}
+
+/// Read password from terminal without echoing (fallback: read line if not a tty).
+fn rpassword_read() -> String {
+    // Try to disable echo via termios
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        let _ = std::io::stderr().flush();
+        // Use /dev/tty directly for password input
+        if let Ok(mut tty) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
+            let original = unsafe {
+                let mut t = std::mem::zeroed::<libc::termios>();
+                libc::tcgetattr(libc::STDIN_FILENO, &mut t);
+                t
+            };
+            // Disable echo
+            let mut raw = original;
+            raw.c_lflag &= !libc::ECHO;
+            unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &raw); }
+
+            let mut pw = String::new();
+            use std::io::BufRead;
+            let reader = std::io::BufReader::new(&mut tty);
+            let _ = reader.lines().next().map(|l| pw = l.unwrap_or_default());
+
+            // Restore echo
+            unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &original); }
+            eprintln!(); // newline after hidden password
+            return pw;
+        }
+    }
+    // Fallback: read from stdin (password will be echoed)
+    let mut pw = String::new();
+    let _ = std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut pw);
+    pw.trim_end_matches('\n').to_string()
 }
 
 fn parse_weekday(s: &str) -> Weekday {

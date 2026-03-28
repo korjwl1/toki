@@ -32,7 +32,8 @@ fs2 = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 chrono-tz = "0.10"
 comfy-table = ">=7.1, <7.2"
-ureq = "2"
+ureq = { version = "2", features = ["json"] }
+keyring = "2"
 cursive = { version = "0.21", default-features = false, features = ["crossterm-backend"] }
 memmap2 = "0.9.10"
 memchr = "2.8.0"
