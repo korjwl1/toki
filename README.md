@@ -269,10 +269,10 @@ toki settings list                             # List all
 ### Sync
 
 ```bash
-toki sync enable --server <host:port> --username <user>  # Connect to sync server
-toki sync disable                                         # Disconnect
-toki sync status                                          # Connection info
-toki sync devices                                         # Registered devices
+toki settings sync enable --server <host:port> --username <user>  # Connect to sync server
+toki settings sync disable                                         # Disconnect
+toki settings sync status                                          # Connection info
+toki settings sync devices                                         # Registered devices
 ```
 
 Also available as `toki settings sync ...`.
@@ -287,22 +287,22 @@ Sync token usage across multiple machines to a central [toki-sync](https://githu
 
 ```bash
 # Connect to your sync server
-toki sync enable --server sync.example.com:9090 --username admin
+toki settings sync enable --server sync.example.com:9090 --username admin
 
 # For self-signed TLS (IP-only servers)
-toki sync enable --server 1.2.3.4:9090 --insecure --username admin
+toki settings sync enable --server 1.2.3.4:9090 --insecure --username admin
 
 # Check status
-toki sync status
+toki settings sync status
 
 # List registered devices
-toki sync devices
+toki settings sync devices
 
 # Query server data from CLI
 toki report query --remote 'sum by (model)(toki_tokens_total)'
 
 # Disable sync
-toki sync disable
+toki settings sync disable
 ```
 
 ### How it works
@@ -311,7 +311,7 @@ toki sync disable
 - Events are batched (1,000/batch), zstd-compressed (≥100 items), and sent with ACK-based flow control
 - On disconnect: events accumulate locally in fjall DB, delta-synced on reconnect
 - JWT auto-refresh, exponential backoff (2s→300s cap), wake detection
-- Settings hot-reload: `toki sync enable` takes effect without daemon restart
+- Settings hot-reload: `toki settings sync enable` takes effect without daemon restart
 
 ### Privacy
 

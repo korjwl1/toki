@@ -359,9 +359,9 @@ Sync token usage across multiple devices to a central [toki-sync](https://github
 ### sync enable
 
 ```bash
-toki sync enable --server <host:port> --username <user>
-toki sync enable --server sync.example.com:9090 --username admin
-toki sync enable --server 1.2.3.4:9090 --insecure --username admin
+toki settings sync enable --server <host:port> --username <user>
+toki settings sync enable --server sync.example.com:9090 --username admin
+toki settings sync enable --server 1.2.3.4:9090 --insecure --username admin
 ```
 
 Connects the daemon to a toki-sync server. Prompts for password interactively (or use `--password` for scripts). Takes effect immediately via hot-reload — no daemon restart needed.
@@ -380,7 +380,7 @@ Credentials are stored in macOS Keychain (macOS) or `~/.config/toki/sync.json` (
 ### sync disable
 
 ```bash
-toki sync disable
+toki settings sync disable
 ```
 
 Disconnects from the sync server. Takes effect immediately via hot-reload.
@@ -388,7 +388,7 @@ Disconnects from the sync server. Takes effect immediately via hot-reload.
 ### sync status
 
 ```bash
-toki sync status
+toki settings sync status
 ```
 
 Shows current sync configuration: server address, username, connection state, and TLS mode.
@@ -396,7 +396,7 @@ Shows current sync configuration: server address, username, connection state, an
 ### sync devices
 
 ```bash
-toki sync devices
+toki settings sync devices
 ```
 
 Lists all devices registered under your account on the sync server.

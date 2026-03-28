@@ -363,9 +363,9 @@ toki settings list
 ### sync enable
 
 ```bash
-toki sync enable --server <host:port> --username <user>
-toki sync enable --server sync.example.com:9090 --username admin
-toki sync enable --server 1.2.3.4:9090 --insecure --username admin
+toki settings sync enable --server <host:port> --username <user>
+toki settings sync enable --server sync.example.com:9090 --username admin
+toki settings sync enable --server 1.2.3.4:9090 --insecure --username admin
 ```
 
 데몬을 toki-sync 서버에 연결한다. 비밀번호는 대화형으로 입력받는다 (스크립트에서는 `--password` 사용). 핫리로드로 즉시 반영 — 데몬 재시작 불필요.
@@ -384,7 +384,7 @@ toki sync enable --server 1.2.3.4:9090 --insecure --username admin
 ### sync disable
 
 ```bash
-toki sync disable
+toki settings sync disable
 ```
 
 동기화 서버와의 연결을 해제한다. 핫리로드로 즉시 반영.
@@ -392,7 +392,7 @@ toki sync disable
 ### sync status
 
 ```bash
-toki sync status
+toki settings sync status
 ```
 
 현재 동기화 설정을 표시한다: 서버 주소, 사용자명, 연결 상태, TLS 모드.
@@ -400,7 +400,7 @@ toki sync status
 ### sync devices
 
 ```bash
-toki sync devices
+toki settings sync devices
 ```
 
 동기화 서버에 등록된 모든 디바이스 목록을 표시한다.
