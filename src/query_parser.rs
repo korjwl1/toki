@@ -1,20 +1,34 @@
 /// Minimal PromQL-inspired query parser for toki.
 ///
-/// Grammar:
-///   query   = aggregation_start? metric filters? bucket? offset? aggregation_end? group_by?
-///   aggregation_start = ("sum" | "avg" | "count") "("
-///   aggregation_end = ")"
-///   metric  = "usage" | "sessions" | "projects" | "events"
-///   filters = "{" (filter ("," filter)*)? "}"
-///   filter  = key "=" quoted_string
-///   bucket  = "[" duration "]"
-///   offset  = "offset" duration
-///   group_by = "by" "(" key ("," key)* ")"
+/// Grammar (two accepted forms):
+///
+///   Standard PromQL (preferred):
+///     query        = agg_by_expr | increase_expr | metric_expr
+///     agg_by_expr  = agg_func "by" "(" group_key* ")" "(" increase_expr | metric_expr ")"
+///     increase_expr = "increase" "(" metric_expr ")"
+///     metric_expr  = metric filters? bucket? offset?
+///     metric       = "toki_tokens_total" | "usage" | "sessions" | "projects" | "events"
+///     agg_func     = "sum" | "avg" | "count"
+///
+///   Legacy toki form (still accepted for backwards compatibility):
+///     query   = agg_start? metric filters? bucket? offset? agg_end? group_by?
+///     agg_start = ("sum" | "avg" | "count") "("
+///     agg_end = ")"
+///
+///   Shared:
+///     filters  = "{" (filter ("," filter)*)? "}"
+///     filter   = key "=" quoted_string
+///     bucket   = "[" duration "]"
+///     offset   = "offset" duration
+///     group_by = "by" "(" key ("," key)* ")"
 ///
 /// Time range is NOT part of the query string. Pass --since/--until as CLI flags;
 /// they are transmitted as separate `start`/`end` fields in the daemon protocol.
 ///
 /// Examples:
+///   sum by (model) (increase(toki_tokens_total{provider="claude_code"}[1h]))
+///   increase(toki_tokens_total[1h]) by (model)
+///   toki_tokens_total{provider="claude_code"}[1h]
 ///   usage{model="claude-opus-4-6"}[5m] by (model)
 ///   usage{project="myapp"}[1h]
 ///   events{session="abc123"}
@@ -216,24 +230,44 @@ const VALID_GROUP_KEYS: &[&str] = &["model", "session", "project"];
 pub fn parse(input: &str) -> Result<Query, String> {
     let mut p = Parser::new(input);
 
-    // Optional aggregation function: sum( / avg( / count(
+    // Optional aggregation function: sum / avg / count
+    // Supports both legacy toki form "sum(...) by (...)"
+    // and standard PromQL form  "sum by (...) (...)"
     p.skip_ws();
     let aggregation = if p.consume_literal("sum") {
-        p.expect_char('(')?;
         Some(AggregationFunc::Sum)
     } else if p.consume_literal("avg") {
-        p.expect_char('(')?;
         Some(AggregationFunc::Avg)
     } else if p.consume_literal("count") {
-        p.expect_char('(')?;
         Some(AggregationFunc::Count)
     } else {
         None
     };
 
-    // Parse metric name
+    // Standard PromQL: "sum by (dim) (...)" — by-clause comes before the opening paren
+    let mut early_group_by: Vec<String> = Vec::new();
+    if aggregation.is_some() {
+        p.skip_ws();
+        if p.consume_literal("by") {
+            early_group_by = p.parse_group_by()?;
+        }
+        p.expect_char('(')?;
+    }
+
+    // Optional "increase(" wrapper (standard PromQL range function)
     p.skip_ws();
-    let metric = if p.consume_literal("usage") {
+    let has_increase = if p.consume_literal("increase") {
+        p.expect_char('(')?;
+        true
+    } else {
+        false
+    };
+
+    // Parse metric name — "toki_tokens_total" is standard PromQL name for Metric::Usage
+    p.skip_ws();
+    let metric = if p.consume_literal("toki_tokens_total") {
+        Metric::Usage
+    } else if p.consume_literal("usage") {
         Metric::Usage
     } else if p.consume_literal("events") {
         Metric::Events
@@ -242,7 +276,11 @@ pub fn parse(input: &str) -> Result<Query, String> {
     } else if p.consume_literal("projects") {
         Metric::Projects
     } else {
-        return Err("query must start with 'usage', 'events', 'sessions', or 'projects'".into());
+        return Err(
+            "expected metric name ('toki_tokens_total', 'usage', 'events', 'sessions', 'projects') \
+             or aggregation function ('sum', 'avg', 'count')"
+                .into(),
+        );
     };
 
     // Optional filters: { ... }
@@ -270,14 +308,23 @@ pub fn parse(input: &str) -> Result<Query, String> {
         None
     };
 
+    // Close increase() wrapper if opened
+    if has_increase {
+        p.expect_char(')')?;
+    }
+
     // Close aggregation: )
     if aggregation.is_some() {
         p.expect_char(')')?;
     }
 
     // Optional group_by: by ( ... )
+    // "early_group_by" was already parsed for standard PromQL "sum by (...) (...)" form;
+    // otherwise try the trailing "by (...)" form used by legacy toki syntax.
     p.skip_ws();
-    let group_by = if p.consume_literal("by") {
+    let group_by = if !early_group_by.is_empty() {
+        early_group_by
+    } else if p.consume_literal("by") {
         p.parse_group_by()?
     } else {
         Vec::new()
@@ -953,6 +1000,68 @@ mod tests {
         let q = parse("count(usage[1d] offset 7d)").unwrap();
         let s = q.to_query_string();
         assert_eq!(s, "count(usage[1d] offset 1w)");
+    }
+
+    // ── standard PromQL syntax (toki_tokens_total + increase()) ──
+
+    #[test]
+    fn test_toki_tokens_total_bare() {
+        let q = parse("toki_tokens_total").unwrap();
+        assert_eq!(q.metric, Metric::Usage);
+        assert!(q.filters.is_empty());
+        assert!(q.bucket.is_none());
+    }
+
+    #[test]
+    fn test_toki_tokens_total_with_filter_and_bucket() {
+        let q = parse(r#"toki_tokens_total{provider="claude_code"}[1h]"#).unwrap();
+        assert_eq!(q.metric, Metric::Usage);
+        assert_eq!(q.provider, Some("claude_code".to_string()));
+        assert_eq!(q.bucket, Some(Bucket(3600)));
+    }
+
+    #[test]
+    fn test_increase_wrapper() {
+        let q = parse(r#"increase(toki_tokens_total{provider="claude_code"}[1h])"#).unwrap();
+        assert_eq!(q.metric, Metric::Usage);
+        assert_eq!(q.provider, Some("claude_code".to_string()));
+        assert_eq!(q.bucket, Some(Bucket(3600)));
+    }
+
+    #[test]
+    fn test_sum_by_increase_standard_promql() {
+        let q = parse(r#"sum by (model) (increase(toki_tokens_total{provider="claude_code"}[1h]))"#).unwrap();
+        assert_eq!(q.metric, Metric::Usage);
+        assert_eq!(q.aggregation, Some(AggregationFunc::Sum));
+        assert_eq!(q.group_by, vec!["model"]);
+        assert_eq!(q.provider, Some("claude_code".to_string()));
+        assert_eq!(q.bucket, Some(Bucket(3600)));
+    }
+
+    #[test]
+    fn test_sum_by_increase_no_filter() {
+        let q = parse("sum by (model) (increase(toki_tokens_total[1h]))").unwrap();
+        assert_eq!(q.metric, Metric::Usage);
+        assert_eq!(q.aggregation, Some(AggregationFunc::Sum));
+        assert_eq!(q.group_by, vec!["model"]);
+        assert!(q.provider.is_none());
+        assert_eq!(q.bucket, Some(Bucket(3600)));
+    }
+
+    #[test]
+    fn test_increase_usage_alias() {
+        // "usage" still accepted inside increase()
+        let q = parse("increase(usage[1h])").unwrap();
+        assert_eq!(q.metric, Metric::Usage);
+        assert_eq!(q.bucket, Some(Bucket(3600)));
+    }
+
+    #[test]
+    fn test_sum_by_increase_with_model_filter() {
+        let q = parse(r#"sum by (model) (increase(toki_tokens_total{model="claude-opus-4-6"}[1h]))"#).unwrap();
+        assert_eq!(q.group_by, vec!["model"]);
+        assert_eq!(q.filter_value("model"), Some("claude-opus-4-6"));
+        assert_eq!(q.bucket, Some(Bucket(3600)));
     }
 
     // ── compound duration ──
