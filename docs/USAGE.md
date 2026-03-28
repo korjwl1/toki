@@ -379,11 +379,21 @@ Credentials are stored in macOS Keychain (macOS) or `~/.config/toki/sync.json` (
 
 ### sync disable
 
+Disables sync and clears local credentials.
+
 ```bash
-toki settings sync disable
+toki settings sync disable              # Interactive: asks to delete remote data
+toki settings sync disable --delete     # Delete this device + VM data from server
+toki settings sync disable --keep       # Keep remote data (device history preserved)
 ```
 
-Disconnects from the sync server. Takes effect immediately via hot-reload.
+| Flag | Behavior |
+|------|----------|
+| (none) | Prompts: "Delete this device's data from the server? [y/N]" |
+| `--delete` | Immediately deletes device and its time-series data from the server |
+| `--keep` | Server data preserved -- useful for device migration or temporary disable |
+
+In all cases, local credentials (Keychain/sync.json) and settings are cleared. Takes effect immediately via hot-reload.
 
 ### sync status
 
@@ -407,7 +417,9 @@ All sync commands are also available as `toki settings sync` subcommands:
 
 ```bash
 toki settings sync enable --server <host:port> --username <user>
-toki settings sync disable
+toki settings sync disable              # Interactive prompt
+toki settings sync disable --delete     # Delete remote data
+toki settings sync disable --keep       # Keep remote data
 toki settings sync status
 toki settings sync devices
 ```

@@ -383,11 +383,21 @@ toki settings sync enable --server 1.2.3.4:9090 --insecure --username admin
 
 ### sync disable
 
+동기화를 비활성화하고 로컬 인증 정보를 삭제한다.
+
 ```bash
-toki settings sync disable
+toki settings sync disable              # 대화형: 원격 데이터 삭제 여부를 묻는다
+toki settings sync disable --delete     # 서버에서 이 디바이스 + VM 데이터를 삭제한다
+toki settings sync disable --keep       # 원격 데이터를 유지한다 (디바이스 기록 보존)
 ```
 
-동기화 서버와의 연결을 해제한다. 핫리로드로 즉시 반영.
+| 플래그 | 동작 |
+|--------|------|
+| (없음) | 프롬프트: "서버에서 이 디바이스의 데이터를 삭제하시겠습니까? [y/N]" |
+| `--delete` | 서버에서 디바이스와 시계열 데이터를 즉시 삭제한다 |
+| `--keep` | 서버 데이터를 보존한다 — 디바이스 이전이나 일시적 비활성화에 유용하다 |
+
+모든 경우에 로컬 인증 정보(Keychain/sync.json)와 설정이 삭제된다. 핫리로드로 즉시 반영.
 
 ### sync status
 
@@ -411,7 +421,9 @@ toki settings sync devices
 
 ```bash
 toki settings sync enable --server <host:port> --username <user>
-toki settings sync disable
+toki settings sync disable              # 대화형 프롬프트
+toki settings sync disable --delete     # 원격 데이터 삭제
+toki settings sync disable --keep       # 원격 데이터 유지
 toki settings sync status
 toki settings sync devices
 ```

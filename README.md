@@ -270,7 +270,9 @@ toki settings list                             # List all
 
 ```bash
 toki settings sync enable --server <host:port> --username <user>  # Connect to sync server
-toki settings sync disable                                         # Disconnect
+toki settings sync disable              # Prompts to delete remote data
+toki settings sync disable --delete     # Delete this device's data from server
+toki settings sync disable --keep       # Keep remote data, only disable locally
 toki settings sync status                                          # Connection info
 toki settings sync devices                                         # Registered devices
 ```
@@ -302,7 +304,9 @@ toki settings sync devices
 toki report query --remote 'sum by (model)(toki_tokens_total)'
 
 # Disable sync
-toki settings sync disable
+toki settings sync disable              # Prompts to delete remote data
+toki settings sync disable --delete     # Delete this device's data from server
+toki settings sync disable --keep       # Keep remote data, only disable locally
 ```
 
 ### How it works

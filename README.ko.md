@@ -268,7 +268,9 @@ toki settings list                             # 전체 설정 출력
 
 ```bash
 toki settings sync enable --server <host:port> --username <user>  # 동기화 서버에 연결
-toki settings sync disable                                         # 연결 해제
+toki settings sync disable              # 원격 데이터 삭제 여부를 묻습니다
+toki settings sync disable --delete     # 서버에서 이 디바이스의 데이터를 삭제합니다
+toki settings sync disable --keep       # 원격 데이터를 유지하고 로컬에서만 비활성화합니다
 toki settings sync status                                          # 연결 정보 확인
 toki settings sync devices                                         # 등록된 디바이스 목록
 ```
@@ -300,7 +302,9 @@ toki settings sync devices
 toki report query --remote 'sum by (model)(toki_tokens_total)'
 
 # 동기화 비활성화
-toki settings sync disable
+toki settings sync disable              # 원격 데이터 삭제 여부를 묻습니다
+toki settings sync disable --delete     # 서버에서 이 디바이스의 데이터를 삭제합니다
+toki settings sync disable --keep       # 원격 데이터를 유지하고 로컬에서만 비활성화합니다
 ```
 
 ### 동작 방식
