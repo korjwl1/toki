@@ -242,34 +242,31 @@ fn sync_new_events(
         .map_err(|e| format!("get_last_ts failed: {e}"))?;
 
     let cursor_key = format!("sync_last_ts_{provider}");
-    // Use only the server cursor as the single source of truth.
-    let since_ms = server_last_ts;
+    let mut since_ms = server_last_ts;
+    let mut total_synced = 0;
 
-    // Query events newer than cursor (since_ms + 1 to exclude already-synced events at exactly since_ms)
-    let events = db.query_events_range(since_ms.saturating_add(1), i64::MAX)
-        .map_err(|e| format!("query_events_range failed: {e}"))?;
+    loop {
+        // Query only BATCH_SIZE events at a time
+        let events = db.query_events_range_limit(since_ms.saturating_add(1), i64::MAX, BATCH_SIZE)
+            .map_err(|e| format!("query_events_range failed: {e}"))?;
 
-    if events.is_empty() {
-        return Ok(0);
-    }
+        if events.is_empty() {
+            break;
+        }
 
-    let mut synced = 0;
-
-    // Send in batches of BATCH_SIZE
-    for chunk in events.chunks(BATCH_SIZE) {
-        // Check if any dict IDs in this chunk are missing from cache; reload if so
-        let needs_reload = chunk.iter().any(|(_, _, event)| {
+        // Check if any dict IDs in this batch are missing from cache; merge if so
+        let needs_reload = events.iter().any(|(_, _, event)| {
             [event.model_id, event.session_id, event.source_file_id, event.project_name_id]
                 .iter()
                 .any(|id| !dict.contains_key(id))
         });
         if needs_reload {
             if let Ok(fresh) = db.load_dict_reverse() {
-                *dict = fresh;
+                dict.extend(fresh);
             }
         }
 
-        let items: Vec<SyncItem> = chunk.iter().map(|(ts_ms, _msg_id, event)| {
+        let items: Vec<SyncItem> = events.iter().map(|(ts_ms, _msg_id, event)| {
             SyncItem {
                 ts_ms: *ts_ms,
                 event: event.clone(),
@@ -278,7 +275,8 @@ fn sync_new_events(
 
         match client.sync_batch(items, dict, provider) {
             Ok(ack_ts) => {
-                synced += chunk.len();
+                total_synced += events.len();
+                since_ms = ack_ts;
                 // Persist cursor locally, keyed per provider
                 let _ = crate::config::set_setting(&cursor_key, &ack_ts.to_string());
             }
@@ -286,9 +284,14 @@ fn sync_new_events(
                 return Err(format!("sync_batch failed: {e}"));
             }
         }
+
+        // If we got fewer than BATCH_SIZE, we've caught up
+        if events.len() < BATCH_SIZE {
+            break;
+        }
     }
 
-    Ok(synced)
+    Ok(total_synced)
 }
 
 fn try_refresh_token(config: &mut SyncConfig) -> bool {
