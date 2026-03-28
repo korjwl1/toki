@@ -62,7 +62,7 @@ impl SyncConfig {
 }
 
 fn gethostname() -> String {
-    let mut buf = vec![0i8; 64];
+    let mut buf = vec![0i8; 256];
     unsafe {
         libc::gethostname(buf.as_mut_ptr(), buf.len());
     }
@@ -241,15 +241,12 @@ fn sync_new_events(
     let server_last_ts = client.get_last_ts(provider)
         .map_err(|e| format!("get_last_ts failed: {e}"))?;
 
-    // Also check our local cursor — keyed per provider to avoid cross-provider clobbering
     let cursor_key = format!("sync_last_ts_{provider}");
-    let local_cursor: i64 = crate::config::get_setting(&cursor_key)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let since_ms = server_last_ts.max(local_cursor);
+    // Use only the server cursor as the single source of truth.
+    let since_ms = server_last_ts;
 
-    // Query events newer than cursor
-    let events = db.query_events_range(since_ms, i64::MAX)
+    // Query events newer than cursor (since_ms + 1 to exclude already-synced events at exactly since_ms)
+    let events = db.query_events_range(since_ms + 1, i64::MAX)
         .map_err(|e| format!("query_events_range failed: {e}"))?;
 
     if events.is_empty() {

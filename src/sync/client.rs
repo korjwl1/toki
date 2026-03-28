@@ -32,6 +32,7 @@ impl SyncClient {
 
         let stream = TcpStream::connect_timeout(&socket_addr, CONNECT_TIMEOUT)?;
         stream.set_read_timeout(Some(READ_TIMEOUT))?;
+        stream.set_write_timeout(Some(Duration::from_secs(30)))?;
         stream.set_nodelay(true)?;
 
         let reader = BufReader::new(stream.try_clone()?);

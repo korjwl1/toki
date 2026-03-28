@@ -120,6 +120,12 @@ pub struct LastTsPayload {
 // ─── Frame read/write ────────────────────────────────────────────────────────
 
 pub fn write_frame<W: Write>(w: &mut W, msg_type: MsgType, payload: &[u8]) -> io::Result<()> {
+    if payload.len() > MAX_PAYLOAD_SIZE as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("payload too large: {} bytes (max {MAX_PAYLOAD_SIZE})", payload.len()),
+        ));
+    }
     let len = payload.len() as u32;
     w.write_all(&(msg_type as u32).to_le_bytes())?;
     w.write_all(&len.to_le_bytes())?;
