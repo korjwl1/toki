@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{self, BufReader, BufWriter};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
@@ -14,14 +14,83 @@ const READ_TIMEOUT: Duration = Duration::from_secs(90);  // PING every 60s; allo
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const BATCH_SIZE: usize = 1000;
 
+/// A Read+Write stream, either plain TCP or TLS-wrapped.
+enum SyncStream {
+    Plain(TcpStream),
+    Tls(native_tls::TlsStream<TcpStream>),
+}
+
+impl Read for SyncStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            SyncStream::Plain(s) => s.read(buf),
+            SyncStream::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for SyncStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            SyncStream::Plain(s) => s.write(buf),
+            SyncStream::Tls(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            SyncStream::Plain(s) => s.flush(),
+            SyncStream::Tls(s) => s.flush(),
+        }
+    }
+}
+
+/// Sync client using a single bidirectional stream.
+/// The protocol is strictly request-response, so concurrent read+write is never needed.
+/// This allows TLS streams (which cannot be split/cloned) to work seamlessly.
 pub struct SyncClient {
-    reader: BufReader<TcpStream>,
-    writer: BufWriter<TcpStream>,
+    reader: BufReader<StreamHalf>,
+    writer: BufWriter<StreamHalf>,
+}
+
+/// We need separate read/write halves but SyncStream can't be cloned.
+/// Instead, store the stream in a shared wrapper.  For the request-response
+/// protocol we never read and write concurrently, so we use an unsafe split
+/// approach: duplicate the raw fd for plain TCP, or for TLS wrap a single
+/// SyncStream behind an UnsafeCell (safe because we never overlap read+write).
+///
+/// Actually, the simplest correct approach: for plain TCP, clone the fd.
+/// For TLS, use a single BufStream and alternate read/write.
+///
+/// Simplest: just use a combined buffer. write_frame flushes, then read_frame reads.
+/// We can wrap a single SyncStream in a struct that does both.
+
+struct StreamHalf(*mut SyncStream);
+
+// SAFETY: SyncClient is !Sync and the protocol guarantees sequential
+// read-then-write access — never concurrent.  Both halves point to the
+// same SyncStream but are never used at the same time.
+unsafe impl Send for StreamHalf {}
+
+impl Read for StreamHalf {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        unsafe { &mut *self.0 }.read(buf)
+    }
+}
+
+impl Write for StreamHalf {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        unsafe { &mut *self.0 }.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        unsafe { &mut *self.0 }.flush()
+    }
 }
 
 impl SyncClient {
     /// Connect to server and perform TCP handshake (no auth yet).
-    pub fn connect(addr: &str) -> io::Result<Self> {
+    /// If `use_tls` is true, wrap the connection in TLS.
+    pub fn connect(addr: &str, use_tls: bool) -> io::Result<Self> {
         // Resolve hostname (handles both "host:port" and "1.2.3.4:port").
         use std::net::ToSocketAddrs;
         let socket_addr = addr
@@ -35,8 +104,20 @@ impl SyncClient {
         stream.set_write_timeout(Some(Duration::from_secs(30)))?;
         stream.set_nodelay(true)?;
 
-        let reader = BufReader::new(stream.try_clone()?);
-        let writer = BufWriter::new(stream);
+        let sync_stream = if use_tls {
+            let connector = native_tls::TlsConnector::new()
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("TLS init: {e}")))?;
+            let hostname = addr.split(':').next().unwrap_or(addr);
+            let tls_stream = connector.connect(hostname, stream)
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("TLS handshake: {e}")))?;
+            SyncStream::Tls(tls_stream)
+        } else {
+            SyncStream::Plain(stream)
+        };
+
+        let boxed = Box::into_raw(Box::new(sync_stream));
+        let reader = BufReader::new(StreamHalf(boxed));
+        let writer = BufWriter::new(StreamHalf(boxed));
         Ok(Self { reader, writer })
     }
 
@@ -164,6 +245,17 @@ impl SyncClient {
             ));
         }
         Ok(())
+    }
+}
+
+impl Drop for SyncClient {
+    fn drop(&mut self) {
+        // Recover and drop the heap-allocated SyncStream.
+        // Both StreamHalf instances share the same pointer; extract from reader.
+        let ptr = self.reader.get_ref().0;
+        if !ptr.is_null() {
+            unsafe { drop(Box::from_raw(ptr)); }
+        }
     }
 }
 

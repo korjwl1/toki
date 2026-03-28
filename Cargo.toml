@@ -40,6 +40,8 @@ memchr = "2.8.0"
 uuid = { version = "1", features = ["v4"] }
 urlencoding = "2"
 zstd = "0.13"
+native-tls = "0.2"
+toki-sync-protocol = { path = "../toki_sync_protocol" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tikv-jemallocator = "0.6"

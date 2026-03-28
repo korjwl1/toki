@@ -17,6 +17,9 @@ pub struct SyncConfig {
     /// Generated once at `toki sync enable`, persisted in settings.
     pub device_key: String,
     pub provider: String,
+    /// Whether to use TLS for the sync TCP connection.
+    /// Defaults to true for non-localhost servers.
+    pub use_tls: bool,
 }
 
 impl SyncConfig {
@@ -51,26 +54,36 @@ impl SyncConfig {
                 }
                 key
             });
+        // TLS: default to true unless explicitly "false" or server is localhost
+        let use_tls = match crate::config::get_setting("sync_tls") {
+            Some(v) if v == "false" => false,
+            Some(v) if v == "true" => true,
+            _ => {
+                // Auto-detect: disable TLS for localhost/127.0.0.1, enable otherwise
+                let host = server.split(':').next().unwrap_or(&server);
+                host != "localhost" && host != "127.0.0.1" && host != "::1"
+            }
+        };
+
         Some(SyncConfig {
             server_addr: server,
             access_token: token,
             device_name: device,
             device_key,
             provider: provider.to_string(),
+            use_tls,
         })
     }
 }
 
 fn gethostname() -> String {
-    let mut buf = vec![0i8; 256];
-    unsafe {
-        libc::gethostname(buf.as_mut_ptr(), buf.len());
+    let mut buf = vec![0u8; 256];
+    let ret = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut i8, buf.len()) };
+    if ret != 0 {
+        return "unknown".to_string();
     }
-    let cstr = buf.iter()
-        .take_while(|&&c| c != 0)
-        .map(|&c| c as u8 as char)
-        .collect::<String>();
-    if cstr.is_empty() { "unknown".to_string() } else { cstr }
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..len]).into_owned()
 }
 
 const PING_INTERVAL: Duration = Duration::from_secs(60);
@@ -160,7 +173,7 @@ fn run_sync_loop(
                 }
             }
 
-            match SyncClient::connect(&config.server_addr) {
+            match SyncClient::connect(&config.server_addr, config.use_tls) {
                 Ok(mut c) => {
                     match c.auth(&config.access_token, &config.device_name, &config.device_key, &config.provider) {
                         Ok(device_id) => {
