@@ -110,11 +110,21 @@ fn run_sync_loop(
     // Set after auth succeeds — triggers an immediate initial delta sync
     // without waiting for the next flush notification.
     let mut needs_initial_sync = false;
+    let mut last_loop_time = Instant::now();
 
     loop {
         // Check stop signal
         if stop_rx.try_recv().is_ok() {
             return;
+        }
+
+        // Wake detection: if elapsed wall-clock time since last loop iteration
+        // is much longer than expected, the machine likely slept.
+        let elapsed = last_loop_time.elapsed();
+        last_loop_time = Instant::now();
+        if client.is_some() && elapsed > PING_INTERVAL * 2 {
+            eprintln!("[toki:sync] wake detected, forcing reconnect");
+            client = None;
         }
 
         // Wait for a flush notification or PING timeout.
@@ -223,7 +233,7 @@ fn sync_new_events(
     provider: &str,
 ) -> Result<usize, String> {
     // Get server's last known ts
-    let server_last_ts = client.get_last_ts()
+    let server_last_ts = client.get_last_ts(provider)
         .map_err(|e| format!("get_last_ts failed: {e}"))?;
 
     // Also check our local cursor — keyed per provider to avoid cross-provider clobbering
@@ -257,10 +267,9 @@ fn sync_new_events(
             }
         }
 
-        let items: Vec<SyncItem> = chunk.iter().map(|(ts_ms, msg_id, event)| {
+        let items: Vec<SyncItem> = chunk.iter().map(|(ts_ms, _msg_id, event)| {
             SyncItem {
                 ts_ms: *ts_ms,
-                message_id: msg_id.clone(),
                 event: event.clone(),
             }
         }).collect();

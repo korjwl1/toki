@@ -5,9 +5,9 @@ use std::time::Duration;
 
 use crate::db::SCHEMA_VERSION;
 use super::protocol::{
-    AuthErrPayload, AuthOkPayload, AuthPayload, LastTsPayload, MsgType, PROTOCOL_VERSION,
-    SyncAckPayload, SyncBatchPayload, SyncErrPayload, SyncItem,
-    read_frame, write_empty_frame, write_frame,
+    AuthErrPayload, AuthOkPayload, AuthPayload, GetLastTsPayload, LastTsPayload,
+    MsgType, PROTOCOL_VERSION, SyncAckPayload, SyncBatchPayload, SyncErrPayload,
+    SyncItem, read_frame, write_empty_frame, write_frame,
 };
 
 const READ_TIMEOUT: Duration = Duration::from_secs(90);  // PING every 60s; allow margin
@@ -77,8 +77,11 @@ impl SyncClient {
     }
 
     /// Send GET_LAST_TS and receive LAST_TS.
-    pub fn get_last_ts(&mut self) -> io::Result<i64> {
-        write_empty_frame(&mut self.writer, MsgType::GetLastTs)?;
+    pub fn get_last_ts(&mut self, provider: &str) -> io::Result<i64> {
+        let payload = GetLastTsPayload { provider: provider.to_string() };
+        let bytes = bincode::serialize(&payload)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        write_frame(&mut self.writer, MsgType::GetLastTs, &bytes)?;
         let (msg_type, payload) = read_frame(&mut self.reader)?;
         if msg_type != MsgType::LastTs {
             return Err(io::Error::new(
@@ -121,8 +124,17 @@ impl SyncClient {
         };
         let bytes = bincode::serialize(&payload)
             .map_err(|e| SyncError::Protocol(e.to_string()))?;
-        write_frame(&mut self.writer, MsgType::SyncBatch, &bytes)
-            .map_err(SyncError::Io)?;
+
+        // Compress with zstd for batches >= 100 items
+        if payload.items.len() >= 100 {
+            let compressed = zstd::encode_all(bytes.as_slice(), 3)
+                .map_err(|e| SyncError::Protocol(format!("zstd compress failed: {e}")))?;
+            write_frame(&mut self.writer, MsgType::SyncBatchZstd, &compressed)
+                .map_err(SyncError::Io)?;
+        } else {
+            write_frame(&mut self.writer, MsgType::SyncBatch, &bytes)
+                .map_err(SyncError::Io)?;
+        }
 
         let (msg_type, resp_payload) = read_frame(&mut self.reader).map_err(SyncError::Io)?;
         match msg_type {
