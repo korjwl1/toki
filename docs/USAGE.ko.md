@@ -356,6 +356,77 @@ toki settings list
 
 환경변수는 사용하지 않는다 (`TOKI_DEBUG` 제외).
 
+## sync
+
+여러 디바이스의 토큰 사용량을 중앙 [toki-sync](https://github.com/korjwl1/toki-sync) 서버로 동기화한다. 모든 서브커맨드는 `toki settings sync`로도 사용할 수 있다.
+
+### sync enable
+
+```bash
+toki sync enable --server <host:port> --username <user>
+toki sync enable --server sync.example.com:9090 --username admin
+toki sync enable --server 1.2.3.4:9090 --insecure --username admin
+```
+
+데몬을 toki-sync 서버에 연결한다. 비밀번호는 대화형으로 입력받는다 (스크립트에서는 `--password` 사용). 핫리로드로 즉시 반영 — 데몬 재시작 불필요.
+
+| 플래그 | 필수 | 설명 |
+|--------|------|------|
+| `--server <host:port>` | O | 동기화 서버 주소 (호스트명 또는 IP + 포트) |
+| `--username <user>` | O | 계정 사용자명 |
+| `--password <pass>` | X | 비밀번호 (생략 시 대화형 입력) |
+| `--insecure` | X | 자체 서명 TLS 인증서 허용 (IP 전용 서버용) |
+| `--no-tls` | X | TLS 비활성화 (개발 전용) |
+| `--headless` | X | 비대화형 모드 (`--password` 필수) |
+
+인증 정보는 macOS Keychain(macOS) 또는 `~/.config/toki/sync.json`(Linux)에 저장된다.
+
+### sync disable
+
+```bash
+toki sync disable
+```
+
+동기화 서버와의 연결을 해제한다. 핫리로드로 즉시 반영.
+
+### sync status
+
+```bash
+toki sync status
+```
+
+현재 동기화 설정을 표시한다: 서버 주소, 사용자명, 연결 상태, TLS 모드.
+
+### sync devices
+
+```bash
+toki sync devices
+```
+
+동기화 서버에 등록된 모든 디바이스 목록을 표시한다.
+
+### settings sync
+
+모든 sync 명령은 `toki settings sync` 서브커맨드로도 사용할 수 있다:
+
+```bash
+toki settings sync enable --server <host:port> --username <user>
+toki settings sync disable
+toki settings sync status
+toki settings sync devices
+```
+
+### report query --remote
+
+CLI에서 서버 집계 데이터를 직접 조회할 수 있다:
+
+```bash
+toki report query --remote 'sum by (model)(toki_tokens_total)'
+toki report query --remote 'toki_tokens_total{device="macbook-pro"}'
+```
+
+`--remote` 플래그는 PromQL 쿼리를 로컬 데몬 대신 toki-sync 서버로 전송한다. sync가 활성화되어 있어야 한다.
+
 ## 클라이언트 옵션
 
 | 옵션 | 적용 대상 | 설명 |

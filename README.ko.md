@@ -33,6 +33,7 @@
 - [성능](#성능)
 - [프라이버시 & 보안](#프라이버시--보안)
 - [명령어](#명령어)
+- [멀티 디바이스 동기화](#멀티-디바이스-동기화)
 - [비용 계산](#비용-계산)
 - [지원 Provider](#지원-provider)
 - [예정된 기능](#예정된-기능)
@@ -263,6 +264,57 @@ toki settings set providers --add codex        # Provider 추가
 toki settings list                             # 전체 설정 출력
 ```
 
+### Sync
+
+```bash
+toki sync enable --server <host:port> --username <user>  # 동기화 서버에 연결
+toki sync disable                                         # 연결 해제
+toki sync status                                          # 연결 정보 확인
+toki sync devices                                         # 등록된 디바이스 목록
+```
+
+`toki settings sync ...`으로도 사용할 수 있습니다.
+
+---
+
+## 멀티 디바이스 동기화
+
+여러 기기의 토큰 사용량을 중앙 [toki-sync](https://github.com/korjwl1/toki-sync) 서버로 동기화합니다. 모든 디바이스의 데이터를 한 곳에서 조회할 수 있습니다 — PromQL 쿼리, 웹 대시보드, [Toki Monitor](https://github.com/korjwl1/toki-monitor) 모두 지원합니다.
+
+### 설정
+
+```bash
+# 동기화 서버에 연결
+toki sync enable --server sync.example.com:9090 --username admin
+
+# 자체 서명 TLS (IP 전용 서버)
+toki sync enable --server 1.2.3.4:9090 --insecure --username admin
+
+# 상태 확인
+toki sync status
+
+# 등록된 디바이스 목록
+toki sync devices
+
+# CLI에서 서버 데이터 쿼리
+toki report query --remote 'sum by (model)(toki_tokens_total)'
+
+# 동기화 비활성화
+toki sync disable
+```
+
+### 동작 방식
+
+- 데몬의 sync 스레드가 toki-sync 서버에 TLS TCP로 연결 (persistent connection)
+- 이벤트를 배치로 모아서 (1,000/배치) zstd 압축(100개 이상 시) 후 ACK 기반 흐름 제어로 전송
+- 연결이 끊기면: 이벤트가 로컬 fjall DB에 누적되고, 재연결 시 delta-sync
+- JWT 자동 갱신, 지수 백오프 (2s→300s 상한), wake 감지
+- 설정 핫리로드: `toki sync enable` 실행 시 데몬 재시작 없이 즉시 반영
+
+### 프라이버시
+
+동기화는 opt-in이며 기본적으로 꺼져 있습니다. 활성화하면 토큰 수와 메타데이터(모델, 세션 ID, 프로젝트명)만 전송됩니다 — 프롬프트나 응답은 절대 전송되지 않습니다. TLS로 모든 트래픽을 암호화합니다. 서버에서 사용자별 데이터는 label injection으로 격리됩니다.
+
 ---
 
 ## 비용 계산
@@ -293,7 +345,7 @@ toki settings list                             # 전체 설정 출력
 | 기능 | 설명 | 상태 |
 |------|------|------|
 | Gemini CLI | Google Gemini CLI provider 지원 | 예정 |
-| `toki-sync` | 멀티 디바이스 지원 — 여러 기기 간 사용량 데이터 동기화 | 예정 |
+| `toki-sync` | 멀티 디바이스 지원 — 여러 기기 간 사용량 데이터 동기화 | 지원 |
 
 기능 요청이나 버그 리포트는 [이슈](https://github.com/korjwl1/toki/issues)에 남겨주세요.
 
@@ -326,6 +378,8 @@ toki settings list                             # 전체 설정 출력
 | HTTP | ureq 2.x | 동기 HTTP, ETag 조건부 요청 |
 | CLI | clap 4.x | 서브커맨드, 글로벌 옵션 지원 |
 | 테이블 | comfy-table 7.1 | Unicode 테이블 렌더링 |
+| Sync 프로토콜 | toki-sync-protocol (공유 crate) | Wire-compatible 타입, bincode 직렬화 |
+| TLS | native-tls 0.2 | 플랫폼 TLS (sync 연결용) |
 | IPC | Unix Domain Socket | 데몬-클라이언트 NDJSON 스트리밍 |
 
 ---
@@ -365,6 +419,12 @@ src/
 │   └── codex/                      # Codex CLI JSONL 파서
 │       ├── mod.rs                  # CodexProvider impl
 │       └── parser.rs              # Stateful 파서 (model tracking)
+├── sync/                           # 멀티 디바이스 동기화
+│   ├── thread.rs                   # Sync 루프, SyncToggle, wake 감지
+│   ├── client.rs                   # TCP+TLS 클라이언트, 인증, 배치 전송
+│   ├── protocol.rs                 # toki-sync-protocol 재수출
+│   ├── backoff.rs                  # 지수 백오프 (2s→300s)
+│   └── credentials.rs             # Keychain (macOS) / sync.json (Linux)
 └── platform/mod.rs                 # FSEvents 감시 + provider별 폴링 전략
 ```
 

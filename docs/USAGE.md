@@ -352,6 +352,77 @@ Settings priority: **CLI args > Settings file (settings.json) > Defaults**
 
 Environment variables are not used (except `TOKI_DEBUG`).
 
+## sync
+
+Sync token usage across multiple devices to a central [toki-sync](https://github.com/korjwl1/toki-sync) server. All subcommands are also available under `toki settings sync`.
+
+### sync enable
+
+```bash
+toki sync enable --server <host:port> --username <user>
+toki sync enable --server sync.example.com:9090 --username admin
+toki sync enable --server 1.2.3.4:9090 --insecure --username admin
+```
+
+Connects the daemon to a toki-sync server. Prompts for password interactively (or use `--password` for scripts). Takes effect immediately via hot-reload — no daemon restart needed.
+
+| Flag | Required | Description |
+|------|----------|-------------|
+| `--server <host:port>` | Yes | Sync server address (hostname or IP with port) |
+| `--username <user>` | Yes | Account username |
+| `--password <pass>` | No | Password (prompts interactively if omitted) |
+| `--insecure` | No | Accept self-signed TLS certificates (for IP-only servers) |
+| `--no-tls` | No | Disable TLS entirely (development only) |
+| `--headless` | No | Non-interactive mode (requires `--password`) |
+
+Credentials are stored in macOS Keychain (macOS) or `~/.config/toki/sync.json` (Linux).
+
+### sync disable
+
+```bash
+toki sync disable
+```
+
+Disconnects from the sync server. Takes effect immediately via hot-reload.
+
+### sync status
+
+```bash
+toki sync status
+```
+
+Shows current sync configuration: server address, username, connection state, and TLS mode.
+
+### sync devices
+
+```bash
+toki sync devices
+```
+
+Lists all devices registered under your account on the sync server.
+
+### settings sync
+
+All sync commands are also available as `toki settings sync` subcommands:
+
+```bash
+toki settings sync enable --server <host:port> --username <user>
+toki settings sync disable
+toki settings sync status
+toki settings sync devices
+```
+
+### report query --remote
+
+Query server-aggregated data directly from the CLI:
+
+```bash
+toki report query --remote 'sum by (model)(toki_tokens_total)'
+toki report query --remote 'toki_tokens_total{device="macbook-pro"}'
+```
+
+The `--remote` flag sends the PromQL query to the toki-sync server instead of the local daemon. Requires sync to be enabled.
+
 ## Client Options
 
 | Option | Applies to | Description |
