@@ -167,7 +167,8 @@ fn run_sync_loop(
                             eprintln!("[toki:sync] auth rejected: {reason}");
                             if reset_required {
                                 eprintln!("[toki:sync] schema mismatch — clearing sync cursor");
-                                let _ = crate::config::set_setting("sync_last_ts", "0");
+                                let key = format!("sync_last_ts_{}", config.provider);
+                                let _ = crate::config::set_setting(&key, "0");
                             }
                         }
                         Err(e) => {
@@ -186,7 +187,7 @@ fn run_sync_loop(
         // Sync new events on flush or immediately after a fresh connection.
         if flush_happened || needs_initial_sync {
             needs_initial_sync = false;
-            match sync_new_events(c, &db, &dict_cache, &config.provider) {
+            match sync_new_events(c, &db, &mut dict_cache, &config.provider) {
                 Ok(synced) => {
                     if synced > 0 {
                         eprintln!("[toki:sync] synced {synced} events");
@@ -218,15 +219,16 @@ fn run_sync_loop(
 fn sync_new_events(
     client: &mut SyncClient,
     db: &Database,
-    dict: &HashMap<u32, String>,
+    dict: &mut HashMap<u32, String>,
     provider: &str,
 ) -> Result<usize, String> {
     // Get server's last known ts
     let server_last_ts = client.get_last_ts()
         .map_err(|e| format!("get_last_ts failed: {e}"))?;
 
-    // Also check our local cursor (use max of the two for safety)
-    let local_cursor: i64 = crate::config::get_setting("sync_last_ts")
+    // Also check our local cursor — keyed per provider to avoid cross-provider clobbering
+    let cursor_key = format!("sync_last_ts_{provider}");
+    let local_cursor: i64 = crate::config::get_setting(&cursor_key)
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
     let since_ms = server_last_ts.max(local_cursor);
@@ -243,6 +245,18 @@ fn sync_new_events(
 
     // Send in batches of BATCH_SIZE
     for chunk in events.chunks(BATCH_SIZE) {
+        // Check if any dict IDs in this chunk are missing from cache; reload if so
+        let needs_reload = chunk.iter().any(|(_, _, event)| {
+            [event.model_id, event.session_id, event.source_file_id, event.project_name_id]
+                .iter()
+                .any(|id| !dict.contains_key(id))
+        });
+        if needs_reload {
+            if let Ok(fresh) = db.load_dict_reverse() {
+                *dict = fresh;
+            }
+        }
+
         let items: Vec<SyncItem> = chunk.iter().map(|(ts_ms, msg_id, event)| {
             SyncItem {
                 ts_ms: *ts_ms,
@@ -254,8 +268,8 @@ fn sync_new_events(
         match client.sync_batch(items, dict, provider) {
             Ok(ack_ts) => {
                 synced += chunk.len();
-                // Persist cursor locally
-                let _ = crate::config::set_setting("sync_last_ts", &ack_ts.to_string());
+                // Persist cursor locally, keyed per provider
+                let _ = crate::config::set_setting(&cursor_key, &ack_ts.to_string());
             }
             Err(e) => {
                 return Err(format!("sync_batch failed: {e}"));
