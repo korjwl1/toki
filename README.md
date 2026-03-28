@@ -33,6 +33,7 @@
 - [Performance](#performance)
 - [Privacy & Security](#privacy--security)
 - [Commands](#commands)
+- [Multi-Device Sync](#multi-device-sync)
 - [Cost Calculation](#cost-calculation)
 - [Supported Providers](#supported-providers)
 - [Planned Features](#planned-features)
@@ -265,6 +266,57 @@ toki settings set providers --add codex        # Add a provider
 toki settings list                             # List all
 ```
 
+### Sync
+
+```bash
+toki sync enable --server <host:port> --username <user>  # Connect to sync server
+toki sync disable                                         # Disconnect
+toki sync status                                          # Connection info
+toki sync devices                                         # Registered devices
+```
+
+Also available as `toki settings sync ...`.
+
+---
+
+## Multi-Device Sync
+
+Sync token usage across multiple machines to a central [toki-sync](https://github.com/korjwl1/toki-sync) server. All your devices' data in one place — queryable via PromQL, visible in the web dashboard or [Toki Monitor](https://github.com/korjwl1/toki-monitor).
+
+### Setup
+
+```bash
+# Connect to your sync server
+toki sync enable --server sync.example.com:9090 --username admin
+
+# For self-signed TLS (IP-only servers)
+toki sync enable --server 1.2.3.4:9090 --insecure --username admin
+
+# Check status
+toki sync status
+
+# List registered devices
+toki sync devices
+
+# Query server data from CLI
+toki report query --remote 'sum by (model)(toki_tokens_total)'
+
+# Disable sync
+toki sync disable
+```
+
+### How it works
+
+- Daemon sync thread connects to toki-sync server via TLS TCP (persistent connection)
+- Events are batched (1,000/batch), zstd-compressed (≥100 items), and sent with ACK-based flow control
+- On disconnect: events accumulate locally in fjall DB, delta-synced on reconnect
+- JWT auto-refresh, exponential backoff (2s→300s cap), wake detection
+- Settings hot-reload: `toki sync enable` takes effect without daemon restart
+
+### Privacy
+
+Sync is opt-in and off by default. When enabled, only token counts and metadata (model, session ID, project name) are transmitted — never prompts or responses. TLS encrypts all traffic. Each user's data is isolated on the server via label injection.
+
 ---
 
 ## Cost Calculation
@@ -295,7 +347,7 @@ Each provider gets its own isolated database (`~/.config/toki/<provider>.fjall`)
 | Feature | Description | Status |
 |---------|-------------|--------|
 | Gemini CLI | Google Gemini CLI provider support | Planned |
-| `toki-sync` | Multi-device support — sync usage data across machines | Planned |
+| `toki-sync` | Multi-device support — sync usage data across machines | Available |
 
 Have a feature request or found a bug? [Open an issue](https://github.com/korjwl1/toki/issues).
 
@@ -328,6 +380,8 @@ Have a feature request or found a bug? [Open an issue](https://github.com/korjwl
 | HTTP | ureq 2.x | Synchronous, ETag conditional requests |
 | CLI | clap 4.x | Subcommands, global options |
 | Tables | comfy-table 7.1 | Unicode table rendering |
+| Sync protocol | toki-sync-protocol (shared crate) | Wire-compatible types, bincode serialization |
+| TLS | native-tls 0.2 | Platform TLS for sync connections |
 | IPC | Unix Domain Socket | Daemon-client NDJSON streaming |
 
 ---
@@ -367,6 +421,12 @@ src/
 │   └── codex/                      # Codex CLI JSONL parser
 │       ├── mod.rs                  # CodexProvider impl
 │       └── parser.rs              # Stateful parser (model tracking)
+├── sync/                           # Multi-device sync
+│   ├── thread.rs                   # Sync loop, SyncToggle, wake detection
+│   ├── client.rs                   # TCP+TLS client, auth, batch send
+│   ├── protocol.rs                 # Re-exports from toki-sync-protocol
+│   ├── backoff.rs                  # Exponential backoff (2s→300s)
+│   └── credentials.rs             # Keychain (macOS) / sync.json (Linux)
 └── platform/mod.rs                 # FSEvents watcher + per-provider polling strategy
 ```
 
