@@ -80,9 +80,15 @@ impl Handle {
     }
 
     fn shutdown(&mut self) {
-        // Stop sync threads first (they hold DB read handles)
+        // Signal sync threads to stop
         for tx in &self.sync_stops {
             let _ = tx.send(());
+        }
+        // Join sync threads before shutting down DB writers — they hold DB read handles
+        for handle_opt in &mut self.sync_threads {
+            if let Some(handle) = handle_opt.take() {
+                let _ = handle.join();
+            }
         }
 
         // Stop the worker thread (sends remaining ops to writers)
@@ -100,13 +106,6 @@ impl Handle {
         // Then join all (they're already shutting down concurrently)
         for rt in &mut self.runtimes {
             if let Some(handle) = rt.writer_handle.take() {
-                let _ = handle.join();
-            }
-        }
-
-        // Join sync threads last
-        for handle_opt in &mut self.sync_threads {
-            if let Some(handle) = handle_opt.take() {
                 let _ = handle.join();
             }
         }

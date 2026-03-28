@@ -45,6 +45,7 @@ impl SyncClient {
         &mut self,
         jwt: &str,
         device_name: &str,
+        device_key: &str,
         provider: &str,
     ) -> Result<String, AuthError> {
         let payload = AuthPayload {
@@ -52,6 +53,7 @@ impl SyncClient {
             device_name: device_name.to_string(),
             schema_version: SCHEMA_VERSION,
             provider: provider.to_string(),
+            device_key: device_key.to_string(),
         };
         let bytes = bincode::serialize(&payload).map_err(|e| AuthError::Protocol(e.to_string()))?;
         write_frame(&mut self.writer, MsgType::Auth, &bytes)

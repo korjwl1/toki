@@ -21,6 +21,10 @@ pub struct Credentials {
     pub access_token: String,
     /// Refresh token for obtaining new access tokens
     pub refresh_token: String,
+    /// Stable UUID that uniquely identifies this device across reconnects.
+    /// Generated once at `toki sync enable` and stored permanently.
+    #[serde(default)]
+    pub device_key: String,
 }
 
 /// Save credentials to secure storage.

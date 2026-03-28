@@ -399,7 +399,7 @@ const VALID_SETTINGS: &[&str] = &[
     "claude_code_root", "codex_root", "daemon_sock", "timezone", "output_format",
     "start_of_week", "no_cost", "retention_days", "rollup_retention_days",
     "providers", "daemon_autostart",
-    "sync_enabled", "sync_server", "sync_access_token", "sync_device_name",
+    "sync_enabled", "sync_server", "sync_access_token", "sync_device_name", "sync_device_key",
 ];
 
 /// Settings that require daemon restart to take effect.
@@ -1449,12 +1449,17 @@ fn handle_sync_enable(
         std::process::exit(1);
     }
 
+    // Generate or reuse stable device key (UUID) — generated once, never changes
+    let device_key = toki::config::get_setting("sync_device_key")
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
     // Save credentials
     let creds = toki::sync::credentials::Credentials {
         server_addr: server.clone(),
         http_url: http_base,
         access_token: access_token.clone(),
         refresh_token,
+        device_key: device_key.clone(),
     };
     if let Err(e) = toki::sync::credentials::save(&creds) {
         eprintln!("[toki] Failed to save credentials: {}", e);
@@ -1467,6 +1472,7 @@ fn handle_sync_enable(
     let _ = toki::config::set_setting("sync_server", &server);
     let _ = toki::config::set_setting("sync_access_token", &access_token);
     let _ = toki::config::set_setting("sync_device_name", &device_name);
+    let _ = toki::config::set_setting("sync_device_key", &device_key);
 
     println!("[toki] Sync enabled.");
     println!("[toki] Server:  {}", server);

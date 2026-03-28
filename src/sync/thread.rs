@@ -13,6 +13,9 @@ pub struct SyncConfig {
     pub server_addr: String,   // host:port (e.g. "sync.example.com:9090")
     pub access_token: String,  // JWT
     pub device_name: String,
+    /// Stable UUID that uniquely identifies this device.
+    /// Generated once at `toki sync enable`, persisted in settings.
+    pub device_key: String,
     pub provider: String,
 }
 
@@ -32,10 +35,18 @@ impl SyncConfig {
         let token = crate::config::get_setting("sync_access_token")?;
         let device = crate::config::get_setting("sync_device_name")
             .unwrap_or_else(gethostname);
+        // Generate device_key on first run if missing (handles pre-existing installations)
+        let device_key = crate::config::get_setting("sync_device_key")
+            .unwrap_or_else(|| {
+                let key = uuid::Uuid::new_v4().to_string();
+                let _ = crate::config::set_setting("sync_device_key", &key);
+                key
+            });
         Some(SyncConfig {
             server_addr: server,
             access_token: token,
             device_name: device,
+            device_key,
             provider: provider.to_string(),
         })
     }
@@ -132,7 +143,7 @@ fn run_sync_loop(
 
             match SyncClient::connect(&config.server_addr) {
                 Ok(mut c) => {
-                    match c.auth(&config.access_token, &config.device_name, &config.provider) {
+                    match c.auth(&config.access_token, &config.device_name, &config.device_key, &config.provider) {
                         Ok(device_id) => {
                             eprintln!("[toki:sync] connected (device_id={})", truncate(&device_id, 12));
                             backoff.reset();
