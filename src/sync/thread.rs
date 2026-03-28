@@ -35,11 +35,20 @@ impl SyncConfig {
         let token = crate::config::get_setting("sync_access_token")?;
         let device = crate::config::get_setting("sync_device_name")
             .unwrap_or_else(gethostname);
-        // Generate device_key on first run if missing (handles pre-existing installations)
-        let device_key = crate::config::get_setting("sync_device_key")
+        // device_key: Keychain is authoritative (survives settings wipe).
+        // Priority: Keychain → settings DB → generate new (save to both).
+        let device_key = crate::sync::credentials::load()
+            .filter(|c| !c.device_key.is_empty())
+            .map(|c| c.device_key.clone())
+            .or_else(|| crate::config::get_setting("sync_device_key"))
             .unwrap_or_else(|| {
                 let key = uuid::Uuid::new_v4().to_string();
                 let _ = crate::config::set_setting("sync_device_key", &key);
+                // Also persist to Keychain so it survives a settings DB wipe
+                if let Some(mut creds) = crate::sync::credentials::load() {
+                    creds.device_key = key.clone();
+                    let _ = crate::sync::credentials::save(&creds);
+                }
                 key
             });
         Some(SyncConfig {

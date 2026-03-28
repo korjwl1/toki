@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crate::db::SCHEMA_VERSION;
 use super::protocol::{
-    AuthErrPayload, AuthOkPayload, AuthPayload, LastTsPayload, MsgType,
+    AuthErrPayload, AuthOkPayload, AuthPayload, LastTsPayload, MsgType, PROTOCOL_VERSION,
     SyncAckPayload, SyncBatchPayload, SyncErrPayload, SyncItem,
     read_frame, write_empty_frame, write_frame,
 };
@@ -54,6 +54,7 @@ impl SyncClient {
             schema_version: SCHEMA_VERSION,
             provider: provider.to_string(),
             device_key: device_key.to_string(),
+            protocol_version: PROTOCOL_VERSION,
         };
         let bytes = bincode::serialize(&payload).map_err(|e| AuthError::Protocol(e.to_string()))?;
         write_frame(&mut self.writer, MsgType::Auth, &bytes)
