@@ -4,3 +4,4 @@ Cargo.lock
 __pycache__/
 *.pyc
 .claude/settings.local.json
+docs/internal/
