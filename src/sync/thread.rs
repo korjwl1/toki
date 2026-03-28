@@ -101,7 +101,7 @@ fn run_sync_loop(
     db: Arc<Database>,
     flush_notify: FlushNotify,
     stop_rx: crossbeam_channel::Receiver<()>,
-    config: SyncConfig,
+    mut config: SyncConfig,
 ) {
     let mut backoff = Backoff::new();
     let mut client: Option<SyncClient> = None;
@@ -138,12 +138,10 @@ fn run_sync_loop(
         } else {
             let (lock, cvar) = &*flush_notify;
             let timeout = PING_INTERVAL.saturating_sub(last_ping.elapsed());
-            let wait_result = {
-                let guard = lock.lock().unwrap();
-                cvar.wait_timeout_while(guard, timeout, |dirty| !*dirty).unwrap()
-            };
-            let happened = !wait_result.1.timed_out() || *wait_result.0;
-            *lock.lock().unwrap() = false;
+            let guard = lock.lock().unwrap();
+            let (mut guard, timeout_result) = cvar.wait_timeout_while(guard, timeout, |dirty| !*dirty).unwrap();
+            let happened = !timeout_result.timed_out() || *guard;
+            *guard = false;
             happened
         };
 
@@ -157,7 +155,9 @@ fn run_sync_loop(
             let delay = backoff.next_delay();
             if !delay.is_zero() {
                 eprintln!("[toki:sync] reconnecting in {:?}", delay);
-                std::thread::sleep(delay);
+                if stop_rx.recv_timeout(delay).is_ok() {
+                    return; // Stop signal received during backoff
+                }
             }
 
             match SyncClient::connect(&config.server_addr) {
@@ -183,6 +183,11 @@ fn run_sync_loop(
                         }
                         Err(e) => {
                             eprintln!("[toki:sync] auth error: {e}");
+                            // Try refreshing the token
+                            if try_refresh_token(&mut config) {
+                                eprintln!("[toki:sync] token refreshed, retrying auth");
+                                backoff.reset();
+                            }
                         }
                     }
                 }
@@ -287,6 +292,53 @@ fn sync_new_events(
     }
 
     Ok(synced)
+}
+
+fn try_refresh_token(config: &mut SyncConfig) -> bool {
+    // Load credentials from Keychain/file
+    let Some(creds) = crate::sync::credentials::load() else { return false };
+    if creds.refresh_token.is_empty() { return false; }
+
+    // Build HTTP URL from credentials
+    let http_url = if creds.http_url.is_empty() {
+        return false;
+    } else {
+        creds.http_url.clone()
+    };
+
+    // POST /token/refresh
+    let resp = match ureq::post(&format!("{http_url}/token/refresh"))
+        .send_json(ureq::json!({
+            "refresh_token": creds.refresh_token,
+        })) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+
+    let body: serde_json::Value = match resp.into_json() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    let new_access = body["access_token"].as_str().unwrap_or_default();
+    let new_refresh = body["refresh_token"].as_str().unwrap_or_default();
+    if new_access.is_empty() { return false; }
+
+    // Update credentials
+    let mut new_creds = creds;
+    new_creds.access_token = new_access.to_string();
+    if !new_refresh.is_empty() {
+        new_creds.refresh_token = new_refresh.to_string();
+    }
+    let _ = crate::sync::credentials::save(&new_creds);
+
+    // Update config
+    config.access_token = new_creds.access_token;
+
+    // Also update settings DB
+    let _ = crate::config::set_setting("sync_access_token", &config.access_token);
+
+    true
 }
 
 fn truncate(s: &str, n: usize) -> &str {

@@ -1503,19 +1503,26 @@ fn handle_sync_status() {
         .map(|v| v == "true").unwrap_or(false);
     let server = toki::config::get_setting("sync_server").unwrap_or_else(|| "(not set)".to_string());
     let device = toki::config::get_setting("sync_device_name").unwrap_or_else(|| "(not set)".to_string());
-    let last_ts: i64 = toki::config::get_setting("sync_last_ts")
-        .and_then(|s| s.parse().ok()).unwrap_or(0);
-
     println!("Sync status:");
     println!("  enabled:    {}", if enabled { "yes" } else { "no" });
     println!("  server:     {}", server);
     println!("  device:     {}", device);
-    if last_ts > 0 {
-        let last_dt = chrono::DateTime::from_timestamp_millis(last_ts)
-            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-            .unwrap_or_else(|| last_ts.to_string());
-        println!("  last sync:  {}", last_dt);
-    } else {
+
+    // Show per-provider sync cursors
+    let mut any_synced = false;
+    for &provider in toki::providers::KNOWN_PROVIDERS {
+        let key = format!("sync_last_ts_{}", provider);
+        let last_ts: i64 = toki::config::get_setting(&key)
+            .and_then(|s| s.parse().ok()).unwrap_or(0);
+        if last_ts > 0 {
+            let last_dt = chrono::DateTime::from_timestamp_millis(last_ts)
+                .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
+                .unwrap_or_else(|| last_ts.to_string());
+            println!("  last sync ({}): {}", provider, last_dt);
+            any_synced = true;
+        }
+    }
+    if !any_synced {
         println!("  last sync:  (never)");
     }
 

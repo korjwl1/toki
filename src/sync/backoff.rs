@@ -27,7 +27,7 @@ impl Backoff {
         let delay = if self.attempt == 0 {
             Duration::ZERO
         } else {
-            let secs = 2u64.saturating_pow(self.attempt - 1).min(self.cap.as_secs());
+            let secs = 2u64.saturating_pow(self.attempt).min(self.cap.as_secs());
             Duration::from_secs(secs)
         };
         self.attempt = self.attempt.saturating_add(1);
@@ -47,10 +47,10 @@ mod tests {
     fn test_backoff_sequence() {
         let mut b = Backoff::new();
         assert_eq!(b.next_delay(), Duration::ZERO);           // attempt 0: immediate
-        assert_eq!(b.next_delay(), Duration::from_secs(1));   // 2^0 = 1
         assert_eq!(b.next_delay(), Duration::from_secs(2));   // 2^1 = 2
         assert_eq!(b.next_delay(), Duration::from_secs(4));   // 2^2 = 4
         assert_eq!(b.next_delay(), Duration::from_secs(8));   // 2^3 = 8
+        assert_eq!(b.next_delay(), Duration::from_secs(16));  // 2^4 = 16
     }
 
     #[test]
