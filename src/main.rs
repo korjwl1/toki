@@ -142,6 +142,12 @@ enum SyncCommands {
         /// Headless mode: print OIDC URL and wait for pasted callback URL (no browser)
         #[arg(long)]
         headless: bool,
+        /// Skip TLS certificate verification (for self-signed certs)
+        #[arg(long)]
+        insecure: bool,
+        /// Connect without TLS (plaintext, insecure — LAN/VPN only)
+        #[arg(long)]
+        no_tls: bool,
     },
     /// Disable sync and remove stored credentials
     Disable,
@@ -414,6 +420,7 @@ const VALID_SETTINGS: &[&str] = &[
     "start_of_week", "no_cost", "retention_days", "rollup_retention_days",
     "providers", "daemon_autostart",
     "sync_enabled", "sync_server", "sync_access_token", "sync_device_name", "sync_device_key",
+    "sync_tls", "sync_tls_insecure",
 ];
 
 /// Settings that require daemon restart to take effect.
@@ -426,6 +433,7 @@ const RESTART_SETTINGS: &[&str] = &[
 /// Settings that are hot-reloadable by the daemon (no restart needed).
 const HOT_RELOAD_SETTINGS: &[&str] = &[
     "sync_enabled", "sync_server", "sync_access_token", "sync_device_name",
+    "sync_tls", "sync_tls_insecure",
     "retention_days", "rollup_retention_days",
     "timezone", "output_format", "start_of_week", "no_cost",
 ];
@@ -1482,8 +1490,8 @@ fn handle_sync(command: SyncCommands) {
     toki::sync::credentials::check_file_permissions();
 
     match command {
-        SyncCommands::Enable { server, http_url, username, password, headless } => {
-            handle_sync_enable(server, http_url, username, password, headless);
+        SyncCommands::Enable { server, http_url, username, password, headless, insecure, no_tls } => {
+            handle_sync_enable(server, http_url, username, password, headless, insecure, no_tls);
         }
         SyncCommands::Disable => {
             handle_sync_disable();
@@ -1503,6 +1511,8 @@ fn handle_sync_enable(
     username: String,
     password: Option<String>,
     headless: bool,
+    insecure: bool,
+    no_tls: bool,
 ) {
     // Derive HTTP URL from server address if not provided
     let http_base = http_url.unwrap_or_else(|| {
@@ -1598,9 +1608,25 @@ fn handle_sync_enable(
     let _ = toki::config::set_setting("sync_device_name", &device_name);
     let _ = toki::config::set_setting("sync_device_key", &device_key);
 
+    // Save TLS settings based on flags
+    if insecure {
+        let _ = toki::config::set_setting("sync_tls_insecure", "true");
+    }
+    if no_tls {
+        let _ = toki::config::set_setting("sync_tls", "false");
+    }
+
     println!("[toki] Sync enabled.");
     println!("[toki] Server:  {}", server);
     println!("[toki] Device:  {}", device_name);
+
+    if insecure {
+        eprintln!("[toki] Sync enabled with insecure TLS (self-signed cert accepted)");
+    }
+    if no_tls {
+        eprintln!("[toki] Warning: Sync enabled WITHOUT TLS -- credentials sent in plaintext!");
+        eprintln!("[toki]   Only use this on trusted networks (LAN/VPN)");
+    }
 
     // Prompt daemon restart
     let pidfile = toki::daemon::default_pidfile_path();

@@ -90,7 +90,8 @@ impl Write for StreamHalf {
 impl SyncClient {
     /// Connect to server and perform TCP handshake (no auth yet).
     /// If `use_tls` is true, wrap the connection in TLS.
-    pub fn connect(addr: &str, use_tls: bool) -> io::Result<Self> {
+    /// If `insecure` is true, skip TLS certificate verification (for self-signed certs).
+    pub fn connect(addr: &str, use_tls: bool, insecure: bool) -> io::Result<Self> {
         // Resolve hostname (handles both "host:port" and "1.2.3.4:port").
         use std::net::ToSocketAddrs;
         let socket_addr = addr
@@ -105,8 +106,16 @@ impl SyncClient {
         stream.set_nodelay(true)?;
 
         let sync_stream = if use_tls {
-            let connector = native_tls::TlsConnector::new()
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("TLS init: {e}")))?;
+            let connector = if insecure {
+                native_tls::TlsConnector::builder()
+                    .danger_accept_invalid_certs(true)
+                    .danger_accept_invalid_hostnames(true)
+                    .build()
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("TLS init: {e}")))?
+            } else {
+                native_tls::TlsConnector::new()
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("TLS init: {e}")))?
+            };
             let hostname = addr.split(':').next().unwrap_or(addr);
             let tls_stream = connector.connect(hostname, stream)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("TLS handshake: {e}")))?;

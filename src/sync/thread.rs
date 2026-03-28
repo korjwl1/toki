@@ -20,6 +20,8 @@ pub struct SyncConfig {
     /// Whether to use TLS for the sync TCP connection.
     /// Defaults to true for non-localhost servers.
     pub use_tls: bool,
+    /// Whether to skip TLS certificate verification (for self-signed certs).
+    pub tls_insecure: bool,
 }
 
 impl SyncConfig {
@@ -65,6 +67,10 @@ impl SyncConfig {
             }
         };
 
+        let tls_insecure = crate::config::get_setting("sync_tls_insecure")
+            .map(|v| v == "true")
+            .unwrap_or(false);
+
         Some(SyncConfig {
             server_addr: server,
             access_token: token,
@@ -72,6 +78,7 @@ impl SyncConfig {
             device_key,
             provider: provider.to_string(),
             use_tls,
+            tls_insecure,
         })
     }
 }
@@ -170,6 +177,7 @@ fn run_sync_inner(
     let mut dict_cache: HashMap<u32, String> = HashMap::new();
     let mut needs_initial_sync = false;
     let mut last_loop_time = Instant::now();
+    let mut tls_hint_shown = false;
 
     loop {
         // Check stop signal
@@ -230,7 +238,7 @@ fn run_sync_inner(
                 }
             }
 
-            match SyncClient::connect(&config.server_addr, config.use_tls) {
+            match SyncClient::connect(&config.server_addr, config.use_tls, config.tls_insecure) {
                 Ok(mut c) => {
                     match c.auth(&config.access_token, &config.device_name, &config.device_key, &config.provider) {
                         Ok(device_id) => {
@@ -260,6 +268,13 @@ fn run_sync_inner(
                 }
                 Err(e) => {
                     eprintln!("[toki:sync] connect failed: {e}");
+                    if config.use_tls && !tls_hint_shown {
+                        tls_hint_shown = true;
+                        eprintln!("[toki:sync] TLS connection failed. Options:");
+                        eprintln!("[toki:sync]   - Set up a reverse proxy with TLS (recommended)");
+                        eprintln!("[toki:sync]   - Use `toki settings set sync_tls_insecure true` for self-signed certs");
+                        eprintln!("[toki:sync]   - Use `toki settings set sync_tls false` for plaintext (LAN only)");
+                    }
                 }
             }
         }
