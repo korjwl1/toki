@@ -134,6 +134,9 @@ enum SyncCommands {
         /// Password (prompted if omitted)
         #[arg(long)]
         password: Option<String>,
+        /// Headless mode: print OIDC URL and wait for pasted callback URL (no browser)
+        #[arg(long)]
+        headless: bool,
     },
     /// Disable sync and remove stored credentials
     Disable,
@@ -212,6 +215,9 @@ enum ReportCommands {
     Query {
         /// Query string
         query: String,
+        /// Route the query through the toki-sync server's HTTP API instead of local fjall DB
+        #[arg(long)]
+        remote: bool,
     },
 }
 
@@ -905,12 +911,17 @@ fn handle_report(
     let tz = config.tz;
     let sock_path = config.daemon_sock.clone();
 
-    // Require daemon to be running
-    let pidfile = toki::daemon::default_pidfile_path();
-    if toki::daemon::daemon_status(&pidfile).is_none() {
-        eprintln!("[toki] Cannot connect to toki daemon.");
-        eprintln!("[toki] Start the daemon first: toki daemon start");
-        std::process::exit(1);
+    // Check if this is a remote query (no daemon needed)
+    let has_remote = matches!(command, Some(ReportCommands::Query { remote: true, .. }));
+
+    // Require daemon to be running (unless --remote is used)
+    if !has_remote {
+        let pidfile = toki::daemon::default_pidfile_path();
+        if toki::daemon::daemon_status(&pidfile).is_none() {
+            eprintln!("[toki] Cannot connect to toki daemon.");
+            eprintln!("[toki] Start the daemon first: toki daemon start");
+            std::process::exit(1);
+        }
     }
 
     if group_by_session && command.is_some() && !matches!(command, Some(ReportCommands::Query { .. })) {
@@ -918,10 +929,13 @@ fn handle_report(
         std::process::exit(1);
     }
 
+    // Check if this is a --remote query
+    let is_remote = matches!(command, Some(ReportCommands::Query { remote: true, .. }));
+
     // Build query string and time range from CLI arguments.
     // Returns (query_str, start, end) — start/end sent as separate protocol fields.
     let (query_str, req_start, req_end): (String, Option<String>, Option<String>) =
-        if let Some(ReportCommands::Query { ref query }) = command {
+        if let Some(ReportCommands::Query { ref query, .. }) = command {
             // In query mode, --since/--until work as time range filters; other flags are ignored
             let ignored: Vec<&str> = [
                 session_id.as_ref().map(|_| "--session-id"),
@@ -988,8 +1002,12 @@ fn handle_report(
             (q, since.clone(), until.clone())
         };
 
-    // Send query to daemon via UDS
-    let response = send_report_query(&sock_path, &query_str, tz, req_start.as_deref(), req_end.as_deref());
+    // Send query: remote (via HTTP API) or local (via daemon UDS)
+    let response = if is_remote {
+        send_remote_query(&query_str, req_start.as_deref(), req_end.as_deref())
+    } else {
+        send_report_query(&sock_path, &query_str, tz, req_start.as_deref(), req_end.as_deref())
+    };
 
     // Load pricing client-side (file cache, no DB)
     let pricing = if no_cost {
@@ -1180,6 +1198,77 @@ fn send_report_query(
     }
 }
 
+/// Send a PromQL query to the remote toki-sync server via HTTP API.
+/// Loads credentials from Keychain/sync.json, handles 401 with token refresh.
+fn send_remote_query(
+    query: &str,
+    start: Option<&str>,
+    end: Option<&str>,
+) -> Result<ReportResponse, String> {
+    let creds = toki::sync::credentials::load()
+        .ok_or_else(|| "Not configured for remote query. Run: toki sync enable --server <addr> --username <user>".to_string())?;
+
+    // Build query params
+    let url = format!("{}/api/v1/query_range", creds.http_url);
+
+    let do_request = |token: &str| -> Result<ureq::Response, ureq::Error> {
+        let mut req = ureq::get(&url)
+            .set("Authorization", &format!("Bearer {}", token));
+        req = req.query("query", query);
+        if let Some(s) = start { req = req.query("start", s); }
+        if let Some(e) = end { req = req.query("end", e); }
+        req.call()
+    };
+
+    let resp = match do_request(&creds.access_token) {
+        Ok(r) => r,
+        Err(ureq::Error::Status(401, _)) => {
+            // Try token refresh
+            let refresh_url = format!("{}/token/refresh", creds.http_url);
+            let refresh_resp = ureq::post(&refresh_url)
+                .send_json(serde_json::json!({ "refresh_token": creds.refresh_token }))
+                .map_err(|e| format!("Token refresh failed: {e}"))?;
+
+            let refresh_body: serde_json::Value = refresh_resp.into_json()
+                .map_err(|e| format!("Invalid refresh response: {e}"))?;
+
+            let new_access = refresh_body["access_token"].as_str().unwrap_or("").to_string();
+            let new_refresh = refresh_body["refresh_token"].as_str().unwrap_or("").to_string();
+
+            if new_access.is_empty() {
+                return Err("Token refresh did not return access_token. Re-enable sync.".to_string());
+            }
+
+            // Save updated credentials
+            let updated = toki::sync::credentials::Credentials {
+                access_token: new_access.clone(),
+                refresh_token: if new_refresh.is_empty() { creds.refresh_token } else { new_refresh },
+                ..creds
+            };
+            let _ = toki::sync::credentials::save(&updated);
+            let _ = toki::config::set_setting("sync_access_token", &new_access);
+
+            // Retry with new token
+            do_request(&new_access).map_err(|e| format!("Remote query failed after refresh: {e}"))?
+        }
+        Err(ureq::Error::Status(code, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            return Err(format!("Remote query failed (HTTP {}): {}", code, body.trim()));
+        }
+        Err(e) => return Err(format!("Remote query error: {e}")),
+    };
+
+    let body: serde_json::Value = resp.into_json()
+        .map_err(|e| format!("Invalid remote query response: {e}"))?;
+
+    // The toki-sync /api/v1/query_range proxies to VictoriaMetrics and returns
+    // Prometheus-compatible JSON. Wrap it into our ReportResponse format.
+    Ok(ReportResponse {
+        data: body["data"].clone(),
+        meta: serde_json::json!({}),
+    })
+}
+
 /// Dispatch a JSON result from the daemon to the local sink for display.
 /// Detects a "schema" field in the response to use the correct provider schema for rendering.
 fn dispatch_result_to_sink(
@@ -1368,8 +1457,8 @@ fn handle_sync(command: SyncCommands) {
     toki::sync::credentials::check_file_permissions();
 
     match command {
-        SyncCommands::Enable { server, http_url, username, password } => {
-            handle_sync_enable(server, http_url, username, password);
+        SyncCommands::Enable { server, http_url, username, password, headless } => {
+            handle_sync_enable(server, http_url, username, password, headless);
         }
         SyncCommands::Disable => {
             handle_sync_disable();
@@ -1388,6 +1477,7 @@ fn handle_sync_enable(
     http_url: Option<String>,
     username: String,
     password: Option<String>,
+    headless: bool,
 ) {
     // Derive HTTP URL from server address if not provided
     let http_base = http_url.unwrap_or_else(|| {
@@ -1395,54 +1485,62 @@ fn handle_sync_enable(
         format!("http://{}:9091", host)
     });
 
-    // Prompt for password if not provided
-    let pw = password.unwrap_or_else(|| {
-        eprint!("Password: ");
-        rpassword_read()
-    });
-
-    // GET /auth-method — verify server is reachable
-    let url = format!("{}/auth-method", http_base);
-    match ureq::post(&url)
+    // POST /auth-method — verify server is reachable and determine auth flow
+    let auth_method_url = format!("{}/auth-method", http_base);
+    let auth_resp = match ureq::post(&auth_method_url)
         .send_json(serde_json::json!({ "username": username }))
     {
         Err(e) => {
             eprintln!("[toki] Cannot reach sync server at {}: {}", http_base, e);
             std::process::exit(1);
         }
-        Ok(_) => {}
-    }
-
-    // POST /login
-    let login_url = format!("{}/login", http_base);
-    let resp = match ureq::post(&login_url)
-        .send_json(serde_json::json!({
-            "username": username,
-            "password": pw,
-        }))
-    {
         Ok(r) => r,
-        Err(ureq::Error::Status(code, resp)) => {
-            let body = resp.into_string().unwrap_or_default();
-            eprintln!("[toki] Login failed (HTTP {}): {}", code, body.trim());
-            std::process::exit(1);
-        }
-        Err(e) => {
-            eprintln!("[toki] Login error: {}", e);
-            std::process::exit(1);
-        }
     };
+    let auth_body: serde_json::Value = auth_resp.into_json().unwrap_or_default();
+    let method = auth_body["method"].as_str().unwrap_or("password");
 
-    let body: serde_json::Value = match resp.into_json() {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("[toki] Invalid login response: {}", e);
-            std::process::exit(1);
-        }
+    let (access_token, refresh_token) = if method == "oidc" {
+        // OIDC flow
+        let auth_url_path = auth_body["auth_url"].as_str().unwrap_or("/auth/oidc/authorize");
+        handle_oidc_login(&http_base, auth_url_path, headless)
+    } else {
+        // Password flow
+        let pw = password.unwrap_or_else(|| {
+            eprint!("Password: ");
+            rpassword_read()
+        });
+
+        let login_url = format!("{}/login", http_base);
+        let resp = match ureq::post(&login_url)
+            .send_json(serde_json::json!({
+                "username": username,
+                "password": pw,
+            }))
+        {
+            Ok(r) => r,
+            Err(ureq::Error::Status(code, resp)) => {
+                let body = resp.into_string().unwrap_or_default();
+                eprintln!("[toki] Login failed (HTTP {}): {}", code, body.trim());
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("[toki] Login error: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+        let body: serde_json::Value = match resp.into_json() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[toki] Invalid login response: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+        let at = body["access_token"].as_str().unwrap_or("").to_string();
+        let rt = body["refresh_token"].as_str().unwrap_or("").to_string();
+        (at, rt)
     };
-
-    let access_token = body["access_token"].as_str().unwrap_or("").to_string();
-    let refresh_token = body["refresh_token"].as_str().unwrap_or("").to_string();
 
     if access_token.is_empty() {
         eprintln!("[toki] Login response missing access_token");
@@ -1483,6 +1581,111 @@ fn handle_sync_enable(
     if toki::daemon::daemon_status(&pidfile).is_some() {
         eprintln!("[toki] Restart daemon to start syncing: toki daemon restart");
     }
+}
+
+/// Handle OIDC login flow: start localhost server, open browser, wait for callback.
+fn handle_oidc_login(http_base: &str, auth_url_path: &str, headless: bool) -> (String, String) {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    // Bind a temporary HTTP server on a random port
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap_or_else(|e| {
+        eprintln!("[toki] Failed to start local HTTP server: {}", e);
+        std::process::exit(1);
+    });
+    let local_port = listener.local_addr().unwrap().port();
+    let redirect_uri = format!("http://localhost:{}/callback", local_port);
+
+    // Build the full authorization URL with our redirect_uri
+    let full_auth_url = if auth_url_path.starts_with("http") {
+        format!("{}&redirect_uri={}", auth_url_path, urlencoding::encode(&redirect_uri))
+    } else {
+        format!("{}{}?redirect_uri={}", http_base, auth_url_path, urlencoding::encode(&redirect_uri))
+    };
+
+    if headless {
+        // Headless mode: print URL and ask user to paste callback URL
+        eprintln!("[toki] Open this URL in your browser to authenticate:");
+        eprintln!();
+        eprintln!("  {}", full_auth_url);
+        eprintln!();
+        eprint!("[toki] Paste the callback URL here: ");
+        let _ = std::io::stderr().flush();
+        let mut callback_url = String::new();
+        std::io::stdin().read_line(&mut callback_url).unwrap_or(0);
+        let callback_url = callback_url.trim();
+        return parse_callback_tokens(callback_url);
+    }
+
+    // Open browser
+    eprintln!("[toki] Opening browser for authentication...");
+    eprintln!("[toki] If the browser doesn't open, visit:");
+    eprintln!("  {}", full_auth_url);
+
+    #[cfg(target_os = "macos")]
+    { let _ = std::process::Command::new("open").arg(&full_auth_url).spawn(); }
+    #[cfg(target_os = "linux")]
+    { let _ = std::process::Command::new("xdg-open").arg(&full_auth_url).spawn(); }
+
+    // Wait for callback (single connection)
+    eprintln!("[toki] Waiting for authentication callback...");
+    listener.set_nonblocking(false).ok();
+
+    let (mut stream, _) = listener.accept().unwrap_or_else(|e| {
+        eprintln!("[toki] Failed to accept callback connection: {}", e);
+        std::process::exit(1);
+    });
+
+    // Read the HTTP request
+    let mut buf = vec![0u8; 8192];
+    let n = stream.read(&mut buf).unwrap_or(0);
+    let request = String::from_utf8_lossy(&buf[..n]).to_string();
+
+    // Send success response
+    let html = "<!DOCTYPE html><html><body><h2>Login successful!</h2><p>You can close this window and return to the terminal.</p></body></html>";
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        html.len(), html
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+    drop(stream);
+
+    // Parse query params from the callback request
+    // Request line looks like: GET /callback?access_token=...&refresh_token=... HTTP/1.1
+    let request_line = request.lines().next().unwrap_or("");
+    let path = request_line.split_whitespace().nth(1).unwrap_or("");
+    parse_callback_tokens(path)
+}
+
+/// Extract access_token and refresh_token from a callback URL/path query string.
+fn parse_callback_tokens(url_or_path: &str) -> (String, String) {
+    let query_str = if let Some(idx) = url_or_path.find('?') {
+        &url_or_path[idx + 1..]
+    } else {
+        ""
+    };
+
+    let mut access_token = String::new();
+    let mut refresh_token = String::new();
+
+    for param in query_str.split('&') {
+        if let Some((key, value)) = param.split_once('=') {
+            let decoded = urlencoding::decode(value).unwrap_or_else(|_| value.into());
+            match key {
+                "access_token" => access_token = decoded.to_string(),
+                "refresh_token" => refresh_token = decoded.to_string(),
+                _ => {}
+            }
+        }
+    }
+
+    if access_token.is_empty() {
+        eprintln!("[toki] OIDC callback did not include access_token");
+        std::process::exit(1);
+    }
+
+    (access_token, refresh_token)
 }
 
 fn handle_sync_disable() {
