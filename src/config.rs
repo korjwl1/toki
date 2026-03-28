@@ -195,6 +195,10 @@ pub fn set_setting(key: &str, value: &str) -> Result<(), String> {
     std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
 
     lock_file.unlock().ok();
+
+    // Touch sentinel for daemon hot-reload
+    let _ = touch_settings_sentinel();
+
     Ok(())
 }
 
@@ -233,6 +237,10 @@ pub fn set_setting_array(key: &str, values: &[String]) -> Result<(), String> {
     std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
 
     lock_file.unlock().ok();
+
+    // Touch sentinel for daemon hot-reload
+    let _ = touch_settings_sentinel();
+
     Ok(())
 }
 
@@ -272,6 +280,27 @@ pub fn list_settings() -> HashMap<String, String> {
                 })
         })
         .collect()
+}
+
+/// Path to the settings change sentinel file.
+/// The daemon watches this file; touching it triggers a hot-reload of settings.
+pub fn settings_sentinel_path() -> PathBuf {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    home.join(".config").join("toki").join(".settings_changed")
+}
+
+/// Touch the sentinel file to notify the daemon of settings changes.
+fn touch_settings_sentinel() -> std::io::Result<()> {
+    let path = settings_sentinel_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    // Write current timestamp to force a modify event even if file already exists
+    std::fs::write(&path, format!("{}", std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()))?;
+    Ok(())
 }
 
 pub fn parse_weekday(s: &str) -> Option<Weekday> {

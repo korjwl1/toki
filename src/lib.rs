@@ -55,6 +55,12 @@ pub struct Handle {
     /// Sync thread stop channels + join handles (one per provider).
     sync_stops: Vec<crossbeam_channel::Sender<()>>,
     sync_threads: Vec<Option<JoinHandle<()>>>,
+    /// Per-provider sync toggles for hot-reload.
+    sync_toggles: Vec<(String, sync::SyncToggle)>,
+    /// Settings watcher thread join handle.
+    settings_watcher_handle: Option<JoinHandle<()>>,
+    /// Settings watcher stop channel.
+    settings_watcher_stop: Option<crossbeam_channel::Sender<()>>,
 }
 
 struct ProviderRuntimeHandle {
@@ -80,9 +86,21 @@ impl Handle {
     }
 
     fn shutdown(&mut self) {
+        // Stop settings watcher thread
+        if let Some(tx) = self.settings_watcher_stop.take() {
+            let _ = tx.send(());
+        }
+        if let Some(handle) = self.settings_watcher_handle.take() {
+            let _ = handle.join();
+        }
+
         // Signal sync threads to stop
         for tx in &self.sync_stops {
             let _ = tx.send(());
+        }
+        // Wake sync threads that may be waiting on toggle
+        for (_, toggle) in &self.sync_toggles {
+            toggle.1.notify_one();
         }
         // Join sync threads before shutting down DB writers — they hold DB read handles
         for handle_opt in &mut self.sync_threads {
@@ -289,16 +307,38 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
     // Check credentials file permissions before starting sync
     crate::sync::credentials::check_file_permissions();
 
-    // Start sync threads — one per provider (no-op if sync not configured)
+    // Determine if sync is initially enabled
+    let sync_initially_enabled = config::get_setting("sync_enabled")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
+    // Always spawn sync threads — one per provider. They wait on SyncToggle when disabled.
     let mut sync_stops: Vec<crossbeam_channel::Sender<()>> = Vec::new();
     let mut sync_threads: Vec<Option<JoinHandle<()>>> = Vec::new();
+    let mut sync_toggles: Vec<(String, sync::SyncToggle)> = Vec::new();
     for (flush_notify, db, provider_name) in provider_sync_infos {
         let (sync_stop_tx, sync_stop_rx) = crossbeam_channel::bounded::<()>(1);
-        if let Some(handle) = sync::start_sync_thread(db, flush_notify, sync_stop_rx, provider_name) {
-            sync_stops.push(sync_stop_tx);
-            sync_threads.push(Some(handle));
-        }
+        let sync_toggle: sync::SyncToggle = Arc::new((
+            Mutex::new(sync_initially_enabled),
+            Condvar::new(),
+        ));
+        let handle = sync::start_sync_thread(
+            db, flush_notify, sync_stop_rx, provider_name.clone(), sync_toggle.clone(),
+        );
+        sync_stops.push(sync_stop_tx);
+        sync_threads.push(Some(handle));
+        sync_toggles.push((provider_name, sync_toggle));
     }
+
+    // Start settings file watcher for hot-reload
+    let (settings_stop_tx, settings_stop_rx) = crossbeam_channel::bounded::<()>(1);
+    let settings_toggles = sync_toggles.clone();
+    let settings_watcher_handle = std::thread::Builder::new()
+        .name("toki-settings-watcher".to_string())
+        .spawn(move || {
+            run_settings_watcher(settings_stop_rx, settings_toggles);
+        })
+        .map_err(TokiError::Io)?;
 
     Ok(Handle {
         stop_tx: Some(stop_tx),
@@ -309,7 +349,111 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
         provider_dbs,
         sync_stops,
         sync_threads,
+        sync_toggles,
+        settings_watcher_handle: Some(settings_watcher_handle),
+        settings_watcher_stop: Some(settings_stop_tx),
     })
+}
+
+/// Watch the settings sentinel file for changes and dispatch hot-reload updates.
+/// Runs in its own thread. Polls via `notify` crate file watcher on the sentinel,
+/// with a fallback poll every 10s.
+fn run_settings_watcher(
+    stop_rx: crossbeam_channel::Receiver<()>,
+    sync_toggles: Vec<(String, sync::SyncToggle)>,
+) {
+    let sentinel_path = config::settings_sentinel_path();
+
+    // Ensure sentinel file exists so the watcher has something to watch
+    if let Some(parent) = sentinel_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    if !sentinel_path.exists() {
+        std::fs::write(&sentinel_path, "0").ok();
+    }
+
+    // Track last modification time to detect actual changes
+    let mut last_mtime = std::fs::metadata(&sentinel_path)
+        .and_then(|m| m.modified())
+        .ok();
+
+    // Set up file watcher on the sentinel file
+    let (watch_tx, watch_rx) = crossbeam_channel::unbounded::<()>();
+    let _watcher = {
+        use notify::{RecursiveMode, Watcher, Event, EventKind};
+        let tx = watch_tx.clone();
+        let mut w = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
+            if let Ok(event) = res {
+                if matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_)) {
+                    let _ = tx.send(());
+                }
+            }
+        });
+        match w {
+            Ok(ref mut watcher) => {
+                // Watch the parent directory since the sentinel file may be recreated
+                if let Some(parent) = sentinel_path.parent() {
+                    let _ = watcher.watch(parent, RecursiveMode::NonRecursive);
+                }
+            }
+            Err(ref e) => {
+                eprintln!("[toki:settings-watcher] failed to create watcher: {}, falling back to polling", e);
+            }
+        }
+        w.ok()
+    };
+
+    // Poll interval as fallback
+    let poll_tick = crossbeam_channel::tick(std::time::Duration::from_secs(10));
+
+    loop {
+        crossbeam_channel::select! {
+            recv(stop_rx) -> _ => {
+                return;
+            }
+            recv(watch_rx) -> _ => {
+                // File watcher triggered — check if sentinel actually changed
+            }
+            recv(poll_tick) -> _ => {
+                // Fallback poll
+            }
+        }
+
+        // Check if the sentinel file was actually modified
+        let current_mtime = std::fs::metadata(&sentinel_path)
+            .and_then(|m| m.modified())
+            .ok();
+        if current_mtime == last_mtime {
+            continue;
+        }
+        last_mtime = current_mtime;
+
+        eprintln!("[toki:settings-watcher] settings change detected, reloading...");
+        handle_settings_change(&sync_toggles);
+    }
+}
+
+/// Handle a settings change by re-reading the settings DB and dispatching updates.
+fn handle_settings_change(
+    sync_toggles: &[(String, sync::SyncToggle)],
+) {
+    let sync_enabled = config::get_setting("sync_enabled")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
+    // Update sync toggles for all providers
+    for (provider_name, toggle) in sync_toggles {
+        let mut enabled = toggle.0.lock().unwrap();
+        let was_enabled = *enabled;
+        *enabled = sync_enabled;
+        if sync_enabled && !was_enabled {
+            eprintln!("[toki:settings-watcher] sync enabled for {}", provider_name);
+            toggle.1.notify_one();
+        } else if !sync_enabled && was_enabled {
+            eprintln!("[toki:settings-watcher] sync disabled for {}", provider_name);
+            // Sync thread will notice on next toggle check
+        }
+    }
 }
 
 /// Create a provider instance by name (used to clone providers for worker thread).

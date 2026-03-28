@@ -20,6 +20,9 @@ struct SettingsState {
     no_cost: bool,
     retention_days: String,
     rollup_retention_days: String,
+    sync_enabled: bool,
+    sync_server: String,
+    sync_device_name: String,
 }
 
 impl SettingsState {
@@ -39,6 +42,9 @@ impl SettingsState {
             no_cost: get("no_cost", "false") == "true",
             retention_days: get("retention_days", "0"),
             rollup_retention_days: get("rollup_retention_days", "0"),
+            sync_enabled: get("sync_enabled", "false") == "true",
+            sync_server: get("sync_server", ""),
+            sync_device_name: get("sync_device_name", &crate::sync::thread::SyncConfig::default_device_name()),
         }
     }
 }
@@ -147,6 +153,17 @@ pub fn run_settings() -> bool {
         .child(labeled_edit("Rollup Retention", &state.rollup_retention_days, "rollup_retention_days"))
         .child(hint_text("                        Days to keep rollups (0 = forever)"));
 
+    // -- Sync section --
+    let sync_section = LinearLayout::vertical()
+        .child(labeled_checkbox("Enabled", state.sync_enabled, "sync_enabled"))
+        .child(hint_text("                        Enable/disable multi-device sync (hot-reloaded)"))
+        .child(DummyView.fixed_height(1))
+        .child(labeled_edit("Server", &state.sync_server, "sync_server"))
+        .child(hint_text("                        host:port (e.g. sync.example.com:9090)"))
+        .child(DummyView.fixed_height(1))
+        .child(labeled_edit("Device Name", &state.sync_device_name, "sync_device_name"))
+        .child(hint_text("                        Name for this device (default: hostname)"));
+
     // -- Providers section (popup multi-select) --
     let enabled_providers = crate::config::get_providers();
     let providers_display = format_providers_display(&enabled_providers);
@@ -180,7 +197,9 @@ pub fn run_settings() -> bool {
         .child(DummyView.fixed_height(1))
         .child(Panel::new(PaddedView::new(Margins::lrtb(1, 1, 1, 0), display_section)).title("Display"))
         .child(DummyView.fixed_height(1))
-        .child(Panel::new(PaddedView::new(Margins::lrtb(1, 1, 1, 0), data_section)).title("Data"));
+        .child(Panel::new(PaddedView::new(Margins::lrtb(1, 1, 1, 0), data_section)).title("Data"))
+        .child(DummyView.fixed_height(1))
+        .child(Panel::new(PaddedView::new(Margins::lrtb(1, 1, 1, 0), sync_section)).title("Sync"));
 
     let padded = PaddedView::lrtb(1, 1, 0, 0, form);
 
@@ -255,6 +274,12 @@ fn save_settings(siv: &mut Cursive, restart_flag: std::sync::Arc<std::sync::atom
         v.is_checked()
     }).unwrap_or(false);
 
+    let sync_enabled = siv.call_on_name("sync_enabled", |v: &mut Checkbox| {
+        v.is_checked()
+    }).unwrap_or(false);
+    let sync_server = get_edit(siv, "sync_server");
+    let sync_device_name = get_edit(siv, "sync_device_name");
+
     // Validate timezone
     if !timezone.is_empty()
         && timezone.parse::<chrono_tz::Tz>().is_err() {
@@ -282,6 +307,9 @@ fn save_settings(siv: &mut Cursive, restart_flag: std::sync::Arc<std::sync::atom
         ("no_cost", if no_cost { "true" } else { "false" }),
         ("retention_days", retention.as_str()),
         ("rollup_retention_days", rollup_retention.as_str()),
+        ("sync_enabled", if sync_enabled { "true" } else { "false" }),
+        ("sync_server", sync_server.as_str()),
+        ("sync_device_name", sync_device_name.as_str()),
     ];
 
     // Read providers from hidden storage (set by popup)
@@ -294,10 +322,12 @@ fn save_settings(siv: &mut Cursive, restart_flag: std::sync::Arc<std::sync::atom
         }
     }).unwrap_or_default();
 
-    // Load old values to detect daemon-affecting changes
+    // Load old values to detect restart-requiring changes
+    // Only claude_code_root, codex_root, daemon_sock, providers require restart.
+    // Other settings (including sync, retention) are hot-reloaded.
     let old_providers = crate::config::get_providers();
-    let daemon_keys = ["claude_code_root", "codex_root", "daemon_sock", "retention_days", "rollup_retention_days"];
-    let old_values: Vec<(String, String)> = daemon_keys.iter()
+    let restart_keys = ["claude_code_root", "codex_root", "daemon_sock"];
+    let old_values: Vec<(String, String)> = restart_keys.iter()
         .map(|k| (k.to_string(), crate::config::get_setting(k).unwrap_or_default()))
         .collect();
 

@@ -116,6 +116,11 @@ enum SettingsCommands {
     },
     /// List all settings
     List,
+    /// Multi-device sync management (alias for `toki sync`)
+    Sync {
+        #[command(subcommand)]
+        command: SyncCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -360,6 +365,9 @@ fn main() {
                 Some(SettingsCommands::List) => {
                     handle_settings_list();
                 }
+                Some(SettingsCommands::Sync { command }) => {
+                    handle_sync(command);
+                }
             }
         }
         Commands::Sync { command } => {
@@ -409,9 +417,17 @@ const VALID_SETTINGS: &[&str] = &[
 ];
 
 /// Settings that require daemon restart to take effect.
-const DAEMON_SETTINGS: &[&str] = &[
-    "claude_code_root", "codex_root", "daemon_sock", "retention_days", "rollup_retention_days",
-    "providers",
+/// Hot-reloadable settings (sync_enabled, retention_days, etc.) are NOT listed here
+/// because the daemon picks them up automatically via the settings file watcher.
+const RESTART_SETTINGS: &[&str] = &[
+    "claude_code_root", "codex_root", "daemon_sock", "providers",
+];
+
+/// Settings that are hot-reloadable by the daemon (no restart needed).
+const HOT_RELOAD_SETTINGS: &[&str] = &[
+    "sync_enabled", "sync_server", "sync_access_token", "sync_device_name",
+    "retention_days", "rollup_retention_days",
+    "timezone", "output_format", "start_of_week", "no_cost",
 ];
 
 fn handle_settings_set(key: &str, value: &str) {
@@ -427,8 +443,17 @@ fn handle_settings_set(key: &str, value: &str) {
     }
     println!("{} = {}", key, value);
 
-    // Prompt daemon restart for daemon-affecting settings
-    if DAEMON_SETTINGS.contains(&key) {
+    // Hot-reloadable settings are picked up automatically by the daemon
+    if HOT_RELOAD_SETTINGS.contains(&key) {
+        let pidfile = toki::daemon::default_pidfile_path();
+        if toki::daemon::daemon_status(&pidfile).is_some() {
+            eprintln!("[toki] Setting will be hot-reloaded by the daemon.");
+        }
+        return;
+    }
+
+    // Prompt daemon restart for settings that require it
+    if RESTART_SETTINGS.contains(&key) {
         let pidfile = toki::daemon::default_pidfile_path();
         if toki::daemon::daemon_status(&pidfile).is_some() {
             eprintln!("[toki] This setting requires daemon restart to take effect.");

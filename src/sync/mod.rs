@@ -4,4 +4,4 @@ pub mod credentials;
 pub mod protocol;
 pub mod thread;
 
-pub use thread::{FlushNotify, start_sync_thread};
+pub use thread::{FlushNotify, SyncToggle, start_sync_thread};

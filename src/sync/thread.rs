@@ -91,37 +91,83 @@ const PING_INTERVAL: Duration = Duration::from_secs(60);
 /// Flush notification handle: a Condvar + dirty flag shared with DbWriter.
 pub type FlushNotify = Arc<(Mutex<bool>, Condvar)>;
 
-/// Start the sync thread. Returns None if sync is not configured.
+/// Sync toggle: (enabled flag, condvar). When disabled, the sync thread
+/// waits on the condvar instead of actively syncing.
+pub type SyncToggle = Arc<(Mutex<bool>, Condvar)>;
+
+/// Always spawn a sync thread for the given provider.
+/// The thread uses `sync_toggle` to sleep when sync is disabled (CPU 0%).
+/// When enabled via settings hot-reload, it wakes up, loads config, and runs.
 pub fn start_sync_thread(
     db: Arc<Database>,
     flush_notify: FlushNotify,
     stop_rx: crossbeam_channel::Receiver<()>,
     provider: String,
-) -> Option<std::thread::JoinHandle<()>> {
-    let config = SyncConfig::load(&provider)?;
-
-    let handle = std::thread::Builder::new()
+    sync_toggle: SyncToggle,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
         .name(format!("toki-sync-{provider}"))
         .spawn(move || {
-            run_sync_loop(db, flush_notify, stop_rx, config);
+            run_sync_loop(db, flush_notify, stop_rx, provider, sync_toggle);
         })
-        .expect("failed to spawn sync thread");
-
-    Some(handle)
+        .expect("failed to spawn sync thread")
 }
 
 fn run_sync_loop(
     db: Arc<Database>,
     flush_notify: FlushNotify,
     stop_rx: crossbeam_channel::Receiver<()>,
-    mut config: SyncConfig,
+    provider: String,
+    sync_toggle: SyncToggle,
+) {
+    loop {
+        // Wait until sync is enabled (or stop is signaled)
+        {
+            let (lock, cvar) = &*sync_toggle;
+            let mut enabled = lock.lock().unwrap();
+            while !*enabled {
+                if stop_rx.try_recv().is_ok() {
+                    return;
+                }
+                let (guard, _) = cvar.wait_timeout(enabled, Duration::from_secs(5)).unwrap();
+                enabled = guard;
+            }
+        }
+
+        // Check stop after waking
+        if stop_rx.try_recv().is_ok() {
+            return;
+        }
+
+        // Try to load sync config. Even though toggle says enabled,
+        // config may be incomplete (e.g. server not set yet).
+        let Some(mut config) = SyncConfig::load(&provider) else {
+            eprintln!("[toki:sync:{}] enabled but config incomplete, waiting...", provider);
+            // Sleep briefly and re-check toggle / config
+            if stop_rx.recv_timeout(Duration::from_secs(5)).is_ok() {
+                return;
+            }
+            continue;
+        };
+
+        eprintln!("[toki:sync:{}] starting sync loop", provider);
+        run_sync_inner(&db, &flush_notify, &stop_rx, &mut config, &sync_toggle);
+        eprintln!("[toki:sync:{}] sync loop paused", provider);
+    }
+}
+
+/// Inner sync loop: runs until stop signal or sync gets disabled via toggle.
+fn run_sync_inner(
+    db: &Arc<Database>,
+    flush_notify: &FlushNotify,
+    stop_rx: &crossbeam_channel::Receiver<()>,
+    config: &mut SyncConfig,
+    sync_toggle: &SyncToggle,
 ) {
     let mut backoff = Backoff::new();
     let mut client: Option<SyncClient> = None;
     let mut last_ping = Instant::now();
     let mut dict_cache: HashMap<u32, String> = HashMap::new();
-    // Set after auth succeeds — triggers an immediate initial delta sync
-    // without waiting for the next flush notification.
     let mut needs_initial_sync = false;
     let mut last_loop_time = Instant::now();
 
@@ -131,8 +177,15 @@ fn run_sync_loop(
             return;
         }
 
-        // Wake detection: if elapsed wall-clock time since last loop iteration
-        // is much longer than expected, the machine likely slept.
+        // Check if sync was disabled (finish current iteration, then return)
+        {
+            let enabled = sync_toggle.0.lock().unwrap();
+            if !*enabled {
+                return;
+            }
+        }
+
+        // Wake detection
         let elapsed = last_loop_time.elapsed();
         last_loop_time = Instant::now();
         if client.is_some() && elapsed > PING_INTERVAL * 2 {
@@ -140,16 +193,12 @@ fn run_sync_loop(
             client = None;
         }
 
-        // Wait for a flush notification or PING timeout.
-        // Skip the wait entirely when we are not yet connected (connect immediately
-        // on cold start and after disconnect) or when a fresh connection needs its
-        // initial delta sync.
+        // Wait for flush or PING timeout
         let flush_happened = if client.is_none() || needs_initial_sync {
-            // Drain the dirty flag without blocking, then proceed.
             *flush_notify.0.lock().unwrap() = false;
             false
         } else {
-            let (lock, cvar) = &*flush_notify;
+            let (lock, cvar) = &**flush_notify;
             let timeout = PING_INTERVAL.saturating_sub(last_ping.elapsed());
             let guard = lock.lock().unwrap();
             let (mut guard, timeout_result) = cvar.wait_timeout_while(guard, timeout, |dirty| !*dirty).unwrap();
@@ -163,13 +212,21 @@ fn run_sync_loop(
             return;
         }
 
+        // Check toggle again after wakeup
+        {
+            let enabled = sync_toggle.0.lock().unwrap();
+            if !*enabled {
+                return;
+            }
+        }
+
         // Ensure connection
         if client.is_none() {
             let delay = backoff.next_delay();
             if !delay.is_zero() {
                 eprintln!("[toki:sync] reconnecting in {:?}", delay);
                 if stop_rx.recv_timeout(delay).is_ok() {
-                    return; // Stop signal received during backoff
+                    return;
                 }
             }
 
@@ -179,11 +236,9 @@ fn run_sync_loop(
                         Ok(device_id) => {
                             eprintln!("[toki:sync] connected (device_id={})", truncate(&device_id, 12));
                             backoff.reset();
-                            // Reload dict on fresh connection
                             dict_cache = db.load_dict_reverse().unwrap_or_default();
                             client = Some(c);
                             last_ping = Instant::now();
-                            // Trigger immediate initial delta sync after auth.
                             needs_initial_sync = true;
                         }
                         Err(AuthError::Rejected { reason, reset_required }) => {
@@ -196,8 +251,7 @@ fn run_sync_loop(
                         }
                         Err(e) => {
                             eprintln!("[toki:sync] auth error: {e}");
-                            // Try refreshing the token
-                            if try_refresh_token(&mut config) {
+                            if try_refresh_token(config) {
                                 eprintln!("[toki:sync] token refreshed, retrying auth");
                                 backoff.reset();
                             }
@@ -212,10 +266,10 @@ fn run_sync_loop(
 
         let Some(ref mut c) = client else { continue };
 
-        // Sync new events on flush or immediately after a fresh connection.
+        // Sync new events
         if flush_happened || needs_initial_sync {
             needs_initial_sync = false;
-            match sync_new_events(c, &db, &mut dict_cache, &config.provider) {
+            match sync_new_events(c, db, &mut dict_cache, &config.provider) {
                 Ok(synced) => {
                     if synced > 0 {
                         eprintln!("[toki:sync] synced {synced} events");
