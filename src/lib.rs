@@ -12,6 +12,7 @@ pub mod query_parser;
 pub mod retention;
 pub mod settings;
 pub mod sink;
+pub mod sync;
 pub mod update;
 pub mod writer;
 
@@ -19,7 +20,7 @@ pub use common::types::{UsageEvent, UsageEventWithTs, ModelUsageSummary, Session
 pub use config::Config;
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use db::Database;
@@ -51,6 +52,9 @@ pub struct Handle {
     db: Arc<Database>,
     /// All provider DBs for multi-provider report queries, with provider names.
     provider_dbs: Vec<(String, Arc<Database>)>,
+    /// Sync thread stop channels + join handles (one per provider).
+    sync_stops: Vec<crossbeam_channel::Sender<()>>,
+    sync_threads: Vec<Option<JoinHandle<()>>>,
 }
 
 struct ProviderRuntimeHandle {
@@ -76,7 +80,12 @@ impl Handle {
     }
 
     fn shutdown(&mut self) {
-        // Stop the worker thread first (it sends remaining ops to writers)
+        // Stop sync threads first (they hold DB read handles)
+        for tx in &self.sync_stops {
+            let _ = tx.send(());
+        }
+
+        // Stop the worker thread (sends remaining ops to writers)
         if let Some(tx) = self.stop_tx.take() {
             let _ = tx.send(());
         }
@@ -91,6 +100,13 @@ impl Handle {
         // Then join all (they're already shutting down concurrently)
         for rt in &mut self.runtimes {
             if let Some(handle) = rt.writer_handle.take() {
+                let _ = handle.join();
+            }
+        }
+
+        // Join sync threads last
+        for handle_opt in &mut self.sync_threads {
+            if let Some(handle) = handle_opt.take() {
                 let _ = handle.join();
             }
         }
@@ -141,6 +157,8 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
     let mut runtimes: Vec<ProviderRuntime> = Vec::new();
     let mut channel_map: HashMap<String, crossbeam_channel::Sender<DbOp>> = HashMap::new();
     let mut all_checkpoints: HashMap<String, common::types::FileCheckpoint> = HashMap::new();
+    // (flush_notify, db, provider_name) — used to start sync threads after cold start
+    let mut provider_sync_infos: Vec<(sync::FlushNotify, Arc<Database>, String)> = Vec::new();
 
     for provider in provider_list {
         // Skip providers whose root directory doesn't exist (e.g., Codex not installed)
@@ -160,7 +178,9 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
         }
 
         let (db_tx, db_rx) = crossbeam_channel::bounded::<DbOp>(1024);
-        let writer = DbWriter::new(db.clone(), db_rx, retention.clone());
+        let flush_notify: sync::FlushNotify = Arc::new((Mutex::new(false), Condvar::new()));
+        let mut writer = DbWriter::new(db.clone(), db_rx, retention.clone());
+        writer.flush_notify = Some(flush_notify.clone());
         let provider_name = provider.name().to_string();
         let writer_handle = std::thread::Builder::new()
             .name(format!("toki-writer-{}", provider_name))
@@ -170,6 +190,7 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
             .map_err(TokiError::Io)?;
 
         channel_map.insert(provider.name().to_string(), db_tx.clone());
+        provider_sync_infos.push((flush_notify, db.clone(), provider_name.clone()));
 
         runtimes.push(ProviderRuntime {
             provider,
@@ -266,6 +287,17 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
         })
         .collect();
 
+    // Start sync threads — one per provider (no-op if sync not configured)
+    let mut sync_stops: Vec<crossbeam_channel::Sender<()>> = Vec::new();
+    let mut sync_threads: Vec<Option<JoinHandle<()>>> = Vec::new();
+    for (flush_notify, db, provider_name) in provider_sync_infos {
+        let (sync_stop_tx, sync_stop_rx) = crossbeam_channel::bounded::<()>(1);
+        if let Some(handle) = sync::start_sync_thread(db, flush_notify, sync_stop_rx, provider_name) {
+            sync_stops.push(sync_stop_tx);
+            sync_threads.push(Some(handle));
+        }
+    }
+
     Ok(Handle {
         stop_tx: Some(stop_tx),
         worker_handle: Some(worker_handle),
@@ -273,6 +305,8 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
         runtimes: runtime_handles,
         db: primary_db,
         provider_dbs,
+        sync_stops,
+        sync_threads,
     })
 }
 

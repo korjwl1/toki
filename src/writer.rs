@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use crossbeam_channel::Receiver;
@@ -59,6 +59,9 @@ pub struct DbWriter {
     bulk_rollups: HashMap<(i64, String), RollupValue>,
     /// Accumulated events during cold start bulk writes (flushed at BULK_BATCH_SIZE).
     bulk_pending: Vec<ColdStartEvent>,
+    /// Sync notification: set dirty=true + notify after each flush so the sync thread wakes.
+    /// None when sync is not configured.
+    pub flush_notify: Option<Arc<(Mutex<bool>, Condvar)>>,
 }
 
 struct PendingEvent {
@@ -86,6 +89,7 @@ impl DbWriter {
             retention,
             bulk_rollups: HashMap::new(),
             bulk_pending: Vec::new(),
+            flush_notify: None,
         }
     }
 
@@ -261,6 +265,13 @@ impl DbWriter {
         if crate::engine::debug_level() >= 1 {
             eprintln!("[toki:writer] flushed {} events, {} rollups in {}µs",
                 count, rollup_updates.len(), t.elapsed().as_micros());
+        }
+
+        // Notify sync thread that new data is available
+        if let Some(ref notify) = self.flush_notify {
+            let (lock, cvar) = notify.as_ref();
+            *lock.lock().unwrap() = true;
+            cvar.notify_one();
         }
     }
 
