@@ -25,6 +25,9 @@ pub struct Credentials {
     /// Generated once at `toki sync enable` and stored permanently.
     #[serde(default)]
     pub device_key: String,
+    /// Human-readable device name (typically hostname).
+    #[serde(default)]
+    pub device_name: String,
 }
 
 /// Save credentials to secure storage.

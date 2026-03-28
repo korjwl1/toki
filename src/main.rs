@@ -1552,12 +1552,14 @@ fn handle_sync_enable(
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     // Save credentials
+    let device_name = toki::sync::thread::SyncConfig::default_device_name();
     let creds = toki::sync::credentials::Credentials {
         server_addr: server.clone(),
         http_url: http_base,
         access_token: access_token.clone(),
         refresh_token,
         device_key: device_key.clone(),
+        device_name: device_name.clone(),
     };
     if let Err(e) = toki::sync::credentials::save(&creds) {
         eprintln!("[toki] Failed to save credentials: {}", e);
@@ -1565,7 +1567,6 @@ fn handle_sync_enable(
     }
 
     // Update settings so the daemon picks up sync on next start
-    let device_name = toki::sync::thread::SyncConfig::default_device_name();
     let _ = toki::config::set_setting("sync_enabled", "true");
     let _ = toki::config::set_setting("sync_server", &server);
     let _ = toki::config::set_setting("sync_access_token", &access_token);
