@@ -1241,6 +1241,30 @@ fn send_remote_query(
     let creds = toki::sync::credentials::load()
         .ok_or_else(|| "Not configured for remote query. Run: toki sync enable --server <addr> --username <user>".to_string())?;
 
+    // Convert CLI date strings (e.g. "20230101") to epoch seconds for Prometheus API.
+    let start_epoch = start.map(|s| {
+        toki::query::parse_range_time(s, false, None)
+            .map(|dt| dt.and_utc().timestamp())
+            .unwrap_or(0)
+    });
+    let end_epoch = end.map(|e| {
+        toki::query::parse_range_time(e, true, None)
+            .map(|dt| dt.and_utc().timestamp())
+            .unwrap_or_else(|_| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64)
+    });
+
+    // Calculate a reasonable step: we want at most ~1000 data points.
+    // For summary queries the last value matters most, so use a large step.
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    let s = start_epoch.unwrap_or(now - 86400 * 365);
+    let e = end_epoch.unwrap_or(now);
+    let range = (e - s).max(1);
+    let step = (range / 1000).max(60); // at least 60s step
+
+    let start_str = start_epoch.map(|v| v.to_string());
+    let end_str = end_epoch.map(|v| v.to_string());
+    let step_str = step.to_string();
+
     // Build query params
     let url = format!("{}/api/v1/query_range", creds.http_url);
 
@@ -1248,8 +1272,9 @@ fn send_remote_query(
         let mut req = ureq::get(&url)
             .set("Authorization", &format!("Bearer {}", token));
         req = req.query("query", query);
-        if let Some(s) = start { req = req.query("start", s); }
-        if let Some(e) = end { req = req.query("end", e); }
+        if let Some(ref s) = start_str { req = req.query("start", s); }
+        if let Some(ref e) = end_str { req = req.query("end", e); }
+        req = req.query("step", &step_str);
         req.call()
     };
 
@@ -1295,11 +1320,91 @@ fn send_remote_query(
         .map_err(|e| format!("Invalid remote query response: {e}"))?;
 
     // The toki-sync /api/v1/query_range proxies to VictoriaMetrics and returns
-    // Prometheus-compatible JSON. Wrap it into our ReportResponse format.
+    // Prometheus-compatible JSON. Convert it into toki's ReportResponse format
+    // so the existing display pipeline (dispatch_result_to_sink) can render it.
+    let data = prometheus_response_to_toki_data(&body);
     Ok(ReportResponse {
-        data: body["data"].clone(),
+        data,
         meta: serde_json::json!({}),
     })
+}
+
+/// Convert a Prometheus/VictoriaMetrics JSON response into the array format
+/// that `dispatch_result_to_sink` expects: `[{ "type": "summary", "data": [...] }]`.
+///
+/// Handles both `matrix` (query_range) and `vector` (instant query) result types.
+/// Recognises `toki_tokens_total` metric labels (`model`, `type`) and maps them
+/// into `ModelUsageSummary` fields. For unrecognised queries it falls back to a
+/// generic label+value display.
+fn prometheus_response_to_toki_data(body: &serde_json::Value) -> serde_json::Value {
+    let results = match body["data"]["result"].as_array() {
+        Some(r) => r,
+        None => {
+            // Unexpected shape — return the raw data so JSON output still works.
+            return serde_json::json!([{ "type": "summary", "data": [] }]);
+        }
+    };
+
+    let result_type = body["data"]["resultType"].as_str().unwrap_or("matrix");
+
+    // Collect the latest (or only) value from each series and accumulate into
+    // per-model ModelUsageSummary structs.
+    let mut model_map: std::collections::HashMap<String, toki::ModelUsageSummary> =
+        std::collections::HashMap::new();
+
+    for series in results {
+        let metric = &series["metric"];
+        let model = metric["model"].as_str().unwrap_or("(total)").to_string();
+        let type_label = metric["type"].as_str().unwrap_or("");
+
+        // Extract the numeric value: last element of `values` (matrix) or `value` (vector).
+        let val: f64 = if result_type == "matrix" {
+            series["values"].as_array()
+                .and_then(|vals| vals.last())
+                .and_then(|pair| pair.get(1))
+                .and_then(|v| v.as_str().or_else(|| v.as_f64().map(|_| "")).and_then(|s| if s.is_empty() { v.as_f64() } else { s.parse::<f64>().ok() }))
+                .unwrap_or(0.0)
+        } else {
+            // vector: value is [timestamp, "string_value"]
+            series["value"].get(1)
+                .and_then(|v| v.as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| v.as_f64()))
+                .unwrap_or(0.0)
+        };
+
+        let count = val.round() as u64;
+        let entry = model_map.entry(model.clone()).or_insert_with(|| toki::ModelUsageSummary {
+            model,
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            event_count: 0,
+            cost_usd: None,
+        });
+
+        match type_label {
+            "input" => entry.input_tokens = entry.input_tokens.saturating_add(count),
+            "output" => entry.output_tokens = entry.output_tokens.saturating_add(count),
+            "cache_create" => entry.cache_creation_input_tokens = entry.cache_creation_input_tokens.saturating_add(count),
+            "cache_read" => entry.cache_read_input_tokens = entry.cache_read_input_tokens.saturating_add(count),
+            "" => {
+                // No type label — this is a pre-aggregated total (e.g. sum by (model)).
+                // Put it into input_tokens as "total" since we can't break it down.
+                entry.input_tokens = entry.input_tokens.saturating_add(count);
+            }
+            other => {
+                // Unknown type label — accumulate into input_tokens as best effort.
+                eprintln!("[toki] Warning: unknown token type label '{}', counted as input", other);
+                entry.input_tokens = entry.input_tokens.saturating_add(count);
+            }
+        }
+    }
+
+    let summaries: Vec<serde_json::Value> = model_map.values()
+        .map(|s| serde_json::to_value(s).unwrap_or_default())
+        .collect();
+
+    serde_json::json!([{ "type": "summary", "data": summaries }])
 }
 
 /// Dispatch a JSON result from the daemon to the local sink for display.
