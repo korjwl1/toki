@@ -462,43 +462,100 @@ fn build_group_key(
     result
 }
 
-/// Parse a time range string (YYYYMMDD or YYYYMMDDhhmmss) into NaiveDateTime.
-/// Shared between query execution and CLI argument parsing.
+/// Parse a time range string into NaiveDateTime (UTC).
+///
+/// Accepted formats (in order of detection):
+///   YYYYMMDD              — date only; since=00:00:00, until=23:59:59 (tz-aware)
+///   YYYYMMDDhhmmss        — compact datetime (tz-aware)
+///   Unix seconds          — all-digit, 1–10 chars  e.g. "1743465600"
+///   Unix milliseconds     — all-digit, 13 chars    e.g. "1743465600123"
+///   RFC 3339 / ISO 8601   — e.g. "2026-03-01T12:00:00Z", "2026-03-01T21:00:00+09:00"
+///
+/// The `tz` parameter applies only to the compact formats (YYYYMMDD, YYYYMMDDhhmmss)
+/// where the input has no timezone information. Unix/RFC 3339 inputs are always UTC
+/// regardless of `tz`.
 pub fn parse_range_time(value: &str, is_until: bool, tz: Option<Tz>) -> Result<NaiveDateTime, String> {
-    let naive = if value.len() == 8 && value.chars().all(|c| c.is_ascii_digit()) {
-        let year: i32 = value[0..4].parse().map_err(|_| "invalid year")?;
+    let all_digits = value.chars().all(|c| c.is_ascii_digit());
+
+    // ── Compact YYYYMMDD (must check before Unix seconds — both are all-digit) ─
+    if value.len() == 8 && all_digits {
+        let year: i32  = value[0..4].parse().map_err(|_| "invalid year")?;
         let month: u32 = value[4..6].parse().map_err(|_| "invalid month")?;
-        let day: u32 = value[6..8].parse().map_err(|_| "invalid day")?;
+        let day: u32   = value[6..8].parse().map_err(|_| "invalid day")?;
         let date = chrono::NaiveDate::from_ymd_opt(year, month, day).ok_or("invalid date")?;
         let time = if is_until {
             chrono::NaiveTime::from_hms_opt(23, 59, 59).unwrap()
         } else {
             chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap()
         };
-        NaiveDateTime::new(date, time)
-    } else if value.len() == 14 && value.chars().all(|c| c.is_ascii_digit()) {
-        let year: i32 = value[0..4].parse().map_err(|_| "invalid year")?;
+        let naive = NaiveDateTime::new(date, time);
+        return match tz {
+            Some(tz) => tz.from_local_datetime(&naive)
+                .single()
+                .map(|d| d.naive_utc())
+                .ok_or_else(|| "ambiguous or invalid local time".to_string()),
+            None => Ok(naive),
+        };
+    }
+
+    // ── Compact YYYYMMDDhhmmss (must check before Unix ms — both are 14-digit) ─
+    if value.len() == 14 && all_digits {
+        let year: i32  = value[0..4].parse().map_err(|_| "invalid year")?;
         let month: u32 = value[4..6].parse().map_err(|_| "invalid month")?;
-        let day: u32 = value[6..8].parse().map_err(|_| "invalid day")?;
-        let hour: u32 = value[8..10].parse().map_err(|_| "invalid hour")?;
-        let min: u32 = value[10..12].parse().map_err(|_| "invalid minute")?;
-        let sec: u32 = value[12..14].parse().map_err(|_| "invalid second")?;
+        let day: u32   = value[6..8].parse().map_err(|_| "invalid day")?;
+        let hour: u32  = value[8..10].parse().map_err(|_| "invalid hour")?;
+        let min: u32   = value[10..12].parse().map_err(|_| "invalid minute")?;
+        let sec: u32   = value[12..14].parse().map_err(|_| "invalid second")?;
         let date = chrono::NaiveDate::from_ymd_opt(year, month, day).ok_or("invalid date")?;
         let time = chrono::NaiveTime::from_hms_opt(hour, min, sec).ok_or("invalid time")?;
-        NaiveDateTime::new(date, time)
-    } else {
-        return Err("invalid format (use YYYYMMDD or YYYYMMDDhhmmss)".to_string());
-    };
-
-    match tz {
-        Some(tz) => {
-            let local = tz.from_local_datetime(&naive)
+        let naive = NaiveDateTime::new(date, time);
+        return match tz {
+            Some(tz) => tz.from_local_datetime(&naive)
                 .single()
-                .ok_or("ambiguous or invalid local time")?;
-            Ok(local.naive_utc())
-        }
-        None => Ok(naive),
+                .map(|d| d.naive_utc())
+                .ok_or_else(|| "ambiguous or invalid local time".to_string()),
+            None => Ok(naive),
+        };
     }
+
+    // ── Unix timestamp (seconds or milliseconds) ─────────────────────────────
+    // 13 digits = Unix ms; 1–10 digits = Unix seconds.
+    // 8 and 14 are already handled above as compact date formats.
+    if all_digits && !value.is_empty() && value.len() != 8 && value.len() != 14 && value.len() <= 13 {
+        let n: i64 = value.parse().map_err(|_| "invalid unix timestamp")?;
+        let ms = if value.len() == 13 { n } else { n * 1000 };
+        return chrono::DateTime::from_timestamp_millis(ms)
+            .map(|d| d.naive_utc())
+            .ok_or_else(|| "unix timestamp out of range".to_string());
+    }
+
+    // ── RFC 3339 / ISO 8601 ───────────────────────────────────────────────────
+    // Try fixed-offset first (covers "Z" and "+HH:MM")
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Ok(dt.naive_utc());
+    }
+    // Naive ISO 8601 without timezone (treat as local / tz-aware)
+    for fmt in &["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"] {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(value, fmt)
+            .or_else(|_| {
+                chrono::NaiveDate::parse_from_str(value, fmt)
+                    .map(|d| NaiveDateTime::new(d, chrono::NaiveTime::from_hms_opt(0,0,0).unwrap()))
+            })
+        {
+            return match tz {
+                Some(tz) => tz.from_local_datetime(&naive)
+                    .single()
+                    .map(|d| d.naive_utc())
+                    .ok_or_else(|| "ambiguous or invalid local time".to_string()),
+                None => Ok(naive),
+            };
+        }
+    }
+
+    Err(format!(
+        "invalid time format '{}' (accepted: YYYYMMDD, YYYYMMDDhhmmss, unix seconds, unix ms, RFC 3339)",
+        value
+    ))
 }
 
 fn filter_to_ms(dt: Option<NaiveDateTime>) -> Option<i64> {
@@ -647,5 +704,66 @@ mod tests {
         let session = &result["session-abc"];
         assert_eq!(session["claude-opus-4-6"].input_tokens, 200);
         assert_eq!(session["claude-opus-4-6"].event_count, 2);
+    }
+
+    // ── parse_range_time format coverage ────────────────────────────────────
+
+    #[test]
+    fn test_parse_range_time_yyyymmdd() {
+        let dt = parse_range_time("20260301", false, None).unwrap();
+        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2026-03-01 00:00:00");
+        let dt_until = parse_range_time("20260301", true, None).unwrap();
+        assert_eq!(dt_until.format("%H:%M:%S").to_string(), "23:59:59");
+    }
+
+    #[test]
+    fn test_parse_range_time_yyyymmddhhmmss() {
+        let dt = parse_range_time("20260301120000", false, None).unwrap();
+        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2026-03-01 12:00:00");
+    }
+
+    #[test]
+    fn test_parse_range_time_unix_seconds() {
+        // 2025-01-01 00:00:00 UTC = 1735689600
+        let dt = parse_range_time("1735689600", false, None).unwrap();
+        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2025-01-01 00:00:00");
+    }
+
+    #[test]
+    fn test_parse_range_time_unix_ms() {
+        // Same moment as above, in milliseconds
+        let dt = parse_range_time("1735689600000", false, None).unwrap();
+        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2025-01-01 00:00:00");
+    }
+
+    #[test]
+    fn test_parse_range_time_rfc3339_utc() {
+        let dt = parse_range_time("2025-01-01T12:00:00Z", false, None).unwrap();
+        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2025-01-01 12:00:00");
+    }
+
+    #[test]
+    fn test_parse_range_time_rfc3339_offset() {
+        // +09:00 offset — UTC should be 9 hours earlier
+        let dt = parse_range_time("2025-01-01T21:00:00+09:00", false, None).unwrap();
+        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2025-01-01 12:00:00");
+    }
+
+    #[test]
+    fn test_parse_range_time_all_same_moment() {
+        // All four formats representing the same UTC moment
+        let secs  = parse_range_time("1735689600",          false, None).unwrap();
+        let ms    = parse_range_time("1735689600000",       false, None).unwrap();
+        let rfc   = parse_range_time("2025-01-01T00:00:00Z", false, None).unwrap();
+        let tz    = parse_range_time("2025-01-01T09:00:00+09:00", false, None).unwrap();
+        assert_eq!(secs, ms);
+        assert_eq!(secs, rfc);
+        assert_eq!(secs, tz);
+    }
+
+    #[test]
+    fn test_parse_range_time_invalid() {
+        assert!(parse_range_time("not-a-date", false, None).is_err());
+        assert!(parse_range_time("", false, None).is_err());
     }
 }
