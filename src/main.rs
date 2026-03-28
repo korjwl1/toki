@@ -86,11 +86,6 @@ enum Commands {
         #[command(subcommand)]
         command: Option<SettingsCommands>,
     },
-    /// Multi-device sync: enable, disable, status, devices
-    Sync {
-        #[command(subcommand)]
-        command: SyncCommands,
-    },
 }
 
 #[derive(Subcommand)]
@@ -116,7 +111,7 @@ enum SettingsCommands {
     },
     /// List all settings
     List,
-    /// Multi-device sync management (alias for `toki sync`)
+    /// Multi-device sync management
     Sync {
         #[command(subcommand)]
         command: SyncCommands,
@@ -375,9 +370,6 @@ fn main() {
                     handle_sync(command);
                 }
             }
-        }
-        Commands::Sync { command } => {
-            handle_sync(command);
         }
         Commands::Daemon { command } => {
             let config = build_config(None, false, None);
@@ -1239,7 +1231,7 @@ fn send_remote_query(
     end: Option<&str>,
 ) -> Result<ReportResponse, String> {
     let creds = toki::sync::credentials::load()
-        .ok_or_else(|| "Not configured for remote query. Run: toki sync enable --server <addr> --username <user>".to_string())?;
+        .ok_or_else(|| "Not configured for remote query. Run: toki settings sync enable --server <addr> --username <user>".to_string())?;
 
     // Convert CLI date strings (e.g. "20230101") to epoch seconds for Prometheus API.
     let start_epoch = start.map(|s| {
@@ -1909,7 +1901,7 @@ fn handle_sync_devices() {
     let creds = match toki::sync::credentials::load() {
         Some(c) => c,
         None => {
-            eprintln!("[toki] Not configured. Run: toki sync enable --server <addr> --username <user>");
+            eprintln!("[toki] Not configured. Run: toki settings sync enable --server <addr> --username <user>");
             std::process::exit(1);
         }
     };
@@ -1921,7 +1913,7 @@ fn handle_sync_devices() {
     {
         Ok(r) => r,
         Err(ureq::Error::Status(401, _)) => {
-            eprintln!("[toki] Token expired. Re-enable sync: toki sync enable ...");
+            eprintln!("[toki] Token expired. Re-enable sync: toki settings sync enable ...");
             std::process::exit(1);
         }
         Err(e) => {
