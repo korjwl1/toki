@@ -144,8 +144,15 @@ enum SyncCommands {
         #[arg(long)]
         no_tls: bool,
     },
-    /// Disable sync and remove stored credentials
-    Disable,
+    /// Disable sync and optionally delete remote data
+    Disable {
+        /// Delete this device's data from the server
+        #[arg(long)]
+        delete: bool,
+        /// Keep remote data (don't prompt)
+        #[arg(long)]
+        keep: bool,
+    },
     /// Show sync connection status
     Status,
     /// List devices registered with this account
@@ -1590,8 +1597,8 @@ fn handle_sync(command: SyncCommands) {
         SyncCommands::Enable { server, http_url, username, password, headless, insecure, no_tls } => {
             handle_sync_enable(server, http_url, username, password, headless, insecure, no_tls);
         }
-        SyncCommands::Disable => {
-            handle_sync_disable();
+        SyncCommands::Disable { delete, keep } => {
+            handle_sync_disable(delete, keep);
         }
         SyncCommands::Status => {
             handle_sync_status();
@@ -1851,16 +1858,133 @@ fn parse_callback_tokens(url_or_path: &str) -> (String, String) {
     (access_token, refresh_token)
 }
 
-fn handle_sync_disable() {
+fn handle_sync_disable(delete: bool, keep: bool) {
+    // Load credentials and device key before wiping local state
+    let creds = toki::sync::credentials::load();
+    let device_key = toki::config::get_setting("sync_device_key");
+
+    if !delete && !keep {
+        // Interactive prompt
+        eprint!("Delete this device's data from the server? [y/N] ");
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).ok();
+        if input.trim().eq_ignore_ascii_case("y") {
+            delete_remote_device(&creds, &device_key);
+        }
+    } else if delete {
+        delete_remote_device(&creds, &device_key);
+    }
+    // --keep: skip remote deletion
+
     if let Err(e) = toki::sync::credentials::delete() {
         eprintln!("[toki] Failed to delete credentials: {}", e);
     }
     let _ = toki::config::set_setting("sync_enabled", "false");
-    println!("[toki] Sync disabled.");
+    eprintln!("[toki] Sync disabled.");
 
     let pidfile = toki::daemon::default_pidfile_path();
     if toki::daemon::daemon_status(&pidfile).is_some() {
         eprintln!("[toki] Restart daemon to stop sync thread: toki daemon restart");
+    }
+}
+
+fn try_refresh_and_call(
+    creds: &toki::sync::credentials::Credentials,
+    make_request: impl Fn(&str) -> Result<ureq::Response, ureq::Error>,
+) -> Result<ureq::Response, String> {
+    match make_request(&creds.access_token) {
+        Ok(r) => Ok(r),
+        Err(ureq::Error::Status(401, _)) => {
+            // Attempt token refresh
+            let refresh_url = format!("{}/token/refresh", creds.http_url);
+            let refresh_resp = ureq::post(&refresh_url)
+                .send_json(serde_json::json!({ "refresh_token": creds.refresh_token }))
+                .map_err(|e| format!("Token refresh failed: {e}"))?;
+
+            let refresh_body: serde_json::Value = refresh_resp.into_json()
+                .map_err(|e| format!("Invalid refresh response: {e}"))?;
+
+            let new_access = refresh_body["access_token"].as_str().unwrap_or("").to_string();
+            let new_refresh = refresh_body["refresh_token"].as_str().unwrap_or("").to_string();
+
+            if new_access.is_empty() {
+                return Err("Token refresh did not return access_token. Re-enable sync.".to_string());
+            }
+
+            // Save updated credentials
+            let updated = toki::sync::credentials::Credentials {
+                access_token: new_access.clone(),
+                refresh_token: if new_refresh.is_empty() { creds.refresh_token.clone() } else { new_refresh },
+                ..creds.clone()
+            };
+            let _ = toki::sync::credentials::save(&updated);
+            let _ = toki::config::set_setting("sync_access_token", &new_access);
+
+            make_request(&new_access).map_err(|e| format!("Request failed after token refresh: {e}"))
+        }
+        Err(e) => Err(format!("Request failed: {e}")),
+    }
+}
+
+fn delete_remote_device(
+    creds: &Option<toki::sync::credentials::Credentials>,
+    device_key: &Option<String>,
+) {
+    let Some(creds) = creds else {
+        eprintln!("[toki] No credentials found, skipping remote cleanup.");
+        return;
+    };
+    let Some(device_key) = device_key else {
+        eprintln!("[toki] No device key found, skipping remote cleanup.");
+        return;
+    };
+
+    // List devices to find our device_id by device_key
+    let list_url = format!("{}/me/devices", creds.http_url);
+    let list_url_clone = list_url.clone();
+    let resp = match try_refresh_and_call(creds, |token| {
+        ureq::get(&list_url_clone)
+            .set("Authorization", &format!("Bearer {}", token))
+            .call()
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("[toki] Failed to list devices: {e}");
+            return;
+        }
+    };
+
+    let body: serde_json::Value = match resp.into_json() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[toki] Failed to parse device list: {e}");
+            return;
+        }
+    };
+
+    // Find device_id matching our device_key
+    let device_id = body["devices"].as_array()
+        .and_then(|devices| {
+            devices.iter().find(|d| d["device_key"].as_str() == Some(device_key))
+        })
+        .and_then(|d| d["id"].as_str())
+        .map(|s| s.to_string());
+
+    let Some(device_id) = device_id else {
+        eprintln!("[toki] Device not found on server, skipping remote cleanup.");
+        return;
+    };
+
+    // Delete the device (server will also delete VM series)
+    let delete_url = format!("{}/me/devices/{}", creds.http_url, device_id);
+    let delete_url_clone = delete_url.clone();
+    match try_refresh_and_call(creds, |token| {
+        ureq::delete(&delete_url_clone)
+            .set("Authorization", &format!("Bearer {}", token))
+            .call()
+    }) {
+        Ok(_) => eprintln!("[toki] Remote device data deleted."),
+        Err(e) => eprintln!("[toki] Failed to delete remote data: {e}"),
     }
 }
 
