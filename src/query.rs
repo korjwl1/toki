@@ -6,7 +6,7 @@ use chrono_tz::Tz;
 use crate::common::types::{ModelUsageSummary, RawEvent, GroupedSummaryMap, SummaryMap};
 use crate::db::Database;
 use crate::engine::{ReportFilter, ReportGroupBy};
-use crate::query_parser::{AggregationFunc, Bucket};
+use crate::query_parser::AggregationFunc;
 
 /// Resolve (since, until) from filter into ms timestamps.
 fn filter_range(filter: ReportFilter) -> (i64, i64) {
@@ -123,16 +123,6 @@ pub fn report_by_session_from_db(
     Ok(grouped)
 }
 
-/// Apply offset to a NaiveDateTime by shifting it backward.
-fn apply_offset(dt: Option<NaiveDateTime>, offset: Option<&Bucket>) -> Option<NaiveDateTime> {
-    match (dt, offset) {
-        (Some(dt), Some(offset)) => {
-            Some(dt - chrono::Duration::seconds(offset.as_secs() as i64))
-        }
-        other => other.0,
-    }
-}
-
 /// Collapse a SummaryMap (model → summary) into a single entry based on aggregation function.
 fn apply_aggregation_flat(summaries: &mut SummaryMap, func: AggregationFunc) {
     if summaries.is_empty() { return; }
@@ -185,28 +175,34 @@ fn apply_aggregation_grouped(grouped: &mut GroupedSummaryMap, func: AggregationF
 }
 
 /// Execute a parsed PromQL-style query against the TSDB.
+///
+/// `since_ms` and `until_ms` are millisecond timestamps representing the time range
+/// (0 and i64::MAX respectively mean "no bound"). The query's `offset` modifier shifts
+/// both bounds backward by the specified duration.
 pub fn execute_parsed_query(
     db: &Database,
     parsed: &crate::query_parser::Query,
     tz: Option<Tz>,
     pricing: Option<&crate::pricing::PricingTable>,
     sink: &dyn crate::sink::Sink,
+    since_ms: i64,
+    until_ms: i64,
 ) -> Result<(), String> {
     use crate::query_parser::Metric;
+
+    // Apply offset: shift time range backward by offset duration
+    let offset_ms = parsed.offset.map(|b| b.as_secs() as i64 * 1000).unwrap_or(0);
+    let since_ms = since_ms - offset_ms;
+    let until_ms = until_ms - offset_ms;
 
     match parsed.metric {
         Metric::Sessions => {
             let session_prefix = parsed.filter_value("session");
             let project_filter = parsed.filter_value("project");
-            let has_time_or_project = parsed.since.is_some() || parsed.until.is_some() || project_filter.is_some();
+            let has_time_or_project = since_ms > 0 || until_ms < i64::MAX || project_filter.is_some();
 
             let sessions = if has_time_or_project {
                 // Need event-level scan to filter by time range and/or project
-                let since_dt = apply_offset(parsed.since.as_deref().map(|s| parse_range_time(s, false, tz)).transpose()?, parsed.offset.as_ref());
-                let until_dt = apply_offset(parsed.until.as_deref().map(|s| parse_range_time(s, true, tz)).transpose()?, parsed.offset.as_ref());
-                let since_ms = since_dt.map(|d| d.and_utc().timestamp_millis()).unwrap_or(0);
-                let until_ms = until_dt.map(|d| d.and_utc().timestamp_millis()).unwrap_or(i64::MAX);
-
                 let dict = db.load_dict_reverse().map_err(|e| e.to_string())?;
                 let mut set = std::collections::HashSet::new();
                 db.for_each_event(since_ms, until_ms, |_ts, event| {
@@ -235,15 +231,10 @@ pub fn execute_parsed_query(
         }
         Metric::Projects => {
             let project_filter = parsed.filter_value("project");
-            let has_time = parsed.since.is_some() || parsed.until.is_some();
+            let has_time = since_ms > 0 || until_ms < i64::MAX;
 
             let projects = if has_time {
                 // Event scan for time-filtered project list
-                let since_dt = apply_offset(parsed.since.as_deref().map(|s| parse_range_time(s, false, tz)).transpose()?, parsed.offset.as_ref());
-                let until_dt = apply_offset(parsed.until.as_deref().map(|s| parse_range_time(s, true, tz)).transpose()?, parsed.offset.as_ref());
-                let since_ms = since_dt.map(|d| d.and_utc().timestamp_millis()).unwrap_or(0);
-                let until_ms = until_dt.map(|d| d.and_utc().timestamp_millis()).unwrap_or(i64::MAX);
-
                 let dict = db.load_dict_reverse().map_err(|e| e.to_string())?;
                 let mut set = std::collections::HashSet::new();
                 db.for_each_event(since_ms, until_ms, |_ts, event| {
@@ -267,10 +258,6 @@ pub fn execute_parsed_query(
             sink.emit_list(&projects, "projects");
         }
         Metric::Events => {
-            let since_dt = apply_offset(parsed.since.as_deref().map(|s| parse_range_time(s, false, tz)).transpose()?, parsed.offset.as_ref());
-            let until_dt = apply_offset(parsed.until.as_deref().map(|s| parse_range_time(s, true, tz)).transpose()?, parsed.offset.as_ref());
-            let since_ms = since_dt.map(|d| d.and_utc().timestamp_millis()).unwrap_or(0);
-            let until_ms = until_dt.map(|d| d.and_utc().timestamp_millis()).unwrap_or(i64::MAX);
 
             let dict = db.load_dict_reverse().map_err(|e| e.to_string())?;
             let unknown = String::new();
@@ -309,8 +296,16 @@ pub fn execute_parsed_query(
             sink.emit_events_batch(&events, pricing, None);
         }
         Metric::Usage => {
-            let since_dt = apply_offset(parsed.since.as_deref().map(|s| parse_range_time(s, false, tz)).transpose()?, parsed.offset.as_ref());
-            let until_dt = apply_offset(parsed.until.as_deref().map(|s| parse_range_time(s, true, tz)).transpose()?, parsed.offset.as_ref());
+            let since_dt = if since_ms > 0 {
+                chrono::DateTime::from_timestamp_millis(since_ms).map(|d| d.naive_utc())
+            } else {
+                None
+            };
+            let until_dt = if until_ms < i64::MAX {
+                chrono::DateTime::from_timestamp_millis(until_ms).map(|d| d.naive_utc())
+            } else {
+                None
+            };
 
             let filter = ReportFilter { since: since_dt, until: until_dt, tz };
             let model_filter = parsed.filter_value("model");

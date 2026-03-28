@@ -11,14 +11,16 @@
 ///   offset  = "offset" duration
 ///   group_by = "by" "(" key ("," key)* ")"
 ///
+/// Time range is NOT part of the query string. Pass --since/--until as CLI flags;
+/// they are transmitted as separate `start`/`end` fields in the daemon protocol.
+///
 /// Examples:
 ///   usage{model="claude-opus-4-6"}[5m] by (model)
-///   usage{project="myapp", since="20260301"}[1h]
-///   events{session="abc123", since="20260301"}
+///   usage{project="myapp"}[1h]
+///   events{session="abc123"}
 ///   usage[1d] offset 7d
 ///   sum(usage[1d])
 ///   avg(usage[1d]) by (project)
-///   count(usage{since="20260301"}[1d])
 ///   sessions{project="myapp"}
 ///   projects
 
@@ -123,10 +125,6 @@ pub struct Query {
     pub filters: Vec<LabelFilter>,
     pub bucket: Option<Bucket>,
     pub group_by: Vec<String>,
-    /// Time range filter: since (inclusive). Format: YYYYMMDD or YYYYMMDDhhmmss.
-    pub since: Option<String>,
-    /// Time range filter: until (inclusive). Format: YYYYMMDD or YYYYMMDDhhmmss.
-    pub until: Option<String>,
     /// Provider filter: if set, only query this provider's DB.
     pub provider: Option<String>,
     /// Offset modifier: shifts the time window back by this duration.
@@ -159,18 +157,11 @@ impl Query {
             Metric::Events => "events".to_string(),
         };
 
-        // Collect all filters (including since/until)
         let mut filters: Vec<(&str, &str)> = self.filters.iter()
             .map(|f| (f.key.as_str(), f.value.as_str()))
             .collect();
         if let Some(ref provider) = self.provider {
             filters.push(("provider", provider));
-        }
-        if let Some(ref since) = self.since {
-            filters.push(("since", since));
-        }
-        if let Some(ref until) = self.until {
-            filters.push(("until", until));
         }
         if !filters.is_empty() {
             s.push('{');
@@ -218,7 +209,7 @@ impl Query {
     }
 }
 
-const VALID_FILTER_KEYS: &[&str] = &["model", "session", "project", "since", "until", "provider"];
+const VALID_FILTER_KEYS: &[&str] = &["model", "session", "project", "provider"];
 const VALID_GROUP_KEYS: &[&str] = &["model", "session", "project"];
 
 /// Parse a PromQL-like query string.
@@ -261,9 +252,7 @@ pub fn parse(input: &str) -> Result<Query, String> {
         Vec::new()
     };
 
-    // Extract since/until/provider from filters into dedicated fields
-    let since = extract_filter(&mut raw_filters, "since");
-    let until = extract_filter(&mut raw_filters, "until");
+    // Extract provider from filters into dedicated field
     let provider = extract_filter(&mut raw_filters, "provider");
 
     // Optional bucket: [ ... ]
@@ -312,7 +301,7 @@ pub fn parse(input: &str) -> Result<Query, String> {
         }
     }
 
-    Ok(Query { metric, filters: raw_filters, bucket, group_by, since, until, provider, offset, aggregation })
+    Ok(Query { metric, filters: raw_filters, bucket, group_by, provider, offset, aggregation })
 }
 
 /// Extract and remove a filter by key, returning its value if present.
@@ -568,8 +557,6 @@ mod tests {
         assert!(q.filters.is_empty());
         assert!(q.bucket.is_none());
         assert!(q.group_by.is_empty());
-        assert!(q.since.is_none());
-        assert!(q.until.is_none());
     }
 
     #[test]
@@ -697,28 +684,9 @@ mod tests {
     }
 
     #[test]
-    fn test_since_until() {
-        let q = parse(r#"usage{since="20260301", until="20260310"}"#).unwrap();
-        assert_eq!(q.since, Some("20260301".to_string()));
-        assert_eq!(q.until, Some("20260310".to_string()));
-        // since/until should be extracted from filters, not remain as label filters
-        assert!(q.filters.is_empty());
-    }
-
-    #[test]
-    fn test_since_with_other_filters() {
-        let q = parse(r#"usage{model="opus", since="20260301"}[1h] by (model)"#).unwrap();
-        assert_eq!(q.since, Some("20260301".to_string()));
-        assert_eq!(q.until, None);
-        assert_eq!(q.filters.len(), 1);
-        assert_eq!(q.filters[0].key, "model");
-        assert_eq!(q.bucket, Some(Bucket(3600)));
-    }
-
-    #[test]
-    fn test_since_precise() {
-        let q = parse(r#"usage{since="20260301120000"}"#).unwrap();
-        assert_eq!(q.since, Some("20260301120000".to_string()));
+    fn test_since_until_rejected() {
+        // since/until are no longer valid filter keys
+        assert!(parse(r#"usage{since="20260301", until="20260310"}"#).is_err());
     }
 
     #[test]
@@ -825,10 +793,9 @@ mod tests {
 
     #[test]
     fn test_events_with_filters() {
-        let q = parse(r#"events{session="abc123", since="20260301"}"#).unwrap();
+        let q = parse(r#"events{session="abc123"}"#).unwrap();
         assert_eq!(q.metric, Metric::Events);
         assert_eq!(q.filter_value("session"), Some("abc123"));
-        assert_eq!(q.since, Some("20260301".to_string()));
     }
 
     #[test]
@@ -850,7 +817,7 @@ mod tests {
 
     #[test]
     fn test_events_serialization() {
-        let q = parse(r#"events{model="opus", since="20260301"}"#).unwrap();
+        let q = parse(r#"events{model="opus"}"#).unwrap();
         let s = q.to_query_string();
         assert!(s.starts_with("events{"));
         assert!(s.contains(r#"model="opus""#));
@@ -896,7 +863,7 @@ mod tests {
 
     #[test]
     fn test_to_query_string_with_bucket_preserves_offset() {
-        let q = parse(r#"usage{since="20260301"} offset 7d"#).unwrap();
+        let q = parse(r#"usage offset 7d"#).unwrap();
         let s = q.to_query_string_with_bucket(crate::engine::ReportGroupBy::Date);
         // bucket should be inserted before offset; 7d displays as 1w
         assert!(s.contains("[1d] offset 1w"));
@@ -926,9 +893,9 @@ mod tests {
 
     #[test]
     fn test_aggregation_with_filters() {
-        let q = parse(r#"sum(usage{since="20260301"}[1d])"#).unwrap();
+        let q = parse(r#"sum(usage{model="opus"}[1d])"#).unwrap();
         assert_eq!(q.aggregation, Some(super::AggregationFunc::Sum));
-        assert_eq!(q.since, Some("20260301".to_string()));
+        assert_eq!(q.filter_value("model"), Some("opus"));
         assert_eq!(q.bucket, Some(Bucket(86400)));
     }
 

@@ -884,25 +884,27 @@ fn handle_report(
         std::process::exit(1);
     }
 
-    // Build query string from CLI arguments
-    let query_str = if let Some(ReportCommands::Query { ref query }) = command {
-        // Warn if user passed filter flags that query mode ignores
-        let ignored: Vec<&str> = [
-            since.as_ref().map(|_| "--since"),
-            until.as_ref().map(|_| "--until"),
-            session_id.as_ref().map(|_| "--session-id"),
-            project.as_ref().map(|_| "--project"),
-            provider.as_ref().map(|_| "--provider"),
-            if group_by_session { Some("--group-by-session") } else { None },
-        ].into_iter().flatten().collect();
-        if !ignored.is_empty() {
-            eprintln!("[toki] Warning: {} ignored in query mode. Use query syntax instead (e.g. usage{{since=\"20260301\"}})",
-                ignored.join(", "));
-        }
-        query.clone()
-    } else {
-        let query = if let Some(cmd) = command {
-            // Time-grouped subcommands — destructure directly to avoid cloning
+    // Build query string and time range from CLI arguments.
+    // Returns (query_str, start, end) — start/end sent as separate protocol fields.
+    let (query_str, req_start, req_end): (String, Option<String>, Option<String>) =
+        if let Some(ReportCommands::Query { ref query }) = command {
+            // In query mode, --since/--until work as time range filters; other flags are ignored
+            let ignored: Vec<&str> = [
+                session_id.as_ref().map(|_| "--session-id"),
+                project.as_ref().map(|_| "--project"),
+                provider.as_ref().map(|_| "--provider"),
+                if group_by_session { Some("--group-by-session") } else { None },
+            ].into_iter().flatten().collect();
+            if !ignored.is_empty() {
+                eprintln!("[toki] Warning: {} ignored in query mode.", ignored.join(", "));
+            }
+            validate_range(
+                parse_opt_range(&since, false, tz),
+                parse_opt_range(&until, true, tz),
+            );
+            (query.clone(), since.clone(), until.clone())
+        } else if let Some(cmd) = command {
+            // Time-grouped subcommands
             let (filter_args, group_by) = match cmd {
                 ReportCommands::Hourly { filter } => (filter, toki::engine::ReportGroupBy::Hour),
                 ReportCommands::Daily { filter } => (filter, toki::engine::ReportGroupBy::Date),
@@ -931,29 +933,29 @@ fn handle_report(
                 }
             }
 
-            let since_dt = parse_opt_range(&eff_since, false, tz);
-            let until_dt = parse_opt_range(&eff_until, true, tz);
-            validate_range(since_dt, until_dt);
+            validate_range(
+                parse_opt_range(&eff_since, false, tz),
+                parse_opt_range(&eff_until, true, tz),
+            );
 
-            // Convert to PromQL-style query string
-            build_query_from_flags(
-                &eff_since, &eff_until, eff_session.as_deref(), eff_project.as_deref(),
+            let q = build_query_from_flags(
+                eff_session.as_deref(), eff_project.as_deref(),
                 eff_provider.as_deref(),
                 &[], // group_by handled via bucket
-            ).to_query_string_with_bucket(group_by)
+            ).to_query_string_with_bucket(group_by);
+            (q, eff_since, eff_until)
         } else {
             // No subcommand — summary or session grouping
-            build_query_from_flags(
-                &since, &until, session_id.as_deref(), project.as_deref(),
+            let q = build_query_from_flags(
+                session_id.as_deref(), project.as_deref(),
                 provider.as_deref(),
                 if group_by_session { &["session"][..] } else { &[] },
-            ).to_query_string()
+            ).to_query_string();
+            (q, since.clone(), until.clone())
         };
-        query
-    };
 
     // Send query to daemon via UDS
-    let response = send_report_query(&sock_path, &query_str, tz);
+    let response = send_report_query(&sock_path, &query_str, tz, req_start.as_deref(), req_end.as_deref());
 
     // Load pricing client-side (file cache, no DB)
     let pricing = if no_cost {
@@ -1104,6 +1106,8 @@ fn send_report_query(
     sock_path: &std::path::Path,
     query: &str,
     tz: Option<chrono_tz::Tz>,
+    start: Option<&str>,
+    end: Option<&str>,
 ) -> Result<ReportResponse, String> {
     use std::io::{BufRead, Write};
 
@@ -1115,6 +1119,8 @@ fn send_report_query(
     let request = serde_json::json!({
         "query": query,
         "tz": tz.map(|t| t.to_string()),
+        "start": start,
+        "end": end,
     });
     let line = serde_json::to_string(&request).unwrap();
     writeln!(stream, "{}", line).map_err(|e| format!("Failed to send query: {}", e))?;
@@ -1205,8 +1211,6 @@ fn dispatch_result_to_sink(
 
 /// Build a Query struct from CLI flags.
 fn build_query_from_flags(
-    since: &Option<String>,
-    until: &Option<String>,
     session_id: Option<&str>,
     project: Option<&str>,
     provider: Option<&str>,
@@ -1225,8 +1229,6 @@ fn build_query_from_flags(
         filters,
         bucket: None,
         group_by: group_by.iter().map(|s| s.to_string()).collect(),
-        since: since.clone(),
-        until: until.clone(),
         provider: provider.map(|s| s.to_string()),
         offset: None,
         aggregation: None,
