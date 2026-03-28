@@ -87,6 +87,9 @@ fn run_sync_loop(
     let mut client: Option<SyncClient> = None;
     let mut last_ping = Instant::now();
     let mut dict_cache: HashMap<u32, String> = HashMap::new();
+    // Set after auth succeeds — triggers an immediate initial delta sync
+    // without waiting for the next flush notification.
+    let mut needs_initial_sync = false;
 
     loop {
         // Check stop signal
@@ -94,16 +97,25 @@ fn run_sync_loop(
             return;
         }
 
-        // Wait on condvar (with 60s timeout for PING keepalive)
-        let (lock, cvar) = &*flush_notify;
-        let timeout = PING_INTERVAL.saturating_sub(last_ping.elapsed());
-        let wait_result = {
-            let guard = lock.lock().unwrap();
-            cvar.wait_timeout_while(guard, timeout, |dirty| !*dirty).unwrap()
+        // Wait for a flush notification or PING timeout.
+        // Skip the wait entirely when we are not yet connected (connect immediately
+        // on cold start and after disconnect) or when a fresh connection needs its
+        // initial delta sync.
+        let flush_happened = if client.is_none() || needs_initial_sync {
+            // Drain the dirty flag without blocking, then proceed.
+            *flush_notify.0.lock().unwrap() = false;
+            false
+        } else {
+            let (lock, cvar) = &*flush_notify;
+            let timeout = PING_INTERVAL.saturating_sub(last_ping.elapsed());
+            let wait_result = {
+                let guard = lock.lock().unwrap();
+                cvar.wait_timeout_while(guard, timeout, |dirty| !*dirty).unwrap()
+            };
+            let happened = !wait_result.1.timed_out() || *wait_result.0;
+            *lock.lock().unwrap() = false;
+            happened
         };
-        let flush_happened = !wait_result.1.timed_out() || *wait_result.0;
-        // Reset dirty flag
-        *lock.lock().unwrap() = false;
 
         // Check stop again after wakeup
         if stop_rx.try_recv().is_ok() {
@@ -128,12 +140,13 @@ fn run_sync_loop(
                             dict_cache = db.load_dict_reverse().unwrap_or_default();
                             client = Some(c);
                             last_ping = Instant::now();
+                            // Trigger immediate initial delta sync after auth.
+                            needs_initial_sync = true;
                         }
                         Err(AuthError::Rejected { reason, reset_required }) => {
                             eprintln!("[toki:sync] auth rejected: {reason}");
                             if reset_required {
                                 eprintln!("[toki:sync] schema mismatch — clearing sync cursor");
-                                // Clear cursor stored in settings
                                 let _ = crate::config::set_setting("sync_last_ts", "0");
                             }
                         }
@@ -150,8 +163,9 @@ fn run_sync_loop(
 
         let Some(ref mut c) = client else { continue };
 
-        // Sync new events if flush happened
-        if flush_happened {
+        // Sync new events on flush or immediately after a fresh connection.
+        if flush_happened || needs_initial_sync {
+            needs_initial_sync = false;
             match sync_new_events(c, &db, &dict_cache, &config.provider) {
                 Ok(synced) => {
                     if synced > 0 {

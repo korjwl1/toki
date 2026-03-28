@@ -22,10 +22,15 @@ pub struct SyncClient {
 impl SyncClient {
     /// Connect to server and perform TCP handshake (no auth yet).
     pub fn connect(addr: &str) -> io::Result<Self> {
-        let stream = TcpStream::connect_timeout(
-            &addr.parse().map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?,
-            CONNECT_TIMEOUT,
-        )?;
+        // Resolve hostname (handles both "host:port" and "1.2.3.4:port").
+        use std::net::ToSocketAddrs;
+        let socket_addr = addr
+            .to_socket_addrs()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
+            .next()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no addresses resolved"))?;
+
+        let stream = TcpStream::connect_timeout(&socket_addr, CONNECT_TIMEOUT)?;
         stream.set_read_timeout(Some(READ_TIMEOUT))?;
         stream.set_nodelay(true)?;
 
