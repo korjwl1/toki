@@ -105,6 +105,9 @@ pub type SyncToggle = Arc<(Mutex<bool>, Condvar)>;
 /// Always spawn a sync thread for the given provider.
 /// The thread uses `sync_toggle` to sleep when sync is disabled (CPU 0%).
 /// When enabled via settings hot-reload, it wakes up, loads config, and runs.
+///
+/// If the sync loop panics, it is automatically restarted after a 5-second delay.
+/// The thread only exits on a normal stop signal.
 pub fn start_sync_thread(
     db: Arc<Database>,
     flush_notify: FlushNotify,
@@ -115,7 +118,41 @@ pub fn start_sync_thread(
     std::thread::Builder::new()
         .name(format!("toki-sync-{provider}"))
         .spawn(move || {
-            run_sync_loop(db, flush_notify, stop_rx, provider, sync_toggle);
+            loop {
+                // Check if we should stop before (re)starting
+                if stop_rx.try_recv().is_ok() {
+                    return;
+                }
+
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_sync_loop(
+                        db.clone(),
+                        flush_notify.clone(),
+                        stop_rx.clone(),
+                        provider.clone(),
+                        sync_toggle.clone(),
+                    );
+                }));
+
+                match result {
+                    Ok(()) => return, // Normal exit (stop signal received)
+                    Err(e) => {
+                        let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else if let Some(s) = e.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "unknown panic".to_string()
+                        };
+                        eprintln!("[toki:sync:{}] thread panicked: {}, restarting in 5s...", provider, msg);
+
+                        // Wait before respawn, but check stop signal
+                        if stop_rx.recv_timeout(Duration::from_secs(5)).is_ok() {
+                            return;
+                        }
+                    }
+                }
+            }
         })
         .expect("failed to spawn sync thread")
 }

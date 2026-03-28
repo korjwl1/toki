@@ -273,15 +273,30 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
         }
     }
 
-    // Spawn worker thread
+    // Spawn worker thread. If this thread panics, events are silently lost,
+    // so we treat a panic as fatal and exit the process (supervisor will restart).
     let worker_handle = std::thread::Builder::new()
         .name("toki-worker".to_string())
         .spawn(move || {
-            engine.watch_loop_providers(
-                event_rx,
-                stop_rx,
-                &provider_channels,
-            );
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                engine.watch_loop_providers(
+                    event_rx,
+                    stop_rx,
+                    &provider_channels,
+                );
+            }));
+
+            if let Err(e) = result {
+                let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = e.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic".to_string()
+                };
+                eprintln!("[toki] FATAL: worker thread panicked: {}", msg);
+                std::process::exit(1);
+            }
         })
         .map_err(TokiError::Io)?;
 
@@ -330,13 +345,39 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
         sync_toggles.push((provider_name, sync_toggle));
     }
 
-    // Start settings file watcher for hot-reload
+    // Start settings file watcher for hot-reload (auto-respawns on panic)
     let (settings_stop_tx, settings_stop_rx) = crossbeam_channel::bounded::<()>(1);
     let settings_toggles = sync_toggles.clone();
     let settings_watcher_handle = std::thread::Builder::new()
         .name("toki-settings-watcher".to_string())
         .spawn(move || {
-            run_settings_watcher(settings_stop_rx, settings_toggles);
+            loop {
+                if settings_stop_rx.try_recv().is_ok() {
+                    return;
+                }
+
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_settings_watcher(settings_stop_rx.clone(), settings_toggles.clone());
+                }));
+
+                match result {
+                    Ok(()) => return, // Normal exit (stop signal)
+                    Err(e) => {
+                        let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else if let Some(s) = e.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "unknown panic".to_string()
+                        };
+                        eprintln!("[toki:settings-watcher] thread panicked: {}, restarting in 5s...", msg);
+
+                        if settings_stop_rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok() {
+                            return;
+                        }
+                    }
+                }
+            }
         })
         .map_err(TokiError::Io)?;
 
