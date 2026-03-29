@@ -201,6 +201,9 @@ fn run_sync_loop(
 }
 
 /// Inner sync loop: runs until stop signal or sync gets disabled via toggle.
+/// Proactive token refresh interval (30 minutes).
+const PROACTIVE_REFRESH_INTERVAL: Duration = Duration::from_secs(1800);
+
 fn run_sync_inner(
     db: &Arc<Database>,
     flush_notify: &FlushNotify,
@@ -215,6 +218,8 @@ fn run_sync_inner(
     let mut needs_initial_sync = false;
     let mut last_loop_time = Instant::now();
     let mut tls_hint_shown = false;
+    let mut last_refresh = Instant::now();
+    let mut auth_failure_notified = false;
 
     loop {
         // Check stop signal
@@ -284,10 +289,17 @@ fn run_sync_inner(
                             dict_cache = db.load_dict_reverse().unwrap_or_default();
                             client = Some(c);
                             last_ping = Instant::now();
+                            last_refresh = Instant::now();
                             needs_initial_sync = true;
+                            auth_failure_notified = false;
+                            let _ = crate::config::set_setting("sync_status", "connected");
+                            let _ = crate::config::set_setting("sync_last_success", &now_epoch().to_string());
                         }
                         Err(AuthError::Rejected { reason, reset_required }) => {
                             eprintln!("[toki:sync] auth rejected: {reason}");
+                            let _ = crate::config::set_setting("sync_status", "auth_failed");
+                            let _ = crate::config::set_setting("sync_last_error", &reason);
+                            let _ = crate::config::set_setting("sync_last_error_at", &now_epoch().to_string());
                             if reset_required {
                                 eprintln!("[toki:sync] schema mismatch — clearing sync cursor");
                                 let key = format!("sync_last_ts_{}", config.provider);
@@ -299,12 +311,27 @@ fn run_sync_inner(
                             if try_refresh_token(config) {
                                 eprintln!("[toki:sync] token refreshed, retrying auth");
                                 backoff.reset();
+                                last_refresh = Instant::now();
+                            } else {
+                                let _ = crate::config::set_setting("sync_status", "token_expired");
+                                let _ = crate::config::set_setting("sync_last_error", &format!("{e}"));
+                                let _ = crate::config::set_setting("sync_last_error_at", &now_epoch().to_string());
+                                if !auth_failure_notified {
+                                    send_sync_notification(
+                                        "toki sync: re-login required",
+                                        "Token expired. Run: toki settings sync disable --keep && toki settings sync enable --server ...",
+                                    );
+                                    auth_failure_notified = true;
+                                }
                             }
                         }
                     }
                 }
                 Err(e) => {
                     eprintln!("[toki:sync] connect failed: {e}");
+                    let _ = crate::config::set_setting("sync_status", "disconnected");
+                    let _ = crate::config::set_setting("sync_last_error", &format!("{e}"));
+                    let _ = crate::config::set_setting("sync_last_error_at", &now_epoch().to_string());
                     if config.use_tls && !tls_hint_shown {
                         tls_hint_shown = true;
                         eprintln!("[toki:sync] TLS connection failed. Options:");
@@ -326,12 +353,24 @@ fn run_sync_inner(
                     if synced > 0 {
                         eprintln!("[toki:sync] synced {synced} events");
                     }
+                    let _ = crate::config::set_setting("sync_status", "connected");
+                    let _ = crate::config::set_setting("sync_last_success", &now_epoch().to_string());
                 }
                 Err(e) => {
                     eprintln!("[toki:sync] sync error: {e}");
                     client = None;
                     continue;
                 }
+            }
+        }
+
+        // Proactive token refresh: keep the refresh token rotated to prevent expiry
+        if last_refresh.elapsed() > PROACTIVE_REFRESH_INTERVAL {
+            if try_refresh_token(config) {
+                eprintln!("[toki:sync] proactive token refresh succeeded");
+                last_refresh = Instant::now();
+            } else {
+                eprintln!("[toki:sync] proactive token refresh failed (will retry)");
             }
         }
 
@@ -346,6 +385,32 @@ fn run_sync_inner(
             }
         }
     }
+}
+
+fn now_epoch() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn send_sync_notification(title: &str, message: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("osascript")
+            .args(["-e", &format!(
+                "display notification \"{}\" with title \"{}\"", message, title
+            )])
+            .spawn();
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = std::process::Command::new("notify-send")
+            .args([title, message])
+            .spawn();
+    }
+    // Always log
+    eprintln!("[toki:sync] {}: {}", title, message);
 }
 
 /// Sync events newer than our last cursor to the server.

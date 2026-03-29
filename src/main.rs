@@ -1985,6 +1985,71 @@ fn handle_sync_status() {
     println!("  server:     {}", server);
     println!("  device:     {}", device);
 
+    // Show sync health status
+    let status = toki::config::get_setting("sync_status").unwrap_or_else(|| "(unknown)".to_string());
+    let status_display = match status.as_str() {
+        "connected" => "connected".to_string(),
+        "disconnected" => "disconnected".to_string(),
+        "auth_failed" => "auth failed".to_string(),
+        "token_expired" => "token expired (re-login required)".to_string(),
+        other => other.to_string(),
+    };
+    println!("  status:     {}", status_display);
+
+    // Show last successful sync time
+    if let Some(last_success) = toki::config::get_setting("sync_last_success")
+        .and_then(|s| s.parse::<i64>().ok())
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let ago = now - last_success;
+        let ago_str = if ago < 60 {
+            format!("{ago} seconds ago")
+        } else if ago < 3600 {
+            format!("{} minutes ago", ago / 60)
+        } else if ago < 86400 {
+            format!("{} hours ago", ago / 3600)
+        } else {
+            format!("{} days ago", ago / 86400)
+        };
+        println!("  last sync:  {}", ago_str);
+    } else {
+        println!("  last sync:  (never)");
+    }
+
+    // Show last error if present
+    if let Some(last_error) = toki::config::get_setting("sync_last_error") {
+        let error_age = toki::config::get_setting("sync_last_error_at")
+            .and_then(|s| s.parse::<i64>().ok())
+            .map(|at| {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                let ago = now - at;
+                if ago < 60 {
+                    format!("{ago} seconds ago")
+                } else if ago < 3600 {
+                    format!("{} minutes ago", ago / 60)
+                } else if ago < 86400 {
+                    format!("{} hours ago", ago / 3600)
+                } else {
+                    format!("{} days ago", ago / 86400)
+                }
+            })
+            .unwrap_or_default();
+        println!("  last error: {} ({})", last_error, error_age);
+    } else {
+        println!("  last error: (none)");
+    }
+
+    // Show action hint for token_expired
+    if status == "token_expired" {
+        println!("  action:     run `toki settings sync disable --keep && toki settings sync enable --server ...`");
+    }
+
     // Show per-provider sync cursors
     let mut any_synced = false;
     for &provider in toki::providers::KNOWN_PROVIDERS {
@@ -1995,12 +2060,12 @@ fn handle_sync_status() {
             let last_dt = chrono::DateTime::from_timestamp_millis(last_ts)
                 .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
                 .unwrap_or_else(|| last_ts.to_string());
-            println!("  last sync ({}): {}", provider, last_dt);
+            println!("  cursor ({}): {}", provider, last_dt);
             any_synced = true;
         }
     }
-    if !any_synced {
-        println!("  last sync:  (never)");
+    if !any_synced && !enabled {
+        println!("  cursor:     (never synced)");
     }
 
     // Check if credentials are present
