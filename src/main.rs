@@ -131,11 +131,11 @@ enum SyncCommands {
         /// HTTP API port (default: 9091 for no-tls, 443 for TLS)
         #[arg(long)]
         http_port: Option<u16>,
-        /// Username for login
+        /// Username (password auth only; prompted if needed)
         #[arg(long, short = 'u')]
-        username: String,
-        /// Password (prompted if omitted)
-        #[arg(long)]
+        username: Option<String>,
+        /// Password (env: TOKI_SYNC_PASSWORD; prompted if needed)
+        #[arg(long, hide = true)]
         password: Option<String>,
         /// Headless mode: print OIDC URL and wait for pasted callback URL (no browser)
         #[arg(long)]
@@ -1627,7 +1627,7 @@ fn handle_sync_enable(
     server: String,
     sync_port: u16,
     http_port: Option<u16>,
-    username: String,
+    username: Option<String>,
     password: Option<String>,
     headless: bool,
     insecure: bool,
@@ -1654,7 +1654,7 @@ fn handle_sync_enable(
     // POST /auth-method — verify server is reachable and determine auth flow
     let auth_method_url = format!("{}/auth-method", http_base);
     let auth_resp = match ureq::post(&auth_method_url)
-        .send_json(serde_json::json!({ "username": username }))
+        .send_json(serde_json::json!({ "username": username.as_deref().unwrap_or("") }))
     {
         Err(e) => {
             eprintln!("[toki] Cannot reach sync server at {}: {}", http_base, e);
@@ -1666,20 +1666,30 @@ fn handle_sync_enable(
     let method = auth_body["method"].as_str().unwrap_or("password");
 
     let (access_token, refresh_token) = if method == "oidc" {
-        // OIDC flow
+        // OIDC flow — no username/password needed
         let auth_url_path = auth_body["auth_url"].as_str().unwrap_or("/auth/oidc/authorize");
         handle_oidc_login(&http_base, auth_url_path, headless)
     } else {
-        // Password flow
-        let pw = password.unwrap_or_else(|| {
-            eprint!("Password: ");
-            rpassword_read()
-        });
+        // Password flow — prompt for username/password if not provided
+        let user = username
+            .or_else(|| std::env::var("TOKI_SYNC_USERNAME").ok())
+            .unwrap_or_else(|| {
+                eprint!("Username: ");
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input).ok();
+                input.trim().to_string()
+            });
+        let pw = password
+            .or_else(|| std::env::var("TOKI_SYNC_PASSWORD").ok())
+            .unwrap_or_else(|| {
+                eprint!("Password: ");
+                rpassword_read()
+            });
 
         let login_url = format!("{}/login", http_base);
         let resp = match ureq::post(&login_url)
             .send_json(serde_json::json!({
-                "username": username,
+                "username": user,
                 "password": pw,
             }))
         {
