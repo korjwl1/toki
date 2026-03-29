@@ -143,6 +143,9 @@ enum SyncCommands {
         /// Connect without TLS (plaintext, insecure — LAN/VPN only)
         #[arg(long)]
         no_tls: bool,
+        /// Custom device name (default: hostname)
+        #[arg(long)]
+        device_name: Option<String>,
     },
     /// Disable sync and optionally delete remote data
     Disable {
@@ -157,6 +160,11 @@ enum SyncCommands {
     Status,
     /// List devices registered with this account
     Devices,
+    /// Rename this device
+    Rename {
+        /// New device name (1-64 characters)
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1594,8 +1602,8 @@ fn handle_sync(command: SyncCommands) {
     toki::sync::credentials::check_file_permissions();
 
     match command {
-        SyncCommands::Enable { server, http_url, username, password, headless, insecure, no_tls } => {
-            handle_sync_enable(server, http_url, username, password, headless, insecure, no_tls);
+        SyncCommands::Enable { server, http_url, username, password, headless, insecure, no_tls, device_name } => {
+            handle_sync_enable(server, http_url, username, password, headless, insecure, no_tls, device_name);
         }
         SyncCommands::Disable { delete, keep } => {
             handle_sync_disable(delete, keep);
@@ -1605,6 +1613,9 @@ fn handle_sync(command: SyncCommands) {
         }
         SyncCommands::Devices => {
             handle_sync_devices();
+        }
+        SyncCommands::Rename { name } => {
+            handle_sync_rename(&name);
         }
     }
 }
@@ -1617,6 +1628,7 @@ fn handle_sync_enable(
     headless: bool,
     insecure: bool,
     no_tls: bool,
+    custom_device_name: Option<String>,
 ) {
     // Derive HTTP URL from server address if not provided
     let http_base = http_url.unwrap_or_else(|| {
@@ -1691,7 +1703,7 @@ fn handle_sync_enable(
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     // Save credentials
-    let device_name = toki::sync::thread::SyncConfig::default_device_name();
+    let device_name = custom_device_name.unwrap_or_else(|| toki::sync::thread::SyncConfig::default_device_name());
     let creds = toki::sync::credentials::Credentials {
         server_addr: server.clone(),
         http_url: http_base,
@@ -2019,6 +2031,30 @@ fn handle_sync_status() {
     // Check if credentials are present
     let has_creds = toki::sync::credentials::load().is_some();
     println!("  credentials: {}", if has_creds { "stored" } else { "not found" });
+}
+
+fn handle_sync_rename(name: &str) {
+    let name = name.trim();
+    if name.is_empty() || name.len() > 64 {
+        eprintln!("[toki] Device name must be 1-64 characters.");
+        std::process::exit(1);
+    }
+    if name.contains(|c: char| c.is_control()) {
+        eprintln!("[toki] Device name must not contain control characters.");
+        std::process::exit(1);
+    }
+
+    // Save locally
+    let _ = toki::config::set_setting("sync_device_name", name);
+
+    // Update credentials
+    if let Some(mut creds) = toki::sync::credentials::load() {
+        creds.device_name = name.to_string();
+        let _ = toki::sync::credentials::save(&creds);
+    }
+
+    eprintln!("[toki] Device renamed to: {name}");
+    eprintln!("[toki] Server will be updated on next sync connection.");
 }
 
 fn handle_sync_devices() {
