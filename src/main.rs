@@ -1867,6 +1867,16 @@ fn handle_sync_disable(delete: bool, keep: bool) {
         eprintln!("[toki] Failed to delete credentials: {}", e);
     }
     let _ = toki::config::set_setting("sync_enabled", "false");
+    let _ = toki::config::set_setting("sync_server", "");
+    let _ = toki::config::set_setting("sync_access_token", "");
+    let _ = toki::config::set_setting("sync_device_name", "");
+    let _ = toki::config::set_setting("sync_device_key", "");
+    let _ = toki::config::set_setting("sync_tls", "");
+    let _ = toki::config::set_setting("sync_tls_insecure", "");
+    let _ = toki::config::set_setting("sync_status", "");
+    let _ = toki::config::set_setting("sync_last_success", "");
+    let _ = toki::config::set_setting("sync_last_error", "");
+    let _ = toki::config::set_setting("sync_last_error_at", "");
     eprintln!("[toki] Sync disabled.");
 
     let pidfile = toki::daemon::default_pidfile_path();
