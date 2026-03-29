@@ -3,7 +3,7 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use crate::db::SCHEMA_VERSION;
+use toki_sync_protocol::SCHEMA_VERSION;
 use super::protocol::{
     AuthErrPayload, AuthOkPayload, AuthPayload, GetLastTsPayload, LastTsPayload,
     MsgType, PROTOCOL_VERSION, SyncAckPayload, SyncBatchPayload, SyncErrPayload,

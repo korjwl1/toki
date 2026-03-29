@@ -463,13 +463,4 @@ fn show_providers_popup(siv: &mut Cursive) {
     );
 }
 
-/// Collapse home directory prefix to ~ for display.
-fn tilde_path(path: &str) -> String {
-    if let Some(home) = dirs::home_dir() {
-        let home_str = home.to_string_lossy();
-        if path.starts_with(home_str.as_ref()) {
-            return format!("~{}", &path[home_str.len()..]);
-        }
-    }
-    path.to_string()
-}
+
