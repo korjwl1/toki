@@ -199,6 +199,7 @@ impl SyncClient {
         items: Vec<SyncItem>,
         dict: &HashMap<u32, String>,
         provider: &str,
+        token_columns: Vec<String>,
     ) -> Result<i64, SyncError> {
         // Only include dict entries referenced by this batch
         let used_ids: std::collections::HashSet<u32> = items.iter().flat_map(|item| {
@@ -219,6 +220,7 @@ impl SyncClient {
             items,
             dict: batch_dict,
             provider: provider.to_string(),
+            token_columns,
         };
         let bytes = bincode::serialize(&payload)
             .map_err(|e| SyncError::Protocol(e.to_string()))?;

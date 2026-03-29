@@ -459,11 +459,27 @@ fn sync_new_events(
         let items: Vec<SyncItem> = events.iter().map(|(ts_ms, _msg_id, event)| {
             SyncItem {
                 ts_ms: *ts_ms,
-                event: event.clone(),
+                event: toki_sync_protocol::StoredEvent {
+                    model_id: event.model_id,
+                    session_id: event.session_id,
+                    source_file_id: event.source_file_id,
+                    project_name_id: event.project_name_id,
+                    tokens: vec![
+                        event.input_tokens,
+                        event.output_tokens,
+                        event.cache_creation_input_tokens,
+                        event.cache_read_input_tokens,
+                    ],
+                },
             }
         }).collect();
 
-        match client.sync_batch(items, dict, provider) {
+        let token_columns: Vec<String> = match provider {
+            "codex" => vec!["input".into(), "output".into(), "cached_input".into(), "reasoning_output".into()],
+            _ => vec!["input".into(), "output".into(), "cache_create".into(), "cache_read".into()],
+        };
+
+        match client.sync_batch(items, dict, provider, token_columns) {
             Ok(ack_ts) => {
                 total_synced += events.len();
                 since_ms = ack_ts;

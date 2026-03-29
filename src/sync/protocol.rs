@@ -5,11 +5,14 @@
 
 use std::io::{self, Read, Write};
 
-// Re-export all shared types so existing imports continue to work.
+// Re-export shared wire types so existing imports continue to work.
+// Note: StoredEvent is NOT re-exported here — the local fjall StoredEvent is in
+// crate::common::types. The wire protocol StoredEvent (with Vec<u64> tokens) is
+// accessed as toki_sync_protocol::StoredEvent when building sync batches.
 pub use toki_sync_protocol::{
     MsgType, AuthPayload, AuthOkPayload, AuthErrPayload,
     GetLastTsPayload, LastTsPayload,
-    StoredEvent, SyncItem, SyncBatchPayload, SyncAckPayload, SyncErrPayload,
+    SyncItem, SyncBatchPayload, SyncAckPayload, SyncErrPayload,
     PROTOCOL_VERSION, MAX_PAYLOAD_SIZE,
 };
 
