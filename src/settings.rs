@@ -153,10 +153,9 @@ pub fn run_settings() -> bool {
         .child(labeled_edit("Rollup Retention", &state.rollup_retention_days, "rollup_retention_days"))
         .child(hint_text("                        Days to keep rollups (0 = forever)"));
 
-    // -- Sync section (read-only status display) --
+    // -- Sync section (read-only except device name) --
     let sync_status = if state.sync_enabled { "Enabled" } else { "Disabled" };
     let sync_server_display = if state.sync_server.is_empty() { "(not configured)" } else { &state.sync_server };
-    let sync_device_display = if state.sync_device_name.is_empty() { "(default)" } else { &state.sync_device_name };
 
     let sync_section = LinearLayout::vertical()
         .child(LinearLayout::horizontal()
@@ -167,14 +166,12 @@ pub fn run_settings() -> bool {
             .child(field_label(&format!("{:<22}", "Server")))
             .child(TextView::new(sync_server_display)))
         .child(DummyView.fixed_height(1))
-        .child(LinearLayout::horizontal()
-            .child(field_label(&format!("{:<22}", "Device Name")))
-            .child(TextView::new(sync_device_display)))
+        .child(labeled_edit("Device Name", &state.sync_device_name, "sync_device_name"))
+        .child(hint_text("                        1-64 chars, no control characters"))
         .child(DummyView.fixed_height(1))
         .child(hint_text("  Manage sync via CLI:"))
         .child(hint_text("    toki settings sync enable --server <host:port> --username <user>"))
-        .child(hint_text("    toki settings sync disable [--delete | --keep]"))
-        .child(hint_text("    toki settings sync status"));
+        .child(hint_text("    toki settings sync disable [--delete | --keep]"));
 
     // -- Providers section (popup multi-select) --
     let enabled_providers = crate::config::get_providers();
@@ -286,7 +283,18 @@ fn save_settings(siv: &mut Cursive, restart_flag: std::sync::Arc<std::sync::atom
         v.is_checked()
     }).unwrap_or(false);
 
-    // Sync settings are read-only in TUI — managed via `toki settings sync` CLI
+    // Sync: only device name is editable in TUI
+    let sync_device_name = get_edit(siv, "sync_device_name");
+
+    // Validate device name
+    if sync_device_name.len() > 64 {
+        siv.add_layer(Dialog::info("Device name must be 64 characters or less"));
+        return;
+    }
+    if sync_device_name.contains(|c: char| c.is_control()) {
+        siv.add_layer(Dialog::info("Device name must not contain control characters"));
+        return;
+    }
 
     // Validate timezone
     if !timezone.is_empty()
@@ -315,6 +323,7 @@ fn save_settings(siv: &mut Cursive, restart_flag: std::sync::Arc<std::sync::atom
         ("no_cost", if no_cost { "true" } else { "false" }),
         ("retention_days", retention.as_str()),
         ("rollup_retention_days", rollup_retention.as_str()),
+        ("sync_device_name", sync_device_name.as_str()),
     ];
 
     // Read providers from hidden storage (set by popup)
