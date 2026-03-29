@@ -122,12 +122,15 @@ enum SettingsCommands {
 enum SyncCommands {
     /// Enable sync: log in to a toki-sync server and store credentials
     Enable {
-        /// TCP sync address (host:port), e.g. sync.example.com:9090
+        /// Server hostname (e.g. sync.example.com)
         #[arg(long)]
         server: String,
-        /// HTTP base URL for API calls (default: http://<host>:9091)
+        /// TCP sync port (default: 9090)
+        #[arg(long, default_value = "9090")]
+        sync_port: u16,
+        /// HTTP API port (default: 9091 for no-tls, 443 for TLS)
         #[arg(long)]
-        http_url: Option<String>,
+        http_port: Option<u16>,
         /// Username for login
         #[arg(long, short = 'u')]
         username: String,
@@ -1602,8 +1605,8 @@ fn handle_sync(command: SyncCommands) {
     toki::sync::credentials::check_file_permissions();
 
     match command {
-        SyncCommands::Enable { server, http_url, username, password, headless, insecure, no_tls, device_name } => {
-            handle_sync_enable(server, http_url, username, password, headless, insecure, no_tls, device_name);
+        SyncCommands::Enable { server, sync_port, http_port, username, password, headless, insecure, no_tls, device_name } => {
+            handle_sync_enable(server, sync_port, http_port, username, password, headless, insecure, no_tls, device_name);
         }
         SyncCommands::Disable { delete, keep } => {
             handle_sync_disable(delete, keep);
@@ -1622,7 +1625,8 @@ fn handle_sync(command: SyncCommands) {
 
 fn handle_sync_enable(
     server: String,
-    http_url: Option<String>,
+    sync_port: u16,
+    http_port: Option<u16>,
     username: String,
     password: Option<String>,
     headless: bool,
@@ -1630,11 +1634,22 @@ fn handle_sync_enable(
     no_tls: bool,
     custom_device_name: Option<String>,
 ) {
-    // Derive HTTP URL from server address if not provided
-    let http_base = http_url.unwrap_or_else(|| {
-        let host = server.split(':').next().unwrap_or(&server);
-        format!("http://{}:9091", host)
-    });
+    let is_localhost = server == "localhost" || server == "127.0.0.1" || server == "::1";
+    let use_tls = !no_tls && !is_localhost;
+
+    // Derive addresses from server hostname
+    let server_addr = format!("{}:{}", server, sync_port);
+    let http_base = if use_tls {
+        let port = http_port.unwrap_or(443);
+        if port == 443 {
+            format!("https://{}", server)
+        } else {
+            format!("https://{}:{}", server, port)
+        }
+    } else {
+        let port = http_port.unwrap_or(9091);
+        format!("http://{}:{}", server, port)
+    };
 
     // POST /auth-method — verify server is reachable and determine auth flow
     let auth_method_url = format!("{}/auth-method", http_base);
@@ -1705,8 +1720,8 @@ fn handle_sync_enable(
     // Save credentials
     let device_name = custom_device_name.unwrap_or_else(|| toki::sync::thread::SyncConfig::default_device_name());
     let creds = toki::sync::credentials::Credentials {
-        server_addr: server.clone(),
-        http_url: http_base,
+        server_addr: server_addr.clone(),
+        http_url: http_base.clone(),
         access_token: access_token.clone(),
         refresh_token,
         device_key: device_key.clone(),
@@ -1719,7 +1734,7 @@ fn handle_sync_enable(
 
     // Update settings so the daemon picks up sync on next start
     let _ = toki::config::set_setting("sync_enabled", "true");
-    let _ = toki::config::set_setting("sync_server", &server);
+    let _ = toki::config::set_setting("sync_server", &server_addr);
     let _ = toki::config::set_setting("sync_access_token", &access_token);
     let _ = toki::config::set_setting("sync_device_name", &device_name);
     let _ = toki::config::set_setting("sync_device_key", &device_key);
@@ -1733,7 +1748,7 @@ fn handle_sync_enable(
     }
 
     println!("[toki] Sync enabled.");
-    println!("[toki] Server:  {}", server);
+    println!("[toki] Server:  {} (HTTP: {})", server_addr, http_base);
     println!("[toki] Device:  {}", device_name);
 
     if insecure {
