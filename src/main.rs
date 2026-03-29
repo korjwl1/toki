@@ -1720,6 +1720,31 @@ fn handle_sync_enable(
             .send_json(serde_json::json!({ "device_code": device_code }))
         {
             Ok(r) => r,
+            Err(ureq::Error::Status(400, resp)) => {
+                // RFC 8628: authorization_pending and slow_down come as HTTP 400
+                let body: serde_json::Value = resp.into_json().unwrap_or_default();
+                match body["error"].as_str() {
+                    Some("authorization_pending") => continue,
+                    Some("slow_down") => {
+                        // Server asked us to slow down; use the new interval if provided
+                        let new_interval = body["interval"].as_u64().unwrap_or(poll_interval + 5);
+                        std::thread::sleep(std::time::Duration::from_secs(new_interval));
+                        continue;
+                    }
+                    Some("expired_token") => {
+                        eprintln!("[toki] Device code expired. Please try again.");
+                        std::process::exit(1);
+                    }
+                    Some(other) => {
+                        eprintln!("[toki] Device authorization error: {}", other);
+                        std::process::exit(1);
+                    }
+                    None => {
+                        eprintln!("[toki] Unexpected 400 response from server");
+                        std::process::exit(1);
+                    }
+                }
+            }
             Err(ureq::Error::Status(410, _)) => {
                 eprintln!("[toki] Device code expired. Please try again.");
                 std::process::exit(1);
@@ -1738,6 +1763,7 @@ fn handle_sync_enable(
             }
         };
 
+        // Handle error responses that came as 200 (legacy fallback)
         if let Some(err) = body["error"].as_str() {
             match err {
                 "authorization_pending" => continue,
@@ -1810,10 +1836,11 @@ fn handle_sync_enable(
         eprintln!("[toki]   Only use this on trusted networks (LAN/VPN)");
     }
 
-    // Prompt daemon restart
+    // Notify about sync activation
     let pidfile = toki::daemon::default_pidfile_path();
     if toki::daemon::daemon_status(&pidfile).is_some() {
-        eprintln!("[toki] Restart daemon to start syncing: toki daemon restart");
+        eprintln!("[toki] Sync will start automatically within 30 seconds.");
+        eprintln!("[toki] Or restart the daemon for immediate effect: toki daemon restart");
     }
 }
 
