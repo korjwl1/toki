@@ -1626,6 +1626,20 @@ fn handle_sync_enable(
     no_tls: bool,
     custom_device_name: Option<String>,
 ) {
+    // Check if already enabled
+    let already_enabled = toki::config::get_setting("sync_enabled")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    if already_enabled {
+        let current_server = toki::config::get_setting("sync_server").unwrap_or_default();
+        eprintln!("[toki] Sync is already enabled.");
+        eprintln!("  Server: {}", current_server);
+        eprintln!();
+        eprintln!("  To change server:  toki settings sync disable && toki settings sync enable --server ...");
+        eprintln!("  To re-login:       toki settings sync disable --keep && toki settings sync enable --server ...");
+        std::process::exit(0);
+    }
+
     let is_localhost = server == "localhost" || server == "127.0.0.1" || server == "::1";
     let use_tls = !no_tls && !is_localhost;
 
