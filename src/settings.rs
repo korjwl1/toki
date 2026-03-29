@@ -153,16 +153,28 @@ pub fn run_settings() -> bool {
         .child(labeled_edit("Rollup Retention", &state.rollup_retention_days, "rollup_retention_days"))
         .child(hint_text("                        Days to keep rollups (0 = forever)"));
 
-    // -- Sync section --
+    // -- Sync section (read-only status display) --
+    let sync_status = if state.sync_enabled { "Enabled" } else { "Disabled" };
+    let sync_server_display = if state.sync_server.is_empty() { "(not configured)" } else { &state.sync_server };
+    let sync_device_display = if state.sync_device_name.is_empty() { "(default)" } else { &state.sync_device_name };
+
     let sync_section = LinearLayout::vertical()
-        .child(labeled_checkbox("Enabled", state.sync_enabled, "sync_enabled"))
-        .child(hint_text("                        Enable/disable multi-device sync (hot-reloaded)"))
+        .child(LinearLayout::horizontal()
+            .child(field_label(&format!("{:<22}", "Status")))
+            .child(TextView::new(sync_status)))
         .child(DummyView.fixed_height(1))
-        .child(labeled_edit("Server", &state.sync_server, "sync_server"))
-        .child(hint_text("                        host:port (e.g. sync.example.com:9090)"))
+        .child(LinearLayout::horizontal()
+            .child(field_label(&format!("{:<22}", "Server")))
+            .child(TextView::new(sync_server_display)))
         .child(DummyView.fixed_height(1))
-        .child(labeled_edit("Device Name", &state.sync_device_name, "sync_device_name"))
-        .child(hint_text("                        Name for this device (default: hostname)"));
+        .child(LinearLayout::horizontal()
+            .child(field_label(&format!("{:<22}", "Device Name")))
+            .child(TextView::new(sync_device_display)))
+        .child(DummyView.fixed_height(1))
+        .child(hint_text("  Manage sync via CLI:"))
+        .child(hint_text("    toki settings sync enable --server <host:port> --username <user>"))
+        .child(hint_text("    toki settings sync disable [--delete | --keep]"))
+        .child(hint_text("    toki settings sync status"));
 
     // -- Providers section (popup multi-select) --
     let enabled_providers = crate::config::get_providers();
@@ -274,11 +286,7 @@ fn save_settings(siv: &mut Cursive, restart_flag: std::sync::Arc<std::sync::atom
         v.is_checked()
     }).unwrap_or(false);
 
-    let sync_enabled = siv.call_on_name("sync_enabled", |v: &mut Checkbox| {
-        v.is_checked()
-    }).unwrap_or(false);
-    let sync_server = get_edit(siv, "sync_server");
-    let sync_device_name = get_edit(siv, "sync_device_name");
+    // Sync settings are read-only in TUI — managed via `toki settings sync` CLI
 
     // Validate timezone
     if !timezone.is_empty()
@@ -307,9 +315,6 @@ fn save_settings(siv: &mut Cursive, restart_flag: std::sync::Arc<std::sync::atom
         ("no_cost", if no_cost { "true" } else { "false" }),
         ("retention_days", retention.as_str()),
         ("rollup_retention_days", rollup_retention.as_str()),
-        ("sync_enabled", if sync_enabled { "true" } else { "false" }),
-        ("sync_server", sync_server.as_str()),
-        ("sync_device_name", sync_device_name.as_str()),
     ];
 
     // Read providers from hidden storage (set by popup)
