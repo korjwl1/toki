@@ -10,7 +10,7 @@ use super::protocol::{
     SyncItem, read_frame, write_empty_frame, write_frame,
 };
 
-const READ_TIMEOUT: Duration = Duration::from_secs(90);  // PING every 60s; allow margin
+const READ_TIMEOUT: Duration = Duration::from_secs(180);  // Allow margin for slow VM writes; PING every 60s
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const BATCH_SIZE: usize = 1000;
 
@@ -53,22 +53,29 @@ pub struct SyncClient {
     writer: BufWriter<StreamHalf>,
 }
 
-/// We need separate read/write halves but SyncStream can't be cloned.
-/// Instead, store the stream in a shared wrapper.  For the request-response
-/// protocol we never read and write concurrently, so we use an unsafe split
-/// approach: duplicate the raw fd for plain TCP, or for TLS wrap a single
-/// SyncStream behind an UnsafeCell (safe because we never overlap read+write).
+/// A raw-pointer wrapper that gives both `BufReader` and `BufWriter` access to
+/// the same heap-allocated `SyncStream`.
 ///
-/// Actually, the simplest correct approach: for plain TCP, clone the fd.
-/// For TLS, use a single BufStream and alternate read/write.
+/// # Why a raw pointer?
 ///
-/// Simplest: just use a combined buffer. write_frame flushes, then read_frame reads.
-/// We can wrap a single SyncStream in a struct that does both.
-
+/// TLS streams (`native_tls::TlsStream`) cannot be split or cloned, yet we need
+/// separate `BufReader` and `BufWriter` wrappers for ergonomic frame I/O.
+/// A raw pointer lets both wrappers reference the same underlying stream.
+///
+/// # Safety invariants
+///
+/// 1. **No concurrent access.** The sync protocol is strictly request-response:
+///    `write_frame` (which flushes) completes before `read_frame` begins.  The
+///    reader and writer `StreamHalf` instances are never used at the same time.
+/// 2. **Lifetime.** The pointee is heap-allocated via `Box::into_raw` in
+///    `SyncClient::connect`.  It is recovered and freed in `SyncClient::drop`
+///    via `Box::from_raw` on the reader's copy of the pointer.
+/// 3. **Single owner.** Only one `SyncClient` owns the allocation; both
+///    `StreamHalf` copies share the same pointer value.
 struct StreamHalf(*mut SyncStream);
 
 // SAFETY: SyncClient is !Sync and the protocol guarantees sequential
-// read-then-write access — never concurrent.  Both halves point to the
+// read-then-write access -- never concurrent.  Both halves point to the
 // same SyncStream but are never used at the same time.
 unsafe impl Send for StreamHalf {}
 

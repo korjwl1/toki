@@ -394,12 +394,18 @@ fn now_epoch() -> i64 {
         .as_secs() as i64
 }
 
+fn escape_applescript(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 fn send_sync_notification(title: &str, message: &str) {
     #[cfg(target_os = "macos")]
     {
+        let esc_title = escape_applescript(title);
+        let esc_msg = escape_applescript(message);
         let _ = std::process::Command::new("osascript")
             .args(["-e", &format!(
-                "display notification \"{}\" with title \"{}\"", message, title
+                "display notification \"{}\" with title \"{}\"", esc_msg, esc_title
             )])
             .spawn();
     }
