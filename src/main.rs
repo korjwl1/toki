@@ -1678,14 +1678,15 @@ fn handle_sync_enable(
         std::process::exit(1);
     }
 
-    // Step 2: Try to open browser
-    let browser_url = if verification_url.starts_with("http://") || verification_url.starts_with("https://") {
+    // Step 2: Try to open browser (append code to URL for auto-fill)
+    let browser_url_base = if verification_url.starts_with("http://") || verification_url.starts_with("https://") {
         verification_url
     } else {
         // Relative path or empty — prepend http_base
         let path = if verification_url.is_empty() { "/login/device" } else { &verification_url };
         format!("{}{}", http_base, path)
     };
+    let browser_url = format!("{}?code={}", browser_url_base, user_code);
 
     if !headless {
         #[cfg(target_os = "macos")]
