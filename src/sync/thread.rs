@@ -475,7 +475,7 @@ fn sync_new_events(
         }).collect();
 
         let token_columns: Vec<String> = match provider {
-            "codex" => vec!["input".into(), "output".into(), "cached_input".into(), "reasoning_output".into()],
+            "codex" => vec!["input".into(), "output".into(), "reasoning_output".into(), "cached_input".into()],
             _ => vec!["input".into(), "output".into(), "cache_create".into(), "cache_read".into()],
         };
 
