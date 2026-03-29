@@ -1665,10 +1665,12 @@ fn handle_sync_enable(
     }
 
     // Step 2: Try to open browser
-    let browser_url = if verification_url.is_empty() {
-        format!("{}/login/device", http_base)
-    } else {
+    let browser_url = if verification_url.starts_with("http://") || verification_url.starts_with("https://") {
         verification_url
+    } else {
+        // Relative path or empty — prepend http_base
+        let path = if verification_url.is_empty() { "/login/device" } else { &verification_url };
+        format!("{}{}", http_base, path)
     };
 
     if !headless {
