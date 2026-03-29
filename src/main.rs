@@ -120,7 +120,7 @@ enum SettingsCommands {
 
 #[derive(Subcommand)]
 enum SyncCommands {
-    /// Enable sync: log in to a toki-sync server and store credentials
+    /// Enable sync: authenticate via browser and store credentials
     Enable {
         /// Server hostname (e.g. sync.example.com)
         #[arg(long)]
@@ -131,13 +131,7 @@ enum SyncCommands {
         /// HTTP API port (default: 9091 for no-tls, 443 for TLS)
         #[arg(long)]
         http_port: Option<u16>,
-        /// Username (password auth only; prompted if needed)
-        #[arg(long, short = 'u')]
-        username: Option<String>,
-        /// Password (env: TOKI_SYNC_PASSWORD; prompted if needed)
-        #[arg(long, hide = true)]
-        password: Option<String>,
-        /// Headless mode: print OIDC URL and wait for pasted callback URL (no browser)
+        /// Headless mode: don't try to open browser, just print URL
         #[arg(long)]
         headless: bool,
         /// Skip TLS certificate verification (for self-signed certs)
@@ -1605,8 +1599,8 @@ fn handle_sync(command: SyncCommands) {
     toki::sync::credentials::check_file_permissions();
 
     match command {
-        SyncCommands::Enable { server, sync_port, http_port, username, password, headless, insecure, no_tls, device_name } => {
-            handle_sync_enable(server, sync_port, http_port, username, password, headless, insecure, no_tls, device_name);
+        SyncCommands::Enable { server, sync_port, http_port, headless, insecure, no_tls, device_name } => {
+            handle_sync_enable(server, sync_port, http_port, headless, insecure, no_tls, device_name);
         }
         SyncCommands::Disable { delete, keep } => {
             handle_sync_disable(delete, keep);
@@ -1627,8 +1621,6 @@ fn handle_sync_enable(
     server: String,
     sync_port: u16,
     http_port: Option<u16>,
-    username: Option<String>,
-    password: Option<String>,
     headless: bool,
     insecure: bool,
     no_tls: bool,
@@ -1651,56 +1643,73 @@ fn handle_sync_enable(
         format!("http://{}:{}", server, port)
     };
 
-    // POST /auth-method — verify server is reachable and determine auth flow
-    let auth_method_url = format!("{}/auth-method", http_base);
-    let auth_resp = match ureq::post(&auth_method_url)
-        .send_json(serde_json::json!({ "username": username.as_deref().unwrap_or("") }))
-    {
+    // Step 1: POST /device/code to initiate device authorization
+    let device_code_url = format!("{}/device/code", http_base);
+    let dc_resp = match ureq::post(&device_code_url).call() {
         Err(e) => {
             eprintln!("[toki] Cannot reach sync server at {}: {}", http_base, e);
             std::process::exit(1);
         }
         Ok(r) => r,
     };
-    let auth_body: serde_json::Value = auth_resp.into_json().unwrap_or_default();
-    let method = auth_body["method"].as_str().unwrap_or("password");
+    let dc_body: serde_json::Value = dc_resp.into_json().unwrap_or_default();
+    let device_code = dc_body["device_code"].as_str().unwrap_or("").to_string();
+    let user_code = dc_body["user_code"].as_str().unwrap_or("").to_string();
+    let verification_url = dc_body["verification_url"].as_str().unwrap_or("").to_string();
+    let poll_interval = dc_body["interval"].as_u64().unwrap_or(5);
+    let expires_in = dc_body["expires_in"].as_u64().unwrap_or(600);
 
-    let (access_token, refresh_token) = if method == "oidc" {
-        // OIDC flow — no username/password needed
-        let auth_url_path = auth_body["auth_url"].as_str().unwrap_or("/auth/oidc/authorize");
-        handle_oidc_login(&http_base, auth_url_path, headless)
+    if device_code.is_empty() || user_code.is_empty() {
+        eprintln!("[toki] Server did not return a valid device code");
+        std::process::exit(1);
+    }
+
+    // Step 2: Try to open browser
+    let browser_url = if verification_url.is_empty() {
+        format!("{}/login/device", http_base)
     } else {
-        // Password flow — prompt for username/password if not provided
-        let user = username
-            .or_else(|| std::env::var("TOKI_SYNC_USERNAME").ok())
-            .unwrap_or_else(|| {
-                eprint!("Username: ");
-                let mut input = String::new();
-                std::io::stdin().read_line(&mut input).ok();
-                input.trim().to_string()
-            });
-        let pw = password
-            .or_else(|| std::env::var("TOKI_SYNC_PASSWORD").ok())
-            .unwrap_or_else(|| {
-                eprint!("Password: ");
-                rpassword_read()
-            });
+        verification_url
+    };
 
-        let login_url = format!("{}/login", http_base);
-        let resp = match ureq::post(&login_url)
-            .send_json(serde_json::json!({
-                "username": user,
-                "password": pw,
-            }))
+    if !headless {
+        #[cfg(target_os = "macos")]
+        { let _ = std::process::Command::new("open").arg(&browser_url).spawn(); }
+        #[cfg(target_os = "linux")]
+        { let _ = std::process::Command::new("xdg-open").arg(&browser_url).spawn(); }
+    }
+
+    // Step 3: Print instructions
+    eprintln!();
+    eprintln!("[toki] Open this URL to log in:");
+    eprintln!("  {}", browser_url);
+    eprintln!();
+    eprintln!("[toki] Enter code: {}", user_code);
+    eprintln!();
+    eprintln!("[toki] Waiting for approval...");
+
+    // Step 4: Poll POST /device/token every `poll_interval` seconds
+    let device_token_url = format!("{}/device/token", http_base);
+    let timeout = std::time::Duration::from_secs(expires_in);
+    let start = std::time::Instant::now();
+
+    let (access_token, refresh_token) = loop {
+        if start.elapsed() > timeout {
+            eprintln!("[toki] Device authorization timed out ({} seconds). Please try again.", expires_in);
+            std::process::exit(1);
+        }
+
+        std::thread::sleep(std::time::Duration::from_secs(poll_interval));
+
+        let resp = match ureq::post(&device_token_url)
+            .send_json(serde_json::json!({ "device_code": device_code }))
         {
             Ok(r) => r,
-            Err(ureq::Error::Status(code, resp)) => {
-                let body = resp.into_string().unwrap_or_default();
-                eprintln!("[toki] Login failed (HTTP {}): {}", code, body.trim());
+            Err(ureq::Error::Status(410, _)) => {
+                eprintln!("[toki] Device code expired. Please try again.");
                 std::process::exit(1);
             }
             Err(e) => {
-                eprintln!("[toki] Login error: {}", e);
+                eprintln!("[toki] Poll error: {}", e);
                 std::process::exit(1);
             }
         };
@@ -1708,18 +1717,34 @@ fn handle_sync_enable(
         let body: serde_json::Value = match resp.into_json() {
             Ok(v) => v,
             Err(e) => {
-                eprintln!("[toki] Invalid login response: {}", e);
+                eprintln!("[toki] Invalid poll response: {}", e);
                 std::process::exit(1);
             }
         };
 
+        if let Some(err) = body["error"].as_str() {
+            match err {
+                "authorization_pending" => continue,
+                "expired_token" => {
+                    eprintln!("[toki] Device code expired. Please try again.");
+                    std::process::exit(1);
+                }
+                other => {
+                    eprintln!("[toki] Device authorization error: {}", other);
+                    std::process::exit(1);
+                }
+            }
+        }
+
         let at = body["access_token"].as_str().unwrap_or("").to_string();
         let rt = body["refresh_token"].as_str().unwrap_or("").to_string();
-        (at, rt)
+        if !at.is_empty() {
+            break (at, rt);
+        }
     };
 
     if access_token.is_empty() {
-        eprintln!("[toki] Login response missing access_token");
+        eprintln!("[toki] Authorization response missing access_token");
         std::process::exit(1);
     }
 
@@ -1774,125 +1799,6 @@ fn handle_sync_enable(
     if toki::daemon::daemon_status(&pidfile).is_some() {
         eprintln!("[toki] Restart daemon to start syncing: toki daemon restart");
     }
-}
-
-/// Handle OIDC login flow: start localhost server, open browser, wait for callback.
-fn handle_oidc_login(http_base: &str, auth_url_path: &str, headless: bool) -> (String, String) {
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-
-    // Bind a temporary HTTP server on a random port
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap_or_else(|e| {
-        eprintln!("[toki] Failed to start local HTTP server: {}", e);
-        std::process::exit(1);
-    });
-    let local_port = listener.local_addr().unwrap().port();
-    let redirect_uri = format!("http://127.0.0.1:{}/callback", local_port);
-
-    // Build the full authorization URL with our redirect_uri
-    let full_auth_url = if auth_url_path.starts_with("http") {
-        format!("{}&redirect_uri={}", auth_url_path, urlencoding::encode(&redirect_uri))
-    } else {
-        format!("{}{}?redirect_uri={}", http_base, auth_url_path, urlencoding::encode(&redirect_uri))
-    };
-
-    if headless {
-        // Headless mode: print URL and ask user to paste callback URL
-        eprintln!("[toki] Open this URL in your browser to authenticate:");
-        eprintln!();
-        eprintln!("  {}", full_auth_url);
-        eprintln!();
-        eprint!("[toki] Paste the callback URL here: ");
-        let _ = std::io::stderr().flush();
-        let mut callback_url = String::new();
-        std::io::stdin().read_line(&mut callback_url).unwrap_or(0);
-        let callback_url = callback_url.trim();
-        return parse_callback_tokens(callback_url);
-    }
-
-    // Open browser
-    eprintln!("[toki] Opening browser for authentication...");
-    eprintln!("[toki] If the browser doesn't open, visit:");
-    eprintln!("  {}", full_auth_url);
-
-    #[cfg(target_os = "macos")]
-    { let _ = std::process::Command::new("open").arg(&full_auth_url).spawn(); }
-    #[cfg(target_os = "linux")]
-    { let _ = std::process::Command::new("xdg-open").arg(&full_auth_url).spawn(); }
-
-    // Wait for callback (single connection) with 5-minute timeout
-    eprintln!("[toki] Waiting for authentication callback (5 min timeout)...");
-    listener.set_nonblocking(true).ok();
-
-    let timeout = std::time::Duration::from_secs(300);
-    let start = std::time::Instant::now();
-    let (mut stream, _) = loop {
-        match listener.accept() {
-            Ok(conn) => break conn,
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if start.elapsed() > timeout {
-                    eprintln!("[toki] OIDC login timed out (5 minutes). Please try again.");
-                    std::process::exit(1);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            Err(e) => {
-                eprintln!("[toki] Failed to accept callback connection: {}", e);
-                std::process::exit(1);
-            }
-        }
-    };
-
-    // Read the HTTP request
-    let mut buf = vec![0u8; 8192];
-    let n = stream.read(&mut buf).unwrap_or(0);
-    let request = String::from_utf8_lossy(&buf[..n]).to_string();
-
-    // Send success response
-    let html = "<!DOCTYPE html><html><body><h2>Login successful!</h2><p>You can close this window and return to the terminal.</p></body></html>";
-    let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        html.len(), html
-    );
-    let _ = stream.write_all(response.as_bytes());
-    let _ = stream.flush();
-    drop(stream);
-
-    // Parse query params from the callback request
-    // Request line looks like: GET /callback?access_token=...&refresh_token=... HTTP/1.1
-    let request_line = request.lines().next().unwrap_or("");
-    let path = request_line.split_whitespace().nth(1).unwrap_or("");
-    parse_callback_tokens(path)
-}
-
-/// Extract access_token and refresh_token from a callback URL/path query string.
-fn parse_callback_tokens(url_or_path: &str) -> (String, String) {
-    let query_str = if let Some(idx) = url_or_path.find('?') {
-        &url_or_path[idx + 1..]
-    } else {
-        ""
-    };
-
-    let mut access_token = String::new();
-    let mut refresh_token = String::new();
-
-    for param in query_str.split('&') {
-        if let Some((key, value)) = param.split_once('=') {
-            let decoded = urlencoding::decode(value).unwrap_or_else(|_| value.into());
-            match key {
-                "access_token" => access_token = decoded.to_string(),
-                "refresh_token" => refresh_token = decoded.to_string(),
-                _ => {}
-            }
-        }
-    }
-
-    if access_token.is_empty() {
-        eprintln!("[toki] OIDC callback did not include access_token");
-        std::process::exit(1);
-    }
-
-    (access_token, refresh_token)
 }
 
 fn handle_sync_disable(delete: bool, keep: bool) {
@@ -2132,44 +2038,6 @@ fn handle_sync_devices() {
             .unwrap_or_else(|| "-".to_string());
         println!("{:<36}  {:<24}  {}", id, name, last_seen);
     }
-}
-
-/// Read password from terminal without echoing (fallback: read line if not a tty).
-fn rpassword_read() -> String {
-    // Try to disable echo via termios
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        let _ = std::io::stderr().flush();
-        // Use /dev/tty directly for password input
-        if let Ok(mut tty) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") {
-            use std::os::unix::io::AsRawFd;
-            let tty_fd = tty.as_raw_fd();
-            let original = unsafe {
-                let mut t = std::mem::zeroed::<libc::termios>();
-                libc::tcgetattr(tty_fd, &mut t);
-                t
-            };
-            // Disable echo
-            let mut raw = original;
-            raw.c_lflag &= !libc::ECHO;
-            unsafe { libc::tcsetattr(tty_fd, libc::TCSANOW, &raw); }
-
-            let mut pw = String::new();
-            use std::io::BufRead;
-            let reader = std::io::BufReader::new(&mut tty);
-            let _ = reader.lines().next().map(|l| pw = l.unwrap_or_default());
-
-            // Restore echo
-            unsafe { libc::tcsetattr(tty_fd, libc::TCSANOW, &original); }
-            eprintln!(); // newline after hidden password
-            return pw;
-        }
-    }
-    // Fallback: read from stdin (password will be echoed)
-    let mut pw = String::new();
-    let _ = std::io::BufRead::read_line(&mut std::io::stdin().lock(), &mut pw);
-    pw.trim_end_matches('\n').to_string()
 }
 
 fn parse_weekday(s: &str) -> Weekday {

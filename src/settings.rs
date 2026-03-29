@@ -170,7 +170,7 @@ pub fn run_settings() -> bool {
         .child(hint_text("                        1-64 chars, no control characters"))
         .child(DummyView.fixed_height(1))
         .child(hint_text("  Manage sync via CLI:"))
-        .child(hint_text("    toki settings sync enable --server <host:port> --username <user>"))
+        .child(hint_text("    toki settings sync enable --server <host>"))
         .child(hint_text("    toki settings sync disable [--delete | --keep]"));
 
     // -- Providers section (popup multi-select) --
