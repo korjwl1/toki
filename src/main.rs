@@ -1683,10 +1683,10 @@ fn handle_sync_enable(
         verification_url
     } else {
         // Relative path or empty — prepend http_base
-        let path = if verification_url.is_empty() { "/login/device" } else { &verification_url };
+        let path = if verification_url.is_empty() { "/login" } else { &verification_url };
         format!("{}{}", http_base, path)
     };
-    let browser_url = format!("{}?code={}", browser_url_base, user_code);
+    let browser_url = format!("{}?device={}", browser_url_base, user_code);
 
     if !headless {
         #[cfg(target_os = "macos")]
