@@ -290,6 +290,39 @@ impl Database {
     // -- Query operations --
 
     /// Query events in a timestamp range [since_ms, until_ms], returning at most `limit` results.
+    /// Query events starting after the given composite key (ts_ms + msg_id).
+    /// This avoids the +1ms gap that skips same-timestamp events.
+    pub fn query_events_after_key(&self, after_key: &[u8], until_ms: i64, limit: usize) -> Result<Vec<(i64, String, StoredEvent)>, fjall::Error> {
+        let mut results = Vec::new();
+        // Start scan from the key AFTER the given one
+        let mut started = false;
+        for guard in self.events.range(after_key.to_vec()..) {
+            let kv = guard.into_inner()?;
+            let key = &kv.0;
+            // Skip the exact key we're resuming from
+            if !started {
+                if key.as_ref() == after_key {
+                    started = true;
+                    continue;
+                }
+                started = true;
+            }
+            if key.len() < 8 { continue; }
+            let ts_bytes: [u8; 8] = match key[..8].try_into() {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let ts = i64::from_be_bytes(ts_bytes);
+            if ts > until_ms { break; }
+            let msg_id = String::from_utf8_lossy(&key[8..]).into_owned();
+            if let Ok(event) = bincode::deserialize::<StoredEvent>(&kv.1) {
+                results.push((ts, msg_id, event));
+                if results.len() >= limit { break; }
+            }
+        }
+        Ok(results)
+    }
+
     pub fn query_events_range_limit(&self, since_ms: i64, until_ms: i64, limit: usize) -> Result<Vec<(i64, String, StoredEvent)>, fjall::Error> {
         let start_key = since_ms.to_be_bytes().to_vec();
 

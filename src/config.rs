@@ -148,6 +148,27 @@ impl Config {
     }
 }
 
+// ── Stable device identity ──
+
+/// Returns the stable device UUID, creating it on first call.
+/// Stored in `~/.config/toki/device_id` — survives sync enable/disable cycles.
+pub fn device_id() -> String {
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let path = home.join(".config").join("toki").join("device_id");
+    if let Ok(id) = std::fs::read_to_string(&path) {
+        let id = id.trim().to_string();
+        if !id.is_empty() {
+            return id;
+        }
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    std::fs::write(&path, &id).ok();
+    id
+}
+
 // ── File-based settings ──
 
 /// Default settings file path.
@@ -300,6 +321,70 @@ fn touch_settings_sentinel() -> std::io::Result<()> {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()))?;
+    Ok(())
+}
+
+// ── Sync state (separate from settings to avoid sentinel triggers) ──
+
+/// Path to the sync state file (runtime status, not user settings).
+/// Lives in /tmp to avoid unnecessary SSD writes — state is ephemeral
+/// and rebuilt by the daemon on startup.
+pub fn sync_state_path() -> PathBuf {
+    PathBuf::from("/tmp/toki/sync_state.json")
+}
+
+fn load_sync_state() -> Option<HashMap<String, serde_json::Value>> {
+    let path = sync_state_path();
+    let data = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+/// Write a key to sync_state.json (no sentinel touch, no settings lock).
+pub fn set_sync_state(key: &str, value: &str) -> Result<(), String> {
+    let path = sync_state_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+
+    let lock_path = path.with_extension("lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true).truncate(false).read(true).write(true)
+        .open(&lock_path).map_err(|e| e.to_string())?;
+    use fs2::FileExt;
+    lock_file.lock_exclusive().map_err(|e| format!("sync_state lock: {}", e))?;
+
+    let mut state: HashMap<String, serde_json::Value> = if path.exists() {
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|data| serde_json::from_str(&data).ok())
+            .unwrap_or_default()
+    } else {
+        HashMap::new()
+    };
+
+    state.insert(key.to_string(), serde_json::Value::String(value.to_string()));
+
+    let tmp = path.with_extension("tmp");
+    let json = serde_json::to_string_pretty(&state).map_err(|e| e.to_string())?;
+    std::fs::write(&tmp, &json).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+
+    lock_file.unlock().ok();
+    Ok(())
+}
+
+/// Read a key from sync_state.json.
+pub fn get_sync_state(key: &str) -> Option<String> {
+    let state = load_sync_state()?;
+    state.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+}
+
+/// Clear all sync state (called on sync disable).
+pub fn clear_sync_state() -> Result<(), String> {
+    let path = sync_state_path();
+    if path.exists() {
+        std::fs::remove_file(&path).map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 

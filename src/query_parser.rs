@@ -54,6 +54,8 @@ pub enum AggregationFunc {
 pub enum Metric {
     /// Token usage aggregation.
     Usage,
+    /// Cost in USD.
+    Cost,
     /// List sessions.
     Sessions,
     /// List projects.
@@ -173,6 +175,7 @@ impl Query {
 
         let mut s = match self.metric {
             Metric::Usage => "usage".to_string(),
+            Metric::Cost => "cost".to_string(),
             Metric::Sessions => "sessions".to_string(),
             Metric::Projects => "projects".to_string(),
             Metric::Events => "events".to_string(),
@@ -277,6 +280,8 @@ pub fn parse(input: &str) -> Result<Query, String> {
         Metric::Usage
     } else if p.consume_literal("usage") {
         Metric::Usage
+    } else if p.consume_literal("cost") {
+        Metric::Cost
     } else if p.consume_literal("events") {
         Metric::Events
     } else if p.consume_literal("sessions") {
@@ -285,7 +290,7 @@ pub fn parse(input: &str) -> Result<Query, String> {
         Metric::Projects
     } else {
         return Err(
-            "expected metric name ('toki_tokens_total', 'usage', 'events', 'sessions', 'projects') \
+            "expected metric name ('toki_tokens_total', 'usage', 'cost', 'events', 'sessions', 'projects') \
              or aggregation function ('sum', 'avg', 'count')"
                 .into(),
         );
@@ -344,7 +349,7 @@ pub fn parse(input: &str) -> Result<Query, String> {
     }
 
     // Validate: sessions/projects/events don't support bucket or group_by
-    if metric != Metric::Usage {
+    if !matches!(metric, Metric::Usage | Metric::Cost | Metric::Events) {
         if bucket.is_some() {
             return Err(format!("{:?} does not support time buckets", metric));
         }
@@ -871,13 +876,17 @@ mod tests {
     }
 
     #[test]
-    fn test_events_rejects_bucket() {
-        assert!(parse("events[5m]").is_err());
+    fn test_events_accepts_bucket() {
+        let q = parse("events[5m]").unwrap();
+        assert_eq!(q.metric, Metric::Events);
+        assert!(q.bucket.is_some());
     }
 
     #[test]
-    fn test_events_rejects_group_by() {
-        assert!(parse("events by (model)").is_err());
+    fn test_events_accepts_group_by() {
+        let q = parse("events by (model)").unwrap();
+        assert_eq!(q.metric, Metric::Events);
+        assert_eq!(q.group_by, vec!["model"]);
     }
 
     #[test]
@@ -998,8 +1007,10 @@ mod tests {
     }
 
     #[test]
-    fn test_aggregation_rejects_events() {
-        assert!(parse("count(events)").is_err());
+    fn test_aggregation_accepts_events() {
+        let q = parse("count(events)").unwrap();
+        assert_eq!(q.metric, Metric::Events);
+        assert_eq!(q.aggregation, Some(AggregationFunc::Count));
     }
 
     #[test]

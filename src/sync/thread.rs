@@ -40,22 +40,7 @@ impl SyncConfig {
         let token = crate::config::get_setting("sync_access_token")?;
         let device = crate::config::get_setting("sync_device_name")
             .unwrap_or_else(gethostname);
-        // device_key: Keychain is authoritative (survives settings wipe).
-        // Priority: Keychain → settings DB → generate new (save to both).
-        let device_key = crate::sync::credentials::load()
-            .filter(|c| !c.device_key.is_empty())
-            .map(|c| c.device_key.clone())
-            .or_else(|| crate::config::get_setting("sync_device_key"))
-            .unwrap_or_else(|| {
-                let key = uuid::Uuid::new_v4().to_string();
-                let _ = crate::config::set_setting("sync_device_key", &key);
-                // Also persist to Keychain so it survives a settings DB wipe
-                if let Some(mut creds) = crate::sync::credentials::load() {
-                    creds.device_key = key.clone();
-                    let _ = crate::sync::credentials::save(&creds);
-                }
-                key
-            });
+        let device_key = crate::config::device_id();
         // TLS: default to true unless explicitly "false" or server is localhost
         let use_tls = match crate::config::get_setting("sync_tls") {
             Some(v) if v == "false" => false,
@@ -220,6 +205,7 @@ fn run_sync_inner(
     let mut tls_hint_shown = false;
     let mut last_refresh = Instant::now();
     let mut auth_failure_notified = false;
+    let mut sw = SyncStateWriter::new();
 
     loop {
         // Check stop signal
@@ -243,31 +229,21 @@ fn run_sync_inner(
             client = None;
         }
 
-        // Wait for flush or PING timeout
-        let flush_happened = if client.is_none() || needs_initial_sync {
-            *flush_notify.0.lock().unwrap() = false;
-            false
-        } else {
+        // Wait for flush notification or PING timeout.
+        // Skip wait if connecting or doing initial catch-up.
+        if client.is_some() && !needs_initial_sync {
             let (lock, cvar) = &**flush_notify;
-            let timeout = PING_INTERVAL.saturating_sub(last_ping.elapsed());
             let guard = lock.lock().unwrap();
-            let (mut guard, timeout_result) = cvar.wait_timeout_while(guard, timeout, |dirty| !*dirty).unwrap();
-            let happened = !timeout_result.timed_out() || *guard;
+            let timeout = PING_INTERVAL.saturating_sub(last_ping.elapsed());
+            let (mut guard, _) = cvar.wait_timeout_while(
+                guard, timeout, |dirty| !*dirty
+            ).unwrap();
             *guard = false;
-            happened
-        };
 
-        // Check stop again after wakeup
-        if stop_rx.try_recv().is_ok() {
-            return;
-        }
-
-        // Check toggle again after wakeup
-        {
+            // Check stop/toggle after wakeup
+            if stop_rx.try_recv().is_ok() { return; }
             let enabled = sync_toggle.0.lock().unwrap();
-            if !*enabled {
-                return;
-            }
+            if !*enabled { return; }
         }
 
         // Ensure connection
@@ -292,18 +268,44 @@ fn run_sync_inner(
                             last_refresh = Instant::now();
                             needs_initial_sync = true;
                             auth_failure_notified = false;
-                            let _ = crate::config::set_setting("sync_status", "connected");
-                            let _ = crate::config::set_setting("sync_last_success", &now_epoch().to_string());
+                            sw.set("sync_status", "connected");
+                            sw.set("sync_last_success", &now_epoch().to_string());
                         }
                         Err(AuthError::Rejected { reason, reset_required }) => {
                             eprintln!("[toki:sync] auth rejected: {reason}");
-                            let _ = crate::config::set_setting("sync_status", "auth_failed");
-                            let _ = crate::config::set_setting("sync_last_error", &reason);
-                            let _ = crate::config::set_setting("sync_last_error_at", &now_epoch().to_string());
+
+                            if reason.contains("device_removed") {
+                                eprintln!("[toki:sync] device was removed from server — disabling sync");
+                                let _ = crate::config::set_setting("sync_enabled", "false");
+                                sw.set("sync_status", "device_removed");
+                                {
+                                    let mut enabled = sync_toggle.0.lock().unwrap();
+                                    *enabled = false;
+                                }
+                                send_sync_notification(
+                                    "toki sync: device removed",
+                                    "This device was removed from the server. Sync has been disabled. Re-enable with: toki settings sync enable --server ...",
+                                );
+                                return;
+                            }
+
+                            // JWT expired — try refresh before giving up
+                            if reason.contains("Expired") || reason.contains("expired") {
+                                if try_refresh_token(config) {
+                                    eprintln!("[toki:sync] token refreshed after expiry, retrying");
+                                    backoff.reset();
+                                    last_refresh = Instant::now();
+                                    continue; // retry auth immediately
+                                }
+                            }
+
+                            sw.set("sync_status", "auth_failed");
+                            sw.set("sync_last_error", &reason);
+                            sw.set("sync_last_error_at", &now_epoch().to_string());
                             if reset_required {
                                 eprintln!("[toki:sync] schema mismatch — clearing sync cursor");
                                 let key = format!("sync_last_ts_{}", config.provider);
-                                let _ = crate::config::set_setting(&key, "0");
+                                sw.set(&key, "0");
                             }
                         }
                         Err(e) => {
@@ -313,9 +315,9 @@ fn run_sync_inner(
                                 backoff.reset();
                                 last_refresh = Instant::now();
                             } else {
-                                let _ = crate::config::set_setting("sync_status", "token_expired");
-                                let _ = crate::config::set_setting("sync_last_error", &format!("{e}"));
-                                let _ = crate::config::set_setting("sync_last_error_at", &now_epoch().to_string());
+                                sw.set("sync_status", "token_expired");
+                                sw.set("sync_last_error", &format!("{e}"));
+                                sw.set("sync_last_error_at", &now_epoch().to_string());
                                 if !auth_failure_notified {
                                     send_sync_notification(
                                         "toki sync: re-login required",
@@ -329,9 +331,9 @@ fn run_sync_inner(
                 }
                 Err(e) => {
                     eprintln!("[toki:sync] connect failed: {e}");
-                    let _ = crate::config::set_setting("sync_status", "disconnected");
-                    let _ = crate::config::set_setting("sync_last_error", &format!("{e}"));
-                    let _ = crate::config::set_setting("sync_last_error_at", &now_epoch().to_string());
+                    sw.set("sync_status", "disconnected");
+                    sw.set("sync_last_error", &format!("{e}"));
+                    sw.set("sync_last_error_at", &now_epoch().to_string());
                     if config.use_tls && !tls_hint_shown {
                         tls_hint_shown = true;
                         eprintln!("[toki:sync] TLS connection failed. Options:");
@@ -343,25 +345,64 @@ fn run_sync_inner(
             }
         }
 
-        let Some(ref mut c) = client else { continue };
+        if client.is_none() { continue; }
 
-        // Sync new events
-        if flush_happened || needs_initial_sync {
-            needs_initial_sync = false;
-            match sync_new_events(c, db, &mut dict_cache, &config.provider) {
-                Ok(synced) => {
-                    if synced > 0 {
-                        eprintln!("[toki:sync] synced {synced} events");
-                    }
-                    let _ = crate::config::set_setting("sync_status", "connected");
-                    let _ = crate::config::set_setting("sync_last_success", &now_epoch().to_string());
+        // Sync cycle: upload everything until server ts == local ts.
+        // After catching up, re-check dirty flag to avoid missing events
+        // that arrived during the sync cycle.
+        {
+            let mut sync_error = false;
+            let mut total_synced_this_cycle = 0usize;
+            loop {
+                // Check stop/disable between batches
+                if stop_rx.try_recv().is_ok() { return; }
+                {
+                    let enabled = sync_toggle.0.lock().unwrap();
+                    if !*enabled { return; }
                 }
-                Err(e) => {
-                    eprintln!("[toki:sync] sync error: {e}");
-                    client = None;
-                    continue;
+
+                let c = client.as_mut().unwrap();
+                match sync_new_events(c, db, &mut dict_cache, &config.provider, &mut sw) {
+                    Ok(synced) => {
+                        if synced > 0 {
+                            total_synced_this_cycle += synced;
+                            eprintln!("[toki:sync] synced {synced} events");
+                            sw.set("sync_last_success", &now_epoch().to_string());
+                        } else {
+                            // No more events in DB — but check if new ones arrived
+                            // while we were syncing (race between flush and sync)
+                            let still_dirty = {
+                                let mut guard = flush_notify.0.lock().unwrap();
+                                let d = *guard;
+                                *guard = false;
+                                d
+                            };
+                            if still_dirty {
+                                // New data arrived during sync, go around again
+                                continue;
+                            }
+                            break; // truly caught up
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[toki:sync] sync error: {e}");
+                        sync_error = true;
+                        break;
+                    }
                 }
             }
+
+            if sync_error {
+                client = None;
+                continue;
+            }
+
+            if needs_initial_sync {
+                eprintln!("[toki:sync] catch-up complete — entering flush-driven mode");
+                needs_initial_sync = false;
+            }
+            sw.set("sync_status", "connected");
+            sw.set("sync_last_success", &now_epoch().to_string());
         }
 
         // Proactive token refresh: keep the refresh token rotated to prevent expiry
@@ -376,13 +417,56 @@ fn run_sync_inner(
 
         // PING keepalive
         if last_ping.elapsed() >= PING_INTERVAL {
-            match c.ping() {
-                Ok(()) => { last_ping = Instant::now(); }
-                Err(e) => {
-                    eprintln!("[toki:sync] ping failed: {e}");
-                    client = None;
+            if let Some(ref mut c) = client {
+                match c.ping() {
+                    Ok(()) => { last_ping = Instant::now(); }
+                    Err(e) => {
+                        eprintln!("[toki:sync] ping failed: {e}");
+                        client = None;
+                    }
                 }
             }
+        }
+    }
+}
+
+/// Keeps a file descriptor open for /tmp/toki/sync_state.json.
+/// Single writer (sync thread), so no locking needed.
+/// If open fails, all writes silently no-op.
+struct SyncStateWriter {
+    file: Option<std::fs::File>,
+    state: HashMap<String, String>,
+}
+
+impl SyncStateWriter {
+    fn new() -> Self {
+        let dir = std::path::Path::new("/tmp/toki");
+        let _ = std::fs::create_dir_all(dir);
+        let path = dir.join("sync_state.json");
+        let state: HashMap<String, String> = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<HashMap<String, serde_json::Value>>(&s).ok())
+            .map(|m| m.into_iter().filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string()))).collect())
+            .unwrap_or_default();
+        let file = std::fs::OpenOptions::new()
+            .create(true).write(true).truncate(false)
+            .open(&path).ok();
+        Self { file, state }
+    }
+
+    fn set(&mut self, key: &str, value: &str) {
+        self.state.insert(key.to_string(), value.to_string());
+        self.flush();
+    }
+
+    fn flush(&mut self) {
+        use std::io::{Seek, Write};
+        let Some(ref mut f) = self.file else { return };
+        if let Ok(json) = serde_json::to_string_pretty(&self.state) {
+            let _ = f.seek(std::io::SeekFrom::Start(0));
+            let _ = f.set_len(0);
+            let _ = f.write_all(json.as_bytes());
+            let _ = f.flush();
         }
     }
 }
@@ -426,19 +510,29 @@ fn sync_new_events(
     db: &Database,
     dict: &mut HashMap<u32, String>,
     provider: &str,
+    sw: &mut SyncStateWriter,
 ) -> Result<usize, String> {
     // Get server's last known ts
     let server_last_ts = client.get_last_ts(provider)
         .map_err(|e| format!("get_last_ts failed: {e}"))?;
 
     let cursor_key = format!("sync_last_ts_{provider}");
-    let mut since_ms = server_last_ts;
     let mut total_synced = 0;
 
+    // Build the resume key: [ts_bytes].
+    // First batch starts from server_last_ts + 1 (ms boundary).
+    // Subsequent batches use the exact last key to avoid skipping same-ms events.
+    let mut last_key: Vec<u8> = Vec::new();
+    let mut use_after_key = false;
+
     loop {
-        // Query only BATCH_SIZE events at a time
-        let events = db.query_events_range_limit(since_ms.saturating_add(1), i64::MAX, BATCH_SIZE)
-            .map_err(|e| format!("query_events_range failed: {e}"))?;
+        let events = if use_after_key && !last_key.is_empty() {
+            db.query_events_after_key(&last_key, i64::MAX, BATCH_SIZE)
+                .map_err(|e| format!("query_events_after_key failed: {e}"))?
+        } else {
+            db.query_events_range_limit(server_last_ts.saturating_add(1), i64::MAX, BATCH_SIZE)
+                .map_err(|e| format!("query_events_range failed: {e}"))?
+        };
 
         if events.is_empty() {
             break;
@@ -456,9 +550,16 @@ fn sync_new_events(
             }
         }
 
-        let items: Vec<SyncItem> = events.iter().map(|(ts_ms, _msg_id, event)| {
+        let items: Vec<SyncItem> = events.iter().map(|(ts_ms, msg_id, event)| {
+            let usage_total = match provider {
+                "codex" => event.input_tokens + event.output_tokens,
+                _ => event.input_tokens + event.output_tokens
+                    + event.cache_creation_input_tokens + event.cache_read_input_tokens,
+            };
+
             SyncItem {
                 ts_ms: *ts_ms,
+                message_id: msg_id.clone(),
                 event: toki_sync_protocol::StoredEvent {
                     model_id: event.model_id,
                     session_id: event.session_id,
@@ -471,6 +572,7 @@ fn sync_new_events(
                         event.cache_read_input_tokens,
                     ],
                 },
+                usage_total,
             }
         }).collect();
 
@@ -479,12 +581,19 @@ fn sync_new_events(
             _ => vec!["input".into(), "output".into(), "cache_create".into(), "cache_read".into()],
         };
 
+        // Record the last event key for exact resume (avoids +1ms skip)
+        if let Some((last_ts, last_msg, _)) = events.last() {
+            let mut key = last_ts.to_be_bytes().to_vec();
+            key.extend_from_slice(last_msg.as_bytes());
+            last_key = key;
+            use_after_key = true;
+        }
+
         match client.sync_batch(items, dict, provider, token_columns) {
             Ok(ack_ts) => {
                 total_synced += events.len();
-                since_ms = ack_ts;
                 // Persist cursor locally, keyed per provider
-                let _ = crate::config::set_setting(&cursor_key, &ack_ts.to_string());
+                sw.set(&cursor_key, &ack_ts.to_string());
             }
             Err(e) => {
                 return Err(format!("sync_batch failed: {e}"));

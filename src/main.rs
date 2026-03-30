@@ -57,11 +57,17 @@ enum Commands {
     Report {
         #[command(flatten)]
         opts: ReportOptions,
-        /// Filter start time (inclusive): YYYYMMDD or YYYYMMDDhhmmss
+        /// Time range start (epoch seconds, YYYYMMDD, or YYYYMMDDhhmmss)
         #[arg(long)]
+        start: Option<String>,
+        /// Time range end (epoch seconds, YYYYMMDD, or YYYYMMDDhhmmss)
+        #[arg(long)]
+        end: Option<String>,
+        /// Backward compatibility aliases
+        #[arg(long, hide = true)]
         since: Option<String>,
-        /// Filter end time (inclusive): YYYYMMDD or YYYYMMDDhhmmss
-        #[arg(long)]
+        /// Backward compatibility aliases
+        #[arg(long, hide = true)]
         until: Option<String>,
         /// Group results by session instead of time period
         #[arg(long = "group-by-session")]
@@ -78,7 +84,8 @@ enum Commands {
         #[command(subcommand)]
         command: Option<ReportCommands>,
     },
-    /// Execute a PromQL-style query (instant evaluation)
+    /// Execute a PromQL query. Without --start/--end, acts as instant query.
+    /// With --start/--end/--step, acts as range query (Prometheus/VM query_range compatible).
     Query {
         /// PromQL query string
         query: String,
@@ -94,6 +101,15 @@ enum Commands {
         /// Output format override: table or json
         #[arg(long)]
         output_format: Option<String>,
+        /// Range query start (epoch seconds or RFC3339). Enables range query mode.
+        #[arg(long)]
+        start: Option<String>,
+        /// Range query end (epoch seconds or RFC3339). Defaults to now.
+        #[arg(long)]
+        end: Option<String>,
+        /// Range query step (e.g. 240, 4m, 1h). Required for range queries.
+        #[arg(long)]
+        step: Option<String>,
         /// Disable cost calculation
         #[arg(long)]
         no_cost: bool,
@@ -182,6 +198,11 @@ enum SyncCommands {
         /// New device name (1-64 characters)
         name: String,
     },
+    /// Remove a device from the server (it will be rejected on next connect)
+    Remove {
+        /// Device ID to remove (use `toki settings sync devices` to list)
+        device_id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -208,11 +229,17 @@ enum DaemonCommands {
 
 #[derive(Args, Clone)]
 struct ReportFilterArgs {
-    /// Filter start time (inclusive): YYYYMMDD or YYYYMMDDhhmmss
+    /// Time range start (epoch seconds, YYYYMMDD, or YYYYMMDDhhmmss)
     #[arg(long)]
+    start: Option<String>,
+    /// Time range end (epoch seconds, YYYYMMDD, or YYYYMMDDhhmmss)
+    #[arg(long)]
+    end: Option<String>,
+    /// Backward compat
+    #[arg(long, hide = true)]
     since: Option<String>,
-    /// Filter end time (inclusive): YYYYMMDD or YYYYMMDDhhmmss
-    #[arg(long)]
+    /// Backward compat
+    #[arg(long, hide = true)]
     until: Option<String>,
     /// Filter by session ID prefix
     #[arg(long = "session-id")]
@@ -223,6 +250,9 @@ struct ReportFilterArgs {
     /// Filter by provider (e.g. claude_code, codex)
     #[arg(long)]
     provider: Option<String>,
+    /// Output format override: table or json
+    #[arg(long)]
+    output_format: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -248,14 +278,6 @@ enum ReportCommands {
     Hourly {
         #[command(flatten)]
         filter: ReportFilterArgs,
-    },
-    /// Execute a PromQL-style query (e.g. 'sum(usage[1d]) by (project)', 'events{since="20260301"}')
-    Query {
-        /// Query string
-        query: String,
-        /// Route the query through the toki-sync server's HTTP API instead of local fjall DB
-        #[arg(long)]
-        remote: bool,
     },
 }
 
@@ -416,7 +438,7 @@ fn main() {
             };
             handle_trace(&config, &sink_specs, no_cost);
         }
-        Commands::Query { query, remote, timezone, start_of_week: _, output_format: cli_fmt, no_cost: cli_no_cost } => {
+        Commands::Query { query, remote, timezone, start_of_week: _, output_format: cli_fmt, start, end, step: _step, no_cost: cli_no_cost } => {
             let cli_tz: Option<Tz> = match timezone.as_deref() {
                 Some(name) => match name.parse::<Tz>() {
                     Ok(tz) => Some(tz),
@@ -448,7 +470,7 @@ fn main() {
 
             let response = if remote {
                 // Remote instant query: no start/end (instant at current time)
-                send_remote_query(&query, None, None)
+                send_remote_query(&query, start.as_deref(), end.as_deref())
             } else {
                 // Local: full range scan, PromQL handles aggregation window
                 let sock_path = config.daemon_sock.clone();
@@ -458,7 +480,7 @@ fn main() {
                     eprintln!("[toki] Start the daemon first: toki daemon start");
                     std::process::exit(1);
                 }
-                send_report_query(&sock_path, &query, config.tz, None, None)
+                send_report_query(&sock_path, &query, config.tz, start.as_deref(), end.as_deref())
             };
 
             match response {
@@ -477,7 +499,10 @@ fn main() {
                 }
             }
         }
-        Commands::Report { opts, since, until, group_by_session, session_id, project, provider, command } => {
+        Commands::Report { opts, start, end, since, until, group_by_session, session_id, project, provider, command } => {
+            // --start/--end take priority over deprecated --since/--until
+            let since = start.or(since);
+            let until = end.or(until);
             let (cli_tz, cli_no_cost, cli_output_format) = parse_client_opts(&opts);
             let config = build_config(cli_tz, cli_no_cost, cli_output_format);
             let output_format = resolve_output_format(&config);
@@ -504,7 +529,7 @@ const VALID_SETTINGS: &[&str] = &[
     "claude_code_root", "codex_root", "daemon_sock", "timezone", "output_format",
     "start_of_week", "no_cost", "retention_days", "rollup_retention_days",
     "providers", "daemon_autostart",
-    "sync_enabled", "sync_server", "sync_access_token", "sync_device_name", "sync_device_key",
+    "sync_enabled", "sync_server", "sync_access_token", "sync_device_name",
     "sync_tls", "sync_tls_insecure",
 ];
 
@@ -1033,52 +1058,45 @@ fn handle_report(
     output_format: toki::sink::OutputFormat,
     no_cost: bool,
 ) {
+    // Subcommand --output-format overrides parent
+    let output_format = match &command {
+        Some(cmd) => {
+            let sub_fmt = match cmd {
+                ReportCommands::Hourly { filter } => filter.output_format.as_deref(),
+                ReportCommands::Daily { filter } => filter.output_format.as_deref(),
+                ReportCommands::Weekly { filter, .. } => filter.output_format.as_deref(),
+                ReportCommands::Monthly { filter } => filter.output_format.as_deref(),
+                ReportCommands::Yearly { filter } => filter.output_format.as_deref(),
+            };
+            match sub_fmt {
+                Some("json") => toki::sink::OutputFormat::Json,
+                Some("table") => toki::sink::OutputFormat::Table,
+                _ => output_format,
+            }
+        }
+        None => output_format,
+    };
     let sink = toki::sink::create_sinks(sink_specs, output_format);
     let tz = config.tz;
     let sock_path = config.daemon_sock.clone();
 
-    // Check if this is a remote query (no daemon needed)
-    let has_remote = matches!(command, Some(ReportCommands::Query { remote: true, .. }));
-
-    // Require daemon to be running (unless --remote is used)
-    if !has_remote {
-        let pidfile = toki::daemon::default_pidfile_path();
-        if toki::daemon::daemon_status(&pidfile).is_none() {
-            eprintln!("[toki] Cannot connect to toki daemon.");
-            eprintln!("[toki] Start the daemon first: toki daemon start");
-            std::process::exit(1);
-        }
+    // Require daemon to be running
+    let pidfile = toki::daemon::default_pidfile_path();
+    if toki::daemon::daemon_status(&pidfile).is_none() {
+        eprintln!("[toki] Cannot connect to toki daemon.");
+        eprintln!("[toki] Start the daemon first: toki daemon start");
+        std::process::exit(1);
     }
 
-    if group_by_session && command.is_some() && !matches!(command, Some(ReportCommands::Query { .. })) {
+    if group_by_session && command.is_some() {
         eprintln!("[toki] --group-by-session cannot be used with time-based subcommands");
         std::process::exit(1);
     }
 
-    // Check if this is a --remote query
-    let is_remote = matches!(command, Some(ReportCommands::Query { remote: true, .. }));
-
     // Build query string and time range from CLI arguments.
     // Returns (query_str, start, end) — start/end sent as separate protocol fields.
     let (query_str, req_start, req_end): (String, Option<String>, Option<String>) =
-        if let Some(ReportCommands::Query { ref query, .. }) = command {
-            // In query mode, --since/--until set the time window (like VM's start/end params).
-            // The query itself is pure PromQL. Other report-level flags are ignored.
-            let ignored: Vec<&str> = [
-                session_id.as_ref().map(|_| "--session-id"),
-                project.as_ref().map(|_| "--project"),
-                provider.as_ref().map(|_| "--provider"),
-                if group_by_session { Some("--group-by-session") } else { None },
-            ].into_iter().flatten().collect();
-            if !ignored.is_empty() {
-                eprintln!("[toki] Warning: {} ignored in query mode.", ignored.join(", "));
-            }
-            validate_range(
-                parse_opt_range(&since, false, tz),
-                parse_opt_range(&until, true, tz),
-            );
-            (query.clone(), since.clone(), until.clone())
-        } else if let Some(cmd) = command {
+        if let Some(cmd) = command {
             // Time-grouped subcommands
             let (filter_args, group_by) = match cmd {
                 ReportCommands::Hourly { filter } => (filter, toki::engine::ReportGroupBy::Hour),
@@ -1091,11 +1109,10 @@ fn handle_report(
                 }
                 ReportCommands::Monthly { filter } => (filter, toki::engine::ReportGroupBy::Month),
                 ReportCommands::Yearly { filter } => (filter, toki::engine::ReportGroupBy::Year),
-                ReportCommands::Query { .. } => unreachable!(),
             };
 
-            let eff_since = filter_args.since.or(since.clone());
-            let eff_until = filter_args.until.or(until.clone());
+            let eff_since = filter_args.start.or(filter_args.since).or(since.clone());
+            let eff_until = filter_args.end.or(filter_args.until).or(until.clone());
             let eff_session = filter_args.session_id.or(session_id.clone());
             let eff_project = filter_args.project.or(project.clone());
             let eff_provider = filter_args.provider.or(provider.clone());
@@ -1129,13 +1146,6 @@ fn handle_report(
             (q, since.clone(), until.clone())
         };
 
-    // Send query: remote (via HTTP API) or local (via daemon UDS)
-    let response = if is_remote {
-        send_remote_query(&query_str, req_start.as_deref(), req_end.as_deref())
-    } else {
-        send_report_query(&sock_path, &query_str, tz, req_start.as_deref(), req_end.as_deref())
-    };
-
     // Load pricing client-side (file cache, no DB)
     let pricing = if no_cost {
         None
@@ -1143,6 +1153,9 @@ fn handle_report(
         let p = toki::pricing::fetch_pricing(&toki::pricing::default_cache_path());
         if p.is_empty() { None } else { Some(p) }
     };
+
+    // Send query to local daemon via UDS
+    let response = send_report_query(&sock_path, &query_str, tz, req_start.as_deref(), req_end.as_deref());
 
     match response {
         Ok(resp) => {
@@ -1207,7 +1220,7 @@ fn emit_json_report(
         let schema_name = item["schema"].as_str().unwrap_or("claude_code");
         let schema = toki::common::schema::schema_for_provider(schema_name);
 
-        // Re-process data with pricing and correct schema
+        // Re-process data with correct schema
         let processed = reprocess_item_data(item, pricing, Some(schema));
         provider_map.insert(schema_name.to_string(), processed);
     }
@@ -1220,7 +1233,7 @@ fn emit_json_report(
     println!("{}", serde_json::to_string_pretty(&output).unwrap_or_default());
 }
 
-/// Re-process a daemon response item's data with pricing applied.
+/// Re-process a daemon response item's data with correct schema.
 /// Returns the provider's data array (or string array for sessions/projects).
 fn reprocess_item_data(
     item: &serde_json::Value,
@@ -1704,6 +1717,9 @@ fn handle_sync(command: SyncCommands) {
         SyncCommands::Rename { name } => {
             handle_sync_rename(&name);
         }
+        SyncCommands::Remove { device_id } => {
+            handle_sync_remove(&device_id);
+        }
     }
 }
 
@@ -1795,6 +1811,12 @@ fn handle_sync_enable(
     eprintln!("[toki] Waiting for approval...");
 
     // Step 4: Poll POST /device/token every `poll_interval` seconds
+    // Prepare device identity for registration during token exchange
+    let device_key_for_poll = toki::config::device_id();
+    let device_name_for_poll = custom_device_name.clone()
+        .or_else(|| toki::config::get_setting("sync_device_name").filter(|n| !n.is_empty()))
+        .unwrap_or_else(|| toki::sync::thread::SyncConfig::default_device_name());
+
     let device_token_url = format!("{}/device/token", http_base);
     let timeout = std::time::Duration::from_secs(expires_in);
     let start = std::time::Instant::now();
@@ -1808,7 +1830,11 @@ fn handle_sync_enable(
         std::thread::sleep(std::time::Duration::from_secs(poll_interval));
 
         let resp = match ureq::post(&device_token_url)
-            .send_json(serde_json::json!({ "device_code": device_code }))
+            .send_json(serde_json::json!({
+                "device_code": device_code,
+                "device_key": device_key_for_poll,
+                "device_name": device_name_for_poll,
+            }))
         {
             Ok(r) => r,
             Err(ureq::Error::Status(400, resp)) => {
@@ -1881,12 +1907,13 @@ fn handle_sync_enable(
         std::process::exit(1);
     }
 
-    // Generate or reuse stable device key (UUID) — generated once, never changes
-    let device_key = toki::config::get_setting("sync_device_key")
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    // Reuse the device key that was sent during token exchange polling
+    let device_key = device_key_for_poll;
 
     // Save credentials
-    let device_name = custom_device_name.unwrap_or_else(|| toki::sync::thread::SyncConfig::default_device_name());
+    let device_name = custom_device_name
+        .or_else(|| toki::config::get_setting("sync_device_name").filter(|n| !n.is_empty()))
+        .unwrap_or_else(|| toki::sync::thread::SyncConfig::default_device_name());
     let creds = toki::sync::credentials::Credentials {
         server_addr: server_addr.clone(),
         http_url: http_base.clone(),
@@ -1905,7 +1932,6 @@ fn handle_sync_enable(
     let _ = toki::config::set_setting("sync_server", &server_addr);
     let _ = toki::config::set_setting("sync_access_token", &access_token);
     let _ = toki::config::set_setting("sync_device_name", &device_name);
-    let _ = toki::config::set_setting("sync_device_key", &device_key);
 
     // Save TLS settings based on flags
     if insecure {
@@ -1938,7 +1964,7 @@ fn handle_sync_enable(
 fn handle_sync_disable(delete: bool, keep: bool) {
     // Load credentials and device key before wiping local state
     let creds = toki::sync::credentials::load();
-    let device_key = toki::config::get_setting("sync_device_key");
+    let device_key = Some(toki::config::device_id());
 
     if !delete && !keep {
         // Interactive prompt
@@ -1959,14 +1985,12 @@ fn handle_sync_disable(delete: bool, keep: bool) {
     let _ = toki::config::set_setting("sync_enabled", "false");
     let _ = toki::config::set_setting("sync_server", "");
     let _ = toki::config::set_setting("sync_access_token", "");
-    let _ = toki::config::set_setting("sync_device_name", "");
-    let _ = toki::config::set_setting("sync_device_key", "");
     let _ = toki::config::set_setting("sync_tls", "");
     let _ = toki::config::set_setting("sync_tls_insecure", "");
-    let _ = toki::config::set_setting("sync_status", "");
-    let _ = toki::config::set_setting("sync_last_success", "");
-    let _ = toki::config::set_setting("sync_last_error", "");
-    let _ = toki::config::set_setting("sync_last_error_at", "");
+    if !keep {
+        let _ = toki::config::set_setting("sync_device_name", "");
+    }
+    let _ = toki::config::clear_sync_state();
     eprintln!("[toki] Sync disabled.");
 
     let pidfile = toki::daemon::default_pidfile_path();
@@ -2086,7 +2110,7 @@ fn handle_sync_status() {
     println!("  device:     {}", device);
 
     // Show sync health status
-    let status = toki::config::get_setting("sync_status").unwrap_or_else(|| "(unknown)".to_string());
+    let status = toki::config::get_sync_state("sync_status").unwrap_or_else(|| "(unknown)".to_string());
     let status_display = match status.as_str() {
         "connected" => "connected".to_string(),
         "disconnected" => "disconnected".to_string(),
@@ -2097,7 +2121,7 @@ fn handle_sync_status() {
     println!("  status:     {}", status_display);
 
     // Show last successful sync time
-    if let Some(last_success) = toki::config::get_setting("sync_last_success")
+    if let Some(last_success) = toki::config::get_sync_state("sync_last_success")
         .and_then(|s| s.parse::<i64>().ok())
     {
         let now = std::time::SystemTime::now()
@@ -2120,8 +2144,8 @@ fn handle_sync_status() {
     }
 
     // Show last error if present
-    if let Some(last_error) = toki::config::get_setting("sync_last_error") {
-        let error_age = toki::config::get_setting("sync_last_error_at")
+    if let Some(last_error) = toki::config::get_sync_state("sync_last_error") {
+        let error_age = toki::config::get_sync_state("sync_last_error_at")
             .and_then(|s| s.parse::<i64>().ok())
             .map(|at| {
                 let now = std::time::SystemTime::now()
@@ -2154,7 +2178,7 @@ fn handle_sync_status() {
     let mut any_synced = false;
     for &provider in toki::providers::KNOWN_PROVIDERS {
         let key = format!("sync_last_ts_{}", provider);
-        let last_ts: i64 = toki::config::get_setting(&key)
+        let last_ts: i64 = toki::config::get_sync_state(&key)
             .and_then(|s| s.parse().ok()).unwrap_or(0);
         if last_ts > 0 {
             let last_dt = chrono::DateTime::from_timestamp_millis(last_ts)
@@ -2246,6 +2270,34 @@ fn handle_sync_devices() {
             .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
             .unwrap_or_else(|| "-".to_string());
         println!("{:<36}  {:<24}  {}", id, name, last_seen);
+    }
+}
+
+fn handle_sync_remove(device_id: &str) {
+    let creds = match toki::sync::credentials::load() {
+        Some(c) => c,
+        None => {
+            eprintln!("[toki] Not configured. Run: toki settings sync enable --server <host>");
+            std::process::exit(1);
+        }
+    };
+
+    let url = format!("{}/me/devices/{}", creds.http_url, device_id);
+    let result = try_refresh_and_call(&creds, |token| {
+        ureq::delete(&url)
+            .set("Authorization", &format!("Bearer {}", token))
+            .call()
+    });
+
+    match result {
+        Ok(_) => {
+            eprintln!("[toki] Device {} removed.", device_id);
+            eprintln!("[toki] The device will be rejected on its next sync attempt.");
+        }
+        Err(e) => {
+            eprintln!("[toki] Failed to remove device: {}", e);
+            std::process::exit(1);
+        }
     }
 }
 

@@ -60,6 +60,15 @@ fn accumulate_rollup(entry: &mut ModelUsageSummary, rollup: &crate::common::type
     entry.event_count += rollup.count;
 }
 
+/// Accumulate a StoredEvent's token counts into a ModelUsageSummary.
+fn accumulate_event(entry: &mut ModelUsageSummary, event: &crate::common::types::StoredEvent) {
+    entry.input_tokens += event.input_tokens;
+    entry.output_tokens += event.output_tokens;
+    entry.cache_creation_input_tokens += event.cache_creation_input_tokens;
+    entry.cache_read_input_tokens += event.cache_read_input_tokens;
+    entry.event_count += 1;
+}
+
 /// Report total summary from TSDB rollups (streaming — no intermediate Vec).
 pub fn report_summary_from_db(
     db: &Database,
@@ -113,11 +122,7 @@ pub fn report_grouped_from_db(
                 .entry(model.clone()).or_insert_with(|| ModelUsageSummary {
                     model: model.clone(), ..Default::default()
                 });
-            entry.input_tokens += event.input_tokens;
-            entry.output_tokens += event.output_tokens;
-            entry.cache_creation_input_tokens += event.cache_creation_input_tokens;
-            entry.cache_read_input_tokens += event.cache_read_input_tokens;
-            entry.event_count += 1;
+            accumulate_event(entry, &event);
         })?;
     } else {
         // Fast rollup-based scan
@@ -151,11 +156,7 @@ pub fn report_by_session_from_db(
             .entry(model.clone()).or_insert_with(|| ModelUsageSummary {
                 model: model.clone(), ..Default::default()
             });
-        entry.input_tokens += event.input_tokens;
-        entry.output_tokens += event.output_tokens;
-        entry.cache_creation_input_tokens += event.cache_creation_input_tokens;
-        entry.cache_read_input_tokens += event.cache_read_input_tokens;
-        entry.event_count += 1;
+        accumulate_event(entry, &event);
     })?;
     Ok(grouped)
 }
@@ -294,8 +295,8 @@ pub fn execute_parsed_query(
             };
             sink.emit_list(&projects, "projects");
         }
-        Metric::Events => {
-
+        Metric::Events if parsed.bucket.is_none() && parsed.group_by.is_empty() && parsed.aggregation.is_none() => {
+            // Raw event listing (no bucket/group_by)
             let dict = db.load_dict_reverse().map_err(|e| e.to_string())?;
             let unknown = String::new();
             let model_filter = parsed.filter_value("model");
@@ -332,7 +333,7 @@ pub fn execute_parsed_query(
 
             sink.emit_events_batch(&events, pricing, None);
         }
-        Metric::Usage => {
+        Metric::Cost | Metric::Events | Metric::Usage => {
             let since_dt = if since_ms > 0 {
                 chrono::DateTime::from_timestamp_millis(since_ms).map(|d| d.naive_utc())
             } else {
@@ -381,6 +382,7 @@ pub fn execute_parsed_query(
                         // Need event-level access for session/group_by
                         let dict = db.load_dict_reverse().map_err(|e| e.to_string())?;
                         let unknown = String::new();
+                        let step_start_sec = since / 1000;
                         db.for_each_event(since, until, |ts, event| {
                             let model = dict.get(&event.model_id).unwrap_or(&unknown);
                             if let Some(mf) = model_filter {
@@ -392,8 +394,18 @@ pub fn execute_parsed_query(
                             }
 
                             let bucket_key = if let Some(ref bucket) = parsed.bucket {
-                                // Pass original UTC timestamp (ms -> s) and let format_label handle tz
-                                bucket.format_label(ts / 1000, tz)
+                                // VM query_range compatible bucketing.
+                                // Eval points: start, start+step, start+2*step, ...
+                                // Each point t covers window (t-step, t].
+                                let step_ms = bucket.as_secs() as i64 * 1000;
+                                let start_ms = step_start_sec * 1000;
+                                let offset_ms = ts - start_ms;
+                                if offset_ms < -step_ms { return; } // before first window
+                                let idx = if offset_ms <= 0 { 0 } else { (offset_ms + step_ms - 1) / step_ms };
+                                let eval_ms = start_ms + idx * step_ms;
+                                if eval_ms > until { return; } // past end
+                                let eval_sec = eval_ms / 1000;
+                                bucket.format_label(eval_sec, tz)
                             } else {
                                 String::new()
                             };
@@ -413,11 +425,7 @@ pub fn execute_parsed_query(
                                 .entry(model.clone()).or_insert_with(|| ModelUsageSummary {
                                     model: model.clone(), ..Default::default()
                                 });
-                            entry.input_tokens += event.input_tokens;
-                            entry.output_tokens += event.output_tokens;
-                            entry.cache_creation_input_tokens += event.cache_creation_input_tokens;
-                            entry.cache_read_input_tokens += event.cache_read_input_tokens;
-                            entry.event_count += 1;
+                            accumulate_event(entry, &event);
                         }).map_err(|e| e.to_string())?;
                     } else {
                         // Rollup-based (faster, no session/group_by needed)

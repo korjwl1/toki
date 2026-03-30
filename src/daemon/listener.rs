@@ -164,10 +164,13 @@ fn execute_report_request(
     let mut parsed =
         crate::query_parser::parse(&req.query).map_err(|e| format!("query parse error: {}", e))?;
 
-    // Resolve time range from request start/end fields
+    // Resolve time range from request start/end fields.
+    // Extend scan backward by one bucket so the first eval point's window
+    // (start-step, start] is included. VM does this automatically.
+    let bucket_ms = parsed.bucket.as_ref().map(|b| b.as_secs() as i64 * 1000).unwrap_or(0);
     let since_ms = req.start.as_deref()
         .map(|s| crate::query::parse_range_time(s, false, tz)
-            .map(|d| d.and_utc().timestamp_millis()))
+            .map(|d| d.and_utc().timestamp_millis() - bucket_ms))
         .transpose()?
         .unwrap_or(0);
     let until_ms = req.end.as_deref()
