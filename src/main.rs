@@ -1787,10 +1787,10 @@ fn handle_sync_enable(
 
     // Step 3: Print instructions
     eprintln!();
-    eprintln!("[toki] Open this URL to log in:");
-    eprintln!("  {}", browser_url);
+    eprintln!("[toki] To authorize this device, open:");
+    eprintln!("  {}", browser_url_base);
     eprintln!();
-    eprintln!("[toki] Enter code: {}", user_code);
+    eprintln!("[toki] Then enter code: {}", user_code);
     eprintln!();
     eprintln!("[toki] Waiting for approval...");
 
