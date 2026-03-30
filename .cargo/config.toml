@@ -1,0 +1,2 @@
+[patch.'https://github.com/korjwl1/toki-sync-protocol.git']
+toki-sync-protocol = { path = "../toki_sync_protocol" }
