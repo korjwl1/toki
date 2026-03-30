@@ -107,6 +107,7 @@ pub fn check_file_permissions() {
 
 // ─── File-based storage (non-macOS) ──────────────────────────────────────────
 
+#[cfg(not(target_os = "macos"))]
 fn creds_file_path() -> Option<std::path::PathBuf> {
     Some(dirs::config_dir()?.join("toki").join("sync.json"))
 }
