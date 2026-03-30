@@ -1761,7 +1761,7 @@ fn handle_sync_enable(
     let user_code = dc_body["user_code"].as_str().unwrap_or("").to_string();
     let verification_url = dc_body["verification_url"].as_str().unwrap_or("").to_string();
     let poll_interval = dc_body["interval"].as_u64().unwrap_or(5);
-    let expires_in = dc_body["expires_in"].as_u64().unwrap_or(600);
+    let expires_in = dc_body["expires_in"].as_u64().unwrap_or(300);
 
     if device_code.is_empty() || user_code.is_empty() {
         eprintln!("[toki] Server did not return a valid device code");
