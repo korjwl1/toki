@@ -359,21 +359,21 @@ Sync token usage across multiple devices to a central [toki-sync](https://github
 ### sync enable
 
 ```bash
-toki settings sync enable --server <host:port> --username <user>
-toki settings sync enable --server sync.example.com:9090 --username admin
-toki settings sync enable --server 1.2.3.4:9090 --insecure --username admin
+toki settings sync enable --server <host>
+toki settings sync enable --server sync.example.com
+toki settings sync enable --server 1.2.3.4 --insecure
 ```
 
-Connects the daemon to a toki-sync server. Prompts for password interactively (or use `--password` for scripts). Takes effect immediately via hot-reload — no daemon restart needed.
+Connects the daemon to a toki-sync server. Opens a browser for authentication via device code flow. No credentials are passed on the command line. Takes effect immediately via hot-reload — no daemon restart needed.
 
 | Flag | Required | Description |
 |------|----------|-------------|
-| `--server <host:port>` | Yes | Sync server address (hostname or IP with port) |
-| `--username <user>` | Yes | Account username |
-| `--password <pass>` | No | Password (prompts interactively if omitted) |
+| `--server <host>` | Yes | Sync server hostname or IP (no port) |
+| `--sync-port <port>` | No | TCP sync port (default: 9090) |
+| `--http-port <port>` | No | HTTP API port (default: 443 with TLS / 9091 without TLS) |
 | `--insecure` | No | Accept self-signed TLS certificates (for IP-only servers) |
 | `--no-tls` | No | Disable TLS entirely (development only) |
-| `--headless` | No | Non-interactive mode (requires `--password`) |
+| `--headless` | No | Non-interactive mode (prints a URL and code to enter manually) |
 
 Credentials are stored in macOS Keychain (macOS) or `~/.config/toki/sync.json` (Linux).
 
@@ -401,7 +401,15 @@ In all cases, local credentials (Keychain/sync.json) and settings are cleared. T
 toki settings sync status
 ```
 
-Shows current sync configuration: server address, username, connection state, and TLS mode.
+Shows current sync configuration: server address, device name, connection state, and TLS mode.
+
+### sync rename
+
+```bash
+toki settings sync rename <new-name>
+```
+
+Renames the current device on the sync server.
 
 ### sync devices
 
@@ -416,12 +424,13 @@ Lists all devices registered under your account on the sync server.
 All sync commands are also available as `toki settings sync` subcommands:
 
 ```bash
-toki settings sync enable --server <host:port> --username <user>
+toki settings sync enable --server <host>
 toki settings sync disable              # Interactive prompt
 toki settings sync disable --delete     # Delete remote data
 toki settings sync disable --keep       # Keep remote data
 toki settings sync status
 toki settings sync devices
+toki settings sync rename <new-name>
 ```
 
 ### report query --remote

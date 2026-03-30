@@ -269,15 +269,14 @@ toki settings list                             # List all
 ### Sync
 
 ```bash
-toki settings sync enable --server <host:port> --username <user>  # Connect to sync server
+toki settings sync enable --server <host>       # Opens browser for authentication (device code flow)
 toki settings sync disable              # Prompts to delete remote data
 toki settings sync disable --delete     # Delete this device's data from server
 toki settings sync disable --keep       # Keep remote data, only disable locally
 toki settings sync status                                          # Connection info
 toki settings sync devices                                         # Registered devices
+toki settings sync rename <new-name>                               # Rename this device
 ```
-
-Also available as `toki settings sync ...`.
 
 ---
 
@@ -288,11 +287,11 @@ Sync token usage across multiple machines to a central [toki-sync](https://githu
 ### Setup
 
 ```bash
-# Connect to your sync server
-toki settings sync enable --server sync.example.com:9090 --username admin
+# Connect to your sync server (opens browser for authentication)
+toki settings sync enable --server sync.example.com
 
 # For self-signed TLS (IP-only servers)
-toki settings sync enable --server 1.2.3.4:9090 --insecure --username admin
+toki settings sync enable --server 1.2.3.4 --insecure
 
 # Check status
 toki settings sync status
