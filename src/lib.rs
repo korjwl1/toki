@@ -57,6 +57,8 @@ pub struct Handle {
     sync_threads: Vec<Option<JoinHandle<()>>>,
     /// Per-provider sync toggles for hot-reload.
     sync_toggles: Vec<(String, sync::SyncToggle)>,
+    /// Per-provider flush notifiers — wake sync threads on shutdown.
+    flush_notifies: Vec<sync::FlushNotify>,
     /// Settings watcher thread join handle.
     settings_watcher_handle: Option<JoinHandle<()>>,
     /// Settings watcher stop channel.
@@ -98,9 +100,13 @@ impl Handle {
         for tx in &self.sync_stops {
             let _ = tx.send(());
         }
-        // Wake sync threads that may be waiting on toggle
+        // Wake sync threads that may be waiting on toggle or flush_notify
         for (_, toggle) in &self.sync_toggles {
             toggle.1.notify_one();
+        }
+        for flush in &self.flush_notifies {
+            *flush.0.lock().unwrap() = true;
+            flush.1.notify_one();
         }
         // Join sync threads before shutting down DB writers — they hold DB read handles
         for handle_opt in &mut self.sync_threads {
@@ -331,7 +337,9 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
     let mut sync_stops: Vec<crossbeam_channel::Sender<()>> = Vec::new();
     let mut sync_threads: Vec<Option<JoinHandle<()>>> = Vec::new();
     let mut sync_toggles: Vec<(String, sync::SyncToggle)> = Vec::new();
+    let mut flush_notifies: Vec<sync::FlushNotify> = Vec::new();
     for (flush_notify, db, provider_name) in provider_sync_infos {
+        flush_notifies.push(flush_notify.clone());
         let (sync_stop_tx, sync_stop_rx) = crossbeam_channel::bounded::<()>(1);
         let sync_toggle: sync::SyncToggle = Arc::new((
             Mutex::new(sync_initially_enabled),
@@ -391,6 +399,7 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
         sync_stops,
         sync_threads,
         sync_toggles,
+        flush_notifies,
         settings_watcher_handle: Some(settings_watcher_handle),
         settings_watcher_stop: Some(settings_stop_tx),
     })
