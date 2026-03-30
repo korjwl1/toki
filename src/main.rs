@@ -659,14 +659,22 @@ fn start_daemon_detached() {
         std::fs::create_dir_all(parent).ok();
     }
 
+    // Strip macOS quarantine xattr before opening — brew installs can leave
+    // com.apple.provenance on the log file, blocking subsequent opens.
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("xattr")
+            .args(["-d", "com.apple.provenance", &log_path.to_string_lossy()])
+            .output();
+    }
+
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
         .open(&log_path)
         .or_else(|_| {
-            // macOS quarantine (com.apple.provenance) can block reopening.
-            // Delete and recreate the file.
+            // If open still fails, delete and recreate.
             std::fs::remove_file(&log_path).ok();
             std::fs::OpenOptions::new()
                 .create(true)

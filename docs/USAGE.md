@@ -16,7 +16,9 @@ toki operates with a daemon/client architecture:
 - **`daemon reset`**: Full DB wipe and reinitialization
 - **`settings set providers --add/--remove`**: Provider management (Claude Code, Codex CLI, etc.)
 - **`trace`**: Connect to daemon for real-time event streaming
+- **`query`**: Top-level PromQL instant query (pure PromQL, no --since/--until)
 - **`report`**: One-shot TSDB query. Retrieves data collected by the daemon
+- **`report query`**: Range PromQL query with --since/--until time window (backward compat)
 
 ## daemon
 
@@ -318,6 +320,60 @@ The `events` metric returns individual API call records:
 }
 ```
 
+## query
+
+`toki query` is a top-level command for instant PromQL queries. It uses pure PromQL syntax with no `--since`/`--until` flags — time ranges are expressed inside the PromQL expression itself (e.g. `[1h]`, `[1d]`).
+
+### Flags
+
+| Flag | Description |
+|------|-------------|
+| `-z <IANA>` | Timezone for time interpretation |
+| `-w` | Wide table output |
+| `--remote` | Send query to toki-sync server instead of local daemon |
+| `--output-format table\|json` | Output format |
+| `--no-cost` | Disable cost calculation |
+
+### Examples
+
+```bash
+# Instant query (pure PromQL)
+toki query "sum by (model)(toki_tokens_total[1h])"
+toki query -z Asia/Seoul "sum by (model)(toki_tokens_total[1d])"
+
+# type filter and =~ regex operator
+toki query 'sum(toki_tokens_total{type=~"input|output"}[1h])'
+
+# Remote (via sync server)
+toki query --remote "sum by (model)(toki_tokens_total[1h])"
+
+# Wide table
+toki query -w "sum by (model)(toki_tokens_total[1d])"
+
+# JSON output
+toki query --output-format json "toki_tokens_total[1h]"
+
+# Without cost
+toki query --no-cost "toki_tokens_total[1h]"
+```
+
+### toki query vs toki report query
+
+| | `toki query` | `toki report query` |
+|---|---|---|
+| Scope | Instant query (pure PromQL) | Range query (with `--since`/`--until` time window) |
+| Time range | Inside PromQL expression: `[1h]`, `[1d]` | Via `--since`/`--until` flags |
+| `--remote` | Supported | Not supported (use `toki query --remote`) |
+| Status | Preferred for new usage | Backward compatible, still works |
+
+```bash
+# Preferred: instant query
+toki query "sum by (model)(toki_tokens_total[1h])"
+
+# Still works: range query with time window
+toki report --since 20260301 --until 20260331 query "sum by (model)(toki_tokens_total[1d])"
+```
+
 ## settings
 
 `toki settings` opens a cursive TUI settings page. All settings are stored in `~/.config/toki/settings.json`.
@@ -434,13 +490,13 @@ toki settings sync devices
 toki settings sync rename <new-name>
 ```
 
-### report query --remote
+### query --remote
 
 Query server-aggregated data directly from the CLI:
 
 ```bash
-toki report query --remote 'sum by (model)(toki_tokens_total)'
-toki report query --remote 'toki_tokens_total{device="macbook-pro"}'
+toki query --remote 'sum by (model)(toki_tokens_total)'
+toki query --remote 'toki_tokens_total{device="macbook-pro"}'
 ```
 
 The `--remote` flag sends the PromQL query to the toki-sync server instead of the local daemon. Requires sync to be enabled.
@@ -449,10 +505,12 @@ The `--remote` flag sends the PromQL query to the toki-sync server instead of th
 
 | Option | Applies to | Description |
 |--------|-----------|-------------|
-| `--output-format table\|json` | report | Override output format |
+| `--output-format table\|json` | query, report | Override output format |
 | `--sink <SPEC>` | trace | Output target: `print`, `uds://<path>`, `http://<url>` (repeatable) |
-| `--timezone <IANA>` / `-z` | report | Override timezone |
-| `--no-cost` | trace, report | Disable cost calculation |
+| `--timezone <IANA>` / `-z` | query, report | Override timezone |
+| `-w` | query | Wide table output |
+| `--remote` | query | Send query to toki-sync server |
+| `--no-cost` | trace, query, report | Disable cost calculation |
 
 ### --output-format (report only)
 

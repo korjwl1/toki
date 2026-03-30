@@ -62,8 +62,15 @@ toki report daily --since 20260301
 toki report --provider claude_code
 toki report monthly
 
-# 4. PromQL-style queries
-toki report query 'sum(usage{since="20260301"}[1d]) by (project)'
+# 4. PromQL-style queries (instant)
+toki query 'sum by (model)(toki_tokens_total[1h])'
+toki query -z Asia/Seoul 'sum by (model)(toki_tokens_total[1d])'
+
+# 5. Remote query (via sync server)
+toki query --remote 'sum by (model)(toki_tokens_total[1h])'
+
+# 6. Range query (with time window — via report)
+toki report --since 20260301 --until 20260331 query 'sum(usage{since="20260301"}[1d]) by (project)'
 toki report query 'events{since="20260320"}'
 ```
 
@@ -242,11 +249,32 @@ toki report monthly
 toki report --group-by-session
 toki report --project toki
 
-# PromQL-style queries
-toki report query 'sum(usage[1d]) by (project)'
+# Range queries (with --since/--until time window)
+toki report --since 20260301 --until 20260331 query 'sum(usage[1d]) by (project)'
 toki report query 'events{since="20260320"}'
 toki report query 'usage[1d] offset 7d'
 ```
+
+### Query
+
+```bash
+# Instant PromQL query (top-level command, no --since/--until)
+toki query 'sum by (model)(toki_tokens_total[1h])'
+toki query -z Asia/Seoul 'sum by (model)(toki_tokens_total[1d])'
+
+# type filter and regex operator
+toki query 'sum(toki_tokens_total{type=~"input|output"}[1h])'
+
+# Remote (via sync server)
+toki query --remote 'sum by (model)(toki_tokens_total[1h])'
+
+# Output format and options
+toki query -w 'sum by (model)(toki_tokens_total[1d])'   # wide table
+toki query --output-format json 'toki_tokens_total[1h]'
+toki query --no-cost 'toki_tokens_total[1h]'
+```
+
+> `toki report query` still works for range queries with `--since`/`--until` time windows.
 
 For the full command reference, query syntax, and settings options, see the **[Usage Guide](docs/USAGE.md)**.
 
@@ -300,7 +328,7 @@ toki settings sync status
 toki settings sync devices
 
 # Query server data from CLI
-toki report query --remote 'sum by (model)(toki_tokens_total)'
+toki query --remote 'sum by (model)(toki_tokens_total)'
 
 # Disable sync
 toki settings sync disable              # Prompts to delete remote data

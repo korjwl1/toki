@@ -62,8 +62,15 @@ toki report daily --since 20260301
 toki report --provider claude_code
 toki report monthly
 
-# 4. PromQL 스타일 쿼리
-toki report query 'sum(usage{since="20260301"}[1d]) by (project)'
+# 4. PromQL 스타일 쿼리 (instant)
+toki query 'sum by (model)(toki_tokens_total[1h])'
+toki query -z Asia/Seoul 'sum by (model)(toki_tokens_total[1d])'
+
+# 5. 원격 쿼리 (sync 서버 경유)
+toki query --remote 'sum by (model)(toki_tokens_total[1h])'
+
+# 6. 범위 쿼리 (시간 윈도우 지정 — report 경유)
+toki report --since 20260301 --until 20260331 query 'sum(usage{since="20260301"}[1d]) by (project)'
 toki report query 'events{since="20260320"}'
 ```
 
@@ -240,11 +247,32 @@ toki report monthly
 toki report --group-by-session
 toki report --project toki
 
-# PromQL 스타일 쿼리
-toki report query 'sum(usage[1d]) by (project)'
+# 범위 쿼리 (--since/--until 시간 윈도우)
+toki report --since 20260301 --until 20260331 query 'sum(usage[1d]) by (project)'
 toki report query 'events{since="20260320"}'
 toki report query 'usage[1d] offset 7d'
 ```
+
+### Query
+
+```bash
+# Instant PromQL 쿼리 (최상위 명령어, --since/--until 없음)
+toki query 'sum by (model)(toki_tokens_total[1h])'
+toki query -z Asia/Seoul 'sum by (model)(toki_tokens_total[1d])'
+
+# type 필터와 =~ 정규식 연산자
+toki query 'sum(toki_tokens_total{type=~"input|output"}[1h])'
+
+# 원격 쿼리 (sync 서버 경유)
+toki query --remote 'sum by (model)(toki_tokens_total[1h])'
+
+# 출력 형식 및 옵션
+toki query -w 'sum by (model)(toki_tokens_total[1d])'   # 넓은 테이블
+toki query --output-format json 'toki_tokens_total[1h]'
+toki query --no-cost 'toki_tokens_total[1h]'
+```
+
+> `toki report query`는 `--since`/`--until` 시간 윈도우를 사용하는 범위 쿼리에서 여전히 사용할 수 있습니다.
 
 전체 명령어 레퍼런스, 쿼리 문법, 설정 옵션은 **[사용법 가이드](docs/USAGE.ko.md)**를 참고하세요.
 
@@ -298,7 +326,7 @@ toki settings sync status
 toki settings sync devices
 
 # CLI에서 서버 데이터 쿼리
-toki report query --remote 'sum by (model)(toki_tokens_total)'
+toki query --remote 'sum by (model)(toki_tokens_total)'
 
 # 동기화 비활성화
 toki settings sync disable              # 원격 데이터 삭제 여부를 묻습니다

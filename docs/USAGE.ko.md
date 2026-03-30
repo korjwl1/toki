@@ -16,7 +16,9 @@ toki는 데몬/클라이언트 구조로 동작한다:
 - **`daemon reset`**: DB 전체 삭제 및 초기화
 - **`settings set providers --add/--remove`**: provider 관리 (Claude Code, Codex CLI 등)
 - **`trace`**: 데몬에 연결하여 실시간 이벤트 스트림 수신
+- **`query`**: 최상위 PromQL instant 쿼리 (순수 PromQL, --since/--until 없음)
 - **`report`**: one-shot TSDB 조회. 데몬이 수집한 데이터를 조회
+- **`report query`**: --since/--until 시간 윈도우를 사용하는 범위 PromQL 쿼리 (하위 호환)
 
 ## daemon
 
@@ -321,6 +323,60 @@ toki report query 'projects{project="myapp"}'
 }
 ```
 
+## query
+
+`toki query`는 instant PromQL 쿼리를 위한 최상위 명령어다. 순수 PromQL 문법을 사용하며 `--since`/`--until` 플래그가 없다 — 시간 범위는 PromQL 표현식 내부에서 지정한다 (예: `[1h]`, `[1d]`).
+
+### 플래그
+
+| 플래그 | 설명 |
+|--------|------|
+| `-z <IANA>` | 시간 해석용 타임존 |
+| `-w` | 넓은 테이블 출력 |
+| `--remote` | 로컬 데몬 대신 toki-sync 서버로 쿼리 전송 |
+| `--output-format table\|json` | 출력 형식 |
+| `--no-cost` | 비용 계산 비활성화 |
+
+### 예시
+
+```bash
+# Instant 쿼리 (순수 PromQL)
+toki query "sum by (model)(toki_tokens_total[1h])"
+toki query -z Asia/Seoul "sum by (model)(toki_tokens_total[1d])"
+
+# type 필터와 =~ 정규식 연산자
+toki query 'sum(toki_tokens_total{type=~"input|output"}[1h])'
+
+# 원격 쿼리 (sync 서버 경유)
+toki query --remote "sum by (model)(toki_tokens_total[1h])"
+
+# 넓은 테이블
+toki query -w "sum by (model)(toki_tokens_total[1d])"
+
+# JSON 출력
+toki query --output-format json "toki_tokens_total[1h]"
+
+# 비용 제외
+toki query --no-cost "toki_tokens_total[1h]"
+```
+
+### toki query vs toki report query
+
+| | `toki query` | `toki report query` |
+|---|---|---|
+| 범위 | Instant 쿼리 (순수 PromQL) | 범위 쿼리 (`--since`/`--until` 시간 윈도우) |
+| 시간 범위 | PromQL 표현식 내부: `[1h]`, `[1d]` | `--since`/`--until` 플래그 |
+| `--remote` | 지원 | 미지원 (`toki query --remote` 사용) |
+| 상태 | 신규 사용 시 권장 | 하위 호환, 계속 동작 |
+
+```bash
+# 권장: instant 쿼리
+toki query "sum by (model)(toki_tokens_total[1h])"
+
+# 계속 동작: 시간 윈도우를 사용하는 범위 쿼리
+toki report --since 20260301 --until 20260331 query "sum by (model)(toki_tokens_total[1d])"
+```
+
 ## settings
 
 `toki settings`는 cursive TUI로 설정 페이지를 연다. 모든 설정은 `~/.config/toki/settings.json` 파일에 저장된다.
@@ -438,13 +494,13 @@ toki settings sync devices
 toki settings sync rename <new-name>
 ```
 
-### report query --remote
+### query --remote
 
 CLI에서 서버 집계 데이터를 직접 조회할 수 있다:
 
 ```bash
-toki report query --remote 'sum by (model)(toki_tokens_total)'
-toki report query --remote 'toki_tokens_total{device="macbook-pro"}'
+toki query --remote 'sum by (model)(toki_tokens_total)'
+toki query --remote 'toki_tokens_total{device="macbook-pro"}'
 ```
 
 `--remote` 플래그는 PromQL 쿼리를 로컬 데몬 대신 toki-sync 서버로 전송한다. sync가 활성화되어 있어야 한다.
@@ -453,10 +509,12 @@ toki report query --remote 'toki_tokens_total{device="macbook-pro"}'
 
 | 옵션 | 적용 대상 | 설명 |
 |------|----------|------|
-| `--output-format table\|json` | report | 출력 형식 오버라이드 |
+| `--output-format table\|json` | query, report | 출력 형식 오버라이드 |
 | `--sink <SPEC>` | trace | 출력 대상: `print`, `uds://<path>`, `http://<url>` (복수 지정 가능) |
-| `--timezone <IANA>` / `-z` | report | 타임존 오버라이드 |
-| `--no-cost` | trace, report | 비용 계산 비활성화 |
+| `--timezone <IANA>` / `-z` | query, report | 타임존 오버라이드 |
+| `-w` | query | 넓은 테이블 출력 |
+| `--remote` | query | toki-sync 서버로 쿼리 전송 |
+| `--no-cost` | trace, query, report | 비용 계산 비활성화 |
 
 ### --output-format (report 전용)
 
