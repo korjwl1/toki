@@ -78,6 +78,26 @@ enum Commands {
         #[command(subcommand)]
         command: Option<ReportCommands>,
     },
+    /// Execute a PromQL-style query (instant evaluation)
+    Query {
+        /// PromQL query string
+        query: String,
+        /// Route the query through the toki-sync server's HTTP API instead of local fjall DB
+        #[arg(long)]
+        remote: bool,
+        /// Timezone override (e.g. Asia/Seoul, US/Eastern)
+        #[arg(long, short = 'z')]
+        timezone: Option<String>,
+        /// Start-of-week override for [1w] buckets (e.g. mon, tue)
+        #[arg(long = "start-of-week", short = 'w')]
+        start_of_week: Option<String>,
+        /// Output format override: table or json
+        #[arg(long)]
+        output_format: Option<String>,
+        /// Disable cost calculation
+        #[arg(long)]
+        no_cost: bool,
+    },
     /// Open settings TUI, or set a value non-interactively
     Settings {
         /// Database path (default: ~/.config/toki/toki.fjall)
@@ -395,6 +415,67 @@ fn main() {
                 sink
             };
             handle_trace(&config, &sink_specs, no_cost);
+        }
+        Commands::Query { query, remote, timezone, start_of_week: _, output_format: cli_fmt, no_cost: cli_no_cost } => {
+            let cli_tz: Option<Tz> = match timezone.as_deref() {
+                Some(name) => match name.parse::<Tz>() {
+                    Ok(tz) => Some(tz),
+                    Err(_) => {
+                        eprintln!("[toki] Invalid --timezone: {} (use IANA name like Asia/Seoul)", name);
+                        std::process::exit(1);
+                    }
+                },
+                None => None,
+            };
+            let cli_output_format = cli_fmt.as_deref();
+            if let Some(fmt) = cli_output_format {
+                if fmt != "table" && fmt != "json" {
+                    eprintln!("[toki] Invalid --output-format: {} (use table|json)", fmt);
+                    std::process::exit(1);
+                }
+            }
+
+            let config = build_config(cli_tz, cli_no_cost, cli_output_format);
+            let output_format = resolve_output_format(&config);
+            let sink = toki::sink::create_sinks(&["print".to_string()], output_format);
+
+            let pricing = if config.no_cost {
+                None
+            } else {
+                let p = toki::pricing::fetch_pricing(&toki::pricing::default_cache_path());
+                if p.is_empty() { None } else { Some(p) }
+            };
+
+            let response = if remote {
+                // Remote instant query: no start/end (instant at current time)
+                send_remote_query(&query, None, None)
+            } else {
+                // Local: full range scan, PromQL handles aggregation window
+                let sock_path = config.daemon_sock.clone();
+                let pidfile = toki::daemon::default_pidfile_path();
+                if toki::daemon::daemon_status(&pidfile).is_none() {
+                    eprintln!("[toki] Cannot connect to toki daemon.");
+                    eprintln!("[toki] Start the daemon first: toki daemon start");
+                    std::process::exit(1);
+                }
+                send_report_query(&sock_path, &query, config.tz, None, None)
+            };
+
+            match response {
+                Ok(resp) => {
+                    if output_format == toki::sink::OutputFormat::Json {
+                        emit_json_report(&resp, &config, pricing.as_ref());
+                    } else {
+                        for item in resp.data.as_array().unwrap_or(&vec![]) {
+                            dispatch_result_to_sink(item, sink.as_ref(), pricing.as_ref());
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[toki] {}", e);
+                    std::process::exit(1);
+                }
+            }
         }
         Commands::Report { opts, since, until, group_by_session, session_id, project, provider, command } => {
             let (cli_tz, cli_no_cost, cli_output_format) = parse_client_opts(&opts);
@@ -973,7 +1054,8 @@ fn handle_report(
     // Returns (query_str, start, end) — start/end sent as separate protocol fields.
     let (query_str, req_start, req_end): (String, Option<String>, Option<String>) =
         if let Some(ReportCommands::Query { ref query, .. }) = command {
-            // In query mode, --since/--until work as time range filters; other flags are ignored
+            // In query mode, --since/--until set the time window (like VM's start/end params).
+            // The query itself is pure PromQL. Other report-level flags are ignored.
             let ignored: Vec<&str> = [
                 session_id.as_ref().map(|_| "--session-id"),
                 project.as_ref().map(|_| "--project"),
@@ -1484,10 +1566,10 @@ fn build_query_from_flags(
     use toki::query_parser::{Query, Metric, LabelFilter};
     let mut filters = Vec::new();
     if let Some(s) = session_id {
-        filters.push(LabelFilter { key: "session".into(), value: s.into() });
+        filters.push(LabelFilter { key: "session".into(), value: s.into(), regex: false });
     }
     if let Some(p) = project {
-        filters.push(LabelFilter { key: "project".into(), value: p.into() });
+        filters.push(LabelFilter { key: "project".into(), value: p.into(), regex: false });
     }
     Query {
         metric: Metric::Usage,

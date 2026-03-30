@@ -67,6 +67,8 @@ pub enum Metric {
 pub struct LabelFilter {
     pub key: String,
     pub value: String,
+    /// True for `=~` (regex match), false for `=` (exact match).
+    pub regex: bool,
 }
 
 /// Parsed time bucket duration in seconds.
@@ -155,6 +157,11 @@ impl Query {
             .map(|f| f.value.as_str())
     }
 
+    /// Get the LabelFilter for a given key, if present.
+    pub fn get_filter(&self, key: &str) -> Option<&LabelFilter> {
+        self.filters.iter().find(|f| f.key == key)
+    }
+
     /// Serialize back to PromQL-style query string.
     pub fn to_query_string(&self) -> String {
         let agg_prefix = match self.aggregation {
@@ -171,18 +178,19 @@ impl Query {
             Metric::Events => "events".to_string(),
         };
 
-        let mut filters: Vec<(&str, &str)> = self.filters.iter()
-            .map(|f| (f.key.as_str(), f.value.as_str()))
+        let mut filters: Vec<(&str, &str, bool)> = self.filters.iter()
+            .map(|f| (f.key.as_str(), f.value.as_str(), f.regex))
             .collect();
         if let Some(ref provider) = self.provider {
-            filters.push(("provider", provider));
+            filters.push(("provider", provider, false));
         }
         if !filters.is_empty() {
             s.push('{');
-            for (i, (k, v)) in filters.iter().enumerate() {
+            for (i, (k, v, regex)) in filters.iter().enumerate() {
                 if i > 0 { s.push_str(", "); }
                 let escaped = v.replace('\\', "\\\\").replace('"', "\\\"");
-                s.push_str(&format!("{}=\"{}\"", k, escaped));
+                let op = if *regex { "=~" } else { "=" };
+                s.push_str(&format!("{}{}\"{}\"", k, op, escaped));
             }
             s.push('}');
         }
@@ -223,7 +231,7 @@ impl Query {
     }
 }
 
-const VALID_FILTER_KEYS: &[&str] = &["model", "session", "project", "provider"];
+const VALID_FILTER_KEYS: &[&str] = &["model", "session", "project", "provider", "type"];
 const VALID_GROUP_KEYS: &[&str] = &["model", "session", "project"];
 
 /// Parse a PromQL-like query string.
@@ -412,6 +420,17 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Consume an operator (like `=~`) without identifier boundary check.
+    fn consume_op(&mut self, op: &str) -> bool {
+        self.skip_ws();
+        if self.remaining().starts_with(op) {
+            self.pos += op.len();
+            true
+        } else {
+            false
+        }
+    }
+
     fn expect_char(&mut self, ch: char) -> Result<(), String> {
         self.skip_ws();
         match self.input[self.pos..].chars().next() {
@@ -483,12 +502,18 @@ impl<'a> Parser<'a> {
             if !VALID_FILTER_KEYS.contains(&key.as_str()) {
                 return Err(format!("unknown filter key '{}' (valid: {})", key, VALID_FILTER_KEYS.join(", ")));
             }
-            self.expect_char('=')?;
+            // Support both `=` (exact) and `=~` (regex) operators
+            let regex = if self.consume_op("=~") {
+                true
+            } else {
+                self.expect_char('=')?;
+                false
+            };
             let value = self.parse_quoted_string()?;
             if filters.iter().any(|f| f.key == key) {
                 return Err(format!("duplicate filter key '{}'", key));
             }
-            filters.push(LabelFilter { key, value });
+            filters.push(LabelFilter { key, value, regex });
 
             match self.peek() {
                 Some(',') => { self.pos += 1; }
@@ -1099,5 +1124,56 @@ mod tests {
     fn test_compound_duration_roundtrip() {
         let q = parse("usage[2h30m]").unwrap();
         assert_eq!(q.to_query_string(), "usage[2h30m]");
+    }
+
+    // ── type filter + regex operator ──
+
+    #[test]
+    fn test_type_filter_exact() {
+        let q = parse(r#"toki_tokens_total{type="input"}[1h]"#).unwrap();
+        assert_eq!(q.filters.len(), 1);
+        assert_eq!(q.filters[0].key, "type");
+        assert_eq!(q.filters[0].value, "input");
+        assert!(!q.filters[0].regex);
+    }
+
+    #[test]
+    fn test_type_filter_regex() {
+        let q = parse(r#"toki_tokens_total{type=~"input|output"}[1h]"#).unwrap();
+        assert_eq!(q.filters.len(), 1);
+        assert_eq!(q.filters[0].key, "type");
+        assert_eq!(q.filters[0].value, "input|output");
+        assert!(q.filters[0].regex);
+    }
+
+    #[test]
+    fn test_type_filter_with_provider() {
+        let q = parse(r#"sum by (model) (increase(toki_tokens_total{type=~"input|output", provider="claude_code"}[1h]))"#).unwrap();
+        assert_eq!(q.provider, Some("claude_code".to_string()));
+        assert_eq!(q.filters.len(), 1);
+        assert_eq!(q.filters[0].key, "type");
+        assert!(q.filters[0].regex);
+    }
+
+    #[test]
+    fn test_type_filter_serialization_exact() {
+        let q = parse(r#"toki_tokens_total{type="input"}[1h]"#).unwrap();
+        let s = q.to_query_string();
+        assert!(s.contains(r#"type="input""#));
+    }
+
+    #[test]
+    fn test_type_filter_serialization_regex() {
+        let q = parse(r#"toki_tokens_total{type=~"input|output"}[1h]"#).unwrap();
+        let s = q.to_query_string();
+        assert!(s.contains(r#"type=~"input|output""#));
+    }
+
+    #[test]
+    fn test_regex_op_on_model() {
+        let q = parse(r#"usage{model=~"opus|sonnet"}[1h]"#).unwrap();
+        assert_eq!(q.filters[0].key, "model");
+        assert_eq!(q.filters[0].value, "opus|sonnet");
+        assert!(q.filters[0].regex);
     }
 }

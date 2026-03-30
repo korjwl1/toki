@@ -6,7 +6,44 @@ use chrono_tz::Tz;
 use crate::common::types::{ModelUsageSummary, RawEvent, GroupedSummaryMap, SummaryMap};
 use crate::db::Database;
 use crate::engine::{ReportFilter, ReportGroupBy};
-use crate::query_parser::AggregationFunc;
+use crate::query_parser::{AggregationFunc, LabelFilter};
+
+/// Token type names corresponding to the 4 token slots.
+/// Slot 0 = input, 1 = output, 2 = cache_create, 3 = cache_read.
+const TOKEN_TYPE_NAMES: &[&str] = &["input", "output", "cache_create", "cache_read"];
+
+/// Check if a token type name matches a LabelFilter (exact or regex via `|` alternation).
+fn type_matches(type_name: &str, filter: &LabelFilter) -> bool {
+    if filter.regex {
+        // Support simple `|`-separated alternation (e.g. "input|output")
+        filter.value.split('|').any(|alt| alt == type_name)
+    } else {
+        filter.value == type_name
+    }
+}
+
+/// Given a type filter, return a 4-element mask [input, output, cache_create, cache_read]
+/// indicating which token slots to include.
+fn type_filter_mask(filter: Option<&LabelFilter>) -> [bool; 4] {
+    match filter {
+        None => [true; 4],
+        Some(f) => {
+            let mut mask = [false; 4];
+            for (i, &name) in TOKEN_TYPE_NAMES.iter().enumerate() {
+                mask[i] = type_matches(name, f);
+            }
+            mask
+        }
+    }
+}
+
+/// Apply a type filter mask to a ModelUsageSummary, zeroing out non-matching token fields.
+fn apply_type_mask(summary: &mut ModelUsageSummary, mask: &[bool; 4]) {
+    if !mask[0] { summary.input_tokens = 0; }
+    if !mask[1] { summary.output_tokens = 0; }
+    if !mask[2] { summary.cache_creation_input_tokens = 0; }
+    if !mask[3] { summary.cache_read_input_tokens = 0; }
+}
 
 /// Resolve (since, until) from filter into ms timestamps.
 fn filter_range(filter: ReportFilter) -> (i64, i64) {
@@ -310,6 +347,8 @@ pub fn execute_parsed_query(
             let filter = ReportFilter { since: since_dt, until: until_dt, tz };
             let model_filter = parsed.filter_value("model");
             let session_filter = parsed.filter_value("session");
+            let type_filter = parsed.get_filter("type");
+            let type_mask = type_filter_mask(type_filter);
 
             match (&parsed.bucket, parsed.group_by.is_empty()) {
                 (None, true) => {
@@ -317,6 +356,11 @@ pub fn execute_parsed_query(
                     let mut summaries = report_summary_from_db(db, filter).map_err(|e| e.to_string())?;
                     if let Some(model) = model_filter {
                         summaries.retain(|k, _| k == model);
+                    }
+                    if type_filter.is_some() {
+                        for s in summaries.values_mut() {
+                            apply_type_mask(s, &type_mask);
+                        }
                     }
                     if let Some(func) = parsed.aggregation {
                         apply_aggregation_flat(&mut summaries, func);
@@ -394,6 +438,14 @@ pub fn execute_parsed_query(
                                 });
                             accumulate_rollup(entry, &rollup);
                         }).map_err(|e| e.to_string())?;
+                    }
+
+                    if type_filter.is_some() {
+                        for models in grouped.values_mut() {
+                            for s in models.values_mut() {
+                                apply_type_mask(s, &type_mask);
+                            }
+                        }
                     }
 
                     if let Some(func) = parsed.aggregation {
