@@ -378,6 +378,7 @@ toki settings sync enable --server 1.2.3.4 --insecure
 | `--insecure` | X | 자체 서명 TLS 인증서 허용 (IP 전용 서버용) |
 | `--no-tls` | X | TLS 비활성화 (개발 전용) |
 | `--headless` | X | 비대화형 모드 (URL과 코드를 출력하여 수동 입력) |
+| `--device-name <이름>` | X | 디바이스 이름 지정 (기본값: 호스트명) |
 
 인증 정보는 macOS Keychain(macOS) 또는 `~/.config/toki/sync.json`(Linux)에 저장된다.
 

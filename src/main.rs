@@ -1243,7 +1243,7 @@ fn send_remote_query(
     end: Option<&str>,
 ) -> Result<ReportResponse, String> {
     let creds = toki::sync::credentials::load()
-        .ok_or_else(|| "Not configured for remote query. Run: toki settings sync enable --server <addr> --username <user>".to_string())?;
+        .ok_or_else(|| "Not configured for remote query. Run: toki settings sync enable --server <host>".to_string())?;
 
     // Convert CLI date strings (e.g. "20230101") to epoch seconds for Prometheus API.
     let start_epoch = start.map(|s| {
@@ -2111,7 +2111,7 @@ fn handle_sync_devices() {
     let creds = match toki::sync::credentials::load() {
         Some(c) => c,
         None => {
-            eprintln!("[toki] Not configured. Run: toki settings sync enable --server <addr> --username <user>");
+            eprintln!("[toki] Not configured. Run: toki settings sync enable --server <host>");
             std::process::exit(1);
         }
     };

@@ -374,6 +374,7 @@ Connects the daemon to a toki-sync server. Opens a browser for authentication vi
 | `--insecure` | No | Accept self-signed TLS certificates (for IP-only servers) |
 | `--no-tls` | No | Disable TLS entirely (development only) |
 | `--headless` | No | Non-interactive mode (prints a URL and code to enter manually) |
+| `--device-name <name>` | No | Custom device name (default: hostname) |
 
 Credentials are stored in macOS Keychain (macOS) or `~/.config/toki/sync.json` (Linux).
 
