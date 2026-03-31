@@ -367,18 +367,14 @@ pub fn execute_parsed_query(
                         }
 
                         let bucket_key = if let Some(ref bucket) = parsed.bucket {
-                            // VM query_range compatible bucketing.
-                            // Eval points: start, start+step, start+2*step, ...
-                            // Each point t covers window (t-step, t].
+                            // Bucket = floor(event_ts / step) * step.
+                            // This assigns each event to the step-aligned period it belongs to.
+                            // E.g. step=86400, event at 03-23T05:00 → bucket=03-23T00:00.
                             let step_ms = bucket.as_secs() as i64 * 1000;
-                            let start_ms = step_start_sec * 1000;
-                            let offset_ms = ts - start_ms;
-                            if offset_ms < -step_ms { return; } // before first window
-                            let idx = if offset_ms <= 0 { 0 } else { (offset_ms + step_ms - 1) / step_ms };
-                            let eval_ms = start_ms + idx * step_ms;
-                            if eval_ms > until { return; } // past end
-                            let eval_sec = eval_ms / 1000;
-                            bucket.format_label(eval_sec, tz)
+                            let bucket_ms = (ts / step_ms) * step_ms;
+                            if bucket_ms < since || bucket_ms >= until { return; }
+                            let bucket_sec = bucket_ms / 1000;
+                            bucket.format_label(bucket_sec, tz)
                         } else {
                             String::new()
                         };
