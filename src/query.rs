@@ -125,11 +125,48 @@ fn apply_aggregation_flat(summaries: &mut SummaryMap, func: AggregationFunc) {
 }
 
 /// Collapse model dimension within each group of a GroupedSummaryMap.
-fn apply_aggregation_grouped(grouped: &mut GroupedSummaryMap, func: AggregationFunc) {
-    for models in grouped.values_mut() {
-        let mut flat: SummaryMap = std::mem::take(models);
-        apply_aggregation_flat(&mut flat, func);
-        *models = flat;
+fn apply_aggregation_grouped(grouped: &mut GroupedSummaryMap, func: AggregationFunc, group_by: &[String]) {
+    // If group_by includes "model", models are already separated by the grouping key.
+    // Aggregation should apply within each model, not collapse models into "(total)".
+    let model_in_group_by = group_by.iter().any(|g| g == "model");
+
+    if model_in_group_by {
+        // Models are already the grouping dimension — just apply func per model.
+        // For Sum this is a no-op (each model entry is already the sum for that model).
+        // For Avg/Count, apply per model.
+        if func == AggregationFunc::Sum {
+            return; // Already summed per model
+        }
+        for models in grouped.values_mut() {
+            for s in models.values_mut() {
+                match func {
+                    AggregationFunc::Avg => {
+                        let count = s.event_count.max(1);
+                        s.input_tokens /= count;
+                        s.output_tokens /= count;
+                        s.cache_creation_input_tokens /= count;
+                        s.cache_read_input_tokens /= count;
+                        s.event_count = 1;
+                    }
+                    AggregationFunc::Count => {
+                        let count = s.event_count;
+                        s.input_tokens = 0;
+                        s.output_tokens = 0;
+                        s.cache_creation_input_tokens = 0;
+                        s.cache_read_input_tokens = 0;
+                        s.event_count = count;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    } else {
+        // No model in group_by — collapse all models within each group
+        for models in grouped.values_mut() {
+            let mut flat: SummaryMap = std::mem::take(models);
+            apply_aggregation_flat(&mut flat, func);
+            *models = flat;
+        }
     }
 }
 
@@ -367,7 +404,7 @@ pub fn execute_parsed_query(
                     }
 
                     if let Some(func) = parsed.aggregation {
-                        apply_aggregation_grouped(&mut grouped, func);
+                        apply_aggregation_grouped(&mut grouped, func, &parsed.group_by);
                     }
 
                     let type_name = if let Some(ref bucket) = parsed.bucket {
