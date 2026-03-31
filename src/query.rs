@@ -372,7 +372,8 @@ pub fn execute_parsed_query(
                             // E.g. step=86400, event at 03-23T05:00 → bucket=03-23T00:00.
                             let step_ms = bucket.as_secs() as i64 * 1000;
                             let bucket_ms = (ts / step_ms) * step_ms;
-                            if bucket_ms < since || bucket_ms >= until { return; }
+                            // Include bucket if it overlaps [since, until)
+                            if bucket_ms + step_ms <= since || bucket_ms >= until { return; }
                             let bucket_sec = bucket_ms / 1000;
                             bucket.format_label(bucket_sec, tz)
                         } else {
