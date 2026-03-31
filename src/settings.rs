@@ -19,7 +19,6 @@ struct SettingsState {
     start_of_week: String,
     no_cost: bool,
     retention_days: String,
-    rollup_retention_days: String,
     sync_enabled: bool,
     sync_server: String,
     sync_device_name: String,
@@ -41,7 +40,6 @@ impl SettingsState {
             start_of_week: get("start_of_week", "mon"),
             no_cost: get("no_cost", "false") == "true",
             retention_days: get("retention_days", "0"),
-            rollup_retention_days: get("rollup_retention_days", "0"),
             sync_enabled: get("sync_enabled", "false") == "true",
             sync_server: get("sync_server", ""),
             sync_device_name: get("sync_device_name", &crate::sync::thread::SyncConfig::default_device_name()),
@@ -148,10 +146,7 @@ pub fn run_settings() -> bool {
     // -- Data section --
     let data_section = LinearLayout::vertical()
         .child(labeled_edit("Event Retention", &state.retention_days, "retention_days"))
-        .child(hint_text("                        Days to keep events (0 = forever)"))
-        .child(DummyView.fixed_height(1))
-        .child(labeled_edit("Rollup Retention", &state.rollup_retention_days, "rollup_retention_days"))
-        .child(hint_text("                        Days to keep rollups (0 = forever)"));
+        .child(hint_text("                        Days to keep events (0 = forever)"));
 
     // -- Sync section (read-only except device name) --
     let sync_status = if state.sync_enabled { "Enabled" } else { "Disabled" };
@@ -269,7 +264,6 @@ fn save_settings(siv: &mut Cursive, restart_flag: std::sync::Arc<std::sync::atom
     let daemon_sock = get_edit(siv, "daemon_sock");
     let timezone = get_edit(siv, "timezone");
     let retention = get_edit(siv, "retention_days");
-    let rollup_retention = get_edit(siv, "rollup_retention_days");
 
     let output_format = siv.call_on_name("output_format", |v: &mut SelectView<String>| {
         v.selection().map(|s| (*s).clone()).unwrap_or_else(|| "table".to_string())
@@ -308,11 +302,6 @@ fn save_settings(siv: &mut Cursive, restart_flag: std::sync::Arc<std::sync::atom
         siv.add_layer(Dialog::info("Retention days must be a number"));
         return;
     }
-    if rollup_retention.parse::<u32>().is_err() {
-        siv.add_layer(Dialog::info("Rollup retention days must be a number"));
-        return;
-    }
-
     let settings = [
         ("claude_code_root", claude_root.as_str()),
         ("codex_root", codex_root.as_str()),
@@ -322,7 +311,6 @@ fn save_settings(siv: &mut Cursive, restart_flag: std::sync::Arc<std::sync::atom
         ("start_of_week", start_of_week.as_str()),
         ("no_cost", if no_cost { "true" } else { "false" }),
         ("retention_days", retention.as_str()),
-        ("rollup_retention_days", rollup_retention.as_str()),
         ("sync_device_name", sync_device_name.as_str()),
     ];
 

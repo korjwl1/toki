@@ -278,9 +278,9 @@ impl TrackerEngine {
         let schema = crate::common::schema::schema_for_provider(provider.name());
         self.sink.emit_summary(&result_summaries, None, Some(schema));
 
-        // Signal writer to flush accumulated rollups, then wait for completion
+        // Signal writer to flush remaining bulk events, then wait for completion
         let (done_tx, done_rx) = crossbeam_channel::bounded(1);
-        let _ = db_tx.send(DbOp::FlushBulkRollups(done_tx));
+        let _ = db_tx.send(DbOp::FlushBulkEvents(done_tx));
         let _ = done_rx.recv();
 
         // Flush checkpoints
@@ -380,7 +380,7 @@ impl TrackerEngine {
         self.sink.emit_summary(&result_summaries, None, None);
 
         let (done_tx, done_rx) = crossbeam_channel::bounded(1);
-        let _ = db_tx.send(DbOp::FlushBulkRollups(done_tx));
+        let _ = db_tx.send(DbOp::FlushBulkEvents(done_tx));
         let _ = done_rx.recv();
 
         let cp_count = checkpoints_batch.len();
@@ -1063,13 +1063,13 @@ mod tests {
         }
     }
 
-    /// Create a db_tx + drain thread that consumes all DbOps (handles FlushBulkRollups done signal).
+    /// Create a db_tx + drain thread that consumes all DbOps (handles FlushBulkEvents done signal).
     fn test_db_channel() -> (crossbeam_channel::Sender<DbOp>, std::thread::JoinHandle<()>) {
         let (db_tx, db_rx) = crossbeam_channel::bounded::<DbOp>(1024);
         let handle = std::thread::spawn(move || {
             while let Ok(op) = db_rx.recv() {
                 match op {
-                    DbOp::FlushBulkRollups(done_tx) => { let _ = done_tx.send(()); }
+                    DbOp::FlushBulkEvents(done_tx) => { let _ = done_tx.send(()); }
                     DbOp::Shutdown => break,
                     _ => {}
                 }

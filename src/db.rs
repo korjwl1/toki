@@ -3,24 +3,23 @@ use std::path::Path;
 
 use fjall::{Database as FjallDatabase, Keyspace, KeyspaceCreateOptions};
 
-use crate::common::types::{FileCheckpoint, RollupValue, StoredEvent};
+use crate::common::types::{FileCheckpoint, StoredEvent};
 
 pub struct Database {
     db: FjallDatabase,
     checkpoints: Keyspace,
     meta: Keyspace,
     events: Keyspace,
-    rollups: Keyspace,
     idx_sessions: Keyspace,
     idx_projects: Keyspace,
     dict: Keyspace,
     /// Maps bare msg_id → event key [ts_ms(8bytes) + event_key] for dedup.
     /// When a new event arrives with the same msg_id, the previous event is
-    /// deleted from events keyspace and its tokens subtracted from rollup.
+    /// deleted from events keyspace and its tokens are no longer counted.
     idx_msg: Keyspace,
 }
 
-/// Schema version. Increment when StoredEvent, RollupValue, or keyspace layout changes.
+/// Schema version. Increment when StoredEvent or keyspace layout changes.
 /// Mismatched version triggers automatic DB reset + cold start rebuild.
 pub const SCHEMA_VERSION: u32 = 3;
 
@@ -61,7 +60,6 @@ impl Database {
         let checkpoints = db.keyspace("checkpoints", opts)?;
         let meta = db.keyspace("meta", opts)?;
         let events = db.keyspace("events", opts)?;
-        let rollups = db.keyspace("rollups", opts)?;
         let idx_sessions = db.keyspace("idx_sessions", opts)?;
         let idx_projects = db.keyspace("idx_projects", opts)?;
         let dict = db.keyspace("dict", opts)?;
@@ -70,7 +68,7 @@ impl Database {
         // Write current schema version
         meta.insert("schema_version", SCHEMA_VERSION.to_string().as_bytes())?;
 
-        Ok(Database { db, checkpoints, meta, events, rollups, idx_sessions, idx_projects, dict, idx_msg })
+        Ok(Database { db, checkpoints, meta, events, idx_sessions, idx_projects, dict, idx_msg })
     }
 
     pub fn inner(&self) -> &FjallDatabase {
@@ -179,7 +177,7 @@ impl Database {
     /// Insert event with msg_id dedup: if a previous event with the same bare msg_id
     /// exists, delete it from events keyspace before inserting the new one.
     /// Also updates idx_msg to track the latest event key per msg_id.
-    /// Returns the previous StoredEvent if one was replaced (for rollup adjustment).
+    /// Returns the previous StoredEvent if one was replaced.
     pub fn insert_event_dedup(
         &self,
         batch: &mut fjall::OwnedWriteBatch,
@@ -209,30 +207,6 @@ impl Database {
         batch.insert(&self.idx_msg, bare_id.as_bytes(), new_key);
 
         prev
-    }
-
-    // -- Rollup operations --
-
-    /// Build rollup key: [hour_ts big-endian 8 bytes][model_name bytes]
-    fn rollup_key(hour_ts: i64, model_name: &str) -> Vec<u8> {
-        let mut key = Vec::with_capacity(8 + model_name.len());
-        key.extend_from_slice(&hour_ts.to_be_bytes());
-        key.extend_from_slice(model_name.as_bytes());
-        key
-    }
-
-    pub fn get_rollup(&self, hour_ts: i64, model_name: &str) -> Result<Option<RollupValue>, fjall::Error> {
-        let key = Self::rollup_key(hour_ts, model_name);
-        match self.rollups.get(&key)? {
-            Some(bytes) => Ok(bincode::deserialize::<RollupValue>(&bytes).ok()),
-            None => Ok(None),
-        }
-    }
-
-    pub fn upsert_rollup(&self, batch: &mut fjall::OwnedWriteBatch, hour_ts: i64, model_name: &str, rollup: &RollupValue) {
-        let key = Self::rollup_key(hour_ts, model_name);
-        let value = bincode::serialize(rollup).expect("RollupValue serialization failed");
-        batch.insert(&self.rollups, key, value);
     }
 
     // -- Index operations --
@@ -415,51 +389,6 @@ impl Database {
         Ok(results)
     }
 
-    /// Check if any rollup data exists (O(1) — reads only first entry).
-    pub fn has_any_rollups(&self) -> bool {
-        self.rollups.first_key_value().is_some()
-    }
-
-    /// Get the actual data time range from rollups (O(1) each — B-tree first/last key).
-    /// Returns (earliest_ms, latest_ms) or None if no data.
-    pub fn data_range(&self) -> Option<(i64, i64)> {
-        let extract_ts = |guard: fjall::Guard| -> Option<i64> {
-            let kv = guard.into_inner().ok()?;
-            let key = &kv.0;
-            if key.len() < 8 { return None; }
-            Some(i64::from_be_bytes(key[..8].try_into().ok()?))
-        };
-
-        let first_ts = extract_ts(self.rollups.first_key_value()?)?;
-        let last_ts = extract_ts(self.rollups.last_key_value()?)?;
-        Some((first_ts, last_ts))
-    }
-
-    /// Iterate rollups in [since_ms, until_ms] range, calling `f` for each.
-    /// Avoids allocating a Vec when only aggregation is needed.
-    pub fn for_each_rollup<F>(&self, since_ms: i64, until_ms: i64, mut f: F) -> Result<(), fjall::Error>
-    where
-        F: FnMut(i64, String, RollupValue),
-    {
-        let start_key = since_ms.to_be_bytes().to_vec();
-        for guard in self.rollups.range(start_key..) {
-            let kv = guard.into_inner()?;
-            let key = &kv.0;
-            if key.len() < 8 { continue; }
-            let ts_bytes: [u8; 8] = match key[..8].try_into() {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            let ts = i64::from_be_bytes(ts_bytes);
-            if ts > until_ms { break; }
-            let model = String::from_utf8_lossy(&key[8..]).into_owned();
-            if let Ok(rollup) = bincode::deserialize::<RollupValue>(&kv.1) {
-                f(ts, model, rollup);
-            }
-        }
-        Ok(())
-    }
-
     /// Iterate events in [since_ms, until_ms] range, calling `f` for each.
     pub fn for_each_event<F>(&self, since_ms: i64, until_ms: i64, mut f: F) -> Result<(), fjall::Error>
     where
@@ -481,6 +410,21 @@ impl Database {
             }
         }
         Ok(())
+    }
+
+    /// Get the actual data time range from events (O(1) each — B-tree first/last key).
+    /// Returns (earliest_ms, latest_ms) or None if no data.
+    pub fn data_range(&self) -> Option<(i64, i64)> {
+        let extract_ts = |guard: fjall::Guard| -> Option<i64> {
+            let kv = guard.into_inner().ok()?;
+            let key = &kv.0;
+            if key.len() < 8 { return None; }
+            Some(i64::from_be_bytes(key[..8].try_into().ok()?))
+        };
+
+        let first_ts = extract_ts(self.events.first_key_value()?)?;
+        let last_ts = extract_ts(self.events.last_key_value()?)?;
+        Some((first_ts, last_ts))
     }
 
     // -- Deletion operations --
@@ -517,38 +461,6 @@ impl Database {
         Ok(deleted)
     }
 
-    /// Delete rollups with timestamp before cutoff_ms. Returns count deleted.
-    pub fn delete_rollups_before(&self, cutoff_ms: i64) -> Result<u64, fjall::Error> {
-        let cutoff_key = cutoff_ms.to_be_bytes().to_vec();
-        let mut deleted = 0u64;
-        let mut keys_to_delete = Vec::new();
-
-        for guard in self.rollups.iter() {
-            let kv = guard.into_inner()?;
-            if kv.0.as_ref() >= cutoff_key.as_slice() {
-                break;
-            }
-            keys_to_delete.push(kv.0.to_vec());
-            if keys_to_delete.len() >= 1000 {
-                let mut batch = self.db.batch();
-                for key in keys_to_delete.drain(..) {
-                    batch.remove(&self.rollups, key);
-                    deleted += 1;
-                }
-                batch.commit()?;
-            }
-        }
-        if !keys_to_delete.is_empty() {
-            let mut batch = self.db.batch();
-            for key in keys_to_delete {
-                batch.remove(&self.rollups, key);
-                deleted += 1;
-            }
-            batch.commit()?;
-        }
-        Ok(deleted)
-    }
-
     /// Create a new batch.
     pub fn batch(&self) -> fjall::OwnedWriteBatch {
         self.db.batch()
@@ -558,7 +470,6 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::types::RollupValue;
 
     fn temp_db() -> (Database, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -709,28 +620,6 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].0, 1000);
         assert_eq!(results[1].0, 2000);
-    }
-
-    #[test]
-    fn test_rollup_upsert_and_query() {
-        let (db, _dir) = temp_db();
-
-        let hour_ts = 3_600_000i64;
-        let rollup = RollupValue {
-            input: 100,
-            output: 50,
-            cache_create: 10,
-            cache_read: 20,
-            count: 5,
-        };
-
-        let mut batch = db.batch();
-        db.upsert_rollup(&mut batch, hour_ts, "claude-opus-4-6", &rollup);
-        batch.commit().unwrap();
-
-        let loaded = db.get_rollup(hour_ts, "claude-opus-4-6").unwrap().unwrap();
-        assert_eq!(loaded.input, 100);
-        assert_eq!(loaded.count, 5);
     }
 
     #[test]

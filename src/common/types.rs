@@ -107,16 +107,6 @@ pub struct StoredEvent {
     pub cache_read_input_tokens: u64,
 }
 
-/// Hourly rollup aggregation per model (rollups keyspace).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct RollupValue {
-    pub input: u64,
-    pub output: u64,
-    pub cache_create: u64,
-    pub cache_read: u64,
-    pub count: u64,
-}
-
 /// A raw event returned by the `events` query metric.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawEvent {

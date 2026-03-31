@@ -527,7 +527,7 @@ fn main() {
 
 const VALID_SETTINGS: &[&str] = &[
     "claude_code_root", "codex_root", "daemon_sock", "timezone", "output_format",
-    "start_of_week", "no_cost", "retention_days", "rollup_retention_days",
+    "start_of_week", "no_cost", "retention_days",
     "providers", "daemon_autostart",
     "sync_enabled", "sync_server", "sync_access_token", "sync_device_name",
     "sync_tls", "sync_tls_insecure",
@@ -544,7 +544,7 @@ const RESTART_SETTINGS: &[&str] = &[
 const HOT_RELOAD_SETTINGS: &[&str] = &[
     "sync_enabled", "sync_server", "sync_access_token", "sync_device_name",
     "sync_tls", "sync_tls_insecure",
-    "retention_days", "rollup_retention_days",
+    "retention_days",
     "timezone", "output_format", "start_of_week", "no_cost",
 ];
 

@@ -147,7 +147,6 @@ impl Drop for Handle {
 pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
     let retention = RetentionPolicy {
         event_retention_days: config.retention_days,
-        rollup_retention_days: config.rollup_retention_days,
     };
 
     // Migrate legacy toki.fjall → claude_code.fjall if needed

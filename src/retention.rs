@@ -5,14 +5,12 @@ use crate::db::Database;
 #[derive(Debug, Clone, Default)]
 pub struct RetentionPolicy {
     pub event_retention_days: u32,
-    pub rollup_retention_days: u32,
 }
 
 // Default: all zeros (disabled). Derive is sufficient.
 
 pub struct RetentionStats {
     pub events_deleted: u64,
-    pub rollups_deleted: u64,
     pub elapsed: Duration,
 }
 
@@ -20,10 +18,9 @@ pub fn run_retention(db: &Database, policy: &RetentionPolicy) -> Result<Retentio
     let t = Instant::now();
 
     // 0 = disabled
-    if policy.event_retention_days == 0 && policy.rollup_retention_days == 0 {
+    if policy.event_retention_days == 0 {
         return Ok(RetentionStats {
             events_deleted: 0,
-            rollups_deleted: 0,
             elapsed: t.elapsed(),
         });
     }
@@ -37,13 +34,6 @@ pub fn run_retention(db: &Database, policy: &RetentionPolicy) -> Result<Retentio
         0
     };
 
-    let rollups_deleted = if policy.rollup_retention_days > 0 {
-        let cutoff = now_ms - (policy.rollup_retention_days as i64) * 86_400_000;
-        db.delete_rollups_before(cutoff)?
-    } else {
-        0
-    };
-
     // Index cleanup is skipped: session/project indices have keys like
     // {prefix}\0{ts}{msg_id}, so a full scan would be O(n) over all entries.
     // Orphaned index entries (pointing to deleted events) are harmless —
@@ -52,7 +42,6 @@ pub fn run_retention(db: &Database, policy: &RetentionPolicy) -> Result<Retentio
 
     Ok(RetentionStats {
         events_deleted,
-        rollups_deleted,
         elapsed: t.elapsed(),
     })
 }
@@ -82,7 +71,6 @@ mod tests {
 
         let policy = RetentionPolicy {
             event_retention_days: 90,
-            rollup_retention_days: 365,
         };
 
         let stats = run_retention(&db, &policy).unwrap();

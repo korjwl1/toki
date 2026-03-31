@@ -52,14 +52,6 @@ fn filter_range(filter: ReportFilter) -> (i64, i64) {
     (since, until)
 }
 
-fn accumulate_rollup(entry: &mut ModelUsageSummary, rollup: &crate::common::types::RollupValue) {
-    entry.input_tokens += rollup.input;
-    entry.output_tokens += rollup.output;
-    entry.cache_creation_input_tokens += rollup.cache_create;
-    entry.cache_read_input_tokens += rollup.cache_read;
-    entry.event_count += rollup.count;
-}
-
 /// Accumulate a StoredEvent's token counts into a ModelUsageSummary.
 fn accumulate_event(entry: &mut ModelUsageSummary, event: &crate::common::types::StoredEvent) {
     entry.input_tokens += event.input_tokens;
@@ -67,77 +59,6 @@ fn accumulate_event(entry: &mut ModelUsageSummary, event: &crate::common::types:
     entry.cache_creation_input_tokens += event.cache_creation_input_tokens;
     entry.cache_read_input_tokens += event.cache_read_input_tokens;
     entry.event_count += 1;
-}
-
-/// Report total summary from TSDB rollups (streaming — no intermediate Vec).
-pub fn report_summary_from_db(
-    db: &Database,
-    filter: ReportFilter,
-) -> Result<SummaryMap, fjall::Error> {
-    let (since, until) = filter_range(filter);
-    let mut summaries: SummaryMap = HashMap::new();
-    db.for_each_rollup(since, until, |_ts, model, rollup| {
-        // Avoid cloning model string when the entry already exists
-        if !summaries.contains_key(&model) {
-            summaries.insert(model.clone(), ModelUsageSummary {
-                model: model.clone(), ..Default::default()
-            });
-        }
-        let entry = summaries.get_mut(&model).unwrap();
-        accumulate_rollup(entry, &rollup);
-    })?;
-    Ok(summaries)
-}
-
-/// Report grouped by time bucket from TSDB.
-/// Uses fast rollup scan when no session/project filters are set.
-/// Falls back to event-level scan when filtering by session or project.
-pub fn report_grouped_from_db(
-    db: &Database,
-    group_by: ReportGroupBy,
-    filter: ReportFilter,
-    session_filter: Option<&str>,
-    project_filter: Option<&str>,
-) -> Result<GroupedSummaryMap, fjall::Error> {
-    let (since, until) = filter_range(filter);
-    let mut grouped: GroupedSummaryMap = HashMap::new();
-
-    if session_filter.is_some() || project_filter.is_some() {
-        // Event-level scan for session/project filtering
-        let dict = db.load_dict_reverse()?;
-        let unknown = String::new();
-        db.for_each_event(since, until, |ts, event| {
-            let model = dict.get(&event.model_id).unwrap_or(&unknown);
-            if let Some(sf) = session_filter {
-                let session = dict.get(&event.session_id).unwrap_or(&unknown);
-                if !session.starts_with(sf) { return; }
-            }
-            if let Some(pf) = project_filter {
-                let project = resolve_project(&dict, &event);
-                if !project.contains(pf) { return; }
-            }
-            let dt = ts_to_datetime(ts, filter.tz);
-            let bucket = bucket_from_datetime(dt, group_by);
-            let entry = grouped.entry(bucket).or_default()
-                .entry(model.clone()).or_insert_with(|| ModelUsageSummary {
-                    model: model.clone(), ..Default::default()
-                });
-            accumulate_event(entry, &event);
-        })?;
-    } else {
-        // Fast rollup-based scan
-        db.for_each_rollup(since, until, |hour_ts, model, rollup| {
-            let dt = ts_to_datetime(hour_ts, filter.tz);
-            let bucket = bucket_from_datetime(dt, group_by);
-            let entry = grouped.entry(bucket).or_default()
-                .entry(model.clone()).or_insert_with(|| ModelUsageSummary {
-                    model, ..Default::default()
-                });
-            accumulate_rollup(entry, &rollup);
-        })?;
-    }
-
-    Ok(grouped)
 }
 
 /// Report grouped by session from TSDB events (streaming).
@@ -353,11 +274,8 @@ pub fn execute_parsed_query(
 
             match (&parsed.bucket, parsed.group_by.is_empty()) {
                 (None, true) => {
-                    // Flat summary.
-                    // Use events keyspace when a time range is specified (precise range).
-                    // Use rollup when no range (full history — faster).
-                    let has_range = since_ms > 0 || until_ms < i64::MAX;
-                    let mut summaries = if has_range {
+                    // Flat summary via events keyspace scan.
+                    let mut summaries = {
                         let dict = db.load_dict_reverse().map_err(|e| e.to_string())?;
                         let unknown = String::new();
                         let mut sums: SummaryMap = HashMap::new();
@@ -372,8 +290,6 @@ pub fn execute_parsed_query(
                             accumulate_event(entry, &event);
                         }).map_err(|e| e.to_string())?;
                         sums
-                    } else {
-                        report_summary_from_db(db, filter).map_err(|e| e.to_string())?
                     };
                     if let Some(model) = model_filter {
                         summaries.retain(|k, _| k == model);
@@ -393,80 +309,54 @@ pub fn execute_parsed_query(
                     let (since, until) = filter_range(filter);
                     let mut grouped: GroupedSummaryMap = HashMap::new();
 
-                    // Use event-level scan when:
-                    // - session filter or group_by needs per-event data, OR
-                    // - bucket is not an exact multiple of the 1-hour rollup granularity
-                    let bucket_needs_event_scan = parsed.bucket.as_ref()
-                        .map_or(false, |b| b.0 < 3600 || b.0 % 3600 != 0);
-                    if session_filter.is_some() || !parsed.group_by.is_empty() || bucket_needs_event_scan {
-                        // Need event-level access for session/group_by
-                        let dict = db.load_dict_reverse().map_err(|e| e.to_string())?;
-                        let unknown = String::new();
-                        let step_start_sec = since / 1000;
-                        db.for_each_event(since, until, |ts, event| {
-                            let model = dict.get(&event.model_id).unwrap_or(&unknown);
-                            if let Some(mf) = model_filter {
-                                if model != mf { return; }
-                            }
-                            let session = dict.get(&event.session_id).unwrap_or(&unknown);
-                            if let Some(sf) = session_filter {
-                                if !session.starts_with(sf) { return; }
-                            }
+                    // Event-level scan for all grouped queries
+                    let dict = db.load_dict_reverse().map_err(|e| e.to_string())?;
+                    let unknown = String::new();
+                    let step_start_sec = since / 1000;
+                    db.for_each_event(since, until, |ts, event| {
+                        let model = dict.get(&event.model_id).unwrap_or(&unknown);
+                        if let Some(mf) = model_filter {
+                            if model != mf { return; }
+                        }
+                        let session = dict.get(&event.session_id).unwrap_or(&unknown);
+                        if let Some(sf) = session_filter {
+                            if !session.starts_with(sf) { return; }
+                        }
 
-                            let bucket_key = if let Some(ref bucket) = parsed.bucket {
-                                // VM query_range compatible bucketing.
-                                // Eval points: start, start+step, start+2*step, ...
-                                // Each point t covers window (t-step, t].
-                                let step_ms = bucket.as_secs() as i64 * 1000;
-                                let start_ms = step_start_sec * 1000;
-                                let offset_ms = ts - start_ms;
-                                if offset_ms < -step_ms { return; } // before first window
-                                let idx = if offset_ms <= 0 { 0 } else { (offset_ms + step_ms - 1) / step_ms };
-                                let eval_ms = start_ms + idx * step_ms;
-                                if eval_ms > until { return; } // past end
-                                let eval_sec = eval_ms / 1000;
-                                bucket.format_label(eval_sec, tz)
-                            } else {
-                                String::new()
-                            };
+                        let bucket_key = if let Some(ref bucket) = parsed.bucket {
+                            // VM query_range compatible bucketing.
+                            // Eval points: start, start+step, start+2*step, ...
+                            // Each point t covers window (t-step, t].
+                            let step_ms = bucket.as_secs() as i64 * 1000;
+                            let start_ms = step_start_sec * 1000;
+                            let offset_ms = ts - start_ms;
+                            if offset_ms < -step_ms { return; } // before first window
+                            let idx = if offset_ms <= 0 { 0 } else { (offset_ms + step_ms - 1) / step_ms };
+                            let eval_ms = start_ms + idx * step_ms;
+                            if eval_ms > until { return; } // past end
+                            let eval_sec = eval_ms / 1000;
+                            bucket.format_label(eval_sec, tz)
+                        } else {
+                            String::new()
+                        };
 
-                            let group_key = build_group_key(&parsed.group_by, model, session, &dict, &event);
-                            let key = if bucket_key.is_empty() && !group_key.is_empty() {
-                                group_key
-                            } else if !bucket_key.is_empty() && group_key.is_empty() {
-                                bucket_key
-                            } else if !bucket_key.is_empty() && !group_key.is_empty() {
-                                format!("{}|{}", bucket_key, group_key)
-                            } else {
-                                "total".to_string()
-                            };
+                        let group_key = build_group_key(&parsed.group_by, model, session, &dict, &event);
+                        let key = if bucket_key.is_empty() && !group_key.is_empty() {
+                            group_key
+                        } else if !bucket_key.is_empty() && group_key.is_empty() {
+                            bucket_key
+                        } else if !bucket_key.is_empty() && !group_key.is_empty() {
+                            format!("{}|{}", bucket_key, group_key)
+                        } else {
+                            "total".to_string()
+                        };
 
-                            let entry = grouped.entry(key).or_default()
-                                .entry(model.clone()).or_insert_with(|| ModelUsageSummary {
-                                    model: model.clone(), ..Default::default()
-                                });
-                            accumulate_event(entry, &event);
-                        }).map_err(|e| e.to_string())?;
-                    } else {
-                        // Rollup-based (faster, no session/group_by needed)
-                        db.for_each_rollup(since, until, |hour_ts, model, rollup| {
-                            if let Some(mf) = model_filter {
-                                if model != mf { return; }
-                            }
-                            let bucket_key = if let Some(ref bucket) = parsed.bucket {
-                                // Pass original UTC timestamp (ms -> s) and let format_label handle tz
-                                bucket.format_label(hour_ts / 1000, tz)
-                            } else {
-                                "total".to_string()
-                            };
-
-                            let entry = grouped.entry(bucket_key).or_default()
-                                .entry(model.clone()).or_insert_with(|| ModelUsageSummary {
-                                    model, ..Default::default()
-                                });
-                            accumulate_rollup(entry, &rollup);
-                        }).map_err(|e| e.to_string())?;
-                    }
+                        let entry = grouped.entry(key).or_default()
+                            .entry(model.clone()).or_insert_with(|| ModelUsageSummary {
+                                model: model.clone(), ..Default::default()
+                            });
+                        accumulate_event(entry, &event);
+                    }).map_err(|e| e.to_string())?;
 
                     if type_filter.is_some() {
                         for models in grouped.values_mut() {
@@ -707,55 +597,7 @@ fn weekday_index(day: Weekday) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::types::{RollupValue, StoredEvent};
-
-    #[test]
-    fn test_report_summary_from_db() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(&dir.path().join("test.fjall")).unwrap();
-
-        let hour1 = 3_600_000i64;
-        let hour2 = 7_200_000i64;
-
-        let r1 = RollupValue { input: 100, output: 50, cache_create: 10, cache_read: 20, count: 5 };
-        let r2 = RollupValue { input: 200, output: 100, cache_create: 20, cache_read: 40, count: 10 };
-
-        let mut batch = db.batch();
-        db.upsert_rollup(&mut batch, hour1, "claude-opus-4-6", &r1);
-        db.upsert_rollup(&mut batch, hour2, "claude-opus-4-6", &r2);
-        batch.commit().unwrap();
-
-        let filter = ReportFilter::default();
-        let result = report_summary_from_db(&db, filter).unwrap();
-
-        assert_eq!(result.len(), 1);
-        let s = &result["claude-opus-4-6"];
-        assert_eq!(s.input_tokens, 300);
-        assert_eq!(s.output_tokens, 150);
-        assert_eq!(s.event_count, 15);
-    }
-
-    #[test]
-    fn test_report_grouped_from_db() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(&dir.path().join("test.fjall")).unwrap();
-
-        // Two different days
-        let day1 = 1709251200000i64; // 2024-03-01 00:00:00 UTC
-        let day2 = 1709337600000i64; // 2024-03-02 00:00:00 UTC
-
-        let r1 = RollupValue { input: 100, output: 50, cache_create: 0, cache_read: 0, count: 5 };
-        let r2 = RollupValue { input: 200, output: 100, cache_create: 0, cache_read: 0, count: 10 };
-
-        let mut batch = db.batch();
-        db.upsert_rollup(&mut batch, day1, "claude-opus-4-6", &r1);
-        db.upsert_rollup(&mut batch, day2, "claude-opus-4-6", &r2);
-        batch.commit().unwrap();
-
-        let filter = ReportFilter::default();
-        let result = report_grouped_from_db(&db, ReportGroupBy::Date, filter, None, None).unwrap();
-        assert_eq!(result.len(), 2);
-    }
+    use crate::common::types::StoredEvent;
 
     #[test]
     fn test_report_by_session_from_db() {
