@@ -236,7 +236,8 @@ impl DbWriter {
                 cache_read_input_tokens: event.tokens.cache_read_input_tokens,
             };
 
-            // Dedup insert: delete previous event with same msg_id
+            // Dedup insert: delete previous event with same msg_id.
+            // Server-side EventStore handles dedup via upsert, so no corrections needed.
             self.db.insert_event_dedup(&mut batch, event.ts_ms, &event.message_id, &stored);
 
             // Session index

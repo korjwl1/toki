@@ -104,7 +104,6 @@ pub fn start_sync_thread(
         .name(format!("toki-sync-{provider}"))
         .spawn(move || {
             loop {
-                // Check if we should stop before (re)starting
                 if stop_rx.try_recv().is_ok() {
                     return;
                 }
@@ -352,7 +351,6 @@ fn run_sync_inner(
         // that arrived during the sync cycle.
         {
             let mut sync_error = false;
-            let mut total_synced_this_cycle = 0usize;
             loop {
                 // Check stop/disable between batches
                 if stop_rx.try_recv().is_ok() { return; }
@@ -365,7 +363,6 @@ fn run_sync_inner(
                 match sync_new_events(c, db, &mut dict_cache, &config.provider, &mut sw) {
                     Ok(synced) => {
                         if synced > 0 {
-                            total_synced_this_cycle += synced;
                             eprintln!("[toki:sync] synced {synced} events");
                             sw.set("sync_last_success", &now_epoch().to_string());
                         } else {
@@ -572,11 +569,6 @@ fn sync_new_events(
 
             SyncItem {
                 ts_ms: *ts_ms,
-                // Use bare msg_id (without timestamp suffix) for VM dedup.
-                // If a streaming snapshot (8) was synced before the final value (246),
-                // both land in the same VM series → sum_over_time sums both.
-                // But with msg_id dedup locally, only the final value gets synced
-                // in steady state. The bare msg_id prevents series explosion.
                 message_id: crate::db::Database::bare_msg_id(msg_id).to_string(),
                 event: toki_sync_protocol::StoredEvent {
                     model_id: event.model_id,
@@ -591,6 +583,7 @@ fn sync_new_events(
                     ],
                 },
                 usage_total,
+                ..Default::default()
             }
         }).collect();
 

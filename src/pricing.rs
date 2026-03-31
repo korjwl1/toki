@@ -191,10 +191,19 @@ pub fn fetch_pricing(cache_path: &Path) -> PricingTable {
 
     // Invalidate cache if parser version changed (e.g., added new provider support)
     let cache_valid = cached.as_ref().map_or(false, |c| c.version == PRICING_CACHE_VERSION);
-    let cached_etag = if cache_valid {
+
+    // Also invalidate etag if cache file is older than 24 hours.
+    // LiteLLM's CDN sometimes returns the same etag even when prices change,
+    // so we force a full fetch periodically to pick up updates.
+    let cache_age_ok = cache_path.metadata()
+        .and_then(|m| m.modified())
+        .map(|t| t.elapsed().map_or(false, |age| age.as_secs() < 86400))
+        .unwrap_or(false);
+
+    let cached_etag = if cache_valid && cache_age_ok {
         cached.as_ref().and_then(|c| c.etag.clone())
     } else {
-        None // Force full fetch
+        None // Force full fetch (version mismatch or stale cache)
     };
 
     // Note: ureq's into_string() enforces a 10 MB default response size limit,
