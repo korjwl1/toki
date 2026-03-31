@@ -624,6 +624,12 @@ fn sync_new_events(
         }
     }
 
+    // Always record cursor position (even if 0 events synced)
+    // so status display shows all providers
+    if total_synced == 0 && server_last_ts > 0 {
+        sw.set(&cursor_key, &server_last_ts.to_string());
+    }
+
     Ok(total_synced)
 }
 
