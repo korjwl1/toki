@@ -353,8 +353,28 @@ pub fn execute_parsed_query(
 
             match (&parsed.bucket, parsed.group_by.is_empty()) {
                 (None, true) => {
-                    // Flat summary
-                    let mut summaries = report_summary_from_db(db, filter).map_err(|e| e.to_string())?;
+                    // Flat summary.
+                    // Use events keyspace when a time range is specified (precise range).
+                    // Use rollup when no range (full history — faster).
+                    let has_range = since_ms > 0 || until_ms < i64::MAX;
+                    let mut summaries = if has_range {
+                        let dict = db.load_dict_reverse().map_err(|e| e.to_string())?;
+                        let unknown = String::new();
+                        let mut sums: SummaryMap = HashMap::new();
+                        db.for_each_event(since_ms, until_ms, |_ts, event| {
+                            let model = dict.get(&event.model_id).unwrap_or(&unknown);
+                            if let Some(mf) = model_filter {
+                                if model != mf { return; }
+                            }
+                            let entry = sums.entry(model.clone()).or_insert_with(|| ModelUsageSummary {
+                                model: model.clone(), ..Default::default()
+                            });
+                            accumulate_event(entry, &event);
+                        }).map_err(|e| e.to_string())?;
+                        sums
+                    } else {
+                        report_summary_from_db(db, filter).map_err(|e| e.to_string())?
+                    };
                     if let Some(model) = model_filter {
                         summaries.retain(|k, _| k == model);
                     }
