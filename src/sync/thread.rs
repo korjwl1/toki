@@ -559,7 +559,12 @@ fn sync_new_events(
 
             SyncItem {
                 ts_ms: *ts_ms,
-                message_id: msg_id.clone(),
+                // Use bare msg_id (without timestamp suffix) for VM dedup.
+                // If a streaming snapshot (8) was synced before the final value (246),
+                // both land in the same VM series → sum_over_time sums both.
+                // But with msg_id dedup locally, only the final value gets synced
+                // in steady state. The bare msg_id prevents series explosion.
+                message_id: crate::db::Database::bare_msg_id(msg_id).to_string(),
                 event: toki_sync_protocol::StoredEvent {
                     model_id: event.model_id,
                     session_id: event.session_id,
