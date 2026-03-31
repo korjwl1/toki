@@ -276,19 +276,13 @@ impl DbWriter {
     }
 
     /// Buffer a chunk of cold start events. Flushes to DB when buffer reaches BULK_BATCH_SIZE.
+    ///
+    /// Rollup accumulation is deferred until flush time. This avoids double-counting
+    /// when the same event_key appears multiple times in JSONL (e.g. streaming progress
+    /// updates followed by the final result — same msg_id:timestamp).
+    /// Events keyspace uses insert (last write wins for same key), so only the final
+    /// value survives. Rollups must match: we deduplicate by event_key before accumulating.
     fn bulk_write_chunk(&mut self, mut events: Vec<ColdStartEvent>) {
-        // Accumulate rollups in memory (no DB reads).
-        // Note: model.clone() is acceptable here — this only runs during cold start (one-time).
-        for event in &events {
-            let hour_ts = event.ts_ms - (event.ts_ms % 3_600_000);
-            let rollup = self.bulk_rollups.entry((hour_ts, event.model.clone())).or_default();
-            rollup.input += event.tokens.input_tokens;
-            rollup.output += event.tokens.output_tokens;
-            rollup.cache_create += event.tokens.cache_creation_input_tokens;
-            rollup.cache_read += event.tokens.cache_read_input_tokens;
-            rollup.count += 1;
-        }
-
         // Buffer events, flush when large enough
         self.bulk_pending.append(&mut events);
         if self.bulk_pending.len() >= 1024 {
@@ -303,6 +297,7 @@ impl DbWriter {
         }
 
         let events = std::mem::take(&mut self.bulk_pending);
+
         let mut batch = self.db.batch();
         for event in &events {
             let model_id = self.resolve_dict_id(&mut batch, &event.model);
@@ -337,29 +332,56 @@ impl DbWriter {
         }
     }
 
-    /// Flush remaining bulk events + accumulated rollups, then signal completion.
+    /// Flush remaining bulk events + build rollups from events keyspace.
+    ///
+    /// Events keyspace uses insert (last-write-wins for same key), so duplicate
+    /// event_keys (e.g. streaming progress + final result in JSONL) are naturally
+    /// deduplicated. We build rollups by scanning events keyspace after all inserts,
+    /// guaranteeing rollup counts match event counts exactly.
     fn flush_bulk_rollups(&mut self) {
         let t = Instant::now();
 
         // Flush remaining buffered events
         self.flush_bulk_events();
 
-        // Write rollups in a single batch
-        if !self.bulk_rollups.is_empty() {
-            let count = self.bulk_rollups.len();
+        // Build rollups from events keyspace (source of truth after dedup)
+        let dict = match self.db.load_dict_reverse() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("[toki:writer] dict load error: {}", e);
+                return;
+            }
+        };
+        let unknown = String::new();
+        let mut rollups: std::collections::HashMap<(i64, String), RollupValue> = std::collections::HashMap::new();
+
+        let _ = self.db.for_each_event(0, i64::MAX, |ts, event| {
+            let model = dict.get(&event.model_id).unwrap_or(&unknown).clone();
+            let hour_ts = ts - (ts % 3_600_000);
+            let rollup = rollups.entry((hour_ts, model)).or_default();
+            rollup.input += event.input_tokens;
+            rollup.output += event.output_tokens;
+            rollup.cache_create += event.cache_creation_input_tokens;
+            rollup.cache_read += event.cache_read_input_tokens;
+            rollup.count += 1;
+        });
+
+        if !rollups.is_empty() {
+            let count = rollups.len();
             let mut batch = self.db.batch();
-            for ((hour_ts, model), rollup) in &self.bulk_rollups {
-                self.db.upsert_rollup(&mut batch, *hour_ts, model, rollup);
+            for ((hour_ts, model), rollup) in &rollups {
+                self.db.upsert_rollup(&mut batch, hour_ts.clone(), model, rollup);
             }
             if let Err(e) = batch.commit() {
                 eprintln!("[toki:writer] bulk rollup commit error: {}", e);
             }
-            self.bulk_rollups.clear();
 
             if crate::engine::debug_level() >= 1 {
                 eprintln!("[toki:writer] bulk flush complete: {} rollups in {}µs", count, t.elapsed().as_micros());
             }
         }
+
+        self.bulk_rollups.clear();
     }
 
     /// Resolve a string to a dict ID, inserting if new.
