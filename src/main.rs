@@ -461,8 +461,8 @@ fn main() {
             let output_format = resolve_output_format(&config);
             let sink = toki::sink::create_sinks(&["print".to_string()], output_format);
 
-            let pricing = if config.no_cost {
-                None
+            let pricing = if remote || config.no_cost {
+                None  // Remote: server handles pricing. no_cost: skip entirely.
             } else {
                 let p = toki::pricing::fetch_pricing(&toki::pricing::default_cache_path());
                 if p.is_empty() { None } else { Some(p) }
