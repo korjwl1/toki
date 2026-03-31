@@ -199,8 +199,24 @@ impl DbWriter {
         }
 
         let t = Instant::now();
-        // Drain events to avoid borrow conflicts
-        let events: Vec<PendingEvent> = self.pending_events.drain(..).collect();
+        let mut events: Vec<PendingEvent> = self.pending_events.drain(..).collect();
+
+        // In-memory dedup: same msg_id → keep last occurrence only.
+        // This handles the case where multiple streaming snapshots for the same
+        // message arrive in a single file-watcher batch.
+        {
+            let mut last_idx: HashMap<&str, usize> = HashMap::new();
+            for (i, event) in events.iter().enumerate() {
+                let bare = crate::db::Database::bare_msg_id(&event.message_id);
+                last_idx.insert(bare, i);
+            }
+            if last_idx.len() < events.len() {
+                let keep: std::collections::HashSet<usize> = last_idx.values().copied().collect();
+                let mut i = 0;
+                events.retain(|_| { let k = keep.contains(&i); i += 1; k });
+            }
+        }
+
         let count = events.len();
 
         // Build batch transaction with dedup: same msg_id replaces previous event.

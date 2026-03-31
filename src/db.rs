@@ -47,6 +47,8 @@ impl Database {
                         drop(meta);
                         drop(db);
                         std::fs::remove_dir_all(path).ok();
+                        // Also clear sync state so server data gets re-synced
+                        let _ = crate::config::clear_sync_state();
                     }
                 }
             }
@@ -170,7 +172,7 @@ impl Database {
     }
 
     /// Extract bare msg_id from event_key "msg_XXX:timestamp" → "msg_XXX".
-    fn bare_msg_id(message_id: &str) -> &str {
+    pub fn bare_msg_id(message_id: &str) -> &str {
         message_id.split(':').next().unwrap_or(message_id)
     }
 
