@@ -443,20 +443,33 @@ impl SyncStateWriter {
         let dir = std::path::Path::new("/tmp/toki");
         let _ = std::fs::create_dir_all(dir);
         let path = dir.join("sync_state.json");
-        let state: HashMap<String, String> = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<HashMap<String, serde_json::Value>>(&s).ok())
-            .map(|m| m.into_iter().filter_map(|(k, v)| v.as_str().map(|s| (k, s.to_string()))).collect())
-            .unwrap_or_default();
         let file = std::fs::OpenOptions::new()
-            .create(true).write(true).truncate(false)
+            .create(true).write(true).read(true)
             .open(&path).ok();
-        Self { file, state }
+        Self { file, state: HashMap::new() }
     }
 
     fn set(&mut self, key: &str, value: &str) {
+        // Read-modify-write: reload from disk to merge with other threads' writes
+        self.reload();
         self.state.insert(key.to_string(), value.to_string());
         self.flush();
+    }
+
+    fn reload(&mut self) {
+        let Some(ref mut f) = self.file else { return };
+        use std::io::{Read, Seek};
+        let _ = f.seek(std::io::SeekFrom::Start(0));
+        let mut buf = String::new();
+        if f.read_to_string(&mut buf).is_ok() {
+            if let Ok(disk) = serde_json::from_str::<HashMap<String, serde_json::Value>>(&buf) {
+                for (k, v) in disk {
+                    if let Some(s) = v.as_str() {
+                        self.state.entry(k).or_insert_with(|| s.to_string());
+                    }
+                }
+            }
+        }
     }
 
     fn flush(&mut self) {
