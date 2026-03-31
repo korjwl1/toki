@@ -126,11 +126,12 @@ fn apply_aggregation_flat(summaries: &mut SummaryMap, func: AggregationFunc) {
 
 /// Collapse model dimension within each group of a GroupedSummaryMap.
 fn apply_aggregation_grouped(grouped: &mut GroupedSummaryMap, func: AggregationFunc, group_by: &[String]) {
-    // If group_by includes "model", models are already separated by the grouping key.
-    // Aggregation should apply within each model, not collapse models into "(total)".
-    let model_in_group_by = group_by.iter().any(|g| g == "model");
+    // When group_by is specified, the grouping key already encodes the requested
+    // dimension (model, project, session, etc.). The "models" map within each group
+    // should not be collapsed — each entry is already the sum for that dimension.
+    let has_group_by = !group_by.is_empty();
 
-    if model_in_group_by {
+    if has_group_by {
         // Models are already the grouping dimension — just apply func per model.
         // For Sum this is a no-op (each model entry is already the sum for that model).
         // For Avg/Count, apply per model.
