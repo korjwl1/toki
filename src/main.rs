@@ -1360,28 +1360,58 @@ fn send_remote_query(
             .unwrap_or_else(|_| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64)
     });
 
-    // Calculate a reasonable step: we want at most ~1000 data points.
-    // For summary queries the last value matters most, so use a large step.
+    // Step = full range so VM returns one eval point covering the whole window.
+    // For summary (non-chart) queries this gives a single aggregated result.
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
     let s = start_epoch.unwrap_or(now - 86400 * 365);
     let e = end_epoch.unwrap_or(now);
     let range = (e - s).max(1);
-    let step = (range / 1000).max(60); // at least 60s step
+    let step = range; // single eval point
 
     let start_str = start_epoch.map(|v| v.to_string());
     let end_str = end_epoch.map(|v| v.to_string());
     let step_str = step.to_string();
 
-    // Build query params
-    let url = format!("{}/api/v1/query_range", creds.http_url);
+    // Replace $__interval and bracketed ranges [Xs/m/h/d/w/y] with actual time range.
+    // For summary queries, the lookback window must match the query range.
+    let range_str = format!("{}s", range);
+    let effective_query = {
+        let q = query.replace("$__interval", &range_str);
+        // Simple bracket replacement: find [...] that contains a duration
+        let mut result = String::with_capacity(q.len());
+        let mut chars = q.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '[' {
+                let mut bracket_content = String::new();
+                while let Some(&nc) = chars.peek() {
+                    if nc == ']' { chars.next(); break; }
+                    bracket_content.push(chars.next().unwrap());
+                }
+                // Check if bracket content looks like a duration (digits + s/m/h/d/w/y)
+                let is_duration = !bracket_content.is_empty()
+                    && bracket_content.chars().last().map_or(false, |c| "smhdwy".contains(c))
+                    && bracket_content[..bracket_content.len()-1].chars().all(|c| c.is_ascii_digit());
+                if is_duration {
+                    result.push_str(&format!("[{}]", range_str));
+                } else {
+                    result.push_str(&format!("[{}]", bracket_content));
+                }
+            } else {
+                result.push(c);
+            }
+        }
+        result
+    };
+
+    // Use instant query at `time=end` with range=[range]s for summary.
+    // This gives a single aggregated value covering start→end.
+    let url = format!("{}/api/v1/query", creds.http_url);
 
     let do_request = |token: &str| -> Result<ureq::Response, ureq::Error> {
         let mut req = ureq::get(&url)
             .set("Authorization", &format!("Bearer {}", token));
-        req = req.query("query", query);
-        if let Some(ref s) = start_str { req = req.query("start", s); }
-        if let Some(ref e) = end_str { req = req.query("end", e); }
-        req = req.query("step", &step_str);
+        req = req.query("query", &effective_query);
+        req = req.query("time", &e.to_string());
         req.call()
     };
 
@@ -1463,6 +1493,7 @@ fn prometheus_response_to_toki_data(body: &serde_json::Value) -> serde_json::Val
         let metric = &series["metric"];
         let model = metric["model"].as_str().unwrap_or("(total)").to_string();
         let type_label = metric["type"].as_str().unwrap_or("");
+        let toki_metric = metric["__toki_metric__"].as_str().unwrap_or("");
 
         // Extract the numeric value: last element of `values` (matrix) or `value` (vector).
         let val: f64 = if result_type == "matrix" {
@@ -1478,7 +1509,6 @@ fn prometheus_response_to_toki_data(body: &serde_json::Value) -> serde_json::Val
                 .unwrap_or(0.0)
         };
 
-        let count = val.round() as u64;
         let entry = model_map.entry(model.clone()).or_insert_with(|| toki::ModelUsageSummary {
             model,
             input_tokens: 0,
@@ -1489,18 +1519,23 @@ fn prometheus_response_to_toki_data(body: &serde_json::Value) -> serde_json::Val
             cost_usd: None,
         });
 
+        // Server-computed cost: use the last eval point value (covers the full window)
+        if toki_metric == "cost" {
+            *entry.cost_usd.get_or_insert(0.0) += val; // val is already the last point
+            continue;
+        }
+
+        let count = val.round() as u64;
         match type_label {
             "input" => entry.input_tokens = entry.input_tokens.saturating_add(count),
             "output" => entry.output_tokens = entry.output_tokens.saturating_add(count),
             "cache_create" => entry.cache_creation_input_tokens = entry.cache_creation_input_tokens.saturating_add(count),
             "cache_read" => entry.cache_read_input_tokens = entry.cache_read_input_tokens.saturating_add(count),
             "" => {
-                // No type label — this is a pre-aggregated total (e.g. sum by (model)).
-                // Put it into input_tokens as "total" since we can't break it down.
+                // No type label — pre-aggregated total (usage via toki_usage_total).
                 entry.input_tokens = entry.input_tokens.saturating_add(count);
             }
             other => {
-                // Unknown type label — accumulate into input_tokens as best effort.
                 eprintln!("[toki] Warning: unknown token type label '{}', counted as input", other);
                 entry.input_tokens = entry.input_tokens.saturating_add(count);
             }
