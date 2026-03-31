@@ -292,6 +292,7 @@ pub fn execute_parsed_query(
             sink.emit_events_batch(&events, pricing, None);
         }
         Metric::Cost | Metric::Events | Metric::Usage => {
+            let is_events_metric = parsed.metric == Metric::Events;
             let since_dt = if since_ms > 0 {
                 chrono::DateTime::from_timestamp_millis(since_ms).map(|d| d.naive_utc())
             } else {
@@ -324,7 +325,11 @@ pub fn execute_parsed_query(
                             let entry = sums.entry(model.clone()).or_insert_with(|| ModelUsageSummary {
                                 model: model.clone(), ..Default::default()
                             });
-                            accumulate_event(entry, &event);
+                            if is_events_metric {
+                                entry.event_count += 1;
+                            } else {
+                                accumulate_event(entry, &event);
+                            }
                         }).map_err(|e| e.to_string())?;
                         sums
                     };
@@ -392,7 +397,11 @@ pub fn execute_parsed_query(
                             .entry(model.clone()).or_insert_with(|| ModelUsageSummary {
                                 model: model.clone(), ..Default::default()
                             });
-                        accumulate_event(entry, &event);
+                        if is_events_metric {
+                            entry.event_count += 1;
+                        } else {
+                            accumulate_event(entry, &event);
+                        }
                     }).map_err(|e| e.to_string())?;
 
                     if type_filter.is_some() {
