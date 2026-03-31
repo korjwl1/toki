@@ -1348,70 +1348,17 @@ fn send_remote_query(
     let creds = toki::sync::credentials::load()
         .ok_or_else(|| "Not configured for remote query. Run: toki settings sync enable --server <host>".to_string())?;
 
-    // Convert CLI date strings (e.g. "20230101") to epoch seconds for Prometheus API.
-    let start_epoch = start.map(|s| {
-        toki::query::parse_range_time(s, false, None)
-            .map(|dt| dt.and_utc().timestamp())
-            .unwrap_or(0)
-    });
-    let end_epoch = end.map(|e| {
-        toki::query::parse_range_time(e, true, None)
-            .map(|dt| dt.and_utc().timestamp())
-            .unwrap_or_else(|_| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64)
-    });
-
-    // Step = full range so VM returns one eval point covering the whole window.
-    // For summary (non-chart) queries this gives a single aggregated result.
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
-    let s = start_epoch.unwrap_or(now - 86400 * 365);
-    let e = end_epoch.unwrap_or(now);
-    let range = (e - s).max(1);
-    let step = range; // single eval point
-
-    let start_str = start_epoch.map(|v| v.to_string());
-    let end_str = end_epoch.map(|v| v.to_string());
-    let step_str = step.to_string();
-
-    // Replace $__interval and bracketed ranges [Xs/m/h/d/w/y] with actual time range.
-    // For summary queries, the lookback window must match the query range.
-    let range_str = format!("{}s", range);
-    let effective_query = {
-        let q = query.replace("$__interval", &range_str);
-        // Simple bracket replacement: find [...] that contains a duration
-        let mut result = String::with_capacity(q.len());
-        let mut chars = q.chars().peekable();
-        while let Some(c) = chars.next() {
-            if c == '[' {
-                let mut bracket_content = String::new();
-                while let Some(&nc) = chars.peek() {
-                    if nc == ']' { chars.next(); break; }
-                    bracket_content.push(chars.next().unwrap());
-                }
-                // Check if bracket content looks like a duration (digits + s/m/h/d/w/y)
-                let is_duration = !bracket_content.is_empty()
-                    && bracket_content.chars().last().map_or(false, |c| "smhdwy".contains(c))
-                    && bracket_content[..bracket_content.len()-1].chars().all(|c| c.is_ascii_digit());
-                if is_duration {
-                    result.push_str(&format!("[{}]", range_str));
-                } else {
-                    result.push_str(&format!("[{}]", bracket_content));
-                }
-            } else {
-                result.push(c);
-            }
-        }
-        result
-    };
-
-    // Use instant query at `time=end` with range=[range]s for summary.
-    // This gives a single aggregated value covering start→end.
-    let url = format!("{}/api/v1/query", creds.http_url);
+    // Send query as-is to server's toki query endpoint.
+    // Server handles PromQL translation, time range, and pricing — same as local daemon.
+    // start/end are separate params (not embedded in query), matching daemon REPORT protocol.
+    let url = format!("{}/api/v1/toki/query", creds.http_url);
 
     let do_request = |token: &str| -> Result<ureq::Response, ureq::Error> {
         let mut req = ureq::get(&url)
             .set("Authorization", &format!("Bearer {}", token));
-        req = req.query("query", &effective_query);
-        req = req.query("time", &e.to_string());
+        req = req.query("query", query);
+        if let Some(s) = start { req = req.query("start", s); }
+        if let Some(e) = end { req = req.query("end", e); }
         req.call()
     };
 
