@@ -203,25 +203,10 @@ impl DbWriter {
         let events: Vec<PendingEvent> = self.pending_events.drain(..).collect();
         let count = events.len();
 
-        // First pass: resolve rollups (need to read current values before batch)
-        let mut rollup_updates: HashMap<(i64, &str), RollupValue> = HashMap::new();
-        for event in &events {
-            let hour_ts = event.ts_ms - (event.ts_ms % 3_600_000);
-            let key = (hour_ts, event.model.as_str());
-            let rollup = rollup_updates.entry(key).or_insert_with(|| {
-                self.db.get_rollup(hour_ts, &event.model).ok().flatten().unwrap_or_default()
-            });
-            rollup.input += event.tokens.input_tokens;
-            rollup.output += event.tokens.output_tokens;
-            rollup.cache_create += event.tokens.cache_creation_input_tokens;
-            rollup.cache_read += event.tokens.cache_read_input_tokens;
-            rollup.count += 1;
-        }
-
-        // Build batch transaction
+        // Build batch transaction with dedup: same msg_id replaces previous event.
         let mut batch = self.db.batch();
+        let mut rollup_updates: HashMap<(i64, &str), RollupValue> = HashMap::new();
 
-        // Resolve dict IDs and insert new entries
         for event in &events {
             let model_id = self.resolve_dict_id(&mut batch, &event.model);
             let session_id = self.resolve_dict_id(&mut batch, &event.session_id);
@@ -242,7 +227,44 @@ impl DbWriter {
                 cache_read_input_tokens: event.tokens.cache_read_input_tokens,
             };
 
-            self.db.insert_event_batch(&mut batch, event.ts_ms, &event.message_id, &stored);
+            // Dedup insert: delete previous event with same msg_id, get old tokens
+            let prev = self.db.insert_event_dedup(&mut batch, event.ts_ms, &event.message_id, &stored);
+
+            // Rollup: add new tokens, subtract old if replaced
+            let hour_ts = event.ts_ms - (event.ts_ms % 3_600_000);
+            let key = (hour_ts, event.model.as_str());
+            let rollup = rollup_updates.entry(key).or_insert_with(|| {
+                self.db.get_rollup(hour_ts, &event.model).ok().flatten().unwrap_or_default()
+            });
+            rollup.input += event.tokens.input_tokens;
+            rollup.output += event.tokens.output_tokens;
+            rollup.cache_create += event.tokens.cache_creation_input_tokens;
+            rollup.cache_read += event.tokens.cache_read_input_tokens;
+            rollup.count += 1;
+
+            // Subtract previous event's tokens if it was in the same hour bucket
+            if let Some((prev_ts, prev_event)) = prev {
+                let prev_hour = prev_ts - (prev_ts % 3_600_000);
+                if prev_hour == hour_ts {
+                    // Same hour bucket — subtract from this rollup
+                    rollup.input = rollup.input.saturating_sub(prev_event.input_tokens);
+                    rollup.output = rollup.output.saturating_sub(prev_event.output_tokens);
+                    rollup.cache_create = rollup.cache_create.saturating_sub(prev_event.cache_creation_input_tokens);
+                    rollup.cache_read = rollup.cache_read.saturating_sub(prev_event.cache_read_input_tokens);
+                    rollup.count = rollup.count.saturating_sub(1);
+                } else {
+                    // Different hour bucket — need to fix that rollup too
+                    let prev_key = (prev_hour, event.model.as_str());
+                    let prev_rollup = rollup_updates.entry(prev_key).or_insert_with(|| {
+                        self.db.get_rollup(prev_hour, &event.model).ok().flatten().unwrap_or_default()
+                    });
+                    prev_rollup.input = prev_rollup.input.saturating_sub(prev_event.input_tokens);
+                    prev_rollup.output = prev_rollup.output.saturating_sub(prev_event.output_tokens);
+                    prev_rollup.cache_create = prev_rollup.cache_create.saturating_sub(prev_event.cache_creation_input_tokens);
+                    prev_rollup.cache_read = prev_rollup.cache_read.saturating_sub(prev_event.cache_read_input_tokens);
+                    prev_rollup.count = prev_rollup.count.saturating_sub(1);
+                }
+            }
 
             // Session index
             self.db.insert_session_index(&mut batch, &event.session_id, event.ts_ms, &event.message_id);
@@ -319,7 +341,9 @@ impl DbWriter {
                 cache_read_input_tokens: event.tokens.cache_read_input_tokens,
             };
 
-            self.db.insert_event_batch(&mut batch, event.ts_ms, &event.message_id, &stored);
+            // Use dedup insert: engine already deduped by msg_id, but idx_msg
+            // still needs to be populated for watch-mode dedup after cold start.
+            self.db.insert_event_dedup(&mut batch, event.ts_ms, &event.message_id, &stored);
             self.db.insert_session_index(&mut batch, &event.session_id, event.ts_ms, &event.message_id);
 
             if let Some(ref project) = event.project_name {
