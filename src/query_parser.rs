@@ -91,29 +91,24 @@ impl Bucket {
     pub fn format_label(&self, epoch_secs: i64, tz: Option<chrono_tz::Tz>) -> String {
         let bucket_secs = self.0 as i64;
 
-        if bucket_secs >= 86400 {
+        // Always output ISO timestamp (internal format).
+        // Display layer converts to date-only or local TZ as needed.
+        let floored = if bucket_secs >= 86400 {
             if let Some(tz) = tz {
-                // Day+ buckets: floor in local timezone
                 let dt = chrono::DateTime::from_timestamp(epoch_secs, 0)
                     .unwrap_or_default()
                     .with_timezone(&tz);
                 let local_date = dt.date_naive();
-                format!("{}", local_date.format("%Y-%m-%d"))
+                let midnight = local_date.and_hms_opt(0, 0, 0).unwrap();
+                midnight.and_utc().timestamp()
             } else {
-                let floored = (epoch_secs / bucket_secs) * bucket_secs;
-                let dt = chrono::DateTime::from_timestamp(floored, 0).unwrap_or_default();
-                dt.naive_utc().format("%Y-%m-%d").to_string()
+                (epoch_secs / bucket_secs) * bucket_secs
             }
         } else {
-            // Sub-day buckets: floor in UTC, then convert
-            let floored = (epoch_secs / bucket_secs) * bucket_secs;
-            let dt = chrono::DateTime::from_timestamp(floored, 0).unwrap_or_default();
-            let naive = match tz {
-                Some(tz) => dt.with_timezone(&tz).naive_local(),
-                None => dt.naive_utc(),
-            };
-            naive.format("%Y-%m-%dT%H:%M:%S").to_string()
-        }
+            (epoch_secs / bucket_secs) * bucket_secs
+        };
+        let dt = chrono::DateTime::from_timestamp(floored, 0).unwrap_or_default();
+        dt.naive_utc().format("%Y-%m-%dT%H:%M:%S").to_string()
     }
 }
 
