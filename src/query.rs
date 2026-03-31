@@ -384,6 +384,14 @@ pub fn execute_parsed_query(
                         };
 
                         let group_key = build_group_key(&parsed.group_by, model, session, &dict, &event);
+
+                        // Determine inner key before group_key is moved into the period key.
+                        let inner_key = if !group_key.is_empty() && !parsed.group_by.iter().any(|g| g == "model") {
+                            group_key.clone()
+                        } else {
+                            model.clone()
+                        };
+
                         let key = if bucket_key.is_empty() && !group_key.is_empty() {
                             group_key
                         } else if !bucket_key.is_empty() && group_key.is_empty() {
@@ -393,10 +401,9 @@ pub fn execute_parsed_query(
                         } else {
                             "total".to_string()
                         };
-
                         let entry = grouped.entry(key).or_default()
-                            .entry(model.clone()).or_insert_with(|| ModelUsageSummary {
-                                model: model.clone(), ..Default::default()
+                            .entry(inner_key.clone()).or_insert_with(|| ModelUsageSummary {
+                                model: inner_key, ..Default::default()
                             });
                         if is_events_metric {
                             entry.event_count += 1;
