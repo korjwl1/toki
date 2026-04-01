@@ -1729,7 +1729,9 @@ fn handle_sync_enable(
     }
 
     let is_localhost = server == "localhost" || server == "127.0.0.1" || server == "::1";
-    let use_tls = !no_tls && !is_localhost;
+    // If --insecure is explicitly set, user wants TLS (just without cert verification).
+    // Only auto-disable TLS for localhost when neither --insecure nor explicit TLS is requested.
+    let use_tls = !no_tls && (insecure || !is_localhost);
 
     // Derive addresses from server hostname
     let server_addr = format!("{}:{}", server, sync_port);
@@ -1745,9 +1747,21 @@ fn handle_sync_enable(
         format!("http://{}:{}", server, port)
     };
 
+    // Build HTTP agent (with TLS cert verification skip if --insecure)
+    let http_agent = if insecure {
+        let tls = native_tls::TlsConnector::builder()
+            .danger_accept_invalid_certs(true)
+            .danger_accept_invalid_hostnames(true)
+            .build()
+            .expect("TLS connector");
+        ureq::AgentBuilder::new().tls_connector(std::sync::Arc::new(tls)).build()
+    } else {
+        ureq::Agent::new()
+    };
+
     // Step 1: POST /device/code to initiate device authorization
     let device_code_url = format!("{}/device/code", http_base);
-    let dc_resp = match ureq::post(&device_code_url).call() {
+    let dc_resp = match http_agent.post(&device_code_url).call() {
         Err(e) => {
             eprintln!("[toki] Cannot reach sync server at {}: {}", http_base, e);
             std::process::exit(1);
@@ -1811,7 +1825,7 @@ fn handle_sync_enable(
 
         std::thread::sleep(std::time::Duration::from_secs(poll_interval));
 
-        let resp = match ureq::post(&device_token_url)
+        let resp = match http_agent.post(&device_token_url)
             .send_json(serde_json::json!({
                 "device_code": device_code,
                 "device_key": device_key_for_poll,

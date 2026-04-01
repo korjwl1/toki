@@ -23,6 +23,8 @@
 
 > **GUI가 필요하신가요?** [Toki Monitor](https://github.com/korjwl1/toki-monitor)는 실시간 대시보드, 토큰 속도에 반응하는 토끼 애니메이션, 이상 감지 알림을 제공하는 macOS 메뉴바 앱입니다. toki 데몬 위에서 동작합니다.
 
+> **멀티 디바이스 동기화?** [Toki Sync Server](https://github.com/korjwl1/toki-sync)로 여러 기기의 토큰 사용량을 통합 관리할 수 있습니다. 셀프 호스팅, `toki settings sync` 명령으로 연동합니다.
+
 ---
 
 ## 목차

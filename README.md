@@ -23,6 +23,8 @@
 
 > **Looking for a GUI?** [Toki Monitor](https://github.com/korjwl1/toki-monitor) is a macOS menu bar app with a real-time dashboard, animated rabbit indicator, and anomaly alerts — built on the toki daemon.
 
+> **Multi-device sync?** [Toki Sync Server](https://github.com/korjwl1/toki-sync) aggregates token usage across all your devices. Self-hosted, works with the built-in `toki settings sync` commands.
+
 ---
 
 ## Table of Contents
