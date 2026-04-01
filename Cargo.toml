@@ -41,7 +41,7 @@ uuid = { version = "1", features = ["v4"] }
 urlencoding = "2"
 zstd = "0.13"
 native-tls = "0.2"
-toki-sync-protocol = { git = "https://github.com/korjwl1/toki-sync-protocol.git" }
+toki-sync-protocol = { git = "https://github.com/korjwl1/toki-sync-protocol.git", tag = "v1.0.0" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tikv-jemallocator = "0.6"
