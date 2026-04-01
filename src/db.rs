@@ -21,6 +21,11 @@ pub struct Database {
 
 /// Schema version. Increment when StoredEvent or keyspace layout changes.
 /// Mismatched version triggers automatic DB reset + cold start rebuild.
+///
+/// History:
+/// - v1: initial schema
+/// - v2: added idx_msg keyspace for msg_id dedup (streaming snapshot handling)
+/// - v3: added message_id to event key, changed dedup to bare_msg_id
 pub const SCHEMA_VERSION: u32 = 3;
 
 impl Database {
