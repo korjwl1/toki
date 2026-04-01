@@ -461,6 +461,28 @@ impl Database {
         Ok(deleted)
     }
 
+    /// Clean up old idx_msg entries where the referenced event is older than cutoff_ms.
+    pub fn cleanup_old_idx_msg(&self, cutoff_ms: i64) -> Result<(), fjall::Error> {
+        let mut batch = self.db.batch();
+        let mut count = 0;
+        for guard in self.idx_msg.iter() {
+            let kv = guard.into_inner()?;
+            // Value is the event key: [ts_ms(8 bytes)][msg_id]
+            if kv.1.len() >= 8 {
+                let ts = i64::from_be_bytes(kv.1[..8].try_into().unwrap_or([0; 8]));
+                if ts < cutoff_ms {
+                    batch.remove(&self.idx_msg, kv.0.to_vec());
+                    count += 1;
+                }
+            }
+        }
+        if count > 0 {
+            batch.commit()?;
+            eprintln!("[toki] cleaned up {count} old idx_msg entries");
+        }
+        Ok(())
+    }
+
     /// Create a new batch.
     pub fn batch(&self) -> fjall::OwnedWriteBatch {
         self.db.batch()

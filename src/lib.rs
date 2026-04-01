@@ -242,6 +242,13 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
                 eprintln!("[toki] Cold start error for {}: {}", rt.provider.name(), e);
             }
         }
+
+        // Clean up old dedup index entries (> 24h)
+        let cutoff = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64 - 24 * 3600 * 1000;
+        if let Err(e) = rt.db.cleanup_old_idx_msg(cutoff) {
+            eprintln!("[toki] idx_msg cleanup error for {}: {}", rt.provider.name(), e);
+        }
     }
 
     // Set up file watchers — one per provider to avoid FSEvents stream
