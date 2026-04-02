@@ -70,7 +70,7 @@ impl SyncConfig {
 
 fn gethostname() -> String {
     let mut buf = vec![0u8; 256];
-    let ret = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut i8, buf.len()) };
+    let ret = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
     if ret != 0 {
         return "unknown".to_string();
     }
