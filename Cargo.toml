@@ -1,6 +1,6 @@
 [package]
 name = "toki"
-version = "2.0.0"
+version = "2.0.1"
 edition = "2021"
 description = "AI CLI tool token usage tracker module"
 license = "FSL-1.1-Apache-2.0"
