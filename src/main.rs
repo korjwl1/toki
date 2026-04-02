@@ -675,96 +675,45 @@ fn start_daemon_detached() {
         std::process::exit(1);
     }
 
-    // Truncate log file for fresh start
-    let log_path = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".config/toki/daemon.log");
-
-    if let Some(parent) = log_path.parent() {
-        std::fs::create_dir_all(parent).ok();
-    }
-
-    // Strip macOS quarantine xattr before opening — brew installs can leave
-    // com.apple.provenance on the log file, blocking subsequent opens.
-    #[cfg(target_os = "macos")]
-    {
-        let _ = std::process::Command::new("xattr")
-            .args(["-d", "com.apple.provenance", &log_path.to_string_lossy()])
-            .output();
-    }
-
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&log_path)
-        .or_else(|_| {
-            // If open still fails, delete and recreate.
-            std::fs::remove_file(&log_path).ok();
-            std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .open(&log_path)
-        })
-        .unwrap_or_else(|e| {
-            eprintln!("[toki] Failed to open log file {}: {}", log_path.display(), e);
-            std::process::exit(1);
-        });
-
+    // Daemon output goes to /dev/null. For debugging, use `toki daemon start --foreground`.
     let mut child = std::process::Command::new(&toki_bin)
         .args(["daemon", "start", "--foreground"])
         .stdin(std::process::Stdio::null())
-        .stdout(log_file.try_clone().unwrap_or_else(|_| {
-            std::fs::File::open("/dev/null").unwrap_or_else(|_| {
-                // Last resort: use stderr as stdout
-                unsafe { std::os::unix::io::FromRawFd::from_raw_fd(2) }
-            })
-        }))
-        .stderr(log_file)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap_or_else(|e| {
             eprintln!("[toki] Failed to start daemon: {}", e);
             std::process::exit(1);
         });
 
-    // Wait for daemon to become ready (PID file + Listening) or die
+    // Wait for daemon to become ready (PID file + socket) or die
     let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(30);
+    let sock_path = toki::daemon::default_sock_path();
 
     loop {
         // Check if child already exited (crash)
         if let Ok(Some(status)) = child.try_wait() {
-            let log_tail = std::fs::read_to_string(&log_path)
-                .unwrap_or_default()
-                .lines()
-                .rev()
-                .take(5)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>()
-                .join("\n");
             eprintln!("[toki] Daemon exited immediately ({})", status);
-            if !log_tail.is_empty() {
-                eprintln!("{}", log_tail);
-            }
+            eprintln!("[toki] Run `toki daemon start --foreground` to see detailed output");
             std::process::exit(1);
         }
 
-        // Check if socket is ready (Listening)
-        if let Ok(content) = std::fs::read_to_string(&log_path) {
-            if content.contains("Listening") {
-                let pid = toki::daemon::daemon_status(&pidfile)
-                    .map(|p| p as u32)
-                    .unwrap_or(child.id());
-                eprintln!("[toki] Daemon started (PID {})", pid);
-                return;
-            }
+        // Check if daemon is ready: PID file exists + socket is listening
+        if toki::daemon::daemon_status(&pidfile).is_some()
+            && std::path::Path::new(&sock_path).exists()
+        {
+            let pid = toki::daemon::daemon_status(&pidfile)
+                .map(|p| p as u32)
+                .unwrap_or(child.id());
+            eprintln!("[toki] Daemon started (PID {})", pid);
+            return;
         }
 
         if start.elapsed() > timeout {
             eprintln!("[toki] Daemon did not become ready within 30s");
-            eprintln!("[toki] Check log: {}", log_path.display());
+            eprintln!("[toki] Run `toki daemon start --foreground` to see detailed output");
             return;
         }
 
