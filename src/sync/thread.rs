@@ -428,7 +428,8 @@ fn run_sync_inner(
 }
 
 /// Keeps a file descriptor open for /tmp/toki/sync_state.json.
-/// Single writer (sync thread), so no locking needed.
+/// Multiple sync threads (one per provider) share this file, so
+/// flock is used to serialize read-modify-write operations.
 /// If open fails, all writes silently no-op.
 struct SyncStateWriter {
     file: Option<std::fs::File>,
@@ -447,10 +448,21 @@ impl SyncStateWriter {
     }
 
     fn set(&mut self, key: &str, value: &str) {
-        // Read-modify-write: reload from disk to merge with other threads' writes
+        // Acquire exclusive lock to prevent concurrent read-modify-write
+        // from other provider threads. flock blocks until lock is available.
+        if let Some(ref f) = self.file {
+            use std::os::unix::io::AsRawFd;
+            unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX); }
+        }
+
         self.reload();
         self.state.insert(key.to_string(), value.to_string());
         self.flush();
+
+        if let Some(ref f) = self.file {
+            use std::os::unix::io::AsRawFd;
+            unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN); }
+        }
     }
 
     fn reload(&mut self) {
@@ -460,9 +472,11 @@ impl SyncStateWriter {
         let mut buf = String::new();
         if f.read_to_string(&mut buf).is_ok() {
             if let Ok(disk) = serde_json::from_str::<HashMap<String, serde_json::Value>>(&buf) {
+                // Merge disk values — overwrite in-memory with disk state
+                // so we pick up writes from other provider threads
                 for (k, v) in disk {
                     if let Some(s) = v.as_str() {
-                        self.state.entry(k).or_insert_with(|| s.to_string());
+                        self.state.insert(k, s.to_string());
                     }
                 }
             }
