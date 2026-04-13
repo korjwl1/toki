@@ -6,7 +6,44 @@ use chrono_tz::Tz;
 use crate::common::types::{ModelUsageSummary, RawEvent, GroupedSummaryMap, SummaryMap};
 use crate::db::Database;
 use crate::engine::{ReportFilter, ReportGroupBy};
-use crate::query_parser::{AggregationFunc, Bucket};
+use crate::query_parser::{AggregationFunc, LabelFilter};
+
+/// Token type names corresponding to the 4 token slots.
+/// Slot 0 = input, 1 = output, 2 = cache_create, 3 = cache_read.
+const TOKEN_TYPE_NAMES: &[&str] = &["input", "output", "cache_create", "cache_read"];
+
+/// Check if a token type name matches a LabelFilter (exact or regex via `|` alternation).
+fn type_matches(type_name: &str, filter: &LabelFilter) -> bool {
+    if filter.regex {
+        // Support simple `|`-separated alternation (e.g. "input|output")
+        filter.value.split('|').any(|alt| alt == type_name)
+    } else {
+        filter.value == type_name
+    }
+}
+
+/// Given a type filter, return a 4-element mask [input, output, cache_create, cache_read]
+/// indicating which token slots to include.
+fn type_filter_mask(filter: Option<&LabelFilter>) -> [bool; 4] {
+    match filter {
+        None => [true; 4],
+        Some(f) => {
+            let mut mask = [false; 4];
+            for (i, &name) in TOKEN_TYPE_NAMES.iter().enumerate() {
+                mask[i] = type_matches(name, f);
+            }
+            mask
+        }
+    }
+}
+
+/// Apply a type filter mask to a ModelUsageSummary, zeroing out non-matching token fields.
+fn apply_type_mask(summary: &mut ModelUsageSummary, mask: &[bool; 4]) {
+    if !mask[0] { summary.input_tokens = 0; }
+    if !mask[1] { summary.output_tokens = 0; }
+    if !mask[2] { summary.cache_creation_input_tokens = 0; }
+    if !mask[3] { summary.cache_read_input_tokens = 0; }
+}
 
 /// Resolve (since, until) from filter into ms timestamps.
 fn filter_range(filter: ReportFilter) -> (i64, i64) {
@@ -15,87 +52,13 @@ fn filter_range(filter: ReportFilter) -> (i64, i64) {
     (since, until)
 }
 
-fn accumulate_rollup(entry: &mut ModelUsageSummary, rollup: &crate::common::types::RollupValue) {
-    entry.input_tokens += rollup.input;
-    entry.output_tokens += rollup.output;
-    entry.cache_creation_input_tokens += rollup.cache_create;
-    entry.cache_read_input_tokens += rollup.cache_read;
-    entry.event_count += rollup.count;
-}
-
-/// Report total summary from TSDB rollups (streaming — no intermediate Vec).
-pub fn report_summary_from_db(
-    db: &Database,
-    filter: ReportFilter,
-) -> Result<SummaryMap, fjall::Error> {
-    let (since, until) = filter_range(filter);
-    let mut summaries: SummaryMap = HashMap::new();
-    db.for_each_rollup(since, until, |_ts, model, rollup| {
-        // Avoid cloning model string when the entry already exists
-        if !summaries.contains_key(&model) {
-            summaries.insert(model.clone(), ModelUsageSummary {
-                model: model.clone(), ..Default::default()
-            });
-        }
-        let entry = summaries.get_mut(&model).unwrap();
-        accumulate_rollup(entry, &rollup);
-    })?;
-    Ok(summaries)
-}
-
-/// Report grouped by time bucket from TSDB.
-/// Uses fast rollup scan when no session/project filters are set.
-/// Falls back to event-level scan when filtering by session or project.
-pub fn report_grouped_from_db(
-    db: &Database,
-    group_by: ReportGroupBy,
-    filter: ReportFilter,
-    session_filter: Option<&str>,
-    project_filter: Option<&str>,
-) -> Result<GroupedSummaryMap, fjall::Error> {
-    let (since, until) = filter_range(filter);
-    let mut grouped: GroupedSummaryMap = HashMap::new();
-
-    if session_filter.is_some() || project_filter.is_some() {
-        // Event-level scan for session/project filtering
-        let dict = db.load_dict_reverse()?;
-        let unknown = String::new();
-        db.for_each_event(since, until, |ts, event| {
-            let model = dict.get(&event.model_id).unwrap_or(&unknown);
-            if let Some(sf) = session_filter {
-                let session = dict.get(&event.session_id).unwrap_or(&unknown);
-                if !session.starts_with(sf) { return; }
-            }
-            if let Some(pf) = project_filter {
-                let project = resolve_project(&dict, &event);
-                if !project.contains(pf) { return; }
-            }
-            let dt = ts_to_datetime(ts, filter.tz);
-            let bucket = bucket_from_datetime(dt, group_by);
-            let entry = grouped.entry(bucket).or_default()
-                .entry(model.clone()).or_insert_with(|| ModelUsageSummary {
-                    model: model.clone(), ..Default::default()
-                });
-            entry.input_tokens += event.input_tokens;
-            entry.output_tokens += event.output_tokens;
-            entry.cache_creation_input_tokens += event.cache_creation_input_tokens;
-            entry.cache_read_input_tokens += event.cache_read_input_tokens;
-            entry.event_count += 1;
-        })?;
-    } else {
-        // Fast rollup-based scan
-        db.for_each_rollup(since, until, |hour_ts, model, rollup| {
-            let dt = ts_to_datetime(hour_ts, filter.tz);
-            let bucket = bucket_from_datetime(dt, group_by);
-            let entry = grouped.entry(bucket).or_default()
-                .entry(model.clone()).or_insert_with(|| ModelUsageSummary {
-                    model, ..Default::default()
-                });
-            accumulate_rollup(entry, &rollup);
-        })?;
-    }
-
-    Ok(grouped)
+/// Accumulate a StoredEvent's token counts into a ModelUsageSummary.
+fn accumulate_event(entry: &mut ModelUsageSummary, event: &crate::common::types::StoredEvent) {
+    entry.input_tokens += event.input_tokens;
+    entry.output_tokens += event.output_tokens;
+    entry.cache_creation_input_tokens += event.cache_creation_input_tokens;
+    entry.cache_read_input_tokens += event.cache_read_input_tokens;
+    entry.event_count += 1;
 }
 
 /// Report grouped by session from TSDB events (streaming).
@@ -114,23 +77,9 @@ pub fn report_by_session_from_db(
             .entry(model.clone()).or_insert_with(|| ModelUsageSummary {
                 model: model.clone(), ..Default::default()
             });
-        entry.input_tokens += event.input_tokens;
-        entry.output_tokens += event.output_tokens;
-        entry.cache_creation_input_tokens += event.cache_creation_input_tokens;
-        entry.cache_read_input_tokens += event.cache_read_input_tokens;
-        entry.event_count += 1;
+        accumulate_event(entry, &event);
     })?;
     Ok(grouped)
-}
-
-/// Apply offset to a NaiveDateTime by shifting it backward.
-fn apply_offset(dt: Option<NaiveDateTime>, offset: Option<&Bucket>) -> Option<NaiveDateTime> {
-    match (dt, offset) {
-        (Some(dt), Some(offset)) => {
-            Some(dt - chrono::Duration::seconds(offset.as_secs() as i64))
-        }
-        other => other.0,
-    }
 }
 
 /// Collapse a SummaryMap (model → summary) into a single entry based on aggregation function.
@@ -176,37 +125,81 @@ fn apply_aggregation_flat(summaries: &mut SummaryMap, func: AggregationFunc) {
 }
 
 /// Collapse model dimension within each group of a GroupedSummaryMap.
-fn apply_aggregation_grouped(grouped: &mut GroupedSummaryMap, func: AggregationFunc) {
-    for models in grouped.values_mut() {
-        let mut flat: SummaryMap = std::mem::take(models);
-        apply_aggregation_flat(&mut flat, func);
-        *models = flat;
+fn apply_aggregation_grouped(grouped: &mut GroupedSummaryMap, func: AggregationFunc, group_by: &[String]) {
+    // When group_by is specified, the grouping key already encodes the requested
+    // dimension (model, project, session, etc.). The "models" map within each group
+    // should not be collapsed — each entry is already the sum for that dimension.
+    let has_group_by = !group_by.is_empty();
+
+    if has_group_by {
+        // Models are already the grouping dimension — just apply func per model.
+        // For Sum this is a no-op (each model entry is already the sum for that model).
+        // For Avg/Count, apply per model.
+        if func == AggregationFunc::Sum {
+            return; // Already summed per model
+        }
+        for models in grouped.values_mut() {
+            for s in models.values_mut() {
+                match func {
+                    AggregationFunc::Avg => {
+                        let count = s.event_count.max(1);
+                        s.input_tokens /= count;
+                        s.output_tokens /= count;
+                        s.cache_creation_input_tokens /= count;
+                        s.cache_read_input_tokens /= count;
+                        s.event_count = 1;
+                    }
+                    AggregationFunc::Count => {
+                        let count = s.event_count;
+                        s.input_tokens = 0;
+                        s.output_tokens = 0;
+                        s.cache_creation_input_tokens = 0;
+                        s.cache_read_input_tokens = 0;
+                        s.event_count = count;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    } else {
+        // No model in group_by — collapse all models within each group
+        for models in grouped.values_mut() {
+            let mut flat: SummaryMap = std::mem::take(models);
+            apply_aggregation_flat(&mut flat, func);
+            *models = flat;
+        }
     }
 }
 
 /// Execute a parsed PromQL-style query against the TSDB.
+///
+/// `since_ms` and `until_ms` are millisecond timestamps representing the time range
+/// (0 and i64::MAX respectively mean "no bound"). The query's `offset` modifier shifts
+/// both bounds backward by the specified duration.
 pub fn execute_parsed_query(
     db: &Database,
     parsed: &crate::query_parser::Query,
     tz: Option<Tz>,
     pricing: Option<&crate::pricing::PricingTable>,
     sink: &dyn crate::sink::Sink,
+    since_ms: i64,
+    until_ms: i64,
 ) -> Result<(), String> {
     use crate::query_parser::Metric;
+
+    // Apply offset: shift time range backward by offset duration
+    let offset_ms = parsed.offset.map(|b| b.as_secs() as i64 * 1000).unwrap_or(0);
+    let since_ms = since_ms - offset_ms;
+    let until_ms = until_ms - offset_ms;
 
     match parsed.metric {
         Metric::Sessions => {
             let session_prefix = parsed.filter_value("session");
             let project_filter = parsed.filter_value("project");
-            let has_time_or_project = parsed.since.is_some() || parsed.until.is_some() || project_filter.is_some();
+            let has_time_or_project = since_ms > 0 || until_ms < i64::MAX || project_filter.is_some();
 
             let sessions = if has_time_or_project {
                 // Need event-level scan to filter by time range and/or project
-                let since_dt = apply_offset(parsed.since.as_deref().map(|s| parse_range_time(s, false, tz)).transpose()?, parsed.offset.as_ref());
-                let until_dt = apply_offset(parsed.until.as_deref().map(|s| parse_range_time(s, true, tz)).transpose()?, parsed.offset.as_ref());
-                let since_ms = since_dt.map(|d| d.and_utc().timestamp_millis()).unwrap_or(0);
-                let until_ms = until_dt.map(|d| d.and_utc().timestamp_millis()).unwrap_or(i64::MAX);
-
                 let dict = db.load_dict_reverse().map_err(|e| e.to_string())?;
                 let mut set = std::collections::HashSet::new();
                 db.for_each_event(since_ms, until_ms, |_ts, event| {
@@ -235,15 +228,10 @@ pub fn execute_parsed_query(
         }
         Metric::Projects => {
             let project_filter = parsed.filter_value("project");
-            let has_time = parsed.since.is_some() || parsed.until.is_some();
+            let has_time = since_ms > 0 || until_ms < i64::MAX;
 
             let projects = if has_time {
                 // Event scan for time-filtered project list
-                let since_dt = apply_offset(parsed.since.as_deref().map(|s| parse_range_time(s, false, tz)).transpose()?, parsed.offset.as_ref());
-                let until_dt = apply_offset(parsed.until.as_deref().map(|s| parse_range_time(s, true, tz)).transpose()?, parsed.offset.as_ref());
-                let since_ms = since_dt.map(|d| d.and_utc().timestamp_millis()).unwrap_or(0);
-                let until_ms = until_dt.map(|d| d.and_utc().timestamp_millis()).unwrap_or(i64::MAX);
-
                 let dict = db.load_dict_reverse().map_err(|e| e.to_string())?;
                 let mut set = std::collections::HashSet::new();
                 db.for_each_event(since_ms, until_ms, |_ts, event| {
@@ -266,12 +254,8 @@ pub fn execute_parsed_query(
             };
             sink.emit_list(&projects, "projects");
         }
-        Metric::Events => {
-            let since_dt = apply_offset(parsed.since.as_deref().map(|s| parse_range_time(s, false, tz)).transpose()?, parsed.offset.as_ref());
-            let until_dt = apply_offset(parsed.until.as_deref().map(|s| parse_range_time(s, true, tz)).transpose()?, parsed.offset.as_ref());
-            let since_ms = since_dt.map(|d| d.and_utc().timestamp_millis()).unwrap_or(0);
-            let until_ms = until_dt.map(|d| d.and_utc().timestamp_millis()).unwrap_or(i64::MAX);
-
+        Metric::Events if parsed.bucket.is_none() && parsed.group_by.is_empty() && parsed.aggregation.is_none() => {
+            // Raw event listing (no bucket/group_by)
             let dict = db.load_dict_reverse().map_err(|e| e.to_string())?;
             let unknown = String::new();
             let model_filter = parsed.filter_value("model");
@@ -308,20 +292,55 @@ pub fn execute_parsed_query(
 
             sink.emit_events_batch(&events, pricing, None);
         }
-        Metric::Usage => {
-            let since_dt = apply_offset(parsed.since.as_deref().map(|s| parse_range_time(s, false, tz)).transpose()?, parsed.offset.as_ref());
-            let until_dt = apply_offset(parsed.until.as_deref().map(|s| parse_range_time(s, true, tz)).transpose()?, parsed.offset.as_ref());
+        Metric::Cost | Metric::Events | Metric::Usage => {
+            let is_events_metric = parsed.metric == Metric::Events;
+            let since_dt = if since_ms > 0 {
+                chrono::DateTime::from_timestamp_millis(since_ms).map(|d| d.naive_utc())
+            } else {
+                None
+            };
+            let until_dt = if until_ms < i64::MAX {
+                chrono::DateTime::from_timestamp_millis(until_ms).map(|d| d.naive_utc())
+            } else {
+                None
+            };
 
             let filter = ReportFilter { since: since_dt, until: until_dt, tz };
             let model_filter = parsed.filter_value("model");
             let session_filter = parsed.filter_value("session");
+            let type_filter = parsed.get_filter("type");
+            let type_mask = type_filter_mask(type_filter);
 
             match (&parsed.bucket, parsed.group_by.is_empty()) {
                 (None, true) => {
-                    // Flat summary
-                    let mut summaries = report_summary_from_db(db, filter).map_err(|e| e.to_string())?;
+                    // Flat summary via events keyspace scan.
+                    let mut summaries = {
+                        let dict = db.load_dict_reverse().map_err(|e| e.to_string())?;
+                        let unknown = String::new();
+                        let mut sums: SummaryMap = HashMap::new();
+                        db.for_each_event(since_ms, until_ms, |_ts, event| {
+                            let model = dict.get(&event.model_id).unwrap_or(&unknown);
+                            if let Some(mf) = model_filter {
+                                if model != mf { return; }
+                            }
+                            let entry = sums.entry(model.clone()).or_insert_with(|| ModelUsageSummary {
+                                model: model.clone(), ..Default::default()
+                            });
+                            if is_events_metric {
+                                entry.event_count += 1;
+                            } else {
+                                accumulate_event(entry, &event);
+                            }
+                        }).map_err(|e| e.to_string())?;
+                        sums
+                    };
                     if let Some(model) = model_filter {
                         summaries.retain(|k, _| k == model);
+                    }
+                    if type_filter.is_some() {
+                        for s in summaries.values_mut() {
+                            apply_type_mask(s, &type_mask);
+                        }
                     }
                     if let Some(func) = parsed.aggregation {
                         apply_aggregation_flat(&mut summaries, func);
@@ -333,76 +352,73 @@ pub fn execute_parsed_query(
                     let (since, until) = filter_range(filter);
                     let mut grouped: GroupedSummaryMap = HashMap::new();
 
-                    // Use event-level scan when:
-                    // - session filter or group_by needs per-event data, OR
-                    // - bucket is not an exact multiple of the 1-hour rollup granularity
-                    let bucket_needs_event_scan = parsed.bucket.as_ref()
-                        .map_or(false, |b| b.0 < 3600 || b.0 % 3600 != 0);
-                    if session_filter.is_some() || !parsed.group_by.is_empty() || bucket_needs_event_scan {
-                        // Need event-level access for session/group_by
-                        let dict = db.load_dict_reverse().map_err(|e| e.to_string())?;
-                        let unknown = String::new();
-                        db.for_each_event(since, until, |ts, event| {
-                            let model = dict.get(&event.model_id).unwrap_or(&unknown);
-                            if let Some(mf) = model_filter {
-                                if model != mf { return; }
-                            }
-                            let session = dict.get(&event.session_id).unwrap_or(&unknown);
-                            if let Some(sf) = session_filter {
-                                if !session.starts_with(sf) { return; }
-                            }
+                    // Event-level scan for all grouped queries
+                    let dict = db.load_dict_reverse().map_err(|e| e.to_string())?;
+                    let unknown = String::new();
+                    let step_start_sec = since / 1000;
+                    db.for_each_event(since, until, |ts, event| {
+                        let model = dict.get(&event.model_id).unwrap_or(&unknown);
+                        if let Some(mf) = model_filter {
+                            if model != mf { return; }
+                        }
+                        let session = dict.get(&event.session_id).unwrap_or(&unknown);
+                        if let Some(sf) = session_filter {
+                            if !session.starts_with(sf) { return; }
+                        }
 
-                            let bucket_key = if let Some(ref bucket) = parsed.bucket {
-                                // Pass original UTC timestamp (ms -> s) and let format_label handle tz
-                                bucket.format_label(ts / 1000, tz)
-                            } else {
-                                String::new()
-                            };
+                        let bucket_key = if let Some(ref bucket) = parsed.bucket {
+                            // Bucket = floor(event_ts / step) * step.
+                            // This assigns each event to the step-aligned period it belongs to.
+                            // E.g. step=86400, event at 03-23T05:00 → bucket=03-23T00:00.
+                            let step_ms = bucket.as_secs() as i64 * 1000;
+                            let bucket_ms = (ts / step_ms) * step_ms;
+                            // Include bucket if it overlaps [since, until)
+                            if bucket_ms + step_ms <= since || bucket_ms >= until { return; }
+                            let bucket_sec = bucket_ms / 1000;
+                            bucket.format_label(bucket_sec, tz)
+                        } else {
+                            String::new()
+                        };
 
-                            let group_key = build_group_key(&parsed.group_by, model, session, &dict, &event);
-                            let key = if bucket_key.is_empty() && !group_key.is_empty() {
-                                group_key
-                            } else if !bucket_key.is_empty() && group_key.is_empty() {
-                                bucket_key
-                            } else if !bucket_key.is_empty() && !group_key.is_empty() {
-                                format!("{}|{}", bucket_key, group_key)
-                            } else {
-                                "total".to_string()
-                            };
+                        let group_key = build_group_key(&parsed.group_by, model, session, &dict, &event);
 
-                            let entry = grouped.entry(key).or_default()
-                                .entry(model.clone()).or_insert_with(|| ModelUsageSummary {
-                                    model: model.clone(), ..Default::default()
-                                });
-                            entry.input_tokens += event.input_tokens;
-                            entry.output_tokens += event.output_tokens;
-                            entry.cache_creation_input_tokens += event.cache_creation_input_tokens;
-                            entry.cache_read_input_tokens += event.cache_read_input_tokens;
+                        // Determine inner key before group_key is moved into the period key.
+                        let inner_key = if !group_key.is_empty() && !parsed.group_by.iter().any(|g| g == "model") {
+                            group_key.clone()
+                        } else {
+                            model.clone()
+                        };
+
+                        let key = if bucket_key.is_empty() && !group_key.is_empty() {
+                            group_key
+                        } else if !bucket_key.is_empty() && group_key.is_empty() {
+                            bucket_key
+                        } else if !bucket_key.is_empty() && !group_key.is_empty() {
+                            format!("{}|{}", bucket_key, group_key)
+                        } else {
+                            "total".to_string()
+                        };
+                        let entry = grouped.entry(key).or_default()
+                            .entry(inner_key.clone()).or_insert_with(|| ModelUsageSummary {
+                                model: inner_key, ..Default::default()
+                            });
+                        if is_events_metric {
                             entry.event_count += 1;
-                        }).map_err(|e| e.to_string())?;
-                    } else {
-                        // Rollup-based (faster, no session/group_by needed)
-                        db.for_each_rollup(since, until, |hour_ts, model, rollup| {
-                            if let Some(mf) = model_filter {
-                                if model != mf { return; }
-                            }
-                            let bucket_key = if let Some(ref bucket) = parsed.bucket {
-                                // Pass original UTC timestamp (ms -> s) and let format_label handle tz
-                                bucket.format_label(hour_ts / 1000, tz)
-                            } else {
-                                "total".to_string()
-                            };
+                        } else {
+                            accumulate_event(entry, &event);
+                        }
+                    }).map_err(|e| e.to_string())?;
 
-                            let entry = grouped.entry(bucket_key).or_default()
-                                .entry(model.clone()).or_insert_with(|| ModelUsageSummary {
-                                    model, ..Default::default()
-                                });
-                            accumulate_rollup(entry, &rollup);
-                        }).map_err(|e| e.to_string())?;
+                    if type_filter.is_some() {
+                        for models in grouped.values_mut() {
+                            for s in models.values_mut() {
+                                apply_type_mask(s, &type_mask);
+                            }
+                        }
                     }
 
                     if let Some(func) = parsed.aggregation {
-                        apply_aggregation_grouped(&mut grouped, func);
+                        apply_aggregation_grouped(&mut grouped, func, &parsed.group_by);
                     }
 
                     let type_name = if let Some(ref bucket) = parsed.bucket {
@@ -467,43 +483,100 @@ fn build_group_key(
     result
 }
 
-/// Parse a time range string (YYYYMMDD or YYYYMMDDhhmmss) into NaiveDateTime.
-/// Shared between query execution and CLI argument parsing.
+/// Parse a time range string into NaiveDateTime (UTC).
+///
+/// Accepted formats (in order of detection):
+///   YYYYMMDD              — date only; since=00:00:00, until=23:59:59 (tz-aware)
+///   YYYYMMDDhhmmss        — compact datetime (tz-aware)
+///   Unix seconds          — all-digit, 1–10 chars  e.g. "1743465600"
+///   Unix milliseconds     — all-digit, 13 chars    e.g. "1743465600123"
+///   RFC 3339 / ISO 8601   — e.g. "2026-03-01T12:00:00Z", "2026-03-01T21:00:00+09:00"
+///
+/// The `tz` parameter applies only to the compact formats (YYYYMMDD, YYYYMMDDhhmmss)
+/// where the input has no timezone information. Unix/RFC 3339 inputs are always UTC
+/// regardless of `tz`.
 pub fn parse_range_time(value: &str, is_until: bool, tz: Option<Tz>) -> Result<NaiveDateTime, String> {
-    let naive = if value.len() == 8 && value.chars().all(|c| c.is_ascii_digit()) {
-        let year: i32 = value[0..4].parse().map_err(|_| "invalid year")?;
+    let all_digits = value.chars().all(|c| c.is_ascii_digit());
+
+    // ── Compact YYYYMMDD (must check before Unix seconds — both are all-digit) ─
+    if value.len() == 8 && all_digits {
+        let year: i32  = value[0..4].parse().map_err(|_| "invalid year")?;
         let month: u32 = value[4..6].parse().map_err(|_| "invalid month")?;
-        let day: u32 = value[6..8].parse().map_err(|_| "invalid day")?;
+        let day: u32   = value[6..8].parse().map_err(|_| "invalid day")?;
         let date = chrono::NaiveDate::from_ymd_opt(year, month, day).ok_or("invalid date")?;
         let time = if is_until {
             chrono::NaiveTime::from_hms_opt(23, 59, 59).unwrap()
         } else {
             chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap()
         };
-        NaiveDateTime::new(date, time)
-    } else if value.len() == 14 && value.chars().all(|c| c.is_ascii_digit()) {
-        let year: i32 = value[0..4].parse().map_err(|_| "invalid year")?;
+        let naive = NaiveDateTime::new(date, time);
+        return match tz {
+            Some(tz) => tz.from_local_datetime(&naive)
+                .single()
+                .map(|d| d.naive_utc())
+                .ok_or_else(|| "ambiguous or invalid local time".to_string()),
+            None => Ok(naive),
+        };
+    }
+
+    // ── Compact YYYYMMDDhhmmss (must check before Unix ms — both are 14-digit) ─
+    if value.len() == 14 && all_digits {
+        let year: i32  = value[0..4].parse().map_err(|_| "invalid year")?;
         let month: u32 = value[4..6].parse().map_err(|_| "invalid month")?;
-        let day: u32 = value[6..8].parse().map_err(|_| "invalid day")?;
-        let hour: u32 = value[8..10].parse().map_err(|_| "invalid hour")?;
-        let min: u32 = value[10..12].parse().map_err(|_| "invalid minute")?;
-        let sec: u32 = value[12..14].parse().map_err(|_| "invalid second")?;
+        let day: u32   = value[6..8].parse().map_err(|_| "invalid day")?;
+        let hour: u32  = value[8..10].parse().map_err(|_| "invalid hour")?;
+        let min: u32   = value[10..12].parse().map_err(|_| "invalid minute")?;
+        let sec: u32   = value[12..14].parse().map_err(|_| "invalid second")?;
         let date = chrono::NaiveDate::from_ymd_opt(year, month, day).ok_or("invalid date")?;
         let time = chrono::NaiveTime::from_hms_opt(hour, min, sec).ok_or("invalid time")?;
-        NaiveDateTime::new(date, time)
-    } else {
-        return Err("invalid format (use YYYYMMDD or YYYYMMDDhhmmss)".to_string());
-    };
-
-    match tz {
-        Some(tz) => {
-            let local = tz.from_local_datetime(&naive)
+        let naive = NaiveDateTime::new(date, time);
+        return match tz {
+            Some(tz) => tz.from_local_datetime(&naive)
                 .single()
-                .ok_or("ambiguous or invalid local time")?;
-            Ok(local.naive_utc())
-        }
-        None => Ok(naive),
+                .map(|d| d.naive_utc())
+                .ok_or_else(|| "ambiguous or invalid local time".to_string()),
+            None => Ok(naive),
+        };
     }
+
+    // ── Unix timestamp (seconds or milliseconds) ─────────────────────────────
+    // 13 digits = Unix ms; 1–10 digits = Unix seconds.
+    // 8 and 14 are already handled above as compact date formats.
+    if all_digits && !value.is_empty() && value.len() != 8 && value.len() != 14 && value.len() <= 13 {
+        let n: i64 = value.parse().map_err(|_| "invalid unix timestamp")?;
+        let ms = if value.len() == 13 { n } else { n * 1000 };
+        return chrono::DateTime::from_timestamp_millis(ms)
+            .map(|d| d.naive_utc())
+            .ok_or_else(|| "unix timestamp out of range".to_string());
+    }
+
+    // ── RFC 3339 / ISO 8601 ───────────────────────────────────────────────────
+    // Try fixed-offset first (covers "Z" and "+HH:MM")
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Ok(dt.naive_utc());
+    }
+    // Naive ISO 8601 without timezone (treat as local / tz-aware)
+    for fmt in &["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"] {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(value, fmt)
+            .or_else(|_| {
+                chrono::NaiveDate::parse_from_str(value, fmt)
+                    .map(|d| NaiveDateTime::new(d, chrono::NaiveTime::from_hms_opt(0,0,0).unwrap()))
+            })
+        {
+            return match tz {
+                Some(tz) => tz.from_local_datetime(&naive)
+                    .single()
+                    .map(|d| d.naive_utc())
+                    .ok_or_else(|| "ambiguous or invalid local time".to_string()),
+                None => Ok(naive),
+            };
+        }
+    }
+
+    Err(format!(
+        "invalid time format '{}' (accepted: YYYYMMDD, YYYYMMDDhhmmss, unix seconds, unix ms, RFC 3339)",
+        value
+    ))
 }
 
 fn filter_to_ms(dt: Option<NaiveDateTime>) -> Option<i64> {
@@ -575,55 +648,7 @@ fn weekday_index(day: Weekday) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::types::{RollupValue, StoredEvent};
-
-    #[test]
-    fn test_report_summary_from_db() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(&dir.path().join("test.fjall")).unwrap();
-
-        let hour1 = 3_600_000i64;
-        let hour2 = 7_200_000i64;
-
-        let r1 = RollupValue { input: 100, output: 50, cache_create: 10, cache_read: 20, count: 5 };
-        let r2 = RollupValue { input: 200, output: 100, cache_create: 20, cache_read: 40, count: 10 };
-
-        let mut batch = db.batch();
-        db.upsert_rollup(&mut batch, hour1, "claude-opus-4-6", &r1);
-        db.upsert_rollup(&mut batch, hour2, "claude-opus-4-6", &r2);
-        batch.commit().unwrap();
-
-        let filter = ReportFilter::default();
-        let result = report_summary_from_db(&db, filter).unwrap();
-
-        assert_eq!(result.len(), 1);
-        let s = &result["claude-opus-4-6"];
-        assert_eq!(s.input_tokens, 300);
-        assert_eq!(s.output_tokens, 150);
-        assert_eq!(s.event_count, 15);
-    }
-
-    #[test]
-    fn test_report_grouped_from_db() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = Database::open(&dir.path().join("test.fjall")).unwrap();
-
-        // Two different days
-        let day1 = 1709251200000i64; // 2024-03-01 00:00:00 UTC
-        let day2 = 1709337600000i64; // 2024-03-02 00:00:00 UTC
-
-        let r1 = RollupValue { input: 100, output: 50, cache_create: 0, cache_read: 0, count: 5 };
-        let r2 = RollupValue { input: 200, output: 100, cache_create: 0, cache_read: 0, count: 10 };
-
-        let mut batch = db.batch();
-        db.upsert_rollup(&mut batch, day1, "claude-opus-4-6", &r1);
-        db.upsert_rollup(&mut batch, day2, "claude-opus-4-6", &r2);
-        batch.commit().unwrap();
-
-        let filter = ReportFilter::default();
-        let result = report_grouped_from_db(&db, ReportGroupBy::Date, filter, None, None).unwrap();
-        assert_eq!(result.len(), 2);
-    }
+    use crate::common::types::StoredEvent;
 
     #[test]
     fn test_report_by_session_from_db() {
@@ -652,5 +677,66 @@ mod tests {
         let session = &result["session-abc"];
         assert_eq!(session["claude-opus-4-6"].input_tokens, 200);
         assert_eq!(session["claude-opus-4-6"].event_count, 2);
+    }
+
+    // ── parse_range_time format coverage ────────────────────────────────────
+
+    #[test]
+    fn test_parse_range_time_yyyymmdd() {
+        let dt = parse_range_time("20260301", false, None).unwrap();
+        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2026-03-01 00:00:00");
+        let dt_until = parse_range_time("20260301", true, None).unwrap();
+        assert_eq!(dt_until.format("%H:%M:%S").to_string(), "23:59:59");
+    }
+
+    #[test]
+    fn test_parse_range_time_yyyymmddhhmmss() {
+        let dt = parse_range_time("20260301120000", false, None).unwrap();
+        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2026-03-01 12:00:00");
+    }
+
+    #[test]
+    fn test_parse_range_time_unix_seconds() {
+        // 2025-01-01 00:00:00 UTC = 1735689600
+        let dt = parse_range_time("1735689600", false, None).unwrap();
+        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2025-01-01 00:00:00");
+    }
+
+    #[test]
+    fn test_parse_range_time_unix_ms() {
+        // Same moment as above, in milliseconds
+        let dt = parse_range_time("1735689600000", false, None).unwrap();
+        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2025-01-01 00:00:00");
+    }
+
+    #[test]
+    fn test_parse_range_time_rfc3339_utc() {
+        let dt = parse_range_time("2025-01-01T12:00:00Z", false, None).unwrap();
+        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2025-01-01 12:00:00");
+    }
+
+    #[test]
+    fn test_parse_range_time_rfc3339_offset() {
+        // +09:00 offset — UTC should be 9 hours earlier
+        let dt = parse_range_time("2025-01-01T21:00:00+09:00", false, None).unwrap();
+        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2025-01-01 12:00:00");
+    }
+
+    #[test]
+    fn test_parse_range_time_all_same_moment() {
+        // All four formats representing the same UTC moment
+        let secs  = parse_range_time("1735689600",          false, None).unwrap();
+        let ms    = parse_range_time("1735689600000",       false, None).unwrap();
+        let rfc   = parse_range_time("2025-01-01T00:00:00Z", false, None).unwrap();
+        let tz    = parse_range_time("2025-01-01T09:00:00+09:00", false, None).unwrap();
+        assert_eq!(secs, ms);
+        assert_eq!(secs, rfc);
+        assert_eq!(secs, tz);
+    }
+
+    #[test]
+    fn test_parse_range_time_invalid() {
+        assert!(parse_range_time("not-a-date", false, None).is_err());
+        assert!(parse_range_time("", false, None).is_err());
     }
 }

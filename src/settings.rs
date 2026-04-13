@@ -19,7 +19,9 @@ struct SettingsState {
     start_of_week: String,
     no_cost: bool,
     retention_days: String,
-    rollup_retention_days: String,
+    sync_enabled: bool,
+    sync_server: String,
+    sync_device_name: String,
 }
 
 impl SettingsState {
@@ -38,7 +40,9 @@ impl SettingsState {
             start_of_week: get("start_of_week", "mon"),
             no_cost: get("no_cost", "false") == "true",
             retention_days: get("retention_days", "0"),
-            rollup_retention_days: get("rollup_retention_days", "0"),
+            sync_enabled: get("sync_enabled", "false") == "true",
+            sync_server: get("sync_server", ""),
+            sync_device_name: get("sync_device_name", &crate::sync::thread::SyncConfig::default_device_name()),
         }
     }
 }
@@ -142,10 +146,27 @@ pub fn run_settings() -> bool {
     // -- Data section --
     let data_section = LinearLayout::vertical()
         .child(labeled_edit("Event Retention", &state.retention_days, "retention_days"))
-        .child(hint_text("                        Days to keep events (0 = forever)"))
+        .child(hint_text("                        Days to keep events (0 = forever)"));
+
+    // -- Sync section (read-only except device name) --
+    let sync_status = if state.sync_enabled { "Enabled" } else { "Disabled" };
+    let sync_server_display = if state.sync_server.is_empty() { "(not configured)" } else { &state.sync_server };
+
+    let sync_section = LinearLayout::vertical()
+        .child(LinearLayout::horizontal()
+            .child(field_label(&format!("{:<22}", "Status")))
+            .child(TextView::new(sync_status)))
         .child(DummyView.fixed_height(1))
-        .child(labeled_edit("Rollup Retention", &state.rollup_retention_days, "rollup_retention_days"))
-        .child(hint_text("                        Days to keep rollups (0 = forever)"));
+        .child(LinearLayout::horizontal()
+            .child(field_label(&format!("{:<22}", "Server")))
+            .child(TextView::new(sync_server_display)))
+        .child(DummyView.fixed_height(1))
+        .child(labeled_edit("Device Name", &state.sync_device_name, "sync_device_name"))
+        .child(hint_text("                        1-64 chars, no control characters"))
+        .child(DummyView.fixed_height(1))
+        .child(hint_text("  Manage sync via CLI:"))
+        .child(hint_text("    toki settings sync enable --server <host>"))
+        .child(hint_text("    toki settings sync disable [--delete | --keep]"));
 
     // -- Providers section (popup multi-select) --
     let enabled_providers = crate::config::get_providers();
@@ -180,7 +201,9 @@ pub fn run_settings() -> bool {
         .child(DummyView.fixed_height(1))
         .child(Panel::new(PaddedView::new(Margins::lrtb(1, 1, 1, 0), display_section)).title("Display"))
         .child(DummyView.fixed_height(1))
-        .child(Panel::new(PaddedView::new(Margins::lrtb(1, 1, 1, 0), data_section)).title("Data"));
+        .child(Panel::new(PaddedView::new(Margins::lrtb(1, 1, 1, 0), data_section)).title("Data"))
+        .child(DummyView.fixed_height(1))
+        .child(Panel::new(PaddedView::new(Margins::lrtb(1, 1, 1, 0), sync_section)).title("Sync"));
 
     let padded = PaddedView::lrtb(1, 1, 0, 0, form);
 
@@ -241,7 +264,6 @@ fn save_settings(siv: &mut Cursive, restart_flag: std::sync::Arc<std::sync::atom
     let daemon_sock = get_edit(siv, "daemon_sock");
     let timezone = get_edit(siv, "timezone");
     let retention = get_edit(siv, "retention_days");
-    let rollup_retention = get_edit(siv, "rollup_retention_days");
 
     let output_format = siv.call_on_name("output_format", |v: &mut SelectView<String>| {
         v.selection().map(|s| (*s).clone()).unwrap_or_else(|| "table".to_string())
@@ -255,6 +277,19 @@ fn save_settings(siv: &mut Cursive, restart_flag: std::sync::Arc<std::sync::atom
         v.is_checked()
     }).unwrap_or(false);
 
+    // Sync: only device name is editable in TUI
+    let sync_device_name = get_edit(siv, "sync_device_name");
+
+    // Validate device name
+    if sync_device_name.len() > 64 {
+        siv.add_layer(Dialog::info("Device name must be 64 characters or less"));
+        return;
+    }
+    if sync_device_name.contains(|c: char| c.is_control()) {
+        siv.add_layer(Dialog::info("Device name must not contain control characters"));
+        return;
+    }
+
     // Validate timezone
     if !timezone.is_empty()
         && timezone.parse::<chrono_tz::Tz>().is_err() {
@@ -267,11 +302,6 @@ fn save_settings(siv: &mut Cursive, restart_flag: std::sync::Arc<std::sync::atom
         siv.add_layer(Dialog::info("Retention days must be a number"));
         return;
     }
-    if rollup_retention.parse::<u32>().is_err() {
-        siv.add_layer(Dialog::info("Rollup retention days must be a number"));
-        return;
-    }
-
     let settings = [
         ("claude_code_root", claude_root.as_str()),
         ("codex_root", codex_root.as_str()),
@@ -281,7 +311,7 @@ fn save_settings(siv: &mut Cursive, restart_flag: std::sync::Arc<std::sync::atom
         ("start_of_week", start_of_week.as_str()),
         ("no_cost", if no_cost { "true" } else { "false" }),
         ("retention_days", retention.as_str()),
-        ("rollup_retention_days", rollup_retention.as_str()),
+        ("sync_device_name", sync_device_name.as_str()),
     ];
 
     // Read providers from hidden storage (set by popup)
@@ -294,10 +324,12 @@ fn save_settings(siv: &mut Cursive, restart_flag: std::sync::Arc<std::sync::atom
         }
     }).unwrap_or_default();
 
-    // Load old values to detect daemon-affecting changes
+    // Load old values to detect restart-requiring changes
+    // Only claude_code_root, codex_root, daemon_sock, providers require restart.
+    // Other settings (including sync, retention) are hot-reloaded.
     let old_providers = crate::config::get_providers();
-    let daemon_keys = ["claude_code_root", "codex_root", "daemon_sock", "retention_days", "rollup_retention_days"];
-    let old_values: Vec<(String, String)> = daemon_keys.iter()
+    let restart_keys = ["claude_code_root", "codex_root", "daemon_sock"];
+    let old_values: Vec<(String, String)> = restart_keys.iter()
         .map(|k| (k.to_string(), crate::config::get_setting(k).unwrap_or_default()))
         .collect();
 
@@ -419,13 +451,4 @@ fn show_providers_popup(siv: &mut Cursive) {
     );
 }
 
-/// Collapse home directory prefix to ~ for display.
-fn tilde_path(path: &str) -> String {
-    if let Some(home) = dirs::home_dir() {
-        let home_str = home.to_string_lossy();
-        if path.starts_with(home_str.as_ref()) {
-            return format!("~{}", &path[home_str.len()..]);
-        }
-    }
-    path.to_string()
-}
+

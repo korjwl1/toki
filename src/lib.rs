@@ -12,6 +12,7 @@ pub mod query_parser;
 pub mod retention;
 pub mod settings;
 pub mod sink;
+pub mod sync;
 pub mod update;
 pub mod writer;
 
@@ -19,7 +20,7 @@ pub use common::types::{UsageEvent, UsageEventWithTs, ModelUsageSummary, Session
 pub use config::Config;
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use db::Database;
@@ -51,6 +52,17 @@ pub struct Handle {
     db: Arc<Database>,
     /// All provider DBs for multi-provider report queries, with provider names.
     provider_dbs: Vec<(String, Arc<Database>)>,
+    /// Sync thread stop channels + join handles (one per provider).
+    sync_stops: Vec<crossbeam_channel::Sender<()>>,
+    sync_threads: Vec<Option<JoinHandle<()>>>,
+    /// Per-provider sync toggles for hot-reload.
+    sync_toggles: Vec<(String, sync::SyncToggle)>,
+    /// Per-provider flush notifiers — wake sync threads on shutdown.
+    flush_notifies: Vec<sync::FlushNotify>,
+    /// Settings watcher thread join handle.
+    settings_watcher_handle: Option<JoinHandle<()>>,
+    /// Settings watcher stop channel.
+    settings_watcher_stop: Option<crossbeam_channel::Sender<()>>,
 }
 
 struct ProviderRuntimeHandle {
@@ -76,7 +88,34 @@ impl Handle {
     }
 
     fn shutdown(&mut self) {
-        // Stop the worker thread first (it sends remaining ops to writers)
+        // Stop settings watcher thread
+        if let Some(tx) = self.settings_watcher_stop.take() {
+            let _ = tx.send(());
+        }
+        if let Some(handle) = self.settings_watcher_handle.take() {
+            let _ = handle.join();
+        }
+
+        // Signal sync threads to stop
+        for tx in &self.sync_stops {
+            let _ = tx.send(());
+        }
+        // Wake sync threads that may be waiting on toggle or flush_notify
+        for (_, toggle) in &self.sync_toggles {
+            toggle.1.notify_one();
+        }
+        for flush in &self.flush_notifies {
+            *flush.0.lock().unwrap() = true;
+            flush.1.notify_one();
+        }
+        // Join sync threads before shutting down DB writers — they hold DB read handles
+        for handle_opt in &mut self.sync_threads {
+            if let Some(handle) = handle_opt.take() {
+                let _ = handle.join();
+            }
+        }
+
+        // Stop the worker thread (sends remaining ops to writers)
         if let Some(tx) = self.stop_tx.take() {
             let _ = tx.send(());
         }
@@ -108,7 +147,6 @@ impl Drop for Handle {
 pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
     let retention = RetentionPolicy {
         event_retention_days: config.retention_days,
-        rollup_retention_days: config.rollup_retention_days,
     };
 
     // Migrate legacy toki.fjall → claude_code.fjall if needed
@@ -141,6 +179,8 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
     let mut runtimes: Vec<ProviderRuntime> = Vec::new();
     let mut channel_map: HashMap<String, crossbeam_channel::Sender<DbOp>> = HashMap::new();
     let mut all_checkpoints: HashMap<String, common::types::FileCheckpoint> = HashMap::new();
+    // (flush_notify, db, provider_name) — used to start sync threads after cold start
+    let mut provider_sync_infos: Vec<(sync::FlushNotify, Arc<Database>, String)> = Vec::new();
 
     for provider in provider_list {
         // Skip providers whose root directory doesn't exist (e.g., Codex not installed)
@@ -160,7 +200,9 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
         }
 
         let (db_tx, db_rx) = crossbeam_channel::bounded::<DbOp>(1024);
-        let writer = DbWriter::new(db.clone(), db_rx, retention.clone());
+        let flush_notify: sync::FlushNotify = Arc::new((Mutex::new(false), Condvar::new()));
+        let mut writer = DbWriter::new(db.clone(), db_rx, retention.clone());
+        writer.flush_notify = Some(flush_notify.clone());
         let provider_name = provider.name().to_string();
         let writer_handle = std::thread::Builder::new()
             .name(format!("toki-writer-{}", provider_name))
@@ -170,6 +212,7 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
             .map_err(TokiError::Io)?;
 
         channel_map.insert(provider.name().to_string(), db_tx.clone());
+        provider_sync_infos.push((flush_notify, db.clone(), provider_name.clone()));
 
         runtimes.push(ProviderRuntime {
             provider,
@@ -198,6 +241,13 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
             if let Err(e) = engine.cold_start_provider(rt.provider.as_ref(), &rt.db_tx) {
                 eprintln!("[toki] Cold start error for {}: {}", rt.provider.name(), e);
             }
+        }
+
+        // Clean up old dedup index entries (> 24h)
+        let cutoff = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64 - 24 * 3600 * 1000;
+        if let Err(e) = rt.db.cleanup_old_idx_msg(cutoff) {
+            eprintln!("[toki] idx_msg cleanup error for {}: {}", rt.provider.name(), e);
         }
     }
 
@@ -235,15 +285,30 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
         }
     }
 
-    // Spawn worker thread
+    // Spawn worker thread. If this thread panics, events are silently lost,
+    // so we treat a panic as fatal and exit the process (supervisor will restart).
     let worker_handle = std::thread::Builder::new()
         .name("toki-worker".to_string())
         .spawn(move || {
-            engine.watch_loop_providers(
-                event_rx,
-                stop_rx,
-                &provider_channels,
-            );
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                engine.watch_loop_providers(
+                    event_rx,
+                    stop_rx,
+                    &provider_channels,
+                );
+            }));
+
+            if let Err(e) = result {
+                let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = e.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic".to_string()
+                };
+                eprintln!("[toki] FATAL: worker thread panicked: {}", msg);
+                std::process::exit(1);
+            }
         })
         .map_err(TokiError::Io)?;
 
@@ -266,6 +331,70 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
         })
         .collect();
 
+    // Check credentials file permissions before starting sync
+    crate::sync::credentials::check_file_permissions();
+
+    // Determine if sync is initially enabled
+    let sync_initially_enabled = config::get_setting("sync_enabled")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
+    // Always spawn sync threads — one per provider. They wait on SyncToggle when disabled.
+    let mut sync_stops: Vec<crossbeam_channel::Sender<()>> = Vec::new();
+    let mut sync_threads: Vec<Option<JoinHandle<()>>> = Vec::new();
+    let mut sync_toggles: Vec<(String, sync::SyncToggle)> = Vec::new();
+    let mut flush_notifies: Vec<sync::FlushNotify> = Vec::new();
+    for (flush_notify, db, provider_name) in provider_sync_infos {
+        flush_notifies.push(flush_notify.clone());
+        let (sync_stop_tx, sync_stop_rx) = crossbeam_channel::bounded::<()>(1);
+        let sync_toggle: sync::SyncToggle = Arc::new((
+            Mutex::new(sync_initially_enabled),
+            Condvar::new(),
+        ));
+        let handle = sync::start_sync_thread(
+            db, flush_notify, sync_stop_rx, provider_name.clone(), sync_toggle.clone(),
+        );
+        sync_stops.push(sync_stop_tx);
+        sync_threads.push(Some(handle));
+        sync_toggles.push((provider_name, sync_toggle));
+    }
+
+    // Start settings file watcher for hot-reload (auto-respawns on panic)
+    let (settings_stop_tx, settings_stop_rx) = crossbeam_channel::bounded::<()>(1);
+    let settings_toggles = sync_toggles.clone();
+    let settings_watcher_handle = std::thread::Builder::new()
+        .name("toki-settings-watcher".to_string())
+        .spawn(move || {
+            loop {
+                if settings_stop_rx.try_recv().is_ok() {
+                    return;
+                }
+
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_settings_watcher(settings_stop_rx.clone(), settings_toggles.clone());
+                }));
+
+                match result {
+                    Ok(()) => return, // Normal exit (stop signal)
+                    Err(e) => {
+                        let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                            s.to_string()
+                        } else if let Some(s) = e.downcast_ref::<String>() {
+                            s.clone()
+                        } else {
+                            "unknown panic".to_string()
+                        };
+                        eprintln!("[toki:settings-watcher] thread panicked: {}, restarting in 5s...", msg);
+
+                        if settings_stop_rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok() {
+                            return;
+                        }
+                    }
+                }
+            }
+        })
+        .map_err(TokiError::Io)?;
+
     Ok(Handle {
         stop_tx: Some(stop_tx),
         worker_handle: Some(worker_handle),
@@ -273,7 +402,114 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
         runtimes: runtime_handles,
         db: primary_db,
         provider_dbs,
+        sync_stops,
+        sync_threads,
+        sync_toggles,
+        flush_notifies,
+        settings_watcher_handle: Some(settings_watcher_handle),
+        settings_watcher_stop: Some(settings_stop_tx),
     })
+}
+
+/// Watch the settings sentinel file for changes and dispatch hot-reload updates.
+/// Runs in its own thread. Polls via `notify` crate file watcher on the sentinel,
+/// with a fallback poll every 10s.
+fn run_settings_watcher(
+    stop_rx: crossbeam_channel::Receiver<()>,
+    sync_toggles: Vec<(String, sync::SyncToggle)>,
+) {
+    let sentinel_path = config::settings_sentinel_path();
+
+    // Ensure sentinel file exists so the watcher has something to watch
+    if let Some(parent) = sentinel_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    if !sentinel_path.exists() {
+        std::fs::write(&sentinel_path, "0").ok();
+    }
+
+    // Track last modification time to detect actual changes
+    let mut last_mtime = std::fs::metadata(&sentinel_path)
+        .and_then(|m| m.modified())
+        .ok();
+
+    // Set up file watcher on the sentinel file
+    let (watch_tx, watch_rx) = crossbeam_channel::unbounded::<()>();
+    let _watcher = {
+        use notify::{RecursiveMode, Watcher, Event, EventKind};
+        let tx = watch_tx.clone();
+        let mut w = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
+            if let Ok(event) = res {
+                if matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_)) {
+                    let _ = tx.send(());
+                }
+            }
+        });
+        match w {
+            Ok(ref mut watcher) => {
+                // Watch the parent directory since the sentinel file may be recreated
+                if let Some(parent) = sentinel_path.parent() {
+                    let _ = watcher.watch(parent, RecursiveMode::NonRecursive);
+                }
+            }
+            Err(ref e) => {
+                eprintln!("[toki:settings-watcher] failed to create watcher: {}, falling back to polling", e);
+            }
+        }
+        w.ok()
+    };
+
+    // Poll interval as fallback
+    let poll_tick = crossbeam_channel::tick(std::time::Duration::from_secs(10));
+
+    loop {
+        crossbeam_channel::select! {
+            recv(stop_rx) -> _ => {
+                return;
+            }
+            recv(watch_rx) -> _ => {
+                // File watcher triggered — check if sentinel actually changed
+            }
+            recv(poll_tick) -> _ => {
+                // Fallback poll
+            }
+        }
+
+        // Check if the sentinel file was actually modified
+        let current_mtime = std::fs::metadata(&sentinel_path)
+            .and_then(|m| m.modified())
+            .ok();
+        if current_mtime == last_mtime {
+            continue;
+        }
+        last_mtime = current_mtime;
+
+        eprintln!("[toki:settings-watcher] settings change detected, reloading...");
+        handle_settings_change(&sync_toggles);
+    }
+}
+
+/// Handle a settings change by re-reading the settings DB and dispatching updates.
+fn handle_settings_change(
+    sync_toggles: &[(String, sync::SyncToggle)],
+) {
+    let sync_enabled = config::get_setting("sync_enabled")
+        .map(|v| v == "true")
+        .unwrap_or(false);
+
+    // Update sync toggles for all providers
+    for (provider_name, toggle) in sync_toggles {
+        let mut enabled = toggle.0.lock().unwrap();
+        let was_enabled = *enabled;
+        *enabled = sync_enabled;
+        if sync_enabled && !was_enabled {
+            eprintln!("[toki:settings-watcher] sync enabled for {}", provider_name);
+            toggle.1.notify_one();
+        } else if !sync_enabled && was_enabled {
+            eprintln!("[toki:settings-watcher] sync disabled for {}", provider_name);
+            // Sync thread will notice on next toggle check
+        }
+    }
 }
 
 /// Create a provider instance by name (used to clone providers for worker thread).

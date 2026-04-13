@@ -27,6 +27,8 @@
 
 > **Looking for a GUI?** [Toki Monitor](https://github.com/korjwl1/toki-monitor) is a macOS menu bar app with a real-time dashboard, animated rabbit indicator, and anomaly alerts — built on the toki daemon.
 
+> **Multi-device sync?** [Toki Sync Server](https://github.com/korjwl1/toki-sync) aggregates token usage across all your devices. Self-hosted, works with the built-in `toki settings sync` commands.
+
 ---
 
 ## Table of Contents
@@ -37,6 +39,7 @@
 - [Performance](#performance)
 - [Privacy & Security](#privacy--security)
 - [Commands](#commands)
+- [Multi-Device Sync](#multi-device-sync)
 - [Cost Calculation](#cost-calculation)
 - [Supported Providers](#supported-providers)
 - [Planned Features](#planned-features)
@@ -65,8 +68,15 @@ toki report daily --since 20260301
 toki report --provider claude_code
 toki report monthly
 
-# 4. PromQL-style queries
-toki report query 'sum(usage{since="20260301"}[1d]) by (project)'
+# 4. PromQL-style queries (instant)
+toki query 'sum by (model)(toki_tokens_total[1h])'
+toki query -z Asia/Seoul 'sum by (model)(toki_tokens_total[1d])'
+
+# 5. Remote query (via sync server)
+toki query --remote 'sum by (model)(toki_tokens_total[1h])'
+
+# 6. Range query (with time window — via report)
+toki report --since 20260301 --until 20260331 query 'sum(usage{since="20260301"}[1d]) by (project)'
 toki report query 'events{since="20260320"}'
 ```
 
@@ -245,11 +255,32 @@ toki report monthly
 toki report --group-by-session
 toki report --project toki
 
-# PromQL-style queries
-toki report query 'sum(usage[1d]) by (project)'
+# Range queries (with --since/--until time window)
+toki report --since 20260301 --until 20260331 query 'sum(usage[1d]) by (project)'
 toki report query 'events{since="20260320"}'
 toki report query 'usage[1d] offset 7d'
 ```
+
+### Query
+
+```bash
+# Instant PromQL query (top-level command, no --since/--until)
+toki query 'sum by (model)(toki_tokens_total[1h])'
+toki query -z Asia/Seoul 'sum by (model)(toki_tokens_total[1d])'
+
+# type filter and regex operator
+toki query 'sum(toki_tokens_total{type=~"input|output"}[1h])'
+
+# Remote (via sync server)
+toki query --remote 'sum by (model)(toki_tokens_total[1h])'
+
+# Output format and options
+toki query -w 'sum by (model)(toki_tokens_total[1d])'   # wide table
+toki query --output-format json 'toki_tokens_total[1h]'
+toki query --no-cost 'toki_tokens_total[1h]'
+```
+
+> `toki report query` still works for range queries with `--since`/`--until` time windows.
 
 For the full command reference, query syntax, and settings options, see the **[Usage Guide](docs/USAGE.md)**.
 
@@ -268,6 +299,60 @@ toki settings                                  # Open TUI
 toki settings set providers --add codex        # Add a provider
 toki settings list                             # List all
 ```
+
+### Sync
+
+```bash
+toki settings sync enable --server <host>       # Opens browser for authentication (device code flow)
+toki settings sync disable              # Prompts to delete remote data
+toki settings sync disable --delete     # Delete this device's data from server
+toki settings sync disable --keep       # Keep remote data, only disable locally
+toki settings sync status                                          # Connection info
+toki settings sync devices                                         # Registered devices
+toki settings sync rename <new-name>                               # Rename this device
+```
+
+---
+
+## Multi-Device Sync
+
+Sync token usage across multiple machines to a central [toki-sync](https://github.com/korjwl1/toki-sync) server. All your devices' data in one place — queryable via PromQL, visible in the web dashboard or [Toki Monitor](https://github.com/korjwl1/toki-monitor).
+
+### Setup
+
+```bash
+# Connect to your sync server (opens browser for authentication)
+toki settings sync enable --server sync.example.com
+
+# For self-signed TLS (IP-only servers)
+toki settings sync enable --server 1.2.3.4 --insecure
+
+# Check status
+toki settings sync status
+
+# List registered devices
+toki settings sync devices
+
+# Query server data from CLI
+toki query --remote 'sum by (model)(toki_tokens_total)'
+
+# Disable sync
+toki settings sync disable              # Prompts to delete remote data
+toki settings sync disable --delete     # Delete this device's data from server
+toki settings sync disable --keep       # Keep remote data, only disable locally
+```
+
+### How it works
+
+- Daemon sync thread connects to toki-sync server via TLS TCP (persistent connection)
+- Events are batched (1,000/batch), zstd-compressed (≥100 items), and sent with ACK-based flow control
+- On disconnect: events accumulate locally in fjall DB, delta-synced on reconnect
+- JWT auto-refresh, exponential backoff (2s→300s cap), wake detection
+- Settings hot-reload: `toki settings sync enable` takes effect without daemon restart
+
+### Privacy
+
+Sync is opt-in and off by default. When enabled, only token counts and metadata (model, session ID, project name) are transmitted — never prompts or responses. TLS encrypts all traffic. Each user's data is isolated on the server via label injection.
 
 ---
 
@@ -299,7 +384,7 @@ Each provider gets its own isolated database (`~/.config/toki/<provider>.fjall`)
 | Feature | Description | Status |
 |---------|-------------|--------|
 | Gemini CLI | Google Gemini CLI provider support | Planned |
-| `toki-sync` | Multi-device support — sync usage data across machines | Planned |
+| `toki-sync` | Multi-device support — sync usage data across machines | Available |
 
 Have a feature request or found a bug? [Open an issue](https://github.com/korjwl1/toki/issues).
 
@@ -332,6 +417,8 @@ Have a feature request or found a bug? [Open an issue](https://github.com/korjwl
 | HTTP | ureq 2.x | Synchronous, ETag conditional requests |
 | CLI | clap 4.x | Subcommands, global options |
 | Tables | comfy-table 7.1 | Unicode table rendering |
+| Sync protocol | toki-sync-protocol (shared crate) | Wire-compatible types, bincode serialization |
+| TLS | native-tls 0.2 | Platform TLS for sync connections |
 | IPC | Unix Domain Socket | Daemon-client NDJSON streaming |
 
 ---
@@ -371,6 +458,12 @@ src/
 │   └── codex/                      # Codex CLI JSONL parser
 │       ├── mod.rs                  # CodexProvider impl
 │       └── parser.rs              # Stateful parser (model tracking)
+├── sync/                           # Multi-device sync
+│   ├── thread.rs                   # Sync loop, SyncToggle, wake detection
+│   ├── client.rs                   # TCP+TLS client, auth, batch send
+│   ├── protocol.rs                 # Re-exports from toki-sync-protocol
+│   ├── backoff.rs                  # Exponential backoff (2s→300s)
+│   └── credentials.rs             # Keychain (macOS) / sync.json (Linux)
 └── platform/mod.rs                 # FSEvents watcher + per-provider polling strategy
 ```
 

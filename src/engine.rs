@@ -250,8 +250,11 @@ impl TrackerEngine {
                 merge_summaries(&mut s, local);
             }
             if !file_events.is_empty() {
-                event_count.fetch_add(file_events.len(), std::sync::atomic::Ordering::Relaxed);
-                let _ = db_tx.send(DbOp::BulkWrite(file_events));
+                // Dedup by msg_id: JSONL has streaming progress + final result for
+                // the same message. Keep only the last occurrence per msg_id.
+                let deduped = dedup_cold_start_events(file_events);
+                event_count.fetch_add(deduped.len(), std::sync::atomic::Ordering::Relaxed);
+                let _ = db_tx.send(DbOp::BulkWrite(deduped));
             }
             if let Ok(Some((_bytes, last_line_len, last_line_hash))) = result {
                 cp_batch.lock().unwrap_or_else(|e| e.into_inner()).push(FileCheckpoint {
@@ -275,9 +278,9 @@ impl TrackerEngine {
         let schema = crate::common::schema::schema_for_provider(provider.name());
         self.sink.emit_summary(&result_summaries, None, Some(schema));
 
-        // Signal writer to flush accumulated rollups, then wait for completion
+        // Signal writer to flush remaining bulk events, then wait for completion
         let (done_tx, done_rx) = crossbeam_channel::bounded(1);
-        let _ = db_tx.send(DbOp::FlushBulkRollups(done_tx));
+        let _ = db_tx.send(DbOp::FlushBulkEvents(done_tx));
         let _ = done_rx.recv();
 
         // Flush checkpoints
@@ -350,8 +353,11 @@ impl TrackerEngine {
                 merge_summaries(&mut s, local);
             }
             if !file_events.is_empty() {
-                event_count.fetch_add(file_events.len(), std::sync::atomic::Ordering::Relaxed);
-                let _ = db_tx.send(DbOp::BulkWrite(file_events));
+                // Dedup by msg_id: JSONL has streaming progress + final result for
+                // the same message. Keep only the last occurrence per msg_id.
+                let deduped = dedup_cold_start_events(file_events);
+                event_count.fetch_add(deduped.len(), std::sync::atomic::Ordering::Relaxed);
+                let _ = db_tx.send(DbOp::BulkWrite(deduped));
             }
             if let Ok(Some((_bytes, last_line_len, last_line_hash))) = result {
                 cp_batch.lock().unwrap_or_else(|e| e.into_inner()).push(FileCheckpoint {
@@ -374,7 +380,7 @@ impl TrackerEngine {
         self.sink.emit_summary(&result_summaries, None, None);
 
         let (done_tx, done_rx) = crossbeam_channel::bounded(1);
-        let _ = db_tx.send(DbOp::FlushBulkRollups(done_tx));
+        let _ = db_tx.send(DbOp::FlushBulkEvents(done_tx));
         let _ = done_rx.recv();
 
         let cp_count = checkpoints_batch.len();
@@ -889,6 +895,30 @@ fn resolve_offset(path: &str, checkpoints: &HashMap<String, FileCheckpoint>) -> 
     }
 }
 
+/// Deduplicate cold start events by message_id (the part before ':' in event_key).
+/// JSONL contains streaming progress lines + final result for the same message.
+/// All share the same msg_id but have different timestamps.
+/// Keep only the last occurrence per msg_id (which is the final result).
+fn dedup_cold_start_events(events: Vec<ColdStartEvent>) -> Vec<ColdStartEvent> {
+    // message_id format: "msg_XXX:2026-03-30T04:00:00.123Z"
+    // Extract msg_id = part before first ':'
+    let mut last_seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (i, event) in events.iter().enumerate() {
+        let msg_id = event.message_id.split(':').next().unwrap_or(&event.message_id);
+        last_seen.insert(msg_id.to_string(), i);
+    }
+    // If no duplicates, return as-is
+    if last_seen.len() == events.len() {
+        return events;
+    }
+    // デバッグ用: debug_log!("[toki:dedup] {} → {} ({} dups)", events.len(), last_seen.len(), events.len() - last_seen.len());
+    let keep: std::collections::HashSet<usize> = last_seen.values().copied().collect();
+    events.into_iter().enumerate()
+        .filter(|(i, _)| keep.contains(i))
+        .map(|(_, e)| e)
+        .collect()
+}
+
 /// Merge thread-local summaries into global map.
 fn merge_summaries(
     global: &mut HashMap<String, ModelUsageSummary>,
@@ -1033,13 +1063,13 @@ mod tests {
         }
     }
 
-    /// Create a db_tx + drain thread that consumes all DbOps (handles FlushBulkRollups done signal).
+    /// Create a db_tx + drain thread that consumes all DbOps (handles FlushBulkEvents done signal).
     fn test_db_channel() -> (crossbeam_channel::Sender<DbOp>, std::thread::JoinHandle<()>) {
         let (db_tx, db_rx) = crossbeam_channel::bounded::<DbOp>(1024);
         let handle = std::thread::spawn(move || {
             while let Ok(op) = db_rx.recv() {
                 match op {
-                    DbOp::FlushBulkRollups(done_tx) => { let _ = done_tx.send(()); }
+                    DbOp::FlushBulkEvents(done_tx) => { let _ = done_tx.send(()); }
                     DbOp::Shutdown => break,
                     _ => {}
                 }

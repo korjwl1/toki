@@ -1,6 +1,6 @@
 [package]
 name = "toki"
-version = "1.2.0"
+version = "2.0.1"
 edition = "2021"
 description = "AI CLI tool token usage tracker module"
 license = "FSL-1.1-Apache-2.0"
@@ -32,10 +32,16 @@ fs2 = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 chrono-tz = "0.10"
 comfy-table = ">=7.1, <7.2"
-ureq = "2"
+ureq = { version = "2", features = ["json", "native-tls"] }
+keyring = "2"
 cursive = { version = "0.21", default-features = false, features = ["crossterm-backend"] }
 memmap2 = "0.9.10"
 memchr = "2.8.0"
+uuid = { version = "1", features = ["v4"] }
+urlencoding = "2"
+zstd = "0.13"
+native-tls = "0.2"
+toki-sync-protocol = { git = "https://github.com/korjwl1/toki-sync-protocol.git", tag = "v1.0.0" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 tikv-jemallocator = "0.6"

@@ -75,7 +75,8 @@ impl ProviderSchema for CodexSchema {
     }
 
     fn total_tokens(&self, s: &ModelUsageSummary) -> u64 {
-        s.input_tokens + s.output_tokens + s.cache_read_input_tokens + s.cache_creation_input_tokens
+        // cached_input ⊂ input, reasoning_output ⊂ output — don't double-count
+        s.input_tokens + s.output_tokens
     }
 }
 
@@ -138,7 +139,8 @@ mod tests {
         let schema = CodexSchema;
         // Codex: [input, output, cached_input (slot4), reasoning (slot3)]
         assert_eq!(schema.extract_tokens(&s), vec![100, 200, 400, 50]);
-        assert_eq!(schema.total_tokens(&s), 750);
+        // total = input + output only (cached_input ⊂ input, reasoning ⊂ output)
+        assert_eq!(schema.total_tokens(&s), 300);
     }
 
     #[test]

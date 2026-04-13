@@ -164,9 +164,17 @@ fn execute_report_request(
     let mut parsed =
         crate::query_parser::parse(&req.query).map_err(|e| format!("query parse error: {}", e))?;
 
-    // Query metadata — will be enriched with actual DB range below
-    let query_since = parsed.since.clone();
-    let query_until = parsed.until.clone();
+    // Resolve time range from request start/end fields.
+    let since_ms = req.start.as_deref()
+        .map(|s| crate::query::parse_range_time(s, false, tz)
+            .map(|d| d.and_utc().timestamp_millis()))
+        .transpose()?
+        .unwrap_or(0);
+    let until_ms = req.end.as_deref()
+        .map(|s| crate::query::parse_range_time(s, true, tz)
+            .map(|d| d.and_utc().timestamp_millis()))
+        .transpose()?
+        .unwrap_or(i64::MAX);
 
     // Strip "provider" from group_by (handled at DB routing level)
     parsed.group_by.retain(|k| k != "provider");
@@ -186,8 +194,8 @@ fn execute_report_request(
 
     if target_dbs.is_empty() {
         let meta = serde_json::json!({
-            "since": query_since,
-            "until": query_until,
+            "since": req.start,
+            "until": req.end,
             "data_since": serde_json::Value::Null,
             "data_until": serde_json::Value::Null,
         });
@@ -198,7 +206,7 @@ fn execute_report_request(
 
     for (provider_name, db) in &target_dbs {
         let collector = CollectorSink::new();
-        crate::query::execute_parsed_query(db, &parsed, tz, None, &collector)?;
+        crate::query::execute_parsed_query(db, &parsed, tz, None, &collector, since_ms, until_ms)?;
 
         let mut provider_results = collector.take();
         for item in &mut provider_results {
@@ -218,8 +226,8 @@ fn execute_report_request(
     }
 
     let meta = serde_json::json!({
-        "since": query_since,
-        "until": query_until,
+        "since": req.start,
+        "until": req.end,
         "data_since": global_min,
         "data_until": global_max,
     });
@@ -233,6 +241,12 @@ struct ReportRequest {
     query: String,
     #[serde(default)]
     tz: Option<String>,
+    /// Time range start (inclusive): YYYYMMDD or YYYYMMDDhhmmss
+    #[serde(default)]
+    start: Option<String>,
+    /// Time range end (inclusive): YYYYMMDD or YYYYMMDDhhmmss
+    #[serde(default)]
+    end: Option<String>,
 }
 
 /// Sink that collects output as JSON values instead of printing.

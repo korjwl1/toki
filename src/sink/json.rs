@@ -21,7 +21,8 @@ pub fn summary_to_json(s: &ModelUsageSummary, pricing: Option<&PricingTable>, sc
     entry["total_tokens"] = serde_json::json!(total);
     entry["events"] = serde_json::json!(s.event_count);
 
-    if let Some(cost) = pricing.and_then(|p| p.summary_cost(s)) {
+    // Pre-computed cost (e.g. from server) takes priority over local pricing
+    if let Some(cost) = s.cost_usd.filter(|c| *c > 0.0).or_else(|| pricing.and_then(|p| p.summary_cost(s))) {
         entry["cost_usd"] = serde_json::json!(cost);
     }
     entry

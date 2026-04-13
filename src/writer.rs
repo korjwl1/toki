@@ -1,10 +1,10 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use crossbeam_channel::Receiver;
 
-use crate::common::types::{FileCheckpoint, RollupValue, StoredEvent, TokenFields};
+use crate::common::types::{FileCheckpoint, StoredEvent, TokenFields};
 use crate::db::Database;
 use crate::retention::{RetentionPolicy, run_retention};
 
@@ -36,10 +36,9 @@ pub struct WriteEventData {
 pub enum DbOp {
     WriteEvent(Box<WriteEventData>),
     /// Bulk write chunk for cold start -- events from one file.
-    /// Rollups are accumulated in memory until FlushBulkRollups.
     BulkWrite(Vec<ColdStartEvent>),
-    /// Flush accumulated rollups from cold start bulk writes. Signals done.
-    FlushBulkRollups(crossbeam_channel::Sender<()>),
+    /// Flush remaining bulk events from cold start. Signals done.
+    FlushBulkEvents(crossbeam_channel::Sender<()>),
     WriteCheckpoint(FileCheckpoint),
     FlushCheckpoints(Vec<FileCheckpoint>),
     Shutdown,
@@ -55,10 +54,11 @@ pub struct DbWriter {
     next_dict_id: u32,
     pending_events: Vec<PendingEvent>,
     retention: RetentionPolicy,
-    /// Accumulated rollups during cold start bulk writes.
-    bulk_rollups: HashMap<(i64, String), RollupValue>,
     /// Accumulated events during cold start bulk writes (flushed at BULK_BATCH_SIZE).
     bulk_pending: Vec<ColdStartEvent>,
+    /// Sync notification: set dirty=true + notify after each flush so the sync thread wakes.
+    /// None when sync is not configured.
+    pub flush_notify: Option<Arc<(Mutex<bool>, Condvar)>>,
 }
 
 struct PendingEvent {
@@ -84,8 +84,8 @@ impl DbWriter {
             next_dict_id,
             pending_events: Vec::with_capacity(BATCH_SIZE),
             retention,
-            bulk_rollups: HashMap::new(),
             bulk_pending: Vec::new(),
+            flush_notify: None,
         }
     }
 
@@ -94,9 +94,9 @@ impl DbWriter {
         // Run retention on startup
         match run_retention(&self.db, &self.retention) {
             Ok(stats) => {
-                if stats.events_deleted > 0 || stats.rollups_deleted > 0 {
-                    eprintln!("[toki:writer] retention cleanup: {} events, {} rollups deleted ({}ms)",
-                        stats.events_deleted, stats.rollups_deleted, stats.elapsed.as_millis());
+                if stats.events_deleted > 0 {
+                    eprintln!("[toki:writer] retention cleanup: {} events deleted ({}ms)",
+                        stats.events_deleted, stats.elapsed.as_millis());
                 }
             }
             Err(e) => eprintln!("[toki:writer] retention error: {}", e),
@@ -131,9 +131,9 @@ impl DbWriter {
                 recv(retention_tick) -> _ => {
                     match run_retention(&self.db, &self.retention) {
                         Ok(stats) => {
-                            if stats.events_deleted > 0 || stats.rollups_deleted > 0 {
-                                eprintln!("[toki:writer] daily retention: {} events, {} rollups deleted",
-                                    stats.events_deleted, stats.rollups_deleted);
+                            if stats.events_deleted > 0 {
+                                eprintln!("[toki:writer] daily retention: {} events deleted",
+                                    stats.events_deleted);
                             }
                         }
                         Err(e) => eprintln!("[toki:writer] retention error: {}", e),
@@ -165,8 +165,8 @@ impl DbWriter {
                 self.bulk_write_chunk(events);
                 true
             }
-            DbOp::FlushBulkRollups(done_tx) => {
-                self.flush_bulk_rollups();
+            DbOp::FlushBulkEvents(done_tx) => {
+                self.flush_bulk_events();
                 let _ = done_tx.send(());
                 true
             }
@@ -187,37 +187,35 @@ impl DbWriter {
     }
 
     /// Flush pending events as a batch transaction.
-    /// Note: does a DB read per unique (hour, model) to fetch current rollup values.
-    /// This is acceptable for the current BATCH_SIZE (64) — at most ~64 reads per flush.
     fn flush_pending(&mut self) {
         if self.pending_events.is_empty() {
             return;
         }
 
         let t = Instant::now();
-        // Drain events to avoid borrow conflicts
-        let events: Vec<PendingEvent> = self.pending_events.drain(..).collect();
-        let count = events.len();
+        let mut events: Vec<PendingEvent> = self.pending_events.drain(..).collect();
 
-        // First pass: resolve rollups (need to read current values before batch)
-        let mut rollup_updates: HashMap<(i64, &str), RollupValue> = HashMap::new();
-        for event in &events {
-            let hour_ts = event.ts_ms - (event.ts_ms % 3_600_000);
-            let key = (hour_ts, event.model.as_str());
-            let rollup = rollup_updates.entry(key).or_insert_with(|| {
-                self.db.get_rollup(hour_ts, &event.model).ok().flatten().unwrap_or_default()
-            });
-            rollup.input += event.tokens.input_tokens;
-            rollup.output += event.tokens.output_tokens;
-            rollup.cache_create += event.tokens.cache_creation_input_tokens;
-            rollup.cache_read += event.tokens.cache_read_input_tokens;
-            rollup.count += 1;
+        // In-memory dedup: same msg_id → keep last occurrence only.
+        // This handles the case where multiple streaming snapshots for the same
+        // message arrive in a single file-watcher batch.
+        {
+            let mut last_idx: HashMap<&str, usize> = HashMap::new();
+            for (i, event) in events.iter().enumerate() {
+                let bare = crate::db::Database::bare_msg_id(&event.message_id);
+                last_idx.insert(bare, i);
+            }
+            if last_idx.len() < events.len() {
+                let keep: std::collections::HashSet<usize> = last_idx.values().copied().collect();
+                let mut i = 0;
+                events.retain(|_| { let k = keep.contains(&i); i += 1; k });
+            }
         }
 
-        // Build batch transaction
+        let count = events.len();
+
+        // Build batch transaction with dedup: same msg_id replaces previous event.
         let mut batch = self.db.batch();
 
-        // Resolve dict IDs and insert new entries
         for event in &events {
             let model_id = self.resolve_dict_id(&mut batch, &event.model);
             let session_id = self.resolve_dict_id(&mut batch, &event.session_id);
@@ -238,7 +236,9 @@ impl DbWriter {
                 cache_read_input_tokens: event.tokens.cache_read_input_tokens,
             };
 
-            self.db.insert_event_batch(&mut batch, event.ts_ms, &event.message_id, &stored);
+            // Dedup insert: delete previous event with same msg_id.
+            // Server-side EventStore handles dedup via upsert, so no corrections needed.
+            self.db.insert_event_dedup(&mut batch, event.ts_ms, &event.message_id, &stored);
 
             // Session index
             self.db.insert_session_index(&mut batch, &event.session_id, event.ts_ms, &event.message_id);
@@ -249,35 +249,28 @@ impl DbWriter {
             }
         }
 
-        // Write rollups
-        for (&(hour_ts, model), rollup) in &rollup_updates {
-            self.db.upsert_rollup(&mut batch, hour_ts, model, rollup);
-        }
-
         if let Err(e) = batch.commit() {
             eprintln!("[toki:writer] batch commit error: {}", e);
         }
 
         if crate::engine::debug_level() >= 1 {
-            eprintln!("[toki:writer] flushed {} events, {} rollups in {}µs",
-                count, rollup_updates.len(), t.elapsed().as_micros());
+            eprintln!("[toki:writer] flushed {} events in {}µs",
+                count, t.elapsed().as_micros());
+        }
+
+        // Notify sync thread that new data is available
+        if let Some(ref notify) = self.flush_notify {
+            let (lock, cvar) = notify.as_ref();
+            *lock.lock().unwrap() = true;
+            cvar.notify_one();
         }
     }
 
     /// Buffer a chunk of cold start events. Flushes to DB when buffer reaches BULK_BATCH_SIZE.
+    ///
+    /// Events keyspace uses insert (last write wins for same key), so only the final
+    /// value survives. We deduplicate by event_key before inserting.
     fn bulk_write_chunk(&mut self, mut events: Vec<ColdStartEvent>) {
-        // Accumulate rollups in memory (no DB reads).
-        // Note: model.clone() is acceptable here — this only runs during cold start (one-time).
-        for event in &events {
-            let hour_ts = event.ts_ms - (event.ts_ms % 3_600_000);
-            let rollup = self.bulk_rollups.entry((hour_ts, event.model.clone())).or_default();
-            rollup.input += event.tokens.input_tokens;
-            rollup.output += event.tokens.output_tokens;
-            rollup.cache_create += event.tokens.cache_creation_input_tokens;
-            rollup.cache_read += event.tokens.cache_read_input_tokens;
-            rollup.count += 1;
-        }
-
         // Buffer events, flush when large enough
         self.bulk_pending.append(&mut events);
         if self.bulk_pending.len() >= 1024 {
@@ -292,6 +285,7 @@ impl DbWriter {
         }
 
         let events = std::mem::take(&mut self.bulk_pending);
+
         let mut batch = self.db.batch();
         for event in &events {
             let model_id = self.resolve_dict_id(&mut batch, &event.model);
@@ -313,7 +307,9 @@ impl DbWriter {
                 cache_read_input_tokens: event.tokens.cache_read_input_tokens,
             };
 
-            self.db.insert_event_batch(&mut batch, event.ts_ms, &event.message_id, &stored);
+            // Use dedup insert: engine already deduped by msg_id, but idx_msg
+            // still needs to be populated for watch-mode dedup after cold start.
+            self.db.insert_event_dedup(&mut batch, event.ts_ms, &event.message_id, &stored);
             self.db.insert_session_index(&mut batch, &event.session_id, event.ts_ms, &event.message_id);
 
             if let Some(ref project) = event.project_name {
@@ -326,30 +322,8 @@ impl DbWriter {
         }
     }
 
-    /// Flush remaining bulk events + accumulated rollups, then signal completion.
-    fn flush_bulk_rollups(&mut self) {
-        let t = Instant::now();
-
-        // Flush remaining buffered events
-        self.flush_bulk_events();
-
-        // Write rollups in a single batch
-        if !self.bulk_rollups.is_empty() {
-            let count = self.bulk_rollups.len();
-            let mut batch = self.db.batch();
-            for ((hour_ts, model), rollup) in &self.bulk_rollups {
-                self.db.upsert_rollup(&mut batch, *hour_ts, model, rollup);
-            }
-            if let Err(e) = batch.commit() {
-                eprintln!("[toki:writer] bulk rollup commit error: {}", e);
-            }
-            self.bulk_rollups.clear();
-
-            if crate::engine::debug_level() >= 1 {
-                eprintln!("[toki:writer] bulk flush complete: {} rollups in {}µs", count, t.elapsed().as_micros());
-            }
-        }
-    }
+    // Note: flush_bulk_events is called by FlushBulkEvents op at the end of cold start.
+    // It flushes any remaining buffered events to the DB.
 
     /// Resolve a string to a dict ID, inserting if new.
     fn resolve_dict_id(&mut self, batch: &mut fjall::OwnedWriteBatch, key: &str) -> u32 {
