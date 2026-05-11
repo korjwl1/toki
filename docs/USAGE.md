@@ -1,6 +1,32 @@
-# toki Usage Guide
+# toki usage guide
 
-## Build from Source
+This document is task-oriented: it shows how to do things with toki. Each H2 below is tagged with one of three roles:
+
+- **Quick reference** — lookup tables for flags, formats, settings keys.
+- **Common tasks** — copy-paste examples for a specific goal.
+- **How it works** — short explanations of behavior you can rely on.
+
+## Topics
+
+- **Run the daemon and parse providers** — `daemon`, `provider management`
+- **Read your data** — `report`, `query`, `trace`
+- **Configure toki** — `settings`, `sync`, client options, output formats
+- **Understand behavior** — retention, debug logging, JSONL structure, library usage
+
+## Quick reference: commands
+
+toki operates with a daemon/client architecture:
+
+- **`daemon start`**: Server process. Cold start followed by file watching + TSDB storage
+- **`daemon stop/restart/status`**: Daemon management
+- **`daemon reset`**: Full DB wipe and reinitialization
+- **`settings set providers --add/--remove`**: Provider management (Claude Code, Codex CLI, etc.)
+- **`trace`**: Connect to daemon for real-time event streaming
+- **`query`**: Top-level PromQL instant query (pure PromQL, no `--start`/`--end`)
+- **`report`**: One-shot TSDB query. Retrieves data collected by the daemon
+- **`report query`**: Range PromQL query with `--start`/`--end` time window (backward compat)
+
+## Build from source
 
 ```bash
 cargo build --release
@@ -8,19 +34,7 @@ cargo build --release
 # Add to PATH or run directly
 ```
 
-## Commands
-
-toki operates with a daemon/client architecture:
-- **`daemon start`**: Server process. Cold start followed by file watching + TSDB storage
-- **`daemon stop/restart/status`**: Daemon management
-- **`daemon reset`**: Full DB wipe and reinitialization
-- **`settings set providers --add/--remove`**: Provider management (Claude Code, Codex CLI, etc.)
-- **`trace`**: Connect to daemon for real-time event streaming
-- **`query`**: Top-level PromQL instant query (pure PromQL, no --since/--until)
-- **`report`**: One-shot TSDB query. Retrieves data collected by the daemon
-- **`report query`**: Range PromQL query with --since/--until time window (backward compat)
-
-## daemon
+## Common tasks: daemon
 
 ### daemon start
 
@@ -78,7 +92,7 @@ If the daemon is running, stops it first, then completely deletes the TSDB datab
 All events, rollups, checkpoints, and settings are reset.
 After deletion, use `toki daemon start` to collect data from scratch.
 
-## Provider Management
+## Common tasks: provider management
 
 toki auto-detects `~/.claude` (Claude Code) and `~/.codex` (Codex CLI) and enables them automatically. In most cases, no configuration is needed.
 To manage manually, use the TUI (`toki settings`) or CLI.
@@ -100,7 +114,7 @@ toki settings get providers
 Each provider has an independent database (`~/.config/toki/<provider>.fjall`).
 After adding or removing a provider, restart the daemon if it is running.
 
-## trace
+## Common tasks: trace
 
 trace is a client command that connects to a running daemon via UDS to receive real-time events. It sends the `TRACE` command to the daemon and receives a JSONL stream.
 
@@ -128,49 +142,49 @@ toki trace --no-cost
 - Exit with Ctrl+C. The daemon keeps running
 - When using `--sink uds://` or `--sink http://`, spawn `toki trace` as a child process — it auto-terminates when the parent dies (SIGPIPE)
 
-## report
+## Common tasks: report
 
 The daemon must be running. If the daemon is down, shows "Cannot connect to toki daemon" with instructions to start it.
 If the daemon is running but has no data yet (cold start in progress), shows "No data in TSDB".
 
-### Full Summary
+### Full summary
 
 ```bash
 toki report
 toki report --provider claude_code            # Single provider only
-toki report --since 20260301
-toki report --since 20260301 --until 20260331
+toki report --start 20260301
+toki report --start 20260301 --end 20260331
 ```
 
 Outputs per-model token usage totals for the entire period or specified range.
 By default, results from all active providers are merged. Use `--provider` to filter to a single provider.
 
-### Time-based Grouping
+### Time-based grouping
 
 ```bash
-toki report daily --since 20260301
-toki report weekly --since 20260301
-toki report weekly --since 20260301 --start-of-week tue
+toki report daily --start 20260301
+toki report weekly --start 20260301
+toki report weekly --start 20260301 --start-of-week tue
 toki report monthly
 toki report yearly
-toki report hourly --since 20260301
+toki report hourly --start 20260301
 ```
 
-| Subcommand | `--since` required | Note |
+| Subcommand | `--start` required | Note |
 |------------|-------------------|------|
-| `hourly` | Yes | |
-| `daily` | Yes | |
+| `hourly` | Yes | - |
+| `daily` | Yes | - |
 | `weekly` | Yes | `--start-of-week` available |
-| `monthly` | No | |
-| `yearly` | No | |
+| `monthly` | No | - |
+| `yearly` | No | - |
 
-`hourly`, `daily`, `weekly` may produce large output, so `--since` is required.
+`hourly`, `daily`, `weekly` may produce large output, so `--start` is required.
 
-### --since / --until Format
+### --start / --end format
 
 | Format | Example | Interpretation |
 |--------|---------|---------------|
-| `YYYYMMDD` | `20260301` | `--since`: 00:00:00, `--until`: 23:59:59 |
+| `YYYYMMDD` | `20260301` | `--start`: 00:00:00, `--end`: 23:59:59 |
 | `YYYYMMDDhhmmss` | `20260301143000` | Exact time |
 
 - If `--timezone` is set, input values are interpreted as local time in that timezone and converted to UTC
@@ -178,17 +192,17 @@ toki report hourly --since 20260301
 
 ```bash
 # UTC-based
-toki report daily --since 20260301
+toki report daily --start 20260301
 
 # KST-based (2026-03-01 00:00:00 KST = 2026-02-28 15:00:00 UTC)
-toki -z Asia/Seoul report daily --since 20260301
+toki -z Asia/Seoul report daily --start 20260301
 ```
 
-### Session Grouping
+### Session grouping
 
 ```bash
 toki report --group-by-session
-toki report --group-by-session --since 20260301
+toki report --group-by-session --start 20260301
 ```
 
 Cannot be used simultaneously with time-based subcommands (`daily`, `weekly`, etc.).
@@ -200,7 +214,7 @@ Cannot be used simultaneously with time-based subcommands (`daily`, `weekly`, et
 ```bash
 # Project filter (substring match)
 toki report --project toki
-toki report daily --since 20260301 --project ddleague
+toki report daily --start 20260301 --project ddleague
 toki report monthly --project myapp
 
 # Session filter (UUID prefix)
@@ -209,22 +223,22 @@ toki report --session-id 4de9 --group-by-session
 
 # Provider filter
 toki report --provider claude_code
-toki report --provider codex daily --since 20260301
+toki report --provider codex daily --start 20260301
 
 # Combination
 toki report --session-id abc --project myapp
-toki report daily --since 20260301 --session-id abc
+toki report daily --start 20260301 --session-id abc
 ```
 
 When filters are specified, event-level scanning is used instead of rollups (rollups lack session/project information).
 
-### PromQL-style Queries
+### PromQL-style queries
 
 Use the `report query` subcommand for PromQL-inspired free queries.
 
 #### Syntax
 
-```
+```text
 [agg_func(] metric{filters}[bucket] [offset duration] [)] [by (dimensions)]
 ```
 
@@ -249,13 +263,13 @@ toki report query 'usage'
 toki report query 'usage{model="claude-opus-4-6"}'
 
 # 1-hour bucket + model grouping
-toki report query 'usage{since="20260301"}[1h] by (model)'
+toki report --start 20260301 query 'usage[1h] by (model)'
 
 # Provider filter + model grouping
 toki report query 'usage{provider="codex"} by (model)'
 
 # Session grouping + time range
-toki report query 'usage{since="20260301", until="20260331"} by (session)'
+toki report --start 20260301 --end 20260331 query 'usage by (session)'
 
 # Project grouping
 toki report query 'usage{project="myapp"} by (project)'
@@ -270,24 +284,24 @@ toki report query 'usage[1d] offset 7d'
 toki report query 'sum(usage[1d])'                                    # daily total
 toki report query 'avg(usage[1d])'                                    # per-event average
 toki report query 'count(usage[1d])'                                  # event count only
-toki report query 'sum(usage{since="20260301"}[1d]) by (project)'     # per-project daily sum
+toki report --start 20260301 query 'sum(usage[1d]) by (project)'      # per-project daily sum
 
 # Raw events
-toki report query 'events{since="20260320"}'
-toki report query 'events{model="claude-opus-4-6", since="20260301"}'
+toki report --start 20260320 query 'events'
+toki report --start 20260301 query 'events{model="claude-opus-4-6"}'
 toki report query 'events{session="abc123"}'
 
 # Session listing
 toki report query 'sessions'
 toki report query 'sessions{project="myapp"}'
-toki report query 'sessions{since="20260301"}'
+toki report --start 20260301 query 'sessions'
 
 # Project listing
 toki report query 'projects'
 toki report query 'projects{project="myapp"}'
 ```
 
-#### Aggregation Semantics
+#### Aggregation semantics
 
 | Function | Token Fields | Event Count | Cost | Model Name |
 |----------|-------------|-------------|------|------------|
@@ -297,7 +311,7 @@ toki report query 'projects{project="myapp"}'
 
 Without aggregation, results are broken down per model (default behavior).
 
-#### Events Output
+#### Events output
 
 The `events` metric returns individual API call records:
 
@@ -320,9 +334,9 @@ The `events` metric returns individual API call records:
 }
 ```
 
-## query
+## Common tasks: query
 
-`toki query` is a top-level command for instant PromQL queries. It uses pure PromQL syntax with no `--since`/`--until` flags — time ranges are expressed inside the PromQL expression itself (e.g. `[1h]`, `[1d]`).
+`toki query` is a top-level command for instant PromQL queries. It uses pure PromQL syntax with no `--start`/`--end` flags — time ranges are expressed inside the PromQL expression itself (e.g. `[1h]`, `[1d]`).
 
 ### Flags
 
@@ -361,8 +375,8 @@ toki query --no-cost "toki_tokens_total[1h]"
 
 | | `toki query` | `toki report query` |
 |---|---|---|
-| Scope | Instant query (pure PromQL) | Range query (with `--since`/`--until` time window) |
-| Time range | Inside PromQL expression: `[1h]`, `[1d]` | Via `--since`/`--until` flags |
+| Scope | Instant query (pure PromQL) | Range query (with `--start`/`--end` time window) |
+| Time range | Inside PromQL expression: `[1h]`, `[1d]` | Via `--start`/`--end` flags |
 | `--remote` | Supported | Not supported (use `toki query --remote`) |
 | Status | Preferred for new usage | Backward compatible, still works |
 
@@ -371,10 +385,10 @@ toki query --no-cost "toki_tokens_total[1h]"
 toki query "sum by (model)(toki_tokens_total[1h])"
 
 # Still works: range query with time window
-toki report --since 20260301 --until 20260331 query "sum by (model)(toki_tokens_total[1d])"
+toki report --start 20260301 --end 20260331 query "sum by (model)(toki_tokens_total[1d])"
 ```
 
-## settings
+## Common tasks: settings
 
 `toki settings` opens a cursive TUI settings page. All settings are stored in `~/.config/toki/settings.json`.
 
@@ -391,24 +405,24 @@ toki settings list
 
 When daemon-affecting settings (`claude_code_root`, `codex_root`, `daemon_sock`, `retention_days`, `rollup_retention_days`) are changed and the daemon is running, you'll be prompted to restart.
 
-| Setting | Key | Default | Daemon Effect |
+| Setting | Key | Default | Daemon effect |
 |---------|-----|---------|---------------|
 | Providers | `providers` | `[]` | Yes |
-| Claude Code Root | `claude_code_root` | `~/.claude` | Yes |
-| Codex CLI Root | `codex_root` | `~/.codex` | Yes |
-| Daemon Socket | `daemon_sock` | `~/.config/toki/daemon.sock` | Yes |
+| Claude Code root | `claude_code_root` | `~/.claude` | Yes |
+| Codex CLI root | `codex_root` | `~/.codex` | Yes |
+| Daemon socket | `daemon_sock` | `~/.config/toki/daemon.sock` | Yes |
 | Timezone | `timezone` | (empty = UTC) | No |
-| Output Format | `output_format` | `table` | No |
-| Start of Week | `start_of_week` | `mon` | No |
-| No Cost | `no_cost` | `false` | No |
-| Retention Days | `retention_days` | `0` (unlimited) | Yes |
-| Rollup Retention Days | `rollup_retention_days` | `0` (unlimited) | Yes |
+| Output format | `output_format` | `table` | No |
+| Start of week | `start_of_week` | `mon` | No |
+| No cost | `no_cost` | `false` | No |
+| Retention days | `retention_days` | `0` (unlimited) | Yes |
+| Rollup retention days | `rollup_retention_days` | `0` (unlimited) | Yes |
 
 Settings priority: **CLI args > Settings file (settings.json) > Defaults**
 
 Environment variables are not used (except `TOKI_DEBUG`).
 
-## sync
+## Common tasks: sync
 
 Sync token usage across multiple devices to a central [toki-sync](https://github.com/korjwl1/toki-sync) server. All subcommands are also available under `toki settings sync`.
 
@@ -501,7 +515,7 @@ toki query --remote 'toki_tokens_total{device="macbook-pro"}'
 
 The `--remote` flag sends the PromQL query to the toki-sync server instead of the local daemon. Requires sync to be enabled.
 
-## Client Options
+## Quick reference: client options
 
 | Option | Applies to | Description |
 |--------|-----------|-------------|
@@ -524,12 +538,12 @@ Applies only to report's `print` output.
 ### --timezone / -z
 
 ```bash
-toki report -z Asia/Seoul daily --since 20260301
-toki report -z US/Eastern weekly --since 20260101
+toki report -z Asia/Seoul daily --start 20260301
+toki report -z US/Eastern weekly --start 20260101
 ```
 
 Applies to:
-- `--since`/`--until` input value interpretation
+- `--start`/`--end` input value interpretation
 - Time bucketing (date boundaries for daily/hourly grouping, etc.)
 
 ### --no-cost
@@ -542,13 +556,13 @@ toki trace --no-cost
 For report: skips pricing data fetch and hides the Cost column.
 For trace: strips `cost_usd` field from JSONL output.
 
-## Output Formats
+## Quick reference: output formats
 
 ### Table (default)
 
-#### Full Summary
+#### Full summary
 
-```
+```text
 [toki] Token Usage Summary
 ┌───────────────────────────┬─────────┬─────────┬────────────┬──────────────┬──────────────┬────────┬─────────┐
 │ Model                     ┆ Input   ┆ Output  ┆ Cache      ┆ Cache        ┆ Total        ┆ Events ┆ Cost    │
@@ -564,7 +578,7 @@ For trace: strips `cost_usd` field from JSONL output.
 
 #### Grouping (daily, weekly, ...)
 
-```
+```text
 [toki] Usage by daily
 ─── 2026-03-01 ───
 ┌───────────────────────────┬─────────┬─────────┬────────────┬──────────────┬──────────────┬────────┬─────────┐
@@ -574,9 +588,9 @@ For trace: strips `cost_usd` field from JSONL output.
 ...
 ```
 
-#### Session/Project Listing
+#### Session/project listing
 
-```
+```text
 [toki] sessions (3)
 ┌──────────────────────────────────────┐
 │ Session ID                           │
@@ -589,9 +603,9 @@ For trace: strips `cost_usd` field from JSONL output.
 └──────────────────────────────────────┘
 ```
 
-#### Watch Mode (real-time events, trace client)
+#### Watch mode (real-time events, trace client)
 
-```
+```text
 [toki] claude-opus-4-6 | session.jsonl | in:3 cc:5139 cr:9631 out:14 | $0.0112
 ```
 
@@ -602,7 +616,7 @@ All JSON report output is wrapped with `information` (query metadata) and `provi
 | Field | Description |
 |-------|-------------|
 | `since` / `until` | Actual data range in TSDB (earliest/latest rollup timestamp, O(1)) |
-| `query_since` / `query_until` | User-specified `--since`/`--until` filter (null if not set) |
+| `query_since` / `query_until` | User-specified `--start`/`--end` filter (null if not set) |
 | `timezone` | Timezone used for interpretation (null = UTC) |
 | `start_of_week` | Week start day for weekly grouping |
 | `generated_at` | When the report was generated |
@@ -697,7 +711,7 @@ All JSON report output is wrapped with `information` (query metadata) and `provi
 }
 ```
 
-#### Watch Event (JSONL, one line at a time — trace output)
+#### Watch event (JSONL, one line at a time — trace output)
 
 ```json
 {"type":"event","data":{"model":"claude-opus-4-6","source":"4de9291e","provider":"Claude Code","timestamp":"2026-03-19T10:30:00.123Z","input_tokens":3,"output_tokens":14,"cache_creation_input_tokens":5139,"cache_read_input_tokens":9631,"cost_usd":0.0112}}
@@ -705,7 +719,7 @@ All JSON report output is wrapped with `information` (query metadata) and `provi
 
 > Trace always outputs JSONL. Use `--no-cost` to exclude the `cost_usd` field.
 
-### Provider-specific Columns
+### Provider-specific columns
 
 Each provider has its own token column schema. Table headers and JSON keys differ per provider:
 
@@ -716,14 +730,14 @@ Each provider has its own token column schema. Table headers and JSON keys diffe
 
 Reports return per-provider tables, each with provider-specific column headers. Multi-provider results are never merged into a single table since the column semantics differ.
 
-### UDS/HTTP Sink
+### UDS/HTTP sink
 
 UDS and HTTP sinks use the same JSON structure. Always JSON regardless of `--output-format`.
 
 - **UDS**: NDJSON (line-by-line) transmission. If socket doesn't exist, logs error and continues
 - **HTTP**: JSON POST (5s timeout). On failure, logs error and continues
 
-## Retention
+## How it works: retention
 
 Disabled by default. Configure retention periods via `toki settings` to enable.
 
@@ -736,7 +750,7 @@ Disabled by default. Configure retention periods via `toki settings` to enable.
 - When enabled: runs once on daemon start + every 24 hours thereafter
 - Recommend keeping rollups longer than events: reports remain available after events are deleted
 
-## Debug Logging
+## How it works: debug logging
 
 ```bash
 # Level 1: state transitions, events, timing, writer flush
@@ -747,14 +761,15 @@ TOKI_DEBUG=2 toki daemon start
 ```
 
 Example output:
-```
+
+```text
 [toki:debug] process_file /path/to/session.jsonl — 3 lines, 1024 bytes, 2 events, Active | find_resume: 50µs, read: 120µs, total: 180µs
 [toki:debug] flush_dirty — 5 checkpoints sent to writer
 [toki:writer] flushed 64 events, 3 rollups in 450µs
 [toki:writer] retention cleanup: 150 events, 12 rollups deleted (35ms)
 ```
 
-## Library Usage
+## Common tasks: library usage
 
 ```toml
 [dependencies]
@@ -780,11 +795,11 @@ fn main() {
 }
 ```
 
-## Claude Code JSONL Structure
+## How it works: Claude Code JSONL structure
 
 Claude Code stores session logs under `~/.claude/projects/<encoded-path>/`.
 
-```
+```text
 ~/.claude/projects/-Users-user-Documents-project/
 ├── 4de9291e-061e-414a-85cb-de615826aded.jsonl        # Parent session
 ├── 4de9291e-061e-414a-85cb-de615826aded/

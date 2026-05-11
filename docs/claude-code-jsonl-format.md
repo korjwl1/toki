@@ -1,10 +1,10 @@
-# Claude Code JSONL Format Reference
+# Claude Code JSONL format reference
 
 Claude Code CLI records session logs as JSONL files under `~/.claude/projects/<encoded-path>/`.
 
-## File Structure
+## File structure
 
-```
+```text
 ~/.claude/projects/-Users-user-Documents-project/
 ├── 4de9291e-061e-414a-85cb-de615826aded.jsonl          # Parent session
 ├── 4de9291e-061e-414a-85cb-de615826aded/
@@ -17,11 +17,11 @@ Claude Code CLI records session logs as JSONL files under `~/.claude/projects/<e
 - Subagent: `<UUID>/subagents/agent-*.jsonl`
 - Subagent tokens are not included in the parent and are recorded in separate files
 
-## Line Types (type field)
+## Line types (type field)
 
 Each JSONL line is identified by its `"type"` field. 7 types observed:
 
-| type | Purpose | Token Info | Size Characteristics |
+| type | Purpose | Token info | Size characteristics |
 |------|---------|-----------|---------------------|
 | `assistant` | AI response (text, tool use) | **Present** (`message.usage`) | Avg ~1.5KB |
 | `user` | User input | None | Avg ~8.3KB (large when file content included) |
@@ -31,9 +31,9 @@ Each JSONL line is identified by its `"type"` field. 7 types observed:
 | `queue-operation` | Queue operation | None | Avg ~0.2KB |
 | `pr-link` | PR link | None | ~0.2KB |
 
-**Only the `assistant` type is relevant for token tracking.**
+Only the `assistant` type is relevant for token tracking.
 
-## assistant Line Detailed Structure
+## assistant line detailed structure
 
 ```json
 {
@@ -72,9 +72,9 @@ Each JSONL line is identified by its `"type"` field. 7 types observed:
 }
 ```
 
-### Fields Extracted by toki
+### Fields extracted by toki
 
-| Field Path | Purpose |
+| Field path | Purpose |
 |------------|---------|
 | `type` | Identify `"assistant"` lines |
 | `message.model` | Model name (aggregation key) |
@@ -85,9 +85,9 @@ Each JSONL line is identified by its `"type"` field. 7 types observed:
 | `message.usage.output_tokens` | Output tokens |
 | `timestamp` | Event time |
 
-### Fields Ignored by toki
+### Fields ignored by toki
 
-| Field Path | Reason |
+| Field path | Reason |
 |------------|--------|
 | `message.content[]` | Text/thinking/tool_use content — not needed for token tracking, makes up bulk of each line |
 | `message.usage.server_tool_use` | Server-side tool use metadata |
@@ -98,7 +98,7 @@ Each JSONL line is identified by its `"type"` field. 7 types observed:
 | `message.usage.speed` | Speed metric |
 | `parentUuid`, `sessionId`, `cwd`, ... | Session metadata — currently unused |
 
-### Content Block Types
+### Content block types
 
 3 types in the `message.content[]` array:
 
@@ -108,7 +108,7 @@ Each JSONL line is identified by its `"type"` field. 7 types observed:
 | `thinking` | Thought process (extended thinking) |
 | `tool_use` | Tool invocation (file read, bash, search, etc.) |
 
-## Parsing Optimizations
+## Parsing optimizations
 
 ### Pre-filter
 
@@ -117,11 +117,12 @@ Lines not containing the `"assistant"` string are immediately skipped without JS
 - `user`, `file-history-snapshot`, `system`, `queue-operation`, `pr-link` → 100% skipped
 - `progress` → has `"assistant"` nested inside `data.message`, passes pre-filter (false positive), rejected at serde stage where `type != "assistant"`
 
-Measured on real data (5,162 lines, 13.2MB):
-- **67% of data volume skipped without JSON parsing**
+Measured on real data (5,162 lines, 13.2 MB):
+
+- 67% of data volume skipped without JSON parsing
 - Zero false negatives (no missed events)
 
-### Targeted Struct Deserialization
+### Targeted struct deserialization
 
 Deserializes into a struct with only the needed fields instead of `serde_json::Value`.
 Unnecessary fields like the `content` array are scanned by serde but not allocated on the heap.

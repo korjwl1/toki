@@ -4,7 +4,7 @@ Claude Code CLI는 세션 로그를 `~/.claude/projects/<encoded-path>/` 하위�
 
 ## 파일 구조
 
-```
+```text
 ~/.claude/projects/-Users-user-Documents-project/
 ├── 4de9291e-061e-414a-85cb-de615826aded.jsonl          # 부모 세션
 ├── 4de9291e-061e-414a-85cb-de615826aded/
@@ -31,7 +31,7 @@ JSONL의 각 줄은 `"type"` 필드로 구분된다. 총 7종 확인됨:
 | `queue-operation` | 큐 작업 | 없음 | 평균 ~0.2KB |
 | `pr-link` | PR 링크 | 없음 | ~0.2KB |
 
-**토큰 추적에 필요한 타입은 `assistant`만 해당.**
+토큰 추적에 필요한 타입은 `assistant`만 해당한다.
 
 ## assistant 줄 상세 구조
 
@@ -117,8 +117,9 @@ JSONL의 각 줄은 `"type"` 필드로 구분된다. 총 7종 확인됨:
 - `user`, `file-history-snapshot`, `system`, `queue-operation`, `pr-link` → 100% 스킵
 - `progress` → `data.message` 안에 `"assistant"`가 중첩되어 있어 프리필터 통과 (false positive), serde 단계에서 `type != "assistant"`로 탈락
 
-실측 기준 (5,162줄, 13.2MB):
-- **67% 데이터량을 JSON 파싱 없이 스킵**
+실측 기준 (5,162줄, 13.2 MB):
+
+- 67% 데이터량을 JSON 파싱 없이 스킵
 - false negative 0 (누락 없음)
 
 ### 타겟 struct 역직렬화

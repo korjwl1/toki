@@ -1,62 +1,97 @@
-# 왜 OpenTelemetry가 아닌 toki인가?
+# 왜 toki는 OpenTelemetry를 받지 않고 로컬 파일을 직접 파싱하는가
 
-개인 개발자나 소규모 팀이 AI CLI 도구의 토큰 사용량을 추적하려 할 때, OpenTelemetry는 필요 이상으로 무거울 수 있습니다. 이 문서에서는 `toki`가 왜 이 용도에 더 적합한지 설명합니다.
+## 배경
 
----
+Claude Code, Codex CLI, Gemini CLI 모두 OpenTelemetry (OTEL) export를 지원한다. 자연스러운 질문이 따른다: 왜 toki에 OTLP receiver를 내장해서 CLI 도구가 push하게 하지 않고, 로컬 세션 파일을 직접 파싱하는가?
 
-## 아키텍처 비교
+이 문서는 toki의 file 기반 아키텍처가 어떤 근거로 선택되었는지 정리한다.
 
-### OpenTelemetry 방식
-대부분의 대형 AI CLI 도구는 엔터프라이즈 환경을 고려해 OTEL을 사용합니다.
+## 대안: 임베디드 OTLP receiver
 
-- **데이터 흐름:** 이벤트 발생 → 메모리 버퍼링(5~10초) → 네트워크 전송(HTTP/gRPC) → Collector 서버 수신 → 스토리지 저장
-- **특징:** 실시간성보다는 중앙 집중식 관리에 특화되어 있습니다.
+```text
+CLI tool → OTLP export → toki (localhost OTLP server) → DB
+```
 
-### toki 방식 (Local-First)
-- **데이터 흐름:** AI 도구가 로그 기록 → OS 파일 시스템 이벤트 감지 → `toki` 데몬이 즉시 인덱싱 → 로컬 TSDB 저장
-- **특징:** 네트워크 없이, 설정 없이, 즉각적으로 동작합니다.
+대신 현재 구조는:
 
----
+```text
+CLI tool → local session files → toki (file watcher) → DB
+```
 
-## 상세 비교
+## 왜 file parsing이 이기는가
 
-| 비교 항목 | OpenTelemetry | toki |
-| :--- | :--- | :--- |
-| **인프라** | Collector 서버 + 백엔드 필요 | **단일 바이너리, 서버 불필요** |
-| **설정** | 환경 변수, 서버 주소 등 설정 필수 | **설정 제로 — 설치 후 바로 실행** |
-| **과거 데이터** | 설정 이후 데이터만 수집 가능 | **설치 전 수개월 치 로그도 즉시 인덱싱** |
-| **네트워크** | 오프라인에서 동작 불가 | **100% 로컬, 오프라인 완벽 지원** |
-| **오버헤드** | SDK 메모리 점유 + 네트워크 I/O | **이미 써진 파일만 읽어서 Zero Overhead** |
-| **분석 깊이** | 도구가 제공하는 메트릭만 수집 | **원본 로그를 직접 파싱, 세션/서브에이전트 단위 분석** |
+### 1. Cold-start가 file parser를 필수로 만든다
 
----
+toki의 cold-start는 모든 과거 세션 파일을 스캔해서 TSDB에 색인한다. 이는 retroactive 분석을 위해 필수다 — toki 설치 이전의 토큰 사용량, 또는 데몬이 멈춰 있던 기간의 데이터를 보려면 cold-start가 필요하다.
 
-## toki가 더 적합한 이유
+cold-start가 파일을 읽어야 하므로 **file parser는 어떤 provider에 대해서도 반드시 존재해야 한다**. watch mode를 위해 OTLP 수신을 추가한다면, 두 개의 데이터 수집 경로를 유지해야 한다:
 
-### 1. 과거 데이터를 소급 분석할 수 있습니다
+- File parser (전 provider, cold-start용)
+- OTLP event mapper (OTLP를 지원하는 provider, watch mode용)
 
-OTEL은 수집기가 켜져 있는 동안의 데이터만 기록합니다. 추적 설정 전의 기록은 볼 방법이 없죠.
+File-only 방식은 한 경로만 유지한다:
 
-`toki`는 디스크에 이미 쌓여 있는 JSONL 로그 파일을 직접 읽습니다. 오늘 설치해도 3개월 전 사용량을 바로 확인할 수 있습니다.
+- File parser (전 provider, cold-start와 watch mode 양쪽 모두)
 
-### 2. 서버 설정 같은 건 필요 없습니다
+동일한 코드가 두 모드를 다 처리한다. 테스트도 하나, 버그도 하나, 유지보수 대상도 하나다.
 
-개인 개발자가 "오늘 토큰을 얼마나 썼지?" 확인하려고 Collector 서버를 띄우고 환경 변수를 잡는 건 배보다 배꼽이 더 큰 일입니다. `toki`는 AI 도구의 기본 로그 경로를 알고 있어서, 사용자가 아무것도 설정하지 않아도 됩니다.
+### 2. 설정 제로
 
-### 3. 데이터가 내 컴퓨터 밖으로 나가지 않습니다
+toki는 이미 존재하는 디렉토리(`~/.claude`, `~/.codex`)를 가리키기만 하면 동작한다. 어떤 CLI 도구의 설정도 바꿀 필요가 없다.
 
-OTEL은 데이터를 외부 서버로 보내야 하지만, `toki`는 모든 걸 로컬에서만 처리합니다. 오프라인 환경이나 보안이 중요한 상황에서도 문제없이 동작합니다.
+OTLP 수신은 각 CLI 도구를 toki의 endpoint로 export하도록 설정해야 한다:
 
-### 4. 원본 로그를 직접 파싱해서 더 깊이 볼 수 있습니다
+- Claude Code: `~/.claude/settings.json`의 환경변수
+- Codex: `~/.codex/config.toml`의 `[otel]` 섹션
+- Gemini: `~/.gemini/settings.json`의 `telemetry` 객체
 
-OTEL은 도구 제작자가 미리 정의한 메트릭만 볼 수 있습니다. "서브에이전트별 토큰 사용량" 같은 걸 제작자가 메트릭으로 만들어두지 않았다면, 사용자는 그 데이터에 접근할 방법이 없습니다.
+toki가 이 설정을 자동 주입한다고 해도, provider별 설정 주입 로직을 유지해야 한다 — 그리고 사용자의 기존 OTEL 설정과 충돌할 위험이 생긴다.
 
-`toki`는 원본 JSONL 로그 전체를 파싱합니다. 데이터가 로그에 있기만 하면, PromQL 스타일 쿼리로 세션별, 모델별, 프로젝트별 등 원하는 차원으로 자유롭게 분석할 수 있습니다.
+### 3. Retroactive 분석
 
----
+toki는 설치 직후에 수개월치 과거 데이터를 분석할 수 있다. OTLP 수신은 실행 시점 이후의 데이터만 캡처한다. cold-start의 파일 스캔이 retroactive 분석을 가능하게 만들고, 이 스캔은 watch mode와 정확히 같은 parser를 쓴다.
 
-## 결론
+### 4. 추가 의존성 없음
 
-OpenTelemetry가 대규모 분산 시스템의 관측성을 확보하는 데 최고의 도구라면, **toki는 개인 개발자의 CLI 사용량 추적에 최적화된 도구**입니다.
+파일 감시는 OS 기본 메커니즘(FSEvents, inotify)을 `notify` crate로 사용한다 — 이미 의존성에 포함되어 있다. OTLP 수신은 gRPC 또는 HTTP 서버 스택(tonic/axum + protobuf용 prost)을 임베드해야 하며, 바이너리 크기와 의존성 표면이 크게 증가한다.
 
-설정 없이, 과거 데이터까지, 내 컴퓨터 안에서만 안전하고 빠르게. 그게 `toki`가 추구하는 방향입니다.
+### 5. OTLP 데이터도 결국 provider별 해석이 필요하다
+
+각 CLI 도구는 서로 다른 OTLP 시그널을 다른 메트릭명과 구조로 내보낸다:
+
+| CLI | 토큰 메트릭명 | 시그널 타입 |
+|-----|-------------|-------------|
+| Claude Code | `claude_code.token.usage` | Log Record |
+| Gemini CLI | `gemini_cli.token.usage` | Counter |
+| Codex | custom metrics | Log Record |
+
+OTLP를 받는다고 provider별 로직이 사라지는 게 아니다 — "파일 스키마 파싱"에서 "OTLP 이벤트 매핑"으로 이동할 뿐이다. 복잡도는 없어지지 않고 형태만 바뀐다.
+
+### 6. 데이터 완결성
+
+toki 데몬이 재시작될 때 file 기반 복구는 자동이다 — checkpoint가 마지막 처리 라인부터 재개하고, toki가 멈춘 사이에 기록된 데이터를 따라잡는다.
+
+OTLP 수신에서는 toki가 멈춰 있는 동안 보내진 이벤트가 손실된다. 표준 OTEL SDK의 `BatchLogRecordProcessor`는 메모리에만 버퍼링하며, 제3자 endpoint에 대한 디스크 기반 retry가 없다. cold-start는 결국 파일에서 데이터를 복구하므로, OTLP 경로는 신뢰성 면에서 추가 가치가 없다 — file 경로와 완전히 중복된다.
+
+## OTLP가 의미 있어지는 조건
+
+OTLP 수신이 가치 있어지려면 다음 조건이 필요하다:
+
+- toki가 cold-start의 파일 파싱을 완전히 포기 (retroactive 분석 손실)
+- 대상 CLI 도구 전부가 OTLP를 지원 (현재는 아님 — pi-agent, OpenCode 등은 미지원 또는 제한적)
+- toki의 목표가 토큰 추적에 집중하는 게 아니라 general-purpose observability
+
+어느 것도 toki의 설계 목표에 해당하지 않는다.
+
+## 요약
+
+| 측면 | File parsing | OTLP reception |
+|------|-------------|----------------|
+| Parser가 필요한 provider | 전부 | 전부 (cold-start가 여전히 필요) |
+| Watch mode 코드 경로 | 1 (file) | 2 (file + OTLP) |
+| 사용자 설정 필요 | 없음 | CLI별 OTEL 설정 |
+| 과거 데이터 | 즉시 | 활성화 시점 이후만 |
+| 바이너리 의존성 | notify (기존) | + gRPC/HTTP 스택 |
+| 데몬 다운 시 복구 | 자동 (checkpoint) | cold-start 전까지 데이터 손실 |
+
+File parsing은 toki의 목표 — **여러 AI CLI 도구의 토큰 사용량을 설정 없이 추적** — 에 대해 더 단순하고, 더 완결적이며, 더 유지보수하기 쉬운 접근이다.

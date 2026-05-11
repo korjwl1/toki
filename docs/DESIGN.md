@@ -38,17 +38,20 @@ graph TD
     ReportClient["Report Client<br/>query via UDS → sink output"] -->|"UDS connect<br/>sends REPORT command"| Daemon
 ```
 
-### Daemon Process
+### Daemon process
 
-The daemon has a base of 4 threads, plus 2 threads per connected trace client (4 + 2N total):
+The daemon has a base of 4 threads, plus 2 threads per connected trace client (4 + 2N total).
 
-1. **Worker Thread**: Detects file changes via FSEvents (all providers) + 1-second polling (providers that keep fds open, e.g. Codex on macOS) → parses → Sink output + TSDB storage
-2. **Writer Thread**: Sole owner of the DB. Batch event commits, rollup-on-write, retention
-3. **Listener Thread**: UDS accept loop. Reads client command (`TRACE\n` or `REPORT\n`) via BufReader, dispatches accordingly
-4. **Notify Thread**: macOS FSEvents (internal to the notify library)
-5. **Per trace client: +2 threads** (receiver thread + writer thread, see BroadcastSink below)
+Base threads:
 
-### BroadcastSink (Zero Overhead, Condvar-based)
+1. **Worker thread**: Detects file changes via FSEvents (all providers) + 1-second polling (providers that keep fds open, e.g. Codex on macOS) → parses → Sink output + TSDB storage
+2. **Writer thread**: Sole owner of the DB. Batch event commits, rollup-on-write, retention
+3. **Listener thread**: UDS accept loop. Reads client command (`TRACE\n` or `REPORT\n`) via BufReader, dispatches accordingly
+4. **Notify thread**: macOS FSEvents (internal to the notify library)
+
+Each connected trace client adds 2 threads (receiver thread + writer thread). See [BroadcastSink](#broadcastsink-zero-overhead-condvar-based) below.
+
+### BroadcastSink (zero overhead, condvar-based)
 
 `BroadcastSink` implements the `Sink` trait and fans out events to connected trace clients. No tokio dependency — pure `std::sync`.
 
@@ -62,9 +65,9 @@ The daemon has a base of 4 threads, plus 2 threads per connected trace client (4
   - Thread B detects `EPIPE` on write and triggers cleanup
 - **Thread spawn failure**: error is logged and the client is notified via the stream before cleanup
 
-### Trace Client
+### Trace client
 
-```
+```text
 UnixStream::connect(daemon.sock)
     → send "TRACE\n" command
     → BufReader::lines()
@@ -75,9 +78,9 @@ Trace always outputs JSONL to stdout regardless of `--output-format`. The `--out
 
 Each JSONL line includes: `model`, `source`, `provider`, `timestamp` (original from session file), token fields, `cost_usd`.
 
-### Report Client
+### Report client
 
-```
+```text
 UnixStream::connect(daemon.sock)
     → send "REPORT\n" command
     → send JSON query payload
@@ -89,7 +92,7 @@ Report sends a query to the daemon over UDS (sends `REPORT\n` then JSON payload)
 The daemon must be running to use report (verified via PID file).
 Pricing is loaded by the client from the file cache (`~/.config/toki/pricing.json`).
 
-## Worker Thread
+## Worker thread
 
 - Multiplexes FSEvents events, per-provider poll tick, flush tick, and stop signal via `crossbeam_channel::select!`
 - **FSEvents path**: file change detected → `process_and_print_provider()` → parsed events output to Sink + `DbOp::WriteEvent` sent to writer
@@ -97,7 +100,7 @@ Pricing is loaded by the client from the file cache (`~/.config/toki/pricing.jso
 - Watch mode uses blocking `send` (consistent with cold start, zero data loss)
 - Every 5 seconds, dirty checkpoints are batch-flushed to the writer
 
-## Writer Thread
+## Writer thread
 
 - Sole owner of `Database` — no Send issues, single-thread access
 - Receives `DbOp` → accumulates in pending → batch commit when 64 events reached or every 1 second
@@ -105,9 +108,9 @@ Pricing is loaded by the client from the file cache (`~/.config/toki/pricing.jso
 - Daily retention tick automatically deletes old data
 - On shutdown, flushes remaining pending events before exit
 
-## Startup Sequence
+## Startup sequence
 
-```
+```text
 1. Database::open() + load_all_checkpoints()
 2. (db_tx, db_rx) = bounded(1024)
 3. Writer thread spawn (Database ownership transferred)
@@ -123,9 +126,9 @@ The daemon starts with `toki daemon start`, which detaches to the background by 
 Providers are managed with `toki settings set providers --add/--remove`.
 To rebuild the DB from scratch, use `toki daemon reset` followed by `toki daemon start`.
 
-## Shutdown Sequence
+## Shutdown sequence
 
-```
+```text
 1. Receive SIGTERM/SIGINT
 2. Listener stop → listener thread join
 3. stop_tx.send() → Worker thread exit (flush remaining checkpoints)
@@ -134,7 +137,7 @@ To rebuild the DB from scratch, use `toki daemon reset` followed by `toki daemon
 6. Delete PID file + socket file
 ```
 
-## TSDB Schema
+## TSDB schema
 
 7 keyspaces in fjall:
 
@@ -152,7 +155,7 @@ To rebuild the DB from scratch, use `toki daemon reset` followed by `toki daemon
 - Range scan enables time-range queries
 - Index keyspaces have empty values — lookup by key existence only
 
-### Dictionary Compression
+### Dictionary compression
 
 Repeated strings (model, session_id, source_file) are compressed to u32 IDs, reducing `events` keyspace value size.
 
@@ -160,11 +163,11 @@ Repeated strings (model, session_id, source_file) are compressed to u32 IDs, red
 - Writer thread maintains dict_cache in memory, new strings are auto-registered
 - Reverse lookup (ID → string) via `load_dict_reverse()`, used only during report
 
-### Rollup-on-Write
+### Rollup-on-write
 
 When storing events, hourly rollups are simultaneously updated (read-modify-write):
 
-```
+```text
 hour_ts = ts_ms - (ts_ms % 3_600_000)  // truncate to hour
 key = (hour_ts, model_name)
 rollup = db.get_rollup(key) or default
@@ -174,11 +177,11 @@ batch.upsert_rollup(key, rollup)
 
 For daily/monthly time grouping in reports, only the rollup keyspace needs scanning — no need to read all events.
 
-### Batch Transaction
+### Batch transaction
 
 The writer thread accumulates up to 64 events (or flushes every 1 second) and commits them in a single `OwnedWriteBatch`:
 
-```
+```text
 1. Drain pending_events
 2. Rollup read-modify-write (read existing hourly values → accumulate)
 3. Dict ID resolution (cache hit → 0 alloc, miss → add to dict keyspace)
@@ -186,11 +189,11 @@ The writer thread accumulates up to 64 events (or flushes every 1 second) and co
 5. batch.commit()
 ```
 
-## Data Flow
+## Data flow
 
-### Cold Start (daemon start)
+### Cold start (daemon start)
 
-```
+```text
 discover_sessions()
     → SessionGroup[] (parent.jsonl + subagent/*.jsonl)
     → rayon parallel_scan (limited to CPU core count)
@@ -206,9 +209,9 @@ discover_sessions()
 Cold start uses blocking `send`.
 When rayon threads fill the bounded channel (1024), they wait until the writer catches up, guaranteeing zero data loss.
 
-### Watch Mode (real-time)
+### Watch mode (real-time)
 
-```
+```text
 [FSEvents path — all providers]
 FSEvents → event_tx → Worker thread
     → stat() size comparison (1-5µs fast skip)
@@ -226,11 +229,13 @@ poll_tick(1s) → Worker thread
     → crossbeam_channel::never() on Linux/Windows (zero overhead)
 ```
 
-**Why polling for Codex on macOS**: macOS FSEvents fires `FSE_CONTENT_MODIFIED` only in `vn_close()`. Codex holds a single `tokio::fs::File` open for the entire session and only flushes between turns — never closes. Result: zero FSEvents during an active session, one event on exit. Claude Code closes and reopens its session file per turn, so FSEvents works correctly for it. On Linux, inotify `IN_MODIFY` fires per-write regardless of fd state, so polling is not needed on any provider.
+**Why polling for Codex on macOS**: macOS FSEvents fires `FSE_CONTENT_MODIFIED` only in `vn_close()`. Codex holds a single `tokio::fs::File` open for the entire session and only flushes between turns — never closes. The result is zero FSEvents during an active session and one event on exit. Claude Code closes and reopens its session file per turn, so FSEvents works correctly for it.
 
-### Trace Client (real-time stream)
+On Linux, inotify `IN_MODIFY` fires per-write regardless of fd state, so polling is not needed on any provider.
 
-```
+### Trace client (real-time stream)
+
+```text
 UnixStream::connect(daemon.sock)
     → send "TRACE\n" command
     → BufReader::lines() loop
@@ -239,7 +244,7 @@ UnixStream::connect(daemon.sock)
 
 ### Report (one-shot query)
 
-```
+```text
 daemon_status(pidfile)?
     → None: "Cannot connect to toki daemon" → exit
     → Some: continue
@@ -252,9 +257,9 @@ UDS connect → send "REPORT\n" + JSON query
 
 Report sends a query to the daemon over UDS. The client does NOT open the DB directly.
 
-## File Processing Pipeline
+## File processing pipeline
 
-### Active/Idle Classification
+### Active/idle classification
 
 Per-file state tracking minimizes unnecessary processing, particularly during 1-second poll ticks where unchanged files are stat-checked on every cycle.
 
@@ -264,7 +269,7 @@ Per-file state tracking minimizes unnecessary processing, particularly during 1-
 | `IDLE_COOLDOWN` | 500ms | Minimum stat() interval for idle files |
 | `IDLE_TRANSITION` | 15s | Transition to idle after no new lines |
 
-```
+```text
 process_file_with_ts(path)
     → FileActivity exists?
         No  → Active (new file)
@@ -275,20 +280,20 @@ process_file_with_ts(path)
     → If new lines: parse + update checkpoint + promote to Active
 ```
 
-### Fast Skip (size-based)
+### Fast skip (size-based)
 
 - On watch event, check file size via `stat()` only (no file open/read)
 - Skip immediately if size unchanged (~1-5µs vs ~150-300µs)
 - JSONL appends = size increase, so no false negatives
 
-### Reverse Scan (Checkpoint Recovery)
+### Reverse scan (checkpoint recovery)
 
 - Read backwards from file end in 4KB chunks
 - Line length pre-filter (O(1) integer comparison, ~85% candidate elimination)
 - xxHash3-64 comparison only on length match (30GB/s)
 - Byte position changes from compaction are recovered via line hash
 
-## Retention Policy
+## Retention policy
 
 The writer thread automatically enforces data retention policy (disabled by default, configured via `toki settings`):
 
@@ -304,7 +309,7 @@ The writer thread automatically enforces data retention policy (disabled by defa
   - Key structure `{prefix}\0{ts}{msg_id}` is not time-sorted → would require O(n) full scan
   - Orphaned index entries have empty values, so size impact is negligible
 
-## Data Types
+## Data types
 
 ### StoredEvent (events keyspace value)
 
@@ -343,7 +348,7 @@ pub struct FileCheckpoint {
 }
 ```
 
-### DbOp (Writer thread channel message)
+### DbOp (writer thread channel message)
 
 ```rust
 pub enum DbOp {
@@ -354,37 +359,36 @@ pub enum DbOp {
 }
 ```
 
-## Query Architecture
+## Query architecture
 
 Report queries are sent to the daemon over UDS. The daemon executes the query against the TSDB and returns the result.
 
-### Query Paths
+### Query paths
 
-CLI flags (`--session-id`, `--project`, `--since`, `--until`, `--group-by-session`) are internally converted to a `Query` struct and executed via `execute_parsed_query`.
+CLI flags (`--session-id`, `--project`, `--start`, `--end`, `--group-by-session`) are internally converted to a `Query` struct and executed via `execute_parsed_query`.
 Time grouping subcommands (daily/weekly/monthly/yearly/hourly) require calendar-based bucketing and are executed via `report_grouped_from_db`.
 
-| Function | Data Source | Purpose |
+| Function | Data source | Purpose |
 |----------|-------------|---------|
 | `execute_parsed_query` | events + dict or rollups | PromQL query + CLI flag execution |
 | `report_grouped_from_db` | rollups or events + dict | Time-based grouping (daily/weekly/...) |
 | `has_tsdb_data` | rollups (O(1)) | Check TSDB data existence |
 
-### Data Source Selection
+### Data source selection
 
 The data source is determined by the query's filters and grouping conditions:
 
-| Condition | Data Source | Reason |
+| Condition | Data source | Reason |
 |-----------|-------------|--------|
-| Full summary without filters/groups | rollups | Fast (pre-aggregated by hour) |
-| `session` or `project` filter present | events + dict | Rollup lacks session/project info |
-| `by (session)` etc. grouping | events + dict | Rollup lacks session/project info |
+| Full summary, no filters | rollups | Fast (pre-aggregated by hour) |
+| Session or project filter / `by (session\|project)` | events + dict | Rollup lacks session/project info |
 | Time grouping only (daily/weekly/...) | rollups | Fast |
-| Time grouping + session/project filter | events + dict | Event-level filtering required |
+| Time grouping with session/project filter | events + dict | Event-level filtering required |
 | `sessions` / `projects` listing | idx_sessions/idx_projects or events | Index if no time filter, events scan otherwise |
 | `events` listing | events + dict | Always event-level scan |
 | `sum()`/`avg()`/`count()` aggregation | Same as base query | Post-processing: collapses model dimension |
 
-### Streaming Callback Pattern
+### Streaming callback pattern
 
 ```rust
 db.for_each_rollup(since, until, |ts, model, rollup| { ... })
@@ -394,11 +398,11 @@ db.for_each_event(since, until, |ts, event| { ... })
 - Accumulates directly into HashMap without intermediate Vec allocation
 - `has_tsdb_data` is O(1) via `first_key_value().is_some()`
 
-## Config Priority
+## Config priority
 
 Settings values are resolved in this priority order:
 
-```
+```text
 CLI args > Settings file (~/.config/toki/settings.json) > Defaults
 ```
 

@@ -5,7 +5,7 @@
 <h1 align="center">toki</h1>
 
 <p align="center">
-  <b>존재감 없는 토큰 사용량 트래커</b><br>
+  <b>AI CLI 도구를 위한 존재감 없는 토큰 사용량 트래커</b><br>
   Rust로 구축. 데몬 기반. idle 5MB. 리포트 7ms. 작업을 전혀 방해하지 않습니다.
 </p>
 
@@ -37,7 +37,7 @@
 - [누가 쓰면 좋을까?](#누가-쓰면-좋을까)
 - [동작 방식](#동작-방식)
 - [성능](#성능)
-- [프라이버시 & 보안](#프라이버시--보안)
+- [프라이버시와 보안](#프라이버시와-보안)
 - [명령어](#명령어)
 - [멀티 디바이스 동기화](#멀티-디바이스-동기화)
 - [비용 계산](#비용-계산)
@@ -50,47 +50,32 @@
 
 ## Quick Start
 
+설치부터 첫 리포트까지 30초 안에:
+
 ```bash
-# 설치 (macOS)
+# 1. 설치 (macOS)
 brew tap korjwl1/tap
 brew install toki
 
-# toki는 ~/.claude, ~/.codex를 자동 감지합니다. 별도 설정 불필요.
-
-# 1. 데몬 시작
+# 2. 데몬 시작 (~/.claude, ~/.codex 자동 감지)
 toki daemon start
 
-# 2. 실시간 이벤트 스트림 (다른 터미널에서)
-toki trace
-
-# 3. 리포트 조회
-toki report daily --since 20260301
-toki report --provider claude_code
-toki report monthly
-
-# 4. PromQL 스타일 쿼리 (instant)
-toki query 'sum by (model)(toki_tokens_total[1h])'
-toki query -z Asia/Seoul 'sum by (model)(toki_tokens_total[1d])'
-
-# 5. 원격 쿼리 (sync 서버 경유)
-toki query --remote 'sum by (model)(toki_tokens_total[1h])'
-
-# 6. 범위 쿼리 (시간 윈도우 지정 — report 경유)
-toki report --since 20260301 --until 20260331 query 'sum(usage{since="20260301"}[1d]) by (project)'
-toki report query 'events{since="20260320"}'
+# 3. 사용량 확인
+toki report
 ```
+
+trace, PromQL 쿼리, 시간별 그룹핑, 원격 sync 등 추가 명령은 아래 [명령어](#명령어) 또는 [사용법 가이드](docs/USAGE.ko.md)를 참고하세요.
 
 ---
 
 ## 누가 쓰면 좋을까?
 
-- **토큰 리포트 볼 때마다 터미널이 멈추는 분.** toki는 cold start 14배, 리포트 1,700배 빠릅니다. 2GB 데이터도 7ms면 나옵니다.
+toki는 다음 네 가지 상황에 적합합니다:
 
-- **"총 토큰" 이상의 분석이 필요한 분.** 모델별, 세션별, 프로젝트별, 날짜별 분석을 PromQL 스타일로 자유롭게. 시간 범위 필터, 다차원 그룹핑, 비용 추적까지 한 줄이면 됩니다.
-
-- **OpenTelemetry 설정이 귀찮은 분.** Collector도, 환경변수도, 설정 파일 수정도 필요 없습니다. toki를 설치하고 실행하면 디스크에 있는 세션 로그를 바로 읽습니다. 설치 전에 쌓인 수개월치 데이터도 즉시 분석됩니다.
-
-- **여러 AI CLI 도구를 쓰는 분.** Claude Code와 Codex CLI를 하나의 통합 뷰로 볼 수 있습니다. `--provider`로 도구별 필터링도 됩니다.
+- 토큰 리포트 볼 때마다 터미널이 멈추는 분. toki는 cold start 14배, 리포트 1,700배 빠릅니다. 2GB 데이터도 7ms면 나옵니다.
+- "총 토큰" 이상의 분석이 필요한 분. 모델별, 세션별, 프로젝트별, 날짜별 분석을 PromQL 스타일로 자유롭게. 시간 범위 필터, 다차원 그룹핑, 비용 추적까지 한 줄이면 됩니다.
+- OpenTelemetry 설정이 귀찮은 분. Collector도, 환경변수도, 설정 파일 수정도 필요 없습니다. toki를 설치하고 실행하면 디스크에 있는 세션 로그를 바로 읽습니다. 설치 전에 쌓인 수개월치 데이터도 즉시 분석됩니다.
+- 여러 AI CLI 도구를 쓰는 분. Claude Code와 Codex CLI를 하나의 통합 뷰로 볼 수 있습니다. `--provider`로 도구별 필터링도 됩니다.
 
 ---
 
@@ -98,7 +83,7 @@ toki report query 'events{since="20260320"}'
 
 Docker처럼 데몬/클라이언트 구조입니다:
 
-```
+```text
 toki daemon start     # 항상 실행되는 서버   (≈ dockerd)
 toki trace            # 실시간 스트림        (≈ docker logs -f)
 toki report           # 즉시 TSDB 조회      (≈ docker ps)
@@ -146,6 +131,9 @@ ccusage보다 **14배 빠르고**, zzusage와 비슷한 속도에 **메모리는
 | 데이터 | toki | ccusage | zzusage |
 |--------|------|---------|---------|
 | 100 MB | 37 MB | 126 MB | 165 MB |
+| 200 MB | 38 MB | 127 MB | 246 MB |
+| 300 MB | 67 MB | 127 MB | 421 MB |
+| 400 MB | 69 MB | 127 MB | 492 MB |
 | 500 MB | 71 MB | 126 MB | 615 MB |
 | 1 GB | 119 MB | 127 MB | 1,209 MB |
 | 2 GB | 166 MB | 126 MB | **2,311 MB** |
@@ -212,7 +200,7 @@ idle 상태가 있는 건 toki뿐입니다. 나머지는 실행할 때마다 전
 
 ---
 
-## 프라이버시 & 보안
+## 프라이버시와 보안
 
 toki는 정책이 아닌 아키텍처로 프라이버시를 보장합니다.
 
@@ -224,6 +212,20 @@ toki는 정책이 아닌 아키텍처로 프라이버시를 보장합니다.
 ---
 
 ## 명령어
+
+가장 많이 쓰는 흐름:
+
+```bash
+toki daemon start            # 백그라운드 데몬 시작
+toki report                  # 사용량 요약 보기
+toki trace                   # 실시간 이벤트 스트림
+toki query 'sum by (model)(toki_tokens_total[1h])'   # PromQL 스타일 쿼리
+```
+
+전체 명령어 레퍼런스, 쿼리 문법, 설정 옵션, sync 명령은 **[사용법 가이드](docs/USAGE.ko.md)** 참고.
+
+<details>
+<summary>전체 명령어 (daemon, report, query, trace, settings, sync)</summary>
 
 ### Daemon
 
@@ -242,10 +244,10 @@ toki daemon reset                # DB 전체 삭제 + 초기화
 # 전체 요약
 toki report
 toki report --provider claude_code
-toki report --since 20260301 --until 20260331
+toki report --start 20260301 --end 20260331
 
 # 시간별 그룹핑
-toki report daily --since 20260301
+toki report daily --start 20260301
 toki report weekly --start-of-week tue
 toki report monthly
 
@@ -253,16 +255,16 @@ toki report monthly
 toki report --group-by-session
 toki report --project toki
 
-# 범위 쿼리 (--since/--until 시간 윈도우)
-toki report --since 20260301 --until 20260331 query 'sum(usage[1d]) by (project)'
-toki report query 'events{since="20260320"}'
+# 범위 쿼리 (--start/--end 시간 윈도우)
+toki report --start 20260301 --end 20260331 query 'sum(usage[1d]) by (project)'
+toki report --start 20260320 query 'events'
 toki report query 'usage[1d] offset 7d'
 ```
 
 ### Query
 
 ```bash
-# Instant PromQL 쿼리 (최상위 명령어, --since/--until 없음)
+# Instant PromQL 쿼리 (최상위 명령어, --start/--end 없음)
 toki query 'sum by (model)(toki_tokens_total[1h])'
 toki query -z Asia/Seoul 'sum by (model)(toki_tokens_total[1d])'
 
@@ -278,9 +280,7 @@ toki query --output-format json 'toki_tokens_total[1h]'
 toki query --no-cost 'toki_tokens_total[1h]'
 ```
 
-> `toki report query`는 `--since`/`--until` 시간 윈도우를 사용하는 범위 쿼리에서 여전히 사용할 수 있습니다.
-
-전체 명령어 레퍼런스, 쿼리 문법, 설정 옵션은 **[사용법 가이드](docs/USAGE.ko.md)**를 참고하세요.
+> `toki report query`는 `--start`/`--end` 시간 윈도우를 사용하는 범위 쿼리에서 여전히 사용할 수 있습니다.
 
 ### Trace
 
@@ -309,6 +309,8 @@ toki settings sync status                                          # 연결 정�
 toki settings sync devices                                         # 등록된 디바이스 목록
 toki settings sync rename <new-name>                               # 이 디바이스의 이름 변경
 ```
+
+</details>
 
 ---
 
@@ -423,7 +425,7 @@ toki settings sync disable --keep       # 원격 데이터를 유지하고 로�
 
 ## 프로젝트 구조
 
-```
+```text
 src/
 ├── lib.rs                          # Public API: start(), Handle
 ├── main.rs                         # CLI 바이너리 (clap)

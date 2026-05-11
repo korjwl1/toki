@@ -1,8 +1,8 @@
-# Gemini CLI Local Data Analysis
+# Gemini CLI local data analysis
 
 Analysis of how Gemini CLI stores conversation and token usage data locally, compared with Claude Code. Conducted for the purpose of adding Gemini support to toki.
 
-## Data Directory Overview
+## Data directory overview
 
 | Item | Claude Code | Gemini CLI |
 |------|------------|------------|
@@ -12,7 +12,7 @@ Analysis of how Gemini CLI stores conversation and token usage data locally, com
 | **File format** | JSONL (one JSON object per line) | JSON (single file per session) |
 | **Project ID** | Path encoded with `-` (e.g., `-Users-user-project`) | SHA-256 hash or human-readable slug |
 
-## Gemini CLI Directory Structure
+## Gemini CLI directory structure
 
 Top-level `~/.gemini/` contents:
 
@@ -27,13 +27,13 @@ Top-level `~/.gemini/` contents:
 | `history/` | Per-project directory with `.project_root` mapping files |
 | `tmp/` | Per-project session data, chat history, and logs |
 
-## Storage Format Evolution
+## Storage format evolution
 
 Gemini CLI's local storage has gone through three distinct generations.
 
 ### Generation 1: Hash + logs.json only (v0.1.x, ~Aug–Sep 2025)
 
-```
+```text
 ~/.gemini/tmp/<SHA256-of-project-path>/
 └── logs.json              ← user input only, no token data
 ```
@@ -44,7 +44,7 @@ Gemini CLI's local storage has gone through three distinct generations.
 
 ### Generation 2: Hash + logs.json + chats/ (v0.3.0+, ~Oct 2025–Feb 2026)
 
-```
+```text
 ~/.gemini/tmp/<SHA256-of-project-path>/
 ├── logs.json
 └── chats/
@@ -58,7 +58,7 @@ Gemini CLI's local storage has gone through three distinct generations.
 
 ### Generation 3: Human-readable slug + .project_root (v0.29.0+, Feb 2026~)
 
-```
+```text
 ~/.gemini/tmp/ddleague-clitrace/
 ├── .project_root          ← contains "/Volumes/SSD/Projects/Personal/ddleague-clitrace"
 ├── logs.json
@@ -71,7 +71,7 @@ Gemini CLI's local storage has gone through three distinct generations.
 - `projects.json` stores the full path ↔ slug mapping
 - `.project_root` file contains the normalized absolute path for ownership verification
 
-## Version History
+## Version history
 
 | Date | Version | Change |
 |------|---------|--------|
@@ -81,14 +81,14 @@ Gemini CLI's local storage has gone through three distinct generations.
 | 2026.02 | v0.29.0 | Hash→slug directory transition + `.project_root` + `projects.json`. 30-day retention enabled by default |
 | 2026.03 | v0.33.0 | Retention warning removed, 30-day becomes silent default |
 
-## Migration & Backward Compatibility
+## Migration and backward compatibility
 
 - `StorageMigration` class performs **copy-forward** from old hash directories to new slug directories on app startup
 - Original hash directories are **not deleted** — both coexist
 - Migration errors are swallowed gracefully (best-effort)
 - This means **duplicate sessions** can exist across hash and slug folders for the same project
 
-## Token Usage Format
+## Token usage format
 
 ### Claude Code (`assistant` type message)
 
@@ -131,7 +131,7 @@ Gemini CLI's local storage has gone through three distinct generations.
 
 6 token types: `input`, `output`, `cached`, `thoughts`, `tool`, `total`
 
-### Token Type Mapping
+### Token type mapping
 
 | Gemini CLI | Claude Code Equivalent | Notes |
 |-----------|----------------------|-------|
@@ -144,11 +144,11 @@ Gemini CLI's local storage has gone through three distinct generations.
 
 Claude Code has `cache_creation_input_tokens` which Gemini does not track separately.
 
-## Session File Structure (Gemini CLI)
+## Session file structure (Gemini CLI)
 
 ### Session file naming convention
 
-```
+```text
 session-YYYY-MM-DDTHH-MM-<first-8-chars-of-sessionId>.json
 ```
 
@@ -190,7 +190,7 @@ Only `gemini` type messages contain token usage data.
 
 No token data — not useful for usage tracking.
 
-## Documentation & Stability Assessment
+## Documentation and stability assessment
 
 - **No CHANGELOG.md** in the repository — release notes are auto-generated PR title lists
 - **No stable contract** for local data storage format
@@ -200,15 +200,15 @@ No token data — not useful for usage tracking.
 
 ## Implications for toki
 
-### Discovery Pattern
+### Discovery pattern
 
-```
+```text
 ~/.gemini/tmp/**/chats/session-*.json
 ```
 
 Covers both Gen 2 (hash) and Gen 3 (slug) directories.
 
-### Project Path Recovery Strategy
+### Project path recovery strategy
 
 1. **Slug folder** (has `.project_root`): read the file directly
 2. **Hash folder**: compute SHA-256 of paths listed in `projects.json` to reverse-map
@@ -218,7 +218,7 @@ Covers both Gen 2 (hash) and Gen 3 (slug) directories.
 
 Since migration copies (not moves) data, the same session may exist in both hash and slug directories. Deduplicate by `sessionId`.
 
-### Parsing Strategy Differences
+### Parsing strategy differences
 
 | Aspect | Claude Code (current) | Gemini CLI (new) |
 |--------|----------------------|------------------|

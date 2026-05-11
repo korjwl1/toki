@@ -1,4 +1,4 @@
-# Why toki Parses Local Files Instead of Receiving OpenTelemetry
+# Why toki parses local files instead of receiving OpenTelemetry
 
 ## Background
 
@@ -6,19 +6,19 @@ Claude Code, Codex CLI, and Gemini CLI all support OpenTelemetry (OTEL) export. 
 
 This document explains the reasoning behind toki's file-based architecture.
 
-## The Alternative: Embedded OTLP Receiver
+## The alternative: embedded OTLP receiver
 
-```
+```text
 CLI tool → OTLP export → toki (localhost OTLP server) → DB
 ```
 
 Instead of:
 
-```
+```text
 CLI tool → local session files → toki (file watcher) → DB
 ```
 
-## Why File Parsing Wins
+## Why file parsing wins
 
 ### 1. Cold-start makes file parsers mandatory
 
@@ -73,7 +73,7 @@ When toki's daemon restarts, file-based recovery is automatic — the checkpoint
 
 With OTLP reception, events sent while toki is down are lost. The standard OTEL SDK's `BatchLogRecordProcessor` buffers in memory only — no disk-based retry for third-party endpoints. Cold-start would still recover the data from files, but this means the OTLP path adds no reliability value; it's purely redundant with the file path.
 
-## When OTLP Would Make Sense
+## When OTLP would make sense
 
 OTLP reception could be valuable if:
 
@@ -94,4 +94,4 @@ None of these apply to toki's design goals.
 | Binary dependencies | notify (existing) | + gRPC/HTTP stack |
 | Daemon down recovery | Automatic (checkpoint) | Data lost until cold-start |
 
-File parsing is the simpler, more complete, and more maintainable approach for toki's specific use case: **tracking token usage across multiple AI CLI tools with zero configuration.**
+File parsing is the simpler, more complete, and more maintainable approach for toki's specific use case: tracking token usage across multiple AI CLI tools with zero configuration.

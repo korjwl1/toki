@@ -1,14 +1,14 @@
-# OpenTelemetry Integration: Claude Code vs Gemini CLI
+# OpenTelemetry integration: Claude Code vs Gemini CLI
 
 Comparison of how Claude Code and Gemini CLI implement OpenTelemetry, and how toki's local file parsing approach differs.
 
-## Architecture Overview
+## Architecture overview
 
 ### Claude Code OTEL
 
 Two independent export paths coexist within the Claude Code process:
 
-```
+```text
 ┌─ Claude Code Process ───────────────────────────────┐
 │                                                      │
 │  Event occurs (token usage, API call, etc.)          │
@@ -37,7 +37,7 @@ Key finding: Token usage is **not** recorded via OTEL Metrics API counters. Inst
 
 ### Gemini CLI OTEL
 
-```
+```text
 ┌─ Gemini CLI Process ────────────────────────────────┐
 │                                                      │
 │  Event occurs                                        │
@@ -59,7 +59,7 @@ Key finding: Token usage is **not** recorded via OTEL Metrics API counters. Inst
 └──────────────────────────────────────────────────────┘
 ```
 
-## Comparison Table
+## Comparison table
 
 | Aspect | Claude Code | Gemini CLI |
 |--------|------------|------------|
@@ -72,9 +72,9 @@ Key finding: Token usage is **not** recorded via OTEL Metrics API counters. Inst
 | **Service name** | `claude-code` | `gemini-cli` |
 | **Meter name** | `com.anthropic.claude_code` | `gemini-cli` |
 
-## Claude Code OTEL Details
+## Claude Code OTEL details
 
-### Path A: User-Configured 3P OTLP Export
+### Path A: user-configured 3P OTLP export
 
 Activated when `CLAUDE_CODE_ENABLE_TELEMETRY=1` is set.
 
@@ -90,7 +90,7 @@ Activated when `CLAUDE_CODE_ENABLE_TELEMETRY=1` is set.
 | Shutdown timeout | 2s | `CLAUDE_CODE_OTEL_SHUTDOWN_TIMEOUT_MS` |
 | Flush timeout | 5s | `CLAUDE_CODE_OTEL_FLUSH_TIMEOUT_MS` |
 
-### Path B: Anthropic 1P Internal Telemetry
+### Path B: Anthropic 1P internal telemetry
 
 Always active, independent of user settings.
 
@@ -102,7 +102,7 @@ Always active, independent of user settings.
 | Endpoint | Anthropic internal server |
 | Killswitch | `tengu_frond_boric.firstParty` (GrowthBook feature flag) |
 
-### Metrics Emitted
+### Metrics emitted
 
 | Metric | Description | Unit |
 |--------|-------------|------|
@@ -115,7 +115,7 @@ Always active, independent of user settings.
 | `claude_code.active_time.total` | Active usage time | seconds |
 | `claude_code.code_edit_tool.decision` | Code edit tool decisions | count |
 
-### Log Events Emitted
+### Log events emitted
 
 - `claude_code.user_prompt` — user submits a prompt
 - `claude_code.tool_result` — tool completes execution
@@ -123,11 +123,11 @@ Always active, independent of user settings.
 - `claude_code.api_error` — API request fails
 - `claude_code.tool_decision` — tool permission decision
 
-### Retry/Queue Logic (1P Path)
+### Retry/queue logic (1P path)
 
 Failed exports are persisted to disk and retried with exponential backoff:
 
-```
+```text
 Export failure
   → queueFailedEvents()
      → saves to: 1p_failed_events.{sessionId}.{uuid}.json
@@ -137,7 +137,7 @@ Export failure
      → reads previous session's failed files and re-sends
 ```
 
-### Privacy Controls
+### Privacy controls
 
 | Control | Default | Env Var |
 |---------|---------|---------|
@@ -147,7 +147,7 @@ Export failure
 | Include version | Disabled | `OTEL_METRICS_INCLUDE_VERSION` |
 | Include account UUID | Enabled | `OTEL_METRICS_INCLUDE_ACCOUNT_UUID` |
 
-## Gemini CLI OTEL Details
+## Gemini CLI OTEL details
 
 ### Configuration
 
@@ -172,7 +172,7 @@ Export failure
 | Log Prompts | `GEMINI_TELEMETRY_LOG_PROMPTS` | true/1, false |
 | Output File | `GEMINI_TELEMETRY_OUTFILE` | file path |
 
-### Export Intervals
+### Export intervals
 
 | Target | Interval |
 |--------|----------|
@@ -198,7 +198,7 @@ Export failure
 
 Spans created for LLM calls, tool executions, and agent runs. Follows OpenTelemetry GenAI semantic conventions. Attributes include operation name, model, conversation ID, input/output messages.
 
-## toki vs OTEL: Token Usage Tracking
+## toki vs OTEL: token usage tracking
 
 For the specific purpose of token usage monitoring:
 

@@ -1,8 +1,10 @@
-# Multi-Provider Support Implementation Plan
+# Multi-provider support implementation plan
+
+> **Status:** Historical. Implemented as of 2026-03; kept for design context. See [DESIGN.md](../DESIGN.md) for current architecture.
 
 ## Status
 
-**Draft** -- 2026-03-17
+Draft -- 2026-03-17
 
 ## Overview
 

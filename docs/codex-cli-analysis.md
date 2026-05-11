@@ -1,8 +1,8 @@
-# Codex CLI Local Data Analysis
+# Codex CLI local data analysis
 
 Analysis of how Codex CLI stores conversation and token usage data locally, compared with Claude Code. Conducted for the purpose of adding Codex support to toki.
 
-## Data Directory Overview
+## Data directory overview
 
 | Item | Claude Code | Codex CLI |
 |------|------------|-----------|
@@ -13,7 +13,7 @@ Analysis of how Codex CLI stores conversation and token usage data locally, comp
 | **Project ID** | Path encoded with `-` (e.g., `-Users-user-project`) | Session metadata `cwd` field |
 | **History** | N/A | `~/.codex/history.jsonl` (user inputs only, not useful for token tracking) |
 
-## Directory Structure
+## Directory structure
 
 Top-level `~/.codex/` contents:
 
@@ -33,22 +33,23 @@ Top-level `~/.codex/` contents:
 | `shell_snapshots/` | Shell state snapshots |
 | `tmp/` | Temporary files |
 
-## Session File Structure
+## Session file structure
 
 ### File naming convention
 
-```
+```text
 rollout-YYYY-MM-DDTHH-MM-SS-<session-UUID>.jsonl
 ```
 
 Example:
-```
+
+```text
 ~/.codex/sessions/2026/03/12/rollout-2026-03-12T00-35-10-019cdd89-9fd9-7f11-b555-459c0ec30834.jsonl
 ```
 
 ### Session file discovery pattern
 
-```
+```text
 ~/.codex/sessions/**/*.jsonl
 ```
 
@@ -113,7 +114,7 @@ Only `token_count` (inside `event_msg`) contains token usage data.
 }
 ```
 
-## Token Usage Format
+## Token usage format
 
 ### Codex CLI (`token_count` inside `event_msg`)
 
@@ -164,7 +165,7 @@ Two usage objects are provided:
 
 Note: The first `token_count` event in a session may have `"info": null` (no token data yet).
 
-### Token Type Mapping
+### Token type mapping
 
 | Codex CLI | Claude Code Equivalent | Notes |
 |-----------|----------------------|-------|
@@ -175,7 +176,7 @@ Note: The first `token_count` event in a session may have `"info": null` (no tok
 | `total_tokens` | — | Sum field, can be computed |
 | — | `cache_creation_input_tokens` | Claude-specific, Codex does not track |
 
-### Model Name Discovery
+### Model name discovery
 
 Model names are **not in `token_count` events**. They appear in `turn_context` events. To associate a model with token usage:
 
@@ -186,7 +187,7 @@ Observed models: `gpt-5.4`, `gpt-5.3-codex`, `gpt-5.2-codex`
 
 ## Comparison with Claude Code
 
-### Parsing Strategy
+### Parsing strategy
 
 | Aspect | Claude Code | Codex CLI |
 |--------|------------|-----------|
@@ -200,7 +201,7 @@ Observed models: `gpt-5.4`, `gpt-5.3-codex`, `gpt-5.2-codex`
 | Project path | Parent directory name (encoded) | `session_meta` payload `cwd` field |
 | Subagents | Separate files in `subagents/` directory | N/A |
 
-### Key Differences for toki Implementation
+### Key differences for toki implementation
 
 1. **Model tracking requires state**: Unlike Claude Code where each assistant message contains its model, Codex requires tracking the most recent `turn_context` model and associating it with subsequent `token_count` events.
 
@@ -222,13 +223,13 @@ No token data — not useful for usage tracking.
 
 ## Implications for toki
 
-### Discovery Pattern
+### Discovery pattern
 
-```
+```text
 ~/.codex/sessions/**/*.jsonl
 ```
 
-### Parser Implementation
+### Parser implementation
 
 - Reuse existing `process_lines_streaming` and xxHash3 checkpoint system
 - Pre-filter lines containing `"token_count"` for efficiency
@@ -236,7 +237,7 @@ No token data — not useful for usage tracking.
 - Track model from `turn_context` lines (requires minimal state: last seen model)
 - Extract session ID and project path from `session_meta` (first line)
 
-### Estimated Complexity
+### Estimated complexity
 
 Low. The JSONL append-only format is identical to Claude Code, so the core infrastructure (checkpoint, incremental read, parallel cold start) can be shared directly. The main new work is:
 - A new parser struct implementing `LogParser` / `LogParserWithTs` traits
