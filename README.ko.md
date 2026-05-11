@@ -5,7 +5,7 @@
 <h1 align="center">toki</h1>
 
 <p align="center">
-  <b>AI CLI 도구를 위한 존재감 없는 토큰 사용량 트래커</b><br>
+  <b>Claude Code와 Codex CLI를 위한 토큰 사용량 트래커</b><br>
   Rust로 구축. 데몬 기반. idle 5MB. 리포트 7ms. 작업을 전혀 방해하지 않습니다.
 </p>
 

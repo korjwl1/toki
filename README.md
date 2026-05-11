@@ -5,7 +5,7 @@
 <h1 align="center">toki</h1>
 
 <p align="center">
-  <b>Invisible token usage tracker for AI CLI tools</b><br>
+  <b>Token usage tracker for Claude Code and Codex CLI</b><br>
   Built in Rust. Daemon-powered. 5 MB idle. Reports in 7 ms. Your workflow never notices.
 </p>
 
