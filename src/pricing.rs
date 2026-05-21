@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -35,17 +36,17 @@ pub struct PricingTable {
     prices: HashMap<String, ModelPricing>,
 }
 
-/// Fallback multipliers for Anthropic Fast mode when LiteLLM lacks a `-fast`
-/// pricing entry. Direct LiteLLM match always wins; this only kicks in for
-/// `<base>-fast` lookups when the base model is priced and the suffix is not.
-/// Source: Anthropic Claude Code fast-mode pricing ($30/$150 vs $5/$25 = 6x).
-const FAST_MULTIPLIER: &[(&str, f64)] = &[
-    ("claude-opus-4-6", 6.0),
-    ("claude-opus-4-7", 6.0),
-];
-
+/// Walk every provider's fast-multiplier table to resolve `<base>` → multiplier.
+/// Returns the first match. Compile-time `const` slices, so iteration is
+/// O(total provider rows) with zero runtime allocation.
 fn fast_multiplier(base: &str) -> Option<f64> {
-    FAST_MULTIPLIER.iter().find_map(|(k, v)| (*k == base).then_some(*v))
+    [
+        crate::providers::claude_code::FAST_MULTIPLIER,
+        crate::providers::codex::FAST_MULTIPLIER,
+    ]
+    .iter()
+    .flat_map(|table| table.iter())
+    .find_map(|(k, v)| (*k == base).then_some(*v))
 }
 
 impl PricingTable {
@@ -60,25 +61,25 @@ impl PricingTable {
     /// Look up effective pricing for a model name.
     ///
     /// Resolution order:
-    /// 1. Direct exact match in LiteLLM data (takes precedence if/when
-    ///    LiteLLM publishes `-fast` rows for Claude models).
+    /// 1. Direct exact match in LiteLLM data — zero-copy `Cow::Borrowed`.
+    ///    Takes precedence if/when LiteLLM publishes `-fast` rows.
     /// 2. `<base>-fast` suffix fallback: base model pricing scaled by the
-    ///    hardcoded fast multiplier table.
-    pub fn get(&self, model: &str) -> Option<ModelPricing> {
+    ///    per-provider multiplier table — `Cow::Owned` (single allocation).
+    pub fn get(&self, model: &str) -> Option<Cow<'_, ModelPricing>> {
         if let Some(p) = self.prices.get(model) {
-            return Some(p.clone());
+            return Some(Cow::Borrowed(p));
         }
         let base = model.strip_suffix("-fast")?;
         let mul = fast_multiplier(base)?;
         let base_p = self.prices.get(base)?;
-        Some(ModelPricing {
+        Some(Cow::Owned(ModelPricing {
             input_cost_per_token: base_p.input_cost_per_token * mul,
             output_cost_per_token: base_p.output_cost_per_token * mul,
             cache_creation_input_token_cost:
                 base_p.cache_creation_input_token_cost.map(|c| c * mul),
             cache_read_input_token_cost:
                 base_p.cache_read_input_token_cost.map(|c| c * mul),
-        })
+        }))
     }
 
     /// Calculate cost for a ModelUsageSummary.
@@ -501,6 +502,45 @@ mod tests {
             (p.cache_read_input_token_cost.unwrap() - 0.0000005 * 6.0).abs()
                 < 1e-12
         );
+    }
+
+    #[test]
+    fn test_direct_match_is_borrowed() {
+        // Hot-path guard: direct LiteLLM matches must not allocate.
+        let mut prices = HashMap::new();
+        prices.insert("claude-opus-4-7".to_string(), ModelPricing {
+            input_cost_per_token: 0.000005,
+            output_cost_per_token: 0.000025,
+            cache_creation_input_token_cost: None,
+            cache_read_input_token_cost: None,
+        });
+        let table = PricingTable::new(prices);
+        let cow = table.get("claude-opus-4-7").unwrap();
+        assert!(matches!(cow, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_fast_fallback_is_owned() {
+        let mut prices = HashMap::new();
+        prices.insert("claude-opus-4-7".to_string(), ModelPricing {
+            input_cost_per_token: 0.000005,
+            output_cost_per_token: 0.000025,
+            cache_creation_input_token_cost: None,
+            cache_read_input_token_cost: None,
+        });
+        let table = PricingTable::new(prices);
+        let cow = table.get("claude-opus-4-7-fast").unwrap();
+        assert!(matches!(cow, std::borrow::Cow::Owned(_)));
+    }
+
+    #[test]
+    fn test_empty_provider_table_safe() {
+        // Codex's FAST_MULTIPLIER is an empty placeholder; the resolver
+        // must still find Claude entries from the other provider's table.
+        assert_eq!(fast_multiplier("claude-opus-4-7"), Some(6.0));
+        // And an unknown base must yield None without panicking on the
+        // empty Codex slice.
+        assert_eq!(fast_multiplier("gpt-5.5"), None);
     }
 
     #[test]
