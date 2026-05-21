@@ -17,11 +17,12 @@ struct JsonlLine<'a> {
 struct MessagePartial<'a> {
     id: Option<&'a str>,
     model: Option<&'a str>,
-    usage: Option<UsageData>,
+    #[serde(borrow)]
+    usage: Option<UsageData<'a>>,
 }
 
 #[derive(Deserialize)]
-struct UsageData {
+struct UsageData<'a> {
     #[serde(default)]
     input_tokens: u64,
     #[serde(default)]
@@ -30,13 +31,15 @@ struct UsageData {
     cache_read_input_tokens: u64,
     #[serde(default)]
     output_tokens: u64,
+    #[serde(default, borrow)]
+    speed: Option<&'a str>,
 }
 
 struct ParsedLine<'a> {
     message_id: &'a str,
-    model: &'a str,
+    model: String,
     timestamp: &'a str,
-    usage: UsageData,
+    usage: UsageData<'a>,
 }
 
 pub struct ClaudeCodeParser;
@@ -69,12 +72,19 @@ impl ClaudeCodeParser {
 
         let msg = parsed.message?;
         let usage = msg.usage?;
-        let model = msg.model.unwrap_or("unknown");
+        let base_model = msg.model.unwrap_or("unknown");
 
         // Skip synthetic events (internally generated, no real API call)
-        if model == "<synthetic>" {
+        if base_model == "<synthetic>" {
             return None;
         }
+
+        // Anthropic Fast mode: suffix model with "-fast" so pricing/breakdowns separate.
+        let model = if matches!(usage.speed, Some("fast")) {
+            format!("{}-fast", base_model)
+        } else {
+            base_model.to_string()
+        };
 
         Some(ParsedLine {
             message_id: msg.id.unwrap_or(""),
@@ -92,7 +102,7 @@ impl ClaudeCodeParser {
         Some(UsageEventWithTs {
             event_key,
             source_file: source_file.to_string(),
-            model: parsed.model.to_string(),
+            model: parsed.model,
             input_tokens: parsed.usage.input_tokens,
             cache_creation_input_tokens: parsed.usage.cache_creation_input_tokens,
             cache_read_input_tokens: parsed.usage.cache_read_input_tokens,
@@ -112,7 +122,7 @@ impl ClaudeCodeParser {
 
         Some(crate::providers::ColdStartParsed {
             event_key,
-            model: parsed.model.to_string(),
+            model: parsed.model,
             ts_ms,
             tokens: crate::common::types::TokenFields {
                 input_tokens: parsed.usage.input_tokens,
@@ -134,7 +144,7 @@ impl LogParser for ClaudeCodeParser {
         Some(UsageEvent {
             event_key,
             source_file: source_file.to_string(),
-            model: parsed.model.to_string(),
+            model: parsed.model,
             input_tokens: parsed.usage.input_tokens,
             cache_creation_input_tokens: parsed.usage.cache_creation_input_tokens,
             cache_read_input_tokens: parsed.usage.cache_read_input_tokens,
@@ -263,6 +273,30 @@ mod tests {
     fn test_skip_invalid_json() {
         let parser = ClaudeCodeParser;
         assert!(parser.parse_line("not json", "/test.jsonl").is_none());
+    }
+
+    #[test]
+    fn test_speed_fast_suffixes_model() {
+        let line = r#"{"type":"assistant","message":{"id":"msg_1","model":"claude-opus-4-7","usage":{"input_tokens":1,"output_tokens":2,"speed":"fast"}},"timestamp":"2026-03-08T12:00:00Z"}"#;
+        let parser = ClaudeCodeParser;
+        let event = parser.parse_line(line, "/test.jsonl").unwrap();
+        assert_eq!(event.model, "claude-opus-4-7-fast");
+    }
+
+    #[test]
+    fn test_speed_standard_no_suffix() {
+        let line = r#"{"type":"assistant","message":{"id":"msg_1","model":"claude-opus-4-7","usage":{"input_tokens":1,"output_tokens":2,"speed":"standard"}},"timestamp":"2026-03-08T12:00:00Z"}"#;
+        let parser = ClaudeCodeParser;
+        let event = parser.parse_line(line, "/test.jsonl").unwrap();
+        assert_eq!(event.model, "claude-opus-4-7");
+    }
+
+    #[test]
+    fn test_speed_absent_no_suffix() {
+        let line = r#"{"type":"assistant","message":{"id":"msg_1","model":"claude-opus-4-7","usage":{"input_tokens":1,"output_tokens":2}},"timestamp":"2026-03-08T12:00:00Z"}"#;
+        let parser = ClaudeCodeParser;
+        let event = parser.parse_line(line, "/test.jsonl").unwrap();
+        assert_eq!(event.model, "claude-opus-4-7");
     }
 
     #[test]
