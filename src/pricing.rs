@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -35,6 +36,19 @@ pub struct PricingTable {
     prices: HashMap<String, ModelPricing>,
 }
 
+/// Walk every provider's fast-multiplier table to resolve `<base>` → multiplier.
+/// Returns the first match. Compile-time `const` slices, so iteration is
+/// O(total provider rows) with zero runtime allocation.
+fn fast_multiplier(base: &str) -> Option<f64> {
+    [
+        crate::providers::claude_code::FAST_MULTIPLIER,
+        crate::providers::codex::FAST_MULTIPLIER,
+    ]
+    .iter()
+    .flat_map(|table| table.iter())
+    .find_map(|(k, v)| (*k == base).then_some(*v))
+}
+
 impl PricingTable {
     pub fn new(prices: HashMap<String, ModelPricing>) -> Self {
         PricingTable { prices }
@@ -44,9 +58,28 @@ impl PricingTable {
         self.prices.is_empty()
     }
 
-    /// Look up pricing for a model name (exact match only).
-    pub fn get(&self, model: &str) -> Option<&ModelPricing> {
-        self.prices.get(model)
+    /// Look up effective pricing for a model name.
+    ///
+    /// Resolution order:
+    /// 1. Direct exact match in LiteLLM data — zero-copy `Cow::Borrowed`.
+    ///    Takes precedence if/when LiteLLM publishes `-fast` rows.
+    /// 2. `<base>-fast` suffix fallback: base model pricing scaled by the
+    ///    per-provider multiplier table — `Cow::Owned` (single allocation).
+    pub fn get(&self, model: &str) -> Option<Cow<'_, ModelPricing>> {
+        if let Some(p) = self.prices.get(model) {
+            return Some(Cow::Borrowed(p));
+        }
+        let base = model.strip_suffix("-fast")?;
+        let mul = fast_multiplier(base)?;
+        let base_p = self.prices.get(base)?;
+        Some(Cow::Owned(ModelPricing {
+            input_cost_per_token: base_p.input_cost_per_token * mul,
+            output_cost_per_token: base_p.output_cost_per_token * mul,
+            cache_creation_input_token_cost:
+                base_p.cache_creation_input_token_cost.map(|c| c * mul),
+            cache_read_input_token_cost:
+                base_p.cache_read_input_token_cost.map(|c| c * mul),
+        }))
     }
 
     /// Calculate cost for a ModelUsageSummary.
@@ -420,6 +453,109 @@ mod tests {
         };
         let cost = table.event_cost(&event).unwrap();
         assert!((cost - 0.0105).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_fast_suffix_direct_match_wins() {
+        // If LiteLLM ever ships a "-fast" row directly, it must take precedence
+        // over the multiplier fallback.
+        let mut prices = HashMap::new();
+        prices.insert("claude-opus-4-7".to_string(), ModelPricing {
+            input_cost_per_token: 0.000005,
+            output_cost_per_token: 0.000025,
+            cache_creation_input_token_cost: None,
+            cache_read_input_token_cost: None,
+        });
+        prices.insert("claude-opus-4-7-fast".to_string(), ModelPricing {
+            // Pretend LiteLLM ships a hand-tuned (not 6x) value — must not be
+            // overwritten by the fallback table.
+            input_cost_per_token: 0.0000777,
+            output_cost_per_token: 0.0001111,
+            cache_creation_input_token_cost: None,
+            cache_read_input_token_cost: None,
+        });
+        let table = PricingTable::new(prices);
+        let p = table.get("claude-opus-4-7-fast").unwrap();
+        assert!((p.input_cost_per_token - 0.0000777).abs() < 1e-12);
+        assert!((p.output_cost_per_token - 0.0001111).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_fast_suffix_multiplier_fallback() {
+        // Base model priced, "-fast" row missing → apply 6x multiplier.
+        let mut prices = HashMap::new();
+        prices.insert("claude-opus-4-7".to_string(), ModelPricing {
+            input_cost_per_token: 0.000005,
+            output_cost_per_token: 0.000025,
+            cache_creation_input_token_cost: Some(0.00000625),
+            cache_read_input_token_cost: Some(0.0000005),
+        });
+        let table = PricingTable::new(prices);
+        let p = table.get("claude-opus-4-7-fast").unwrap();
+        assert!((p.input_cost_per_token - 0.000005 * 6.0).abs() < 1e-12);
+        assert!((p.output_cost_per_token - 0.000025 * 6.0).abs() < 1e-12);
+        assert!(
+            (p.cache_creation_input_token_cost.unwrap() - 0.00000625 * 6.0).abs()
+                < 1e-12
+        );
+        assert!(
+            (p.cache_read_input_token_cost.unwrap() - 0.0000005 * 6.0).abs()
+                < 1e-12
+        );
+    }
+
+    #[test]
+    fn test_direct_match_is_borrowed() {
+        // Hot-path guard: direct LiteLLM matches must not allocate.
+        let mut prices = HashMap::new();
+        prices.insert("claude-opus-4-7".to_string(), ModelPricing {
+            input_cost_per_token: 0.000005,
+            output_cost_per_token: 0.000025,
+            cache_creation_input_token_cost: None,
+            cache_read_input_token_cost: None,
+        });
+        let table = PricingTable::new(prices);
+        let cow = table.get("claude-opus-4-7").unwrap();
+        assert!(matches!(cow, std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn test_fast_fallback_is_owned() {
+        let mut prices = HashMap::new();
+        prices.insert("claude-opus-4-7".to_string(), ModelPricing {
+            input_cost_per_token: 0.000005,
+            output_cost_per_token: 0.000025,
+            cache_creation_input_token_cost: None,
+            cache_read_input_token_cost: None,
+        });
+        let table = PricingTable::new(prices);
+        let cow = table.get("claude-opus-4-7-fast").unwrap();
+        assert!(matches!(cow, std::borrow::Cow::Owned(_)));
+    }
+
+    #[test]
+    fn test_empty_provider_table_safe() {
+        // Codex's FAST_MULTIPLIER is an empty placeholder; the resolver
+        // must still find Claude entries from the other provider's table.
+        assert_eq!(fast_multiplier("claude-opus-4-7"), Some(6.0));
+        // And an unknown base must yield None without panicking on the
+        // empty Codex slice.
+        assert_eq!(fast_multiplier("gpt-5.5"), None);
+    }
+
+    #[test]
+    fn test_fast_suffix_unknown_base_returns_none() {
+        // "-fast" suffix but base model not in multiplier table → no fallback.
+        let mut prices = HashMap::new();
+        prices.insert("claude-sonnet-4-5".to_string(), ModelPricing {
+            input_cost_per_token: 0.000003,
+            output_cost_per_token: 0.000015,
+            cache_creation_input_token_cost: None,
+            cache_read_input_token_cost: None,
+        });
+        let table = PricingTable::new(prices);
+        // Sonnet isn't in FAST_MULTIPLIER → no fallback, even though base exists.
+        assert!(table.get("claude-sonnet-4-5-fast").is_none());
     }
 
     #[test]

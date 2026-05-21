@@ -2,6 +2,15 @@ pub mod parser;
 
 pub use parser::ClaudeCodeParser;
 
+/// Fast-mode pricing multipliers for Anthropic models.
+/// Applied by `pricing::PricingTable::get` when a `<base>-fast` lookup
+/// misses the LiteLLM table (direct `-fast` rows always win).
+/// Source: Anthropic Claude Code fast-mode pricing ($30/$150 vs $5/$25 = 6x).
+pub const FAST_MULTIPLIER: &[(&str, f64)] = &[
+    ("claude-opus-4-6", 6.0),
+    ("claude-opus-4-7", 6.0),
+];
+
 use crate::common::types::{LogParser, LogParserWithTs, SessionGroup};
 use crate::providers::{
     ColdStartParsed, FileParser, Provider,

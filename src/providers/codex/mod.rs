@@ -2,6 +2,15 @@ pub mod parser;
 
 pub use parser::CodexParser;
 
+/// Fast-mode pricing multipliers for Codex models.
+/// Empty placeholder: Codex JSONL carries no service_tier marker and the
+/// OpenAI API response does not echo it back, so per-event Fast detection
+/// is impossible. Populate this list only if Codex CLI starts recording
+/// the tier inside its session JSONL.
+/// Reference (ccusage's table, kept here for future activation):
+///   gpt-5.5 -> 2.5x, gpt-5.4 -> 2.0x, gpt-5.3-codex -> 2.0x
+pub const FAST_MULTIPLIER: &[(&str, f64)] = &[];
+
 use std::path::PathBuf;
 
 use crate::common::types::{LogParser, LogParserWithTs, SessionGroup};
