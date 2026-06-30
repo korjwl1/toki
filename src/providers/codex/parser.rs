@@ -48,6 +48,28 @@ fn codex_event_key(
     format!("{:016x}:codex:{}", h, ts)
 }
 
+/// Read the `cwd` from a Codex rollout file's `session_meta` line on demand.
+/// session_meta is the first line; we scan a small prefix to stay robust to any
+/// leading lines, and stop early. Returns None if no session_meta/cwd is found.
+fn read_first_session_meta_cwd(path: &str) -> Option<String> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    for line in reader.lines().take(50).map_while(Result::ok) {
+        if !line.contains("\"session_meta\"") {
+            continue;
+        }
+        if let Ok(parsed) = serde_json::from_str::<CodexSessionMetaLine>(&line) {
+            if let Some(cwd) = parsed.payload.and_then(|p| p.cwd) {
+                return Some(cwd.to_string());
+            }
+        }
+        // session_meta seen but no cwd → no point scanning further.
+        break;
+    }
+    None
+}
+
 /// Path-independent identity for a session file, used as the `codex_event_key`
 /// seed in watch mode: the session UUID from the filename, falling back to the
 /// bare filename.
@@ -307,6 +329,23 @@ impl CodexParser {
             .unwrap_or_else(|e| e.into_inner())
             .get(source_file)
             .cloned()
+    }
+
+    /// Resolve cwd for a source file, falling back to a one-time on-demand read
+    /// of the file's session_meta when the watch parser never saw it.
+    ///
+    /// The watch parser only captures cwd from session_meta lines it actually
+    /// streams. A file cold-started before the watcher attached has its
+    /// session_meta consumed by the cold-start parser, so live-appended events
+    /// would otherwise resolve to no project (`unknown`). Here we read the
+    /// session_meta directly (it is the file's first line) and cache it.
+    pub fn cwd_for_or_read(&self, source_file: &str) -> Option<String> {
+        if let Some(cwd) = self.cwd_for(source_file) {
+            return Some(cwd);
+        }
+        let cwd = read_first_session_meta_cwd(source_file)?;
+        self.set_cwd(source_file, &cwd);
+        Some(cwd)
     }
 
     fn set_cwd(&self, source_file: &str, cwd: &str) {
@@ -642,6 +681,27 @@ mod tests {
     }
 
     // --- Issue #11, Bug 2: watch parser resolves cwd from session_meta ---
+
+    #[test]
+    fn test_cwd_for_or_read_falls_back_to_file() {
+        // Simulates a file cold-started before the watcher attached: the watch
+        // parser never streamed session_meta, so cwd_for is empty, but
+        // cwd_for_or_read reads it from the file on demand and caches it.
+        let dir = std::env::temp_dir().join(format!("toki-codex-cwd-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("rollout-x.jsonl");
+        std::fs::write(&path, concat!(
+            r#"{"timestamp":"2026-06-30T20:00:00.000Z","type":"session_meta","payload":{"id":"abc","cwd":"/proj/foo"}}"#, "\n",
+            r#"{"timestamp":"2026-06-30T20:00:05.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"output_tokens":1}}}}"#, "\n",
+        )).unwrap();
+        let p = path.to_string_lossy().to_string();
+
+        let parser = CodexParser::new();
+        assert_eq!(parser.cwd_for(&p), None); // watch parser never saw session_meta
+        assert_eq!(parser.cwd_for_or_read(&p).as_deref(), Some("/proj/foo")); // read on demand
+        assert_eq!(parser.cwd_for(&p).as_deref(), Some("/proj/foo")); // now cached
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_watch_tracks_cwd_from_session_meta() {

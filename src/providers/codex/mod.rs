@@ -123,8 +123,11 @@ impl Provider for CodexProvider {
 
     fn resolve_project_name(&self, path: &str) -> Option<String> {
         // cwd is discovered from session_meta and cached per source file by the
-        // watch parser; `path` is the source file (issue #11, Bug 2).
-        self.parser.cwd_for(path)
+        // watch parser; `path` is the source file (issue #11, Bug 2). Falls back
+        // to a one-time on-demand read of session_meta when the watcher never saw
+        // it (file cold-started before the watcher attached), so live-appended
+        // events don't land under `unknown`.
+        self.parser.cwd_for_or_read(path)
     }
 
     fn poll_dirs(&self) -> Option<Vec<String>> {
