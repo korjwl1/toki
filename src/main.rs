@@ -755,6 +755,20 @@ fn run_daemon_foreground(config: &Config) {
 
     toki::daemon::write_pidfile(&pidfile);
 
+    // Background update-check: refresh the cache from GitHub so CLI commands can
+    // show an upgrade hint without ever blocking on the network. Self-throttles
+    // to once/24h inside check_for_update; the daemon is long-lived so a detached
+    // thread is the right place for this (a short-lived CLI command can't be).
+    std::thread::spawn(|| {
+        let cache = toki::update::default_cache_path();
+        // Small delay so this never competes with the initial cold-start scan.
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        loop {
+            let _ = toki::update::check_for_update(&cache);
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        }
+    });
+
     let (listener_stop_tx, listener_stop_rx) = crossbeam_channel::bounded::<()>(1);
     let listener_sock = sock_path.clone();
     let listener_broadcast = broadcast.clone();
@@ -987,7 +1001,9 @@ fn handle_trace(config: &Config, sink_specs: &[String], no_cost: bool) {
 }
 
 fn print_update_hint() {
-    if let Some(latest) = toki::update::check_for_update(&toki::update::default_cache_path()) {
+    // Read the cache only — never block the CLI on the network. The daemon keeps
+    // the cache fresh (see run_daemon_foreground).
+    if let Some(latest) = toki::update::cached_update(&toki::update::default_cache_path()) {
         eprintln!("[toki] Update available: v{} → brew upgrade toki", latest);
     }
 }

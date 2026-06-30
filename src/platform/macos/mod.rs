@@ -13,10 +13,9 @@ fn plist_path() -> std::path::PathBuf {
 }
 
 fn toki_binary_path() -> String {
-    std::env::current_exe()
-        .unwrap_or_else(|_| std::path::PathBuf::from("toki"))
-        .to_string_lossy()
-        .to_string()
+    // Prefer a stable package-manager symlink over the version-pinned Cellar
+    // path so the LaunchAgent survives `brew upgrade` (see platform::stable_binary_path).
+    super::stable_binary_path()
 }
 
 /// Install and load a LaunchAgent plist for auto-start on login.

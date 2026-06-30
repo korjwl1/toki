@@ -37,6 +37,68 @@ pub fn is_autostart_enabled() -> bool {
     { false }
 }
 
+/// Stable wrapper symlinks a package manager keeps pointing at the current
+/// install across upgrades. Checked in order.
+const STABLE_BINARY_SYMLINKS: &[&str] = &[
+    "/opt/homebrew/bin/toki",              // Homebrew on Apple Silicon
+    "/usr/local/bin/toki",                 // Homebrew on Intel / manual installs
+    "/home/linuxbrew/.linuxbrew/bin/toki", // Linuxbrew
+];
+
+/// Resolve a stable path to the toki binary for baking into autostart units.
+///
+/// `std::env::current_exe()` resolves symlinks, so under Homebrew it returns the
+/// version-pinned Cellar path (e.g. `/opt/homebrew/Cellar/toki/2.1.0/bin/toki`).
+/// Writing that into a LaunchAgent/systemd unit breaks autostart on the next
+/// `brew upgrade`, when the old Cellar directory is deleted. Prefer a stable
+/// wrapper symlink that resolves to the same binary we're running, so the unit
+/// keeps working across upgrades. Falls back to the resolved path (correct for
+/// non-package-manager installs, e.g. `cargo install`).
+pub fn stable_binary_path() -> String {
+    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("toki"));
+    resolve_stable_path(&exe, STABLE_BINARY_SYMLINKS)
+}
+
+fn resolve_stable_path(exe: &Path, candidates: &[&str]) -> String {
+    let exe_canon = std::fs::canonicalize(exe).ok();
+    if exe_canon.is_some() {
+        for cand in candidates {
+            if let Ok(resolved) = std::fs::canonicalize(cand) {
+                if exe_canon.as_ref() == Some(&resolved) {
+                    return (*cand).to_string();
+                }
+            }
+        }
+    }
+    exe.to_string_lossy().to_string()
+}
+
+#[cfg(test)]
+mod stable_path_tests {
+    use super::resolve_stable_path;
+
+    #[test]
+    fn prefers_symlink_that_points_at_current_exe() {
+        let dir = std::env::temp_dir().join(format!("toki-stable-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let real = dir.join("toki-real");
+        std::fs::write(&real, b"#!/bin/sh\n").unwrap();
+        let link = dir.join("toki-link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let link_str = link.to_string_lossy().to_string();
+        // exe == resolved real binary, candidate == stable symlink → pick the symlink
+        assert_eq!(resolve_stable_path(&real, &[&link_str]), link_str);
+        // no candidate matches → fall back to the exe path as passed (not canonicalized)
+        assert_eq!(
+            resolve_stable_path(&real, &["/nonexistent/toki"]),
+            real.to_string_lossy().to_string()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 use crossbeam_channel::Sender;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::Path;
