@@ -121,6 +121,12 @@ impl Provider for CodexProvider {
         None
     }
 
+    fn resolve_project_name(&self, path: &str) -> Option<String> {
+        // cwd is discovered from session_meta and cached per source file by the
+        // watch parser; `path` is the source file (issue #11, Bug 2).
+        self.parser.cwd_for(path)
+    }
+
     fn poll_dirs(&self) -> Option<Vec<String>> {
         // macOS: FSEvents only fires FSE_CONTENT_MODIFIED on vn_close(). Codex holds a single
         // tokio::fs::File open for the entire session and only flushes — never closes — between
