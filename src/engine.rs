@@ -611,7 +611,9 @@ impl TrackerEngine {
         match self.process_file_with_ts_dyn(path, provider.parser_with_ts(), provider.name()) {
             Ok(events) => {
                 let session_id = provider.extract_session_id(path).unwrap_or_default();
-                let project_name = provider.extract_project_name(path).map(|s| s.to_string());
+                // resolve_project_name lets Codex supply the cwd it discovered from
+                // session_meta; for other providers this is the path-based name.
+                let project_name = provider.resolve_project_name(path);
                 for event in events {
                     let ts_ms = crate::common::time::parse_ts_to_ms(&event.timestamp)
                         .unwrap_or_else(|| {

@@ -26,7 +26,10 @@ pub struct Database {
 /// - v1: initial schema
 /// - v2: added idx_msg keyspace for msg_id dedup (streaming snapshot handling)
 /// - v3: added message_id to event key, changed dedup to bare_msg_id
-pub const SCHEMA_VERSION: u32 = 3;
+/// - v4: Codex event_key now leads with a per-event hash so bare_msg_id dedup no
+///       longer collapses Codex events to one (issue #11). Bump forces a one-time
+///       rescan that re-aggregates the full (previously dropped) Codex history.
+pub const SCHEMA_VERSION: u32 = 4;
 
 impl Database {
     pub fn open(path: &Path) -> Result<Self, fjall::Error> {

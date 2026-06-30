@@ -70,6 +70,16 @@ pub trait Provider: Send + Sync {
     /// Extract project name from a file path (zero-alloc where possible).
     fn extract_project_name<'a>(&self, path: &'a str) -> Option<&'a str>;
 
+    /// Resolve the project name for a file, allowing providers to use parser
+    /// state (e.g. a cwd discovered from session_meta inside the file) rather
+    /// than only the file path. Used by the live/watch write path.
+    ///
+    /// Default: the path-based `extract_project_name`. Codex overrides this
+    /// because its cwd lives in the file content, not the path (issue #11, Bug 2).
+    fn resolve_project_name(&self, path: &str) -> Option<String> {
+        self.extract_project_name(path).map(|s| s.to_string())
+    }
+
     /// DB directory name for this provider (e.g., "claude_code.fjall").
     fn db_dir_name(&self) -> &str;
 }

@@ -1,10 +1,69 @@
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::sync::Mutex;
 
 use serde::Deserialize;
+use xxhash_rust::xxh3::xxh3_64;
 
 use crate::common::types::{LogParser, LogParserWithTs, SessionGroup, UsageEvent, UsageEventWithTs};
 use crate::providers::{ColdStartParsed, FileParser};
+
+/// Build a Codex `event_key` whose first `:`-segment is unique per token_count
+/// event.
+///
+/// The dedup layer (`Database::bare_msg_id`) treats the substring before the
+/// first `:` as the logical message id and collapses events that share it. That
+/// contract holds for Claude Code (`{msg_id}:{ts}`, unique id first) but Codex
+/// previously led with a constant literal (`codex`, watch) or a per-session UUID
+/// (cold start), so every Codex event collapsed onto one shared id and all but
+/// one were deleted. See issue #11.
+///
+/// Here we lead with a colon-free xxh3 hash of `identity + ts + token counts`:
+/// - distinct events differ in `ts` (or token counts within the same ms), so
+///   they get distinct keys and are all retained;
+/// - re-reading the exact same physical line hashes identically, so dedup
+///   collapses only true duplicates (idempotent re-scan after `daemon reset`).
+///
+/// `identity` is a per-source stable string: the source file path in watch
+/// mode, the session id in cold start. The readable `ts` tail is kept after the
+/// hash purely for debuggability.
+fn codex_event_key(
+    identity: &str,
+    ts: &str,
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_creation_input_tokens: u64,
+    cache_read_input_tokens: u64,
+) -> String {
+    let mut buf = String::with_capacity(identity.len() + ts.len() + 48);
+    buf.push_str(identity);
+    buf.push('\0');
+    buf.push_str(ts);
+    let _ = write!(
+        buf,
+        "\0{}:{}:{}:{}",
+        input_tokens, output_tokens, cache_creation_input_tokens, cache_read_input_tokens
+    );
+    let h = xxh3_64(buf.as_bytes());
+    format!("{:016x}:codex:{}", h, ts)
+}
+
+/// Path-independent identity for a session file, used as the `codex_event_key`
+/// seed in watch mode: the session UUID from the filename, falling back to the
+/// bare filename.
+///
+/// We deliberately avoid seeding with the full `source_file` path: the same file
+/// can reach the watch path under different equivalent spellings — the FSEvents
+/// watcher reports the canonical path (e.g. `/private/tmp/...`) while the poller
+/// globs the configured dir (e.g. `/tmp/...`, a symlink). Seeding with the path
+/// would hash those to different keys and count every event twice. The filename
+/// is identical regardless of spelling, and the UUID matches session_meta.id so
+/// watch and cold-start keys share one namespace.
+fn watch_identity(source_file: &str) -> String {
+    let name = source_file.rsplit('/').next().unwrap_or(source_file);
+    let stem = name.strip_suffix(".jsonl").unwrap_or(name);
+    super::extract_uuid_from_filename(stem).unwrap_or_else(|| stem.to_string())
+}
 
 /// Stateful per-file parser for Codex CLI cold start.
 /// Tracks model name across turn_context -> token_count events.
@@ -86,12 +145,19 @@ impl FileParser for CodexFileParser {
                 let ts = header.timestamp.unwrap_or("");
                 let ts_ms = crate::common::time::parse_ts_to_ms(ts)?;
 
-                // Build a unique event key from session_id (or timestamp) and timestamp
+                // Build a per-event-unique event key (see codex_event_key).
                 let session_part = self
                     .session_id
                     .as_deref()
                     .unwrap_or("unknown");
-                let event_key = format!("{}:{}", session_part, ts);
+                let event_key = codex_event_key(
+                    session_part,
+                    ts,
+                    input_tokens,
+                    output_tokens,
+                    reasoning_output_tokens,
+                    cached_input_tokens,
+                );
 
                 Some(ColdStartParsed {
                     event_key,
@@ -194,12 +260,18 @@ struct LastTokenUsage {
 pub struct CodexParser {
     /// Per-file model tracking: file_path -> last_model
     file_models: Mutex<HashMap<String, String>>,
+    /// Per-file cwd tracking: file_path -> session_meta.cwd.
+    /// Populated from the session_meta line so live (watch) events can be
+    /// attributed to a project instead of bucketing as `unknown` (issue #11,
+    /// Bug 2). Cold start reads cwd directly via CodexFileParser.
+    file_cwds: Mutex<HashMap<String, String>>,
 }
 
 impl CodexParser {
     pub fn new() -> Self {
         CodexParser {
             file_models: Mutex::new(HashMap::new()),
+            file_cwds: Mutex::new(HashMap::new()),
         }
     }
 
@@ -227,12 +299,38 @@ impl CodexParser {
         }
         map.insert(source_file.to_string(), model.to_string());
     }
+
+    /// Project name (cwd) discovered from session_meta for a given source file.
+    pub fn cwd_for(&self, source_file: &str) -> Option<String> {
+        self.file_cwds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(source_file)
+            .cloned()
+    }
+
+    fn set_cwd(&self, source_file: &str, cwd: &str) {
+        let mut map = self.file_cwds
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Same bounded-growth eviction policy as set_model.
+        if map.len() > 500 {
+            let keys_to_remove: Vec<String> = map.keys().take(250).cloned().collect();
+            for key in keys_to_remove {
+                map.remove(&key);
+            }
+        }
+        map.insert(source_file.to_string(), cwd.to_string());
+    }
 }
 
 impl LogParser for CodexParser {
     fn parse_line(&self, line: &str, source_file: &str) -> Option<UsageEvent> {
-        // Pre-filter
-        if !line.contains("\"token_count\"") && !line.contains("\"turn_context\"") {
+        // Pre-filter (session_meta is cheap: one line per file, carries cwd)
+        if !line.contains("\"token_count\"")
+            && !line.contains("\"turn_context\"")
+            && !line.contains("\"session_meta\"")
+        {
             return None;
         }
 
@@ -240,6 +338,14 @@ impl LogParser for CodexParser {
         let header: CodexLineHeader = serde_json::from_str(line).ok()?;
 
         match header.line_type {
+            "session_meta" => {
+                // Track cwd per source file so live events get a project (Bug 2).
+                let parsed: CodexSessionMetaLine = serde_json::from_str(line).ok()?;
+                if let Some(cwd) = parsed.payload.and_then(|p| p.cwd) {
+                    self.set_cwd(source_file, cwd);
+                }
+                None
+            }
             "turn_context" => {
                 // Second pass: targeted turn_context deserialization
                 let parsed: CodexTurnContextLine = serde_json::from_str(line).ok()?;
@@ -268,7 +374,14 @@ impl LogParser for CodexParser {
 
                 let ts = header.timestamp.unwrap_or("");
                 let model = self.get_model(source_file);
-                let event_key = format!("codex:{}:{}", source_file, ts);
+                let event_key = codex_event_key(
+                    &watch_identity(source_file),
+                    ts,
+                    input_tokens,
+                    output_tokens,
+                    reasoning_output_tokens,
+                    cached_input_tokens,
+                );
 
                 Some(UsageEvent {
                     event_key,
@@ -321,8 +434,11 @@ impl LogParser for CodexParser {
 
 impl LogParserWithTs for CodexParser {
     fn parse_line_with_ts(&self, line: &str, source_file: &str) -> Option<UsageEventWithTs> {
-        // Pre-filter
-        if !line.contains("\"token_count\"") && !line.contains("\"turn_context\"") {
+        // Pre-filter (session_meta is cheap: one line per file, carries cwd)
+        if !line.contains("\"token_count\"")
+            && !line.contains("\"turn_context\"")
+            && !line.contains("\"session_meta\"")
+        {
             return None;
         }
 
@@ -330,6 +446,14 @@ impl LogParserWithTs for CodexParser {
         let header: CodexLineHeader = serde_json::from_str(line).ok()?;
 
         match header.line_type {
+            "session_meta" => {
+                // Track cwd per source file so live events get a project (Bug 2).
+                let parsed: CodexSessionMetaLine = serde_json::from_str(line).ok()?;
+                if let Some(cwd) = parsed.payload.and_then(|p| p.cwd) {
+                    self.set_cwd(source_file, cwd);
+                }
+                None
+            }
             "turn_context" => {
                 // Second pass: targeted turn_context deserialization
                 let parsed: CodexTurnContextLine = serde_json::from_str(line).ok()?;
@@ -358,7 +482,14 @@ impl LogParserWithTs for CodexParser {
 
                 let ts = header.timestamp.unwrap_or_default().to_string();
                 let model = self.get_model(source_file);
-                let event_key = format!("codex:{}:{}", source_file, &ts);
+                let event_key = codex_event_key(
+                    &watch_identity(source_file),
+                    &ts,
+                    input_tokens,
+                    output_tokens,
+                    reasoning_output_tokens,
+                    cached_input_tokens,
+                );
 
                 Some(UsageEventWithTs {
                     event_key,
@@ -447,5 +578,80 @@ mod tests {
         assert_eq!(event.input_tokens, 100);
         assert_eq!(event.output_tokens, 20);
         assert_eq!(event.cache_read_input_tokens, 50);
+    }
+
+    /// First ':'-segment of the event_key — the id the dedup layer collapses on.
+    fn bare(event_key: &str) -> &str {
+        event_key.split(':').next().unwrap()
+    }
+
+    fn tc_line(ts: &str, input: u64, output: u64) -> String {
+        format!(
+            r#"{{"timestamp":"{}","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":{},"cached_input_tokens":0,"output_tokens":{},"reasoning_output_tokens":0,"total_tokens":0}}}}}}}}"#,
+            ts, input, output
+        )
+    }
+
+    // --- Issue #11, Bug 1: distinct Codex events must not collapse on a shared id ---
+
+    #[test]
+    fn test_watch_event_keys_do_not_collapse() {
+        let parser = CodexParser::new();
+        let sf = "/test/rollout-abc.jsonl";
+        let e1 = parser.parse_line(&tc_line("2026-06-19T11:38:31.718Z", 100, 10), sf).unwrap();
+        let e2 = parser.parse_line(&tc_line("2026-06-19T11:39:01.000Z", 200, 20), sf).unwrap();
+        // Pre-fix both bare ids were the literal "codex" -> global collapse.
+        assert_ne!(bare(&e1.event_key), bare(&e2.event_key));
+        assert_ne!(e1.event_key, e2.event_key);
+    }
+
+    #[test]
+    fn test_coldstart_event_keys_do_not_collapse() {
+        let mut parser = CodexFileParser::new();
+        parser.session_id = Some("019ed863-b315-76f1-891a-e8d55fe53f0d".to_string());
+        let e1 = parser.parse_line(&tc_line("2026-06-18T10:41:13.000Z", 100, 10)).unwrap();
+        let e2 = parser.parse_line(&tc_line("2026-06-18T10:41:59.000Z", 200, 20)).unwrap();
+        // Pre-fix both bare ids were the session UUID -> per-session collapse.
+        assert_ne!(bare(&e1.event_key), bare(&e2.event_key));
+    }
+
+    #[test]
+    fn test_event_key_idempotent_on_reread() {
+        // Re-reading the exact same physical line must yield the same key so the
+        // dedup collapses it onto itself (safe rescan after `daemon reset`).
+        let parser = CodexParser::new();
+        let sf = "/test/rollout-abc.jsonl";
+        let line = tc_line("2026-06-19T11:38:31.718Z", 100, 10);
+        let a = parser.parse_line(&line, sf).unwrap();
+        let b = parser.parse_line(&line, sf).unwrap();
+        assert_eq!(a.event_key, b.event_key);
+    }
+
+    #[test]
+    fn test_watch_key_is_path_independent() {
+        // The same file can reach the watch path under equivalent spellings: the
+        // FSEvents watcher reports the canonical path while the poller globs the
+        // configured (possibly symlinked) dir. Both must yield the same key, or
+        // the event is counted twice.
+        let parser = CodexParser::new();
+        let line = tc_line("2026-06-30T20:00:05.000Z", 1000, 100);
+        let name = "rollout-2026-06-30T20-00-00-019f1abc-0000-7000-8000-live00000001.jsonl";
+        let a = parser.parse_line(&line, &format!("/tmp/sessions/{name}")).unwrap();
+        let b = parser.parse_line(&line, &format!("/private/tmp/sessions/{name}")).unwrap();
+        assert_eq!(a.event_key, b.event_key);
+    }
+
+    // --- Issue #11, Bug 2: watch parser resolves cwd from session_meta ---
+
+    #[test]
+    fn test_watch_tracks_cwd_from_session_meta() {
+        let parser = CodexParser::new();
+        let sf = "/test/rollout-abc.jsonl";
+        assert_eq!(parser.cwd_for(sf), None);
+        let meta = r#"{"timestamp":"2026-06-19T11:38:00.000Z","type":"session_meta","payload":{"id":"019ed863-b315-76f1-891a-e8d55fe53f0d","cwd":"/Users/test/sveltos-infra-apps"}}"#;
+        assert!(parser.parse_line(meta, sf).is_none());
+        assert_eq!(parser.cwd_for(sf).as_deref(), Some("/Users/test/sveltos-infra-apps"));
+        // Unrelated files remain unknown.
+        assert_eq!(parser.cwd_for("/test/other.jsonl"), None);
     }
 }
