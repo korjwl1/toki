@@ -8,10 +8,9 @@ fn service_path() -> PathBuf {
 }
 
 fn toki_binary_path() -> String {
-    std::env::current_exe()
-        .unwrap_or_else(|_| PathBuf::from("toki"))
-        .to_string_lossy()
-        .to_string()
+    // Prefer a stable package-manager symlink over the version-pinned Cellar
+    // path so the systemd unit survives `brew upgrade` (see platform::stable_binary_path).
+    super::stable_binary_path()
 }
 
 /// Install and enable a systemd user service for auto-start on login.

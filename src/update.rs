@@ -16,14 +16,30 @@ pub fn default_cache_path() -> PathBuf {
     home.join(".config").join("toki").join("update_check.json")
 }
 
-/// Check for updates. Returns Some("x.y.z") if a newer version is available.
-/// Caches the result for CHECK_INTERVAL_SECS to avoid hitting GitHub on every invocation.
+/// Check for updates, refreshing the cache from GitHub if stale (may block on
+/// the network up to ~3s). Intended for the long-lived daemon — NOT for
+/// short-lived CLI commands, which should use `cached_update` instead so they
+/// never hang on the network. Returns Some("x.y.z") if a newer version exists.
 pub fn check_for_update(cache_path: &Path) -> Option<String> {
     let current = env!("CARGO_PKG_VERSION");
     let latest = get_latest_version(cache_path)?;
 
     if version_newer(&latest, current) {
         Some(latest)
+    } else {
+        None
+    }
+}
+
+/// Read the cached latest version WITHOUT any network access. Returns Some(version)
+/// if the cached latest is newer than the running binary. Used by CLI commands so
+/// printing an update hint never blocks; the daemon keeps the cache fresh via
+/// `check_for_update` (see `run_daemon_foreground`).
+pub fn cached_update(cache_path: &Path) -> Option<String> {
+    let current = env!("CARGO_PKG_VERSION");
+    let cached = load_cache(cache_path)?;
+    if version_newer(&cached.latest_version, current) {
+        Some(cached.latest_version)
     } else {
         None
     }
@@ -71,8 +87,15 @@ fn load_cache(path: &Path) -> Option<UpdateCache> {
 }
 
 fn save_cache(path: &Path, cache: &UpdateCache) {
-    if let Ok(json) = serde_json::to_string(cache) {
-        let _ = std::fs::write(path, json);
+    let Ok(json) = serde_json::to_string(cache) else { return };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Atomic write (tmp + rename) so a concurrent reader (CLI) never sees a
+    // half-written file when the daemon refreshes the cache in the background.
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, json.as_bytes()).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
     }
 }
 
@@ -100,5 +123,39 @@ mod tests {
         assert!(!version_newer("1.1.5", "1.1.5"));
         assert!(!version_newer("1.1.4", "1.1.5"));
         assert!(!version_newer("1.1.5-alpha", "1.1.5"));
+    }
+
+    #[test]
+    fn test_cached_update_reads_cache_only() {
+        let dir = std::env::temp_dir().join(format!("toki-upd-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("update_check.json");
+
+        // A far-future version in cache → reported as available, no network.
+        save_cache(&path, &UpdateCache { latest_version: "999.0.0".into(), checked_at: 0 });
+        assert_eq!(cached_update(&path).as_deref(), Some("999.0.0"));
+
+        // An old version → no update.
+        save_cache(&path, &UpdateCache { latest_version: "0.0.1".into(), checked_at: 0 });
+        assert_eq!(cached_update(&path), None);
+
+        // Missing cache → no update (and never panics / never hits network).
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(cached_update(&path), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_save_cache_creates_parent_and_roundtrips() {
+        let dir = std::env::temp_dir().join(format!("toki-upd-mk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Parent does not exist yet — save_cache must create it.
+        let path = dir.join("nested").join("update_check.json");
+        save_cache(&path, &UpdateCache { latest_version: "1.2.3".into(), checked_at: 42 });
+        let loaded = load_cache(&path).expect("cache should round-trip");
+        assert_eq!(loaded.latest_version, "1.2.3");
+        assert_eq!(loaded.checked_at, 42);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

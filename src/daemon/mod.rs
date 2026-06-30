@@ -14,15 +14,39 @@ pub fn default_sock_path() -> PathBuf {
     home.join(".config").join("toki").join("daemon.sock")
 }
 
+/// Best-effort guard against signaling an unrelated process that reused a stale
+/// PID. Returns `false` only when we can positively confirm the process is NOT
+/// toki; if `ps` is unavailable or its output is empty/ambiguous it returns
+/// `true`, preserving prior behavior (never makes us miss a real toki process).
+fn pid_looks_like_toki(pid: u32) -> bool {
+    match std::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            let comm = String::from_utf8_lossy(&out.stdout);
+            let comm = comm.trim();
+            if comm.is_empty() {
+                return true; // can't determine
+            }
+            // `comm` may be a full path on macOS; match on the basename.
+            let base = comm.rsplit('/').next().unwrap_or(comm);
+            base.contains("toki")
+        }
+        _ => true, // ps failed → don't change behavior
+    }
+}
+
 /// Send SIGTERM to the daemon process via PID file.
 /// Returns Ok(true) if signal sent, Ok(false) if not running.
 pub fn stop_daemon(pidfile: &std::path::Path, sock: &std::path::Path) -> Result<bool, String> {
     match read_pidfile(pidfile) {
         Some(pid) => {
-            // Check if process is alive
+            // Check if process is alive AND is actually toki (guards against a
+            // reused PID after a crash + stale pidfile).
             let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
-            if !alive {
-                // Stale PID file — clean up
+            if !alive || !pid_looks_like_toki(pid) {
+                // Stale PID file (dead, or PID reused by another process) — clean up
                 remove_pidfile(pidfile);
                 let _ = std::fs::remove_file(sock);
                 return Ok(false);
@@ -63,5 +87,23 @@ pub fn stop_daemon(pidfile: &std::path::Path, sock: &std::path::Path) -> Result<
 pub fn daemon_status(pidfile: &std::path::Path) -> Option<u32> {
     let pid = read_pidfile(pidfile)?;
     let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
-    if alive { Some(pid) } else { None }
+    // Also confirm the live PID is actually toki, not a reused PID.
+    if alive && pid_looks_like_toki(pid) { Some(pid) } else { None }
+}
+
+#[cfg(test)]
+mod pid_guard_tests {
+    use super::pid_looks_like_toki;
+
+    #[test]
+    fn current_test_process_is_toki() {
+        // The test binary is named `toki-<hash>`, so its comm contains "toki".
+        assert!(pid_looks_like_toki(std::process::id()));
+    }
+
+    #[test]
+    fn pid1_is_not_toki() {
+        // PID 1 (launchd/init) is always alive and never toki.
+        assert!(!pid_looks_like_toki(1));
+    }
 }
