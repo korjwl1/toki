@@ -121,18 +121,28 @@ class Toki < Formula
   def post_install
     # Restart daemon if it was running (picks up new binary)
     pidfile = File.expand_path("~/.config/toki/daemon.pid")
-    if File.exist?(pidfile)
-      pid = File.read(pidfile).strip.to_i
-      if pid > 0
-        begin
-          Process.kill(0, pid) # check if alive
-          ohai "Restarting toki daemon to use the new version..."
-          system bin/"toki", "daemon", "restart"
-        rescue Errno::ESRCH
-          # daemon not running, stale pidfile — nothing to do
-        end
-      end
+    return unless File.exist?(pidfile)
+
+    pid = File.read(pidfile).strip.to_i
+    return unless pid.positive?
+
+    # Is the daemon actually alive? kill(0) raises ESRCH if the process is gone,
+    # or EPERM if it exists but is owned by another user (still "running").
+    running = begin
+      Process.kill(0, pid)
+      true
+    rescue Errno::EPERM
+      true
+    rescue Errno::ESRCH
+      false
     end
+    return unless running
+
+    ohai "Restarting toki daemon to use the new version..."
+    system bin/"toki", "daemon", "restart"
+  rescue => e
+    # Never let a daemon-restart hiccup fail the whole upgrade.
+    opoo "toki daemon restart skipped (#{e.message}); run `toki daemon restart` manually"
   end
 
   test do
