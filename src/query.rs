@@ -614,13 +614,19 @@ fn ts_to_datetime(ts_ms: i64, tz: Option<Tz>) -> NaiveDateTime {
 /// and the local zone differ only by a whole-day offset, so hourly/minute buckets
 /// are unaffected and cheaper to compute this way.
 ///
-/// Day-and-larger steps are floored against the user's local calendar so an event
-/// is attributed to the wall-clock day/week the user actually saw. Without this,
-/// a KST event at 2026-03-10T20:00Z (local 03-11 05:00) would be counted under
-/// 03-10 because UTC flooring lands on 03-10T00:00Z.
+/// Whole-day-multiple steps (day, week, 2w, …) are floored against the user's
+/// local calendar so an event is attributed to the wall-clock day/week the user
+/// actually saw. Without this, a KST event at 2026-03-10T20:00Z (local 03-11
+/// 05:00) would be counted under 03-10 because UTC flooring lands on
+/// 03-10T00:00Z.
+///
+/// Steps that are NOT an exact whole-day multiple — every sub-day step, plus odd
+/// day+ steps like 27h — stay epoch-aligned. This is required, not just an
+/// optimization: `step_ms / 86_400_000` truncates, so a 27h step would otherwise
+/// be silently treated as a 1-day bucket.
 fn bucket_start_ms(ts_ms: i64, step_ms: i64, tz: Option<Tz>) -> i64 {
     let epoch_aligned = || (ts_ms / step_ms) * step_ms;
-    if step_ms < 86_400_000 {
+    if step_ms < 86_400_000 || step_ms % 86_400_000 != 0 {
         return epoch_aligned();
     }
     let Some(tz) = tz else { return epoch_aligned() };
@@ -630,6 +636,15 @@ fn bucket_start_ms(ts_ms: i64, step_ms: i64, tz: Option<Tz>) -> i64 {
         .unwrap_or_default()
         .with_timezone(&tz)
         .date_naive();
+    // Anchor: the boundary grid is counted in whole days from 1970-01-01. That
+    // date is a Thursday, so a 7-day (week) step lands week starts on Thursday —
+    // this is an artifact of epoch anchoring, not a deliberate "weeks start
+    // Thursday" choice. It is kept because the prior UTC flooring
+    // ((ts / step) * step) anchored to the same epoch, so weekly bucket edges
+    // stay continuous across this change. A user-facing "week starts Monday"
+    // (start_of_week) would need that setting threaded into this floor; it is
+    // dropped by to_query_string_with_bucket before the query reaches here, so
+    // it is intentionally out of scope for this helper.
     let epoch_date = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
     let day_index = (local_date - epoch_date).num_days();
     // Floor the day index to the step boundary, then map back to local midnight.
@@ -836,6 +851,19 @@ mod tests {
         // Sub-day steps ignore tz (epoch-aligned) whether or not a tz is given.
         assert_eq!(bucket_start_ms(ts, hour, Some(tz)), (ts / hour) * hour);
         assert_eq!(bucket_start_ms(ts, hour, None), (ts / hour) * hour);
+    }
+
+    #[test]
+    fn test_bucket_start_ms_non_whole_day_step_epoch_aligned() {
+        let tz: Tz = "Asia/Seoul".parse().unwrap();
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-03-10T20:37:00Z").unwrap().timestamp_millis();
+        // 27h is > a day but not a whole-day multiple: must stay epoch-aligned,
+        // NOT be truncated to a 1-day (86400) bucket.
+        let step_27h = 27 * 3_600_000i64;
+        assert_eq!(bucket_start_ms(ts, step_27h, Some(tz)), (ts / step_27h) * step_27h);
+        // Guard against the truncation bug: it must differ from a 1-day floor.
+        let day = 86_400_000i64;
+        assert_ne!(bucket_start_ms(ts, step_27h, Some(tz)), bucket_start_ms(ts, day, Some(tz)));
     }
 
     // ── usage query session/project filtering (finding #1) ───────────────────
