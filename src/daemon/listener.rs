@@ -174,6 +174,14 @@ fn execute_report_request(
         .map(|s| s.parse().map_err(|_| format!("invalid timezone: {}", s)))
         .transpose()?;
 
+    // start_of_week only affects weekly buckets. Absent (older client) → Monday,
+    // matching the client/server default so bucket edges stay consistent.
+    let start_of_week = req
+        .start_of_week
+        .as_deref()
+        .and_then(|s| crate::config::parse_weekday(&s.to_lowercase()))
+        .unwrap_or(chrono::Weekday::Mon);
+
     let mut parsed =
         crate::query_parser::parse(&req.query).map_err(|e| format!("query parse error: {}", e))?;
 
@@ -219,7 +227,7 @@ fn execute_report_request(
 
     for (provider_name, db) in &target_dbs {
         let collector = CollectorSink::new();
-        crate::query::execute_parsed_query(db, &parsed, tz, None, &collector, since_ms, until_ms)?;
+        crate::query::execute_parsed_query(db, &parsed, tz, start_of_week, None, &collector, since_ms, until_ms)?;
 
         let mut provider_results = collector.take();
         for item in &mut provider_results {
@@ -260,6 +268,9 @@ struct ReportRequest {
     /// Time range end (inclusive): YYYYMMDD or YYYYMMDDhhmmss
     #[serde(default)]
     end: Option<String>,
+    /// Week-start override for weekly buckets (e.g. "mon"). Absent → Monday.
+    #[serde(default)]
+    start_of_week: Option<String>,
 }
 
 /// Sink that collects output as JSON values instead of printing.

@@ -480,7 +480,8 @@ fn main() {
                     eprintln!("[toki] Start the daemon first: toki daemon start");
                     std::process::exit(1);
                 }
-                send_report_query(&sock_path, &query, config.tz, start.as_deref(), end.as_deref())
+                send_report_query(&sock_path, &query, config.tz, start.as_deref(), end.as_deref(),
+                    &config.start_of_week.to_string().to_lowercase())
             };
 
             match response {
@@ -1059,8 +1060,10 @@ fn handle_report(
     }
 
     // Build query string and time range from CLI arguments.
-    // Returns (query_str, start, end) — start/end sent as separate protocol fields.
-    let (query_str, req_start, req_end): (String, Option<String>, Option<String>) =
+    // Returns (query_str, start, end, start_of_week) — the last three are sent as
+    // separate protocol fields. start_of_week reflects a weekly `--start-of-week`
+    // override when present, else the config default; it only affects [1w] buckets.
+    let (query_str, req_start, req_end, req_sow): (String, Option<String>, Option<String>, chrono::Weekday) =
         if let Some(cmd) = command {
             // Time-grouped subcommands
             let (filter_args, group_by) = match cmd {
@@ -1095,12 +1098,19 @@ fn handle_report(
                 parse_opt_range(&eff_until, true, tz),
             );
 
+            // Capture the resolved week start (honours --start-of-week) before
+            // group_by is consumed; to_query_string_with_bucket drops it.
+            let sow = if let toki::engine::ReportGroupBy::Week { start_of_week } = &group_by {
+                *start_of_week
+            } else {
+                config.start_of_week
+            };
             let q = build_query_from_flags(
                 eff_session.as_deref(), eff_project.as_deref(),
                 eff_provider.as_deref(),
                 &[], // group_by handled via bucket
             ).to_query_string_with_bucket(group_by);
-            (q, eff_since, eff_until)
+            (q, eff_since, eff_until, sow)
         } else {
             // No subcommand — summary or session grouping
             let q = build_query_from_flags(
@@ -1108,7 +1118,7 @@ fn handle_report(
                 provider.as_deref(),
                 if group_by_session { &["session"][..] } else { &[] },
             ).to_query_string();
-            (q, since.clone(), until.clone())
+            (q, since.clone(), until.clone(), config.start_of_week)
         };
 
     // Load pricing client-side (file cache, no DB)
@@ -1120,7 +1130,8 @@ fn handle_report(
     };
 
     // Send query to local daemon via UDS
-    let response = send_report_query(&sock_path, &query_str, tz, req_start.as_deref(), req_end.as_deref());
+    let response = send_report_query(&sock_path, &query_str, tz, req_start.as_deref(), req_end.as_deref(),
+        &req_sow.to_string().to_lowercase());
 
     match response {
         Ok(resp) => {
@@ -1265,6 +1276,7 @@ fn send_report_query(
     tz: Option<chrono_tz::Tz>,
     start: Option<&str>,
     end: Option<&str>,
+    start_of_week: &str,
 ) -> Result<ReportResponse, String> {
     use std::io::{BufRead, Write};
 
@@ -1278,6 +1290,7 @@ fn send_report_query(
         "tz": tz.map(|t| t.to_string()),
         "start": start,
         "end": end,
+        "start_of_week": start_of_week,
     });
     let line = serde_json::to_string(&request).unwrap();
     writeln!(stream, "{}", line).map_err(|e| format!("Failed to send query: {}", e))?;
