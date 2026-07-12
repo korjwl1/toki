@@ -169,7 +169,10 @@ impl BroadcastSink {
         if let Err(e) = write_result {
             eprintln!("[toki:daemon] Failed to spawn writer thread: {}", e);
             alive.store(false, Ordering::Relaxed);
-            // receiver thread will exit on next wake via alive check
+            // Wake the receiver immediately so it observes alive=false and exits,
+            // instead of lingering until the 5s condvar timeout. The receiver
+            // parks on the shared broadcast condvar, so notify that.
+            self.condvar.notify_all();
         }
     }
 

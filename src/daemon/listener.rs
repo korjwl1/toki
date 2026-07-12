@@ -49,7 +49,20 @@ pub fn run_listener(
         match listener.accept() {
             Ok((stream, _addr)) => {
                 stream.set_nonblocking(false).ok();
-                handle_connection(stream, &broadcast, &dbs, &report_thread_count);
+                // Handle each connection on its own thread. The initial command
+                // read (handle_connection) can block up to 5s, so doing it inline
+                // would let one idle client stall every other pending connection.
+                let broadcast = Arc::clone(&broadcast);
+                let dbs = dbs.clone();
+                let report_thread_count = Arc::clone(&report_thread_count);
+                let spawned = std::thread::Builder::new()
+                    .name("toki-conn".to_string())
+                    .spawn(move || {
+                        handle_connection(stream, &broadcast, &dbs, &report_thread_count);
+                    });
+                if let Err(e) = spawned {
+                    eprintln!("[toki:daemon] Failed to spawn connection thread: {}", e);
+                }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(std::time::Duration::from_millis(100));
