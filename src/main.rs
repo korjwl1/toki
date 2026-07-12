@@ -438,7 +438,7 @@ fn main() {
             };
             handle_trace(&config, &sink_specs, no_cost);
         }
-        Commands::Query { query, remote, timezone, start_of_week: _, output_format: cli_fmt, start, end, step: _step, no_cost: cli_no_cost } => {
+        Commands::Query { query, remote, timezone, start_of_week: cli_start_of_week, output_format: cli_fmt, start, end, step: _step, no_cost: cli_no_cost } => {
             let cli_tz: Option<Tz> = match timezone.as_deref() {
                 Some(name) => match name.parse::<Tz>() {
                     Ok(tz) => Some(tz),
@@ -461,6 +461,14 @@ fn main() {
             let output_format = resolve_output_format(&config);
             let sink = toki::sink::create_sinks(&["print".to_string()], output_format);
 
+            // Resolve the effective week start: --start-of-week override, else the
+            // config default. Only affects [1w] buckets; sent to both the local
+            // daemon and the remote server so weekly boundaries match either way.
+            let sow = cli_start_of_week.as_deref()
+                .map(parse_weekday)
+                .unwrap_or(config.start_of_week);
+            let sow_str = sow.to_string().to_lowercase();
+
             let pricing = if remote || config.no_cost {
                 None  // Remote: server handles pricing. no_cost: skip entirely.
             } else {
@@ -470,7 +478,7 @@ fn main() {
 
             let response = if remote {
                 // Remote instant query: no start/end (instant at current time)
-                send_remote_query(&query, start.as_deref(), end.as_deref())
+                send_remote_query(&query, start.as_deref(), end.as_deref(), &sow_str)
             } else {
                 // Local: full range scan, PromQL handles aggregation window
                 let sock_path = config.daemon_sock.clone();
@@ -480,8 +488,7 @@ fn main() {
                     eprintln!("[toki] Start the daemon first: toki daemon start");
                     std::process::exit(1);
                 }
-                send_report_query(&sock_path, &query, config.tz, start.as_deref(), end.as_deref(),
-                    &config.start_of_week.to_string().to_lowercase())
+                send_report_query(&sock_path, &query, config.tz, start.as_deref(), end.as_deref(), &sow_str)
             };
 
             match response {
@@ -1316,27 +1323,43 @@ fn send_report_query(
     }
 }
 
+/// Assemble the query-string params for a remote `/toki/query` request.
+/// start_of_week is always sent so weekly buckets honour the caller's setting
+/// (the server otherwise defaults it to Monday); it only affects [1w] buckets.
+fn remote_query_params<'a>(
+    query: &'a str,
+    start: Option<&'a str>,
+    end: Option<&'a str>,
+    start_of_week: &'a str,
+) -> Vec<(&'a str, &'a str)> {
+    let mut params = vec![("query", query), ("start_of_week", start_of_week)];
+    if let Some(s) = start { params.push(("start", s)); }
+    if let Some(e) = end { params.push(("end", e)); }
+    params
+}
+
 /// Send a PromQL query to the remote toki-sync server via HTTP API.
 /// Loads credentials from Keychain/sync.json, handles 401 with token refresh.
 fn send_remote_query(
     query: &str,
     start: Option<&str>,
     end: Option<&str>,
+    start_of_week: &str,
 ) -> Result<ReportResponse, String> {
     let creds = toki::sync::credentials::load()
         .ok_or_else(|| "Not configured for remote query. Run: toki settings sync enable --server <host>".to_string())?;
 
     // Send query as-is to server's toki query endpoint.
     // Server handles PromQL translation, time range, and pricing — same as local daemon.
-    // start/end are separate params (not embedded in query), matching daemon REPORT protocol.
+    // start/end/start_of_week are separate params (not embedded in query), matching
+    // the daemon REPORT protocol.
     let url = format!("{}/api/v1/toki/query", creds.http_url);
+    let params = remote_query_params(query, start, end, start_of_week);
 
     let do_request = |token: &str| -> Result<ureq::Response, ureq::Error> {
         let mut req = ureq::get(&url)
             .set("Authorization", &format!("Bearer {}", token));
-        req = req.query("query", query);
-        if let Some(s) = start { req = req.query("start", s); }
-        if let Some(e) = end { req = req.query("end", e); }
+        for (k, v) in &params { req = req.query(k, v); }
         req.call()
     };
 
@@ -2293,4 +2316,30 @@ extern "C" fn sighandler(_: libc::c_int) {
         std::process::exit(1);
     }
     RUNNING.store(false, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_remote_query_params_includes_start_of_week() {
+        // start_of_week is always present so the server does not silently fall
+        // back to its Monday default when the caller configured another day.
+        let p = remote_query_params("usage[1w]", None, None, "sun");
+        assert!(p.contains(&("query", "usage[1w]")));
+        assert!(p.contains(&("start_of_week", "sun")));
+        // start/end omitted when absent.
+        assert!(!p.iter().any(|(k, _)| *k == "start"));
+        assert!(!p.iter().any(|(k, _)| *k == "end"));
+    }
+
+    #[test]
+    fn test_remote_query_params_with_range() {
+        let p = remote_query_params("usage[1d]", Some("20240301"), Some("20240315"), "mon");
+        assert!(p.contains(&("query", "usage[1d]")));
+        assert!(p.contains(&("start", "20240301")));
+        assert!(p.contains(&("end", "20240315")));
+        assert!(p.contains(&("start_of_week", "mon")));
+    }
 }
