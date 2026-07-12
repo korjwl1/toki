@@ -26,6 +26,11 @@ pub fn enable_autostart() -> Result<(), String> {
     }
 
     let binary = toki_binary_path();
+    // Run the daemon in the foreground so launchd supervises the real process.
+    // Plain `daemon start` double-spawns a detached child and exits, leaving
+    // launchd watching a process that is already gone — the launchd anti-pattern.
+    // KeepAlive is restart-on-crash-only: a clean `toki daemon stop` exits 0 and
+    // stays stopped, while a crash (non-zero) is relaunched.
     let plist = format!(
 r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -38,11 +43,15 @@ r#"<?xml version="1.0" encoding="UTF-8"?>
         <string>{}</string>
         <string>daemon</string>
         <string>start</string>
+        <string>--foreground</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <false/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
 </dict>
 </plist>"#, PLIST_LABEL, binary);
 
