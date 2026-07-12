@@ -943,6 +943,23 @@ mod tests {
     }
 
     #[test]
+    fn test_bucket_start_ms_server_vector_parity() {
+        // Cross-check against the sync server's own published boundary vector
+        // (toki_sync bucket_start_sec, HEAD e13f801). Input: 2024-03-15T10:30Z
+        // (KST 19:30), Asia/Seoul, start_of_week=Monday. Values are epoch seconds
+        // exactly as the server returns them; local must produce the same.
+        let tz: Tz = "Asia/Seoul".parse().unwrap();
+        let ts = chrono::DateTime::parse_from_rfc3339("2024-03-15T10:30:00Z").unwrap().timestamp_millis();
+        let day = 86_400_000i64;
+        let sec = |ms: i64| ms / 1000;
+        assert_eq!(sec(bucket_start_ms(ts, day, Some(tz), Weekday::Mon)), 1_710_428_400);       // 1d
+        assert_eq!(sec(bucket_start_ms(ts, 2 * day, Some(tz), Weekday::Mon)), 1_710_342_000);   // 2d
+        assert_eq!(sec(bucket_start_ms(ts, 7 * day, Some(tz), Weekday::Mon)), 1_710_082_800);   // 1w (Mon)
+        assert_eq!(sec(bucket_start_ms(ts, 30 * day, Some(tz), Weekday::Mon)), 1_708_095_600);  // 30d
+        assert_eq!(sec(bucket_start_ms(ts, 27 * 3_600_000, Some(tz), Weekday::Mon)), 1_710_428_400); // 27h (epoch)
+    }
+
+    #[test]
     fn test_bucket_start_ms_week_no_tz_epoch_aligned() {
         // With no tz, weekly (like every other step) is pure epoch alignment —
         // start_of_week does not apply. Matches the server (no-tz → (ts/step)*step).
