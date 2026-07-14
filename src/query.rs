@@ -381,7 +381,6 @@ pub fn execute_parsed_query(
                     // Event-level scan for all grouped queries
                     let dict = db.load_dict_reverse().map_err(|e| e.to_string())?;
                     let unknown = String::new();
-                    let step_start_sec = since / 1000;
                     db.for_each_event(since, until, |ts, event| {
                         let model = dict.get(&event.model_id).unwrap_or(&unknown);
                         if let Some(f) = model_filter {
