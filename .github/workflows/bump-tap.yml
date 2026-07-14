@@ -1,0 +1,158 @@
+name: Bump Homebrew formula
+
+# Opens a formula-bump PR against korjwl1/homebrew-tap whenever a release is
+# published. It reads the release tarballs, computes their sha256s, and rewrites
+# Formula/toki.rb (version + per-platform url/sha256).
+#
+# PRECONDITION — all four platform tarballs must be attached to the release:
+#   toki-<version>-aarch64-apple-darwin.tar.gz
+#   toki-<version>-x86_64-apple-darwin.tar.gz
+#   toki-<version>-aarch64-unknown-linux-gnu.tar.gz
+#   toki-<version>-x86_64-unknown-linux-gnu.tar.gz
+# The Linux pair is built by release-linux.yml on tag push; the macOS pair is
+# currently uploaded manually. Because this runs on `release: published`, the
+# macOS tarballs may not be attached yet at trigger time — the "Wait for all
+# release assets" step polls for them (up to ~5 min) so the bump never produces
+# a half-updated formula. If they are never uploaded, the job fails loudly
+# rather than shipping stale macOS shas.
+#
+# REQUIRED SECRET — TAP_REPO_TOKEN: a PAT (or fine-grained token) with write
+# access to korjwl1/homebrew-tap (contents + pull-requests). Until it is added
+# in this repo's Settings > Secrets, the checkout/PR steps will fail.
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  bump-formula:
+    # `release: published` also fires for prereleases, but the version/filename
+    # regexes only handle numeric-dot versions — a tag like v2.2.0-rc.1 would hang
+    # waiting for assets or write broken keys. Never bump the formula for a
+    # prerelease (matches the CLI/app policy of never offering prereleases).
+    if: github.event.release.prerelease == false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve version
+        id: meta
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for all release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          triples="aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu"
+          for attempt in $(seq 1 30); do
+            names=$(gh release view "${GITHUB_REF_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --json assets --jq '.assets[].name')
+            missing=""
+            for t in $triples; do
+              echo "$names" | grep -qx "toki-${VERSION}-${t}.tar.gz" || missing="$missing toki-${VERSION}-${t}.tar.gz"
+            done
+            if [ -z "$missing" ]; then
+              echo "All release assets present."
+              exit 0
+            fi
+            echo "Attempt ${attempt}/30 — still waiting for:${missing}"
+            sleep 10
+          done
+          echo "::error::Release assets never became complete; missing:${missing}"
+          exit 1
+
+      - name: Download all release tarballs and compute sha256s
+        id: sha
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern 'toki-*.tar.gz' --dir dist
+          {
+            for f in dist/toki-*.tar.gz; do
+              triple=$(basename "$f" | sed -E 's/^toki-[0-9.]+-//; s/\.tar\.gz$//')
+              sha=$(sha256sum "$f" | awk '{print $1}')
+              echo "${triple}=${sha}"
+            done
+          } > shas.txt
+          cat shas.txt
+
+      - name: Checkout tap
+        uses: actions/checkout@v4
+        with:
+          repository: korjwl1/homebrew-tap
+          token: ${{ secrets.TAP_REPO_TOKEN }}
+          path: tap
+
+      - name: Rewrite formula
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          python3 - "$VERSION" tap/Formula/toki.rb shas.txt <<'PY'
+          import re, sys
+          version, path, shafile = sys.argv[1], sys.argv[2], sys.argv[3]
+
+          # Every platform triple must have a fresh sha256; refuse to write a
+          # partially-updated formula (which would keep an old, wrong sha).
+          expected = {
+              "aarch64-apple-darwin", "x86_64-apple-darwin",
+              "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu",
+          }
+          shas = {}
+          for line in open(shafile):
+              line = line.strip()
+              if not line:
+                  continue
+              triple, sha = line.split("=", 1)
+              shas[triple] = sha
+          missing = expected - shas.keys()
+          if missing:
+              sys.exit(f"missing sha256 for: {', '.join(sorted(missing))}")
+
+          lines = open(path).readlines()
+
+          done_version = False
+          for idx, line in enumerate(lines):
+              if not done_version and re.match(r'\s*version ".*"', line):
+                  lines[idx] = re.sub(r'(version ")[^"]*(")', r'\g<1>' + version + r'\g<2>', line)
+                  done_version = True
+          if not done_version:
+              sys.exit("no version line found in formula")
+
+          rewritten = set()
+          for idx, line in enumerate(lines):
+              m = re.search(r'toki-[0-9.]+-(\S+?)\.tar\.gz', line)
+              if 'url ' in line and m:
+                  triple = m.group(1)
+                  if triple not in shas:
+                      sys.exit(f"formula references unknown triple: {triple}")
+                  line = re.sub(r'toki-[0-9.]+-' + re.escape(triple), f'toki-{version}-{triple}', line)
+                  line = re.sub(r'download/v[0-9.]+/', f'download/v{version}/', line)
+                  lines[idx] = line
+                  for j in range(idx + 1, min(idx + 3, len(lines))):
+                      if 'sha256' in lines[j]:
+                          lines[j] = re.sub(r'sha256 "[^"]*"', f'sha256 "{shas[triple]}"', lines[j])
+                          rewritten.add(triple)
+                          break
+
+          if rewritten != expected:
+              sys.exit(f"did not rewrite all platforms; got {sorted(rewritten)}")
+
+          open(path, "w").writelines(lines)
+          PY
+
+      - name: Open PR against tap
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.TAP_REPO_TOKEN }}
+          path: tap
+          branch: bump-toki-${{ steps.meta.outputs.version }}
+          title: "toki ${{ steps.meta.outputs.version }}"
+          commit-message: "bump toki to ${{ steps.meta.outputs.version }}"
+          body: |
+            Automated formula bump for toki v${{ steps.meta.outputs.version }}.
+            Triggered by release ${{ github.event.release.html_url }}.

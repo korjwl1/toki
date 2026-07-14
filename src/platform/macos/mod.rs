@@ -26,6 +26,11 @@ pub fn enable_autostart() -> Result<(), String> {
     }
 
     let binary = toki_binary_path();
+    // Run the daemon in the foreground so launchd supervises the real process.
+    // Plain `daemon start` double-spawns a detached child and exits, leaving
+    // launchd watching a process that is already gone — the launchd anti-pattern.
+    // KeepAlive is restart-on-crash-only: a clean `toki daemon stop` exits 0 and
+    // stays stopped, while a crash (non-zero) is relaunched.
     let plist = format!(
 r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -38,11 +43,15 @@ r#"<?xml version="1.0" encoding="UTF-8"?>
         <string>{}</string>
         <string>daemon</string>
         <string>start</string>
+        <string>--foreground</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
-    <false/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
 </dict>
 </plist>"#, PLIST_LABEL, binary);
 
@@ -81,4 +90,34 @@ pub fn disable_autostart() -> Result<(), String> {
 /// Check if the LaunchAgent plist exists.
 pub fn is_autostart_enabled() -> bool {
     plist_path().exists()
+}
+
+/// When the LaunchAgent is installed, (re)start the daemon through launchd
+/// instead of spawning a detached process.
+///
+/// A plain `daemon start` double-spawns a detached child that launchd does not
+/// supervise, while the loaded launchd job sits stopped — and because a clean
+/// `daemon stop` exits 0, KeepAlive/SuccessfulExit never relaunches it, so
+/// crash-restart is dead. `launchctl kickstart` starts the job under launchd;
+/// `-k` force-restarts a running one (used for `daemon restart`).
+///
+/// Returns `None` when autostart is not enabled, so the caller falls back to the
+/// detached spawn; otherwise `Some` with the launchctl outcome.
+pub fn supervised_kickstart(force_restart: bool) -> Option<Result<(), String>> {
+    if !is_autostart_enabled() {
+        return None;
+    }
+    let uid = unsafe { libc::getuid() };
+    let target = format!("gui/{}/{}", uid, PLIST_LABEL);
+    let mut args: Vec<&str> = vec!["kickstart"];
+    if force_restart {
+        args.push("-k");
+    }
+    args.push(&target);
+    let result = match std::process::Command::new("launchctl").args(&args).status() {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(format!("launchctl kickstart failed ({})", s)),
+        Err(e) => Err(format!("failed to run launchctl: {}", e)),
+    };
+    Some(result)
 }

@@ -8,8 +8,41 @@ use super::BroadcastSink;
 use crate::common::schema::ProviderSchema;
 use crate::db::Database;
 
-/// Maximum number of concurrent report handler threads.
-const MAX_REPORT_THREADS: usize = 8;
+/// Maximum number of concurrent connection workers (handshake + report). One
+/// cap bounds both the short-lived handshake threads (a client that connects and
+/// never sends still holds a worker until its read times out) and the report
+/// workers, and the permit is acquired BEFORE any blocking read so an idle-client
+/// flood can never exhaust threads.
+const MAX_CONN_WORKERS: usize = 16;
+
+/// RAII permit for a connection worker slot. `try_acquire` bumps the shared
+/// counter without exceeding `MAX_CONN_WORKERS` (atomic compare-exchange, no
+/// check-then-increment race); `Drop` releases it, covering every exit path
+/// including thread spawn failure (the closure that owns the permit is dropped).
+struct ConnPermit {
+    count: Arc<AtomicUsize>,
+}
+
+impl ConnPermit {
+    fn try_acquire(count: &Arc<AtomicUsize>) -> Option<ConnPermit> {
+        let mut cur = count.load(Ordering::Acquire);
+        loop {
+            if cur >= MAX_CONN_WORKERS {
+                return None;
+            }
+            match count.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some(ConnPermit { count: Arc::clone(count) }),
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+}
+
+impl Drop for ConnPermit {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// Run the UDS listener in a loop, accepting new clients.
 /// Clients send a command on the first line: TRACE or REPORT.
@@ -39,7 +72,7 @@ pub fn run_listener(
 
     eprintln!("[toki:daemon] Listening on {}", sock_path.display());
 
-    let report_thread_count = Arc::new(AtomicUsize::new(0));
+    let conn_count = Arc::new(AtomicUsize::new(0));
 
     loop {
         if stop_rx.try_recv().is_ok() {
@@ -49,7 +82,39 @@ pub fn run_listener(
         match listener.accept() {
             Ok((stream, _addr)) => {
                 stream.set_nonblocking(false).ok();
-                handle_connection(stream, &broadcast, &dbs, &report_thread_count);
+                // Acquire a worker permit BEFORE spawning: at capacity we reject
+                // inline (no thread) so a flood of idle clients can never exhaust
+                // threads. The permit is moved into the worker and dropped when it
+                // returns — releasing the slot on every exit path.
+                let permit = match ConnPermit::try_acquire(&conn_count) {
+                    Some(p) => p,
+                    None => {
+                        eprintln!("[toki:daemon] Too many concurrent connections, rejecting");
+                        let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(1)));
+                        let busy = serde_json::json!({
+                            "ok": false,
+                            "error": "server busy, too many concurrent connections"
+                        });
+                        let _ = writeln!(&stream, "{}", serde_json::to_string(&busy).unwrap_or_default());
+                        continue;
+                    }
+                };
+                // Handle each connection on its own thread. The initial command
+                // read (handle_connection) can block up to 5s, so doing it inline
+                // would let one idle client stall every other pending connection.
+                let broadcast = Arc::clone(&broadcast);
+                let dbs = dbs.clone();
+                let spawned = std::thread::Builder::new()
+                    .name("toki-conn".to_string())
+                    .spawn(move || {
+                        // `_permit` releases the worker slot when this returns; on
+                        // spawn failure below the closure (and permit) is dropped.
+                        let _permit = permit;
+                        handle_connection(stream, &broadcast, &dbs);
+                    });
+                if let Err(e) = spawned {
+                    eprintln!("[toki:daemon] Failed to spawn connection thread: {}", e);
+                }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(std::time::Duration::from_millis(100));
@@ -71,7 +136,6 @@ fn handle_connection(
     stream: UnixStream,
     broadcast: &Arc<BroadcastSink>,
     dbs: &[(String, Arc<Database>)],
-    report_thread_count: &Arc<AtomicUsize>,
 ) {
     // 5 second timeout to read the command line
     stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
@@ -91,36 +155,16 @@ fn handle_connection(
             broadcast.add_client(stream);
         }
         "REPORT" => {
-            // Read the next line as JSON payload
+            // Read the next line as JSON payload, then serve inline. This worker
+            // already holds a ConnPermit (acquired in the accept loop), so the
+            // report runs under the single connection-worker cap — no separate
+            // thread and no racy per-report counter.
             stream.set_read_timeout(Some(std::time::Duration::from_secs(60))).ok();
             let mut payload_line = String::new();
             if reader.read_line(&mut payload_line).unwrap_or(0) == 0 {
                 return;
             }
-
-            let current = report_thread_count.load(Ordering::SeqCst);
-            if current >= MAX_REPORT_THREADS {
-                eprintln!(
-                    "[toki:daemon] Too many concurrent report clients ({}), rejecting",
-                    current
-                );
-                let error_resp = serde_json::json!({
-                    "ok": false,
-                    "error": "server busy, too many concurrent requests"
-                });
-                let _ = writeln!(&stream, "{}", serde_json::to_string(&error_resp).unwrap_or_default());
-            } else {
-                let dbs: Vec<(String, Arc<Database>)> = dbs.to_vec();
-                let counter = Arc::clone(report_thread_count);
-                counter.fetch_add(1, Ordering::SeqCst);
-                std::thread::Builder::new()
-                    .name("toki-report".to_string())
-                    .spawn(move || {
-                        handle_report_client(stream, &payload_line, &dbs);
-                        counter.fetch_sub(1, Ordering::SeqCst);
-                    })
-                    .ok();
-            }
+            handle_report_client(stream, &payload_line, dbs);
         }
         _ => {
             let error_resp = serde_json::json!({
@@ -160,6 +204,16 @@ fn execute_report_request(
         .as_deref()
         .map(|s| s.parse().map_err(|_| format!("invalid timezone: {}", s)))
         .transpose()?;
+
+    // start_of_week only affects weekly buckets. Absent (older client) → Monday,
+    // matching the client/server default so bucket edges stay consistent. A
+    // present-but-invalid value is a client bug, not a Monday request: reject it
+    // instead of silently shifting weekly bucket edges. Case-insensitive.
+    let start_of_week = match req.start_of_week.as_deref() {
+        None => chrono::Weekday::Mon,
+        Some(s) => crate::config::parse_weekday(&s.to_lowercase())
+            .ok_or_else(|| format!("invalid start_of_week: {}", s))?,
+    };
 
     let mut parsed =
         crate::query_parser::parse(&req.query).map_err(|e| format!("query parse error: {}", e))?;
@@ -206,7 +260,7 @@ fn execute_report_request(
 
     for (provider_name, db) in &target_dbs {
         let collector = CollectorSink::new();
-        crate::query::execute_parsed_query(db, &parsed, tz, None, &collector, since_ms, until_ms)?;
+        crate::query::execute_parsed_query(db, &parsed, tz, start_of_week, None, &collector, since_ms, until_ms)?;
 
         let mut provider_results = collector.take();
         for item in &mut provider_results {
@@ -247,6 +301,9 @@ struct ReportRequest {
     /// Time range end (inclusive): YYYYMMDD or YYYYMMDDhhmmss
     #[serde(default)]
     end: Option<String>,
+    /// Week-start override for weekly buckets (e.g. "mon"). Absent → Monday.
+    #[serde(default)]
+    start_of_week: Option<String>,
 }
 
 /// Sink that collects output as JSON values instead of printing.
@@ -330,5 +387,84 @@ impl crate::sink::Sink for CollectorSink {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(json);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn conn_permit_caps_and_releases() {
+        let count = Arc::new(AtomicUsize::new(0));
+        // Acquire the full cap.
+        let mut held: Vec<ConnPermit> = (0..MAX_CONN_WORKERS)
+            .map(|_| ConnPermit::try_acquire(&count).expect("under cap must acquire"))
+            .collect();
+        assert_eq!(count.load(Ordering::SeqCst), MAX_CONN_WORKERS);
+        // At cap: further acquisition is refused (no check-then-increment slip).
+        assert!(ConnPermit::try_acquire(&count).is_none(), "must refuse beyond cap");
+        assert_eq!(count.load(Ordering::SeqCst), MAX_CONN_WORKERS, "refusal must not bump the counter");
+        // Releasing one frees exactly one slot.
+        held.pop();
+        assert_eq!(count.load(Ordering::SeqCst), MAX_CONN_WORKERS - 1);
+        assert!(ConnPermit::try_acquire(&count).is_some(), "freed slot must be reusable");
+        drop(held);
+    }
+
+    #[test]
+    fn conn_permit_concurrent_never_exceeds_cap() {
+        // Hammer try_acquire from many threads; the live count must never exceed
+        // the cap, proving the compare-exchange loop has no check-then-increment race.
+        let count = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let count = Arc::clone(&count);
+            let max_seen = Arc::clone(&max_seen);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..2000 {
+                    if let Some(p) = ConnPermit::try_acquire(&count) {
+                        let live = count.load(Ordering::SeqCst);
+                        max_seen.fetch_max(live, Ordering::SeqCst);
+                        assert!(live <= MAX_CONN_WORKERS);
+                        drop(p);
+                    }
+                }
+            }));
+        }
+        for h in handles { h.join().unwrap(); }
+        assert!(max_seen.load(Ordering::SeqCst) <= MAX_CONN_WORKERS);
+        assert_eq!(count.load(Ordering::SeqCst), 0, "all permits released");
+    }
+
+    // ── start_of_week protocol validation (finding #8) ───────────────────────
+    // Empty `dbs` makes execute_report_request return early once the request is
+    // accepted (no provider to route to), so these exercise only the field's
+    // validation: absent/valid/mixed-case accepted, invalid rejected.
+
+    #[test]
+    fn report_request_start_of_week_absent_defaults_monday() {
+        let r = execute_report_request(r#"{"query":"usage[1w]"}"#, &[]);
+        assert!(r.is_ok(), "absent start_of_week must be accepted (older clients)");
+    }
+
+    #[test]
+    fn report_request_start_of_week_valid_accepted() {
+        let r = execute_report_request(r#"{"query":"usage[1w]","start_of_week":"sun"}"#, &[]);
+        assert!(r.is_ok(), "valid start_of_week must be accepted");
+    }
+
+    #[test]
+    fn report_request_start_of_week_mixed_case_accepted() {
+        let r = execute_report_request(r#"{"query":"usage[1w]","start_of_week":"Sun"}"#, &[]);
+        assert!(r.is_ok(), "mixed-case start_of_week must be accepted");
+    }
+
+    #[test]
+    fn report_request_start_of_week_invalid_rejected() {
+        let r = execute_report_request(r#"{"query":"usage[1w]","start_of_week":"funday"}"#, &[]);
+        assert!(r.is_err(), "invalid start_of_week must be a protocol error, not a silent Monday");
+        assert!(r.unwrap_err().contains("start_of_week"));
     }
 }

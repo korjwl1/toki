@@ -31,6 +31,10 @@ pub struct Database {
 ///       rescan that re-aggregates the full (previously dropped) Codex history.
 pub const SCHEMA_VERSION: u32 = 4;
 
+/// meta-keyspace key for the persisted "dict GC owed" retention marker. An
+/// internal bookkeeping key, not a user setting, so it lives outside get/set_setting.
+const PENDING_DICT_GC_KEY: &str = "pending_dict_gc";
+
 impl Database {
     pub fn open(path: &Path) -> Result<Self, fjall::Error> {
         if let Some(parent) = path.parent() {
@@ -469,6 +473,97 @@ impl Database {
         Ok(deleted)
     }
 
+    /// Delete session/project index entries whose embedded timestamp is before
+    /// `cutoff_ms`. Index keys are `{prefix}\0[ts:8][msg_id]`, so the ts is the
+    /// 8 bytes right after the first NUL. Returns the number of entries removed.
+    ///
+    /// Without this, idx_sessions/idx_projects grow unbounded even as the events
+    /// they point at are aged out by retention, slowly bloating list_sessions/
+    /// list_projects full scans.
+    pub fn delete_index_before(&self, cutoff_ms: i64) -> Result<u64, fjall::Error> {
+        let mut deleted = 0u64;
+        for ks in [&self.idx_sessions, &self.idx_projects] {
+            let mut keys_to_delete: Vec<Vec<u8>> = Vec::new();
+            for guard in ks.iter() {
+                let kv = guard.into_inner()?;
+                let key = &kv.0;
+                if let Some(null_pos) = key.iter().position(|&b| b == 0) {
+                    let ts_start = null_pos + 1;
+                    if key.len() >= ts_start + 8 {
+                        let ts = i64::from_be_bytes(key[ts_start..ts_start + 8].try_into().unwrap());
+                        if ts < cutoff_ms {
+                            keys_to_delete.push(key.to_vec());
+                        }
+                    }
+                }
+                if keys_to_delete.len() >= 1000 {
+                    let mut batch = self.db.batch();
+                    for k in keys_to_delete.drain(..) {
+                        batch.remove(ks, k);
+                        deleted += 1;
+                    }
+                    batch.commit()?;
+                }
+            }
+            if !keys_to_delete.is_empty() {
+                let mut batch = self.db.batch();
+                for k in keys_to_delete {
+                    batch.remove(ks, k);
+                    deleted += 1;
+                }
+                batch.commit()?;
+            }
+        }
+        Ok(deleted)
+    }
+
+    /// Collect the set of dictionary IDs still referenced by any stored event
+    /// (model/session/source_file/project). Used to garbage-collect the dict.
+    /// project_name_id == 0 is the "no project" sentinel, not a real dict id.
+    pub fn collect_live_dict_ids(&self) -> Result<std::collections::HashSet<u32>, fjall::Error> {
+        let mut ids = std::collections::HashSet::new();
+        for guard in self.events.iter() {
+            let kv = guard.into_inner()?;
+            if let Ok(ev) = bincode::deserialize::<StoredEvent>(&kv.1) {
+                ids.insert(ev.model_id);
+                ids.insert(ev.session_id);
+                ids.insert(ev.source_file_id);
+                if ev.project_name_id != 0 {
+                    ids.insert(ev.project_name_id);
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    /// Delete dictionary entries whose ID is not in `live_ids`. Returns the list
+    /// of removed keys (strings) so an in-memory dict cache can evict them too —
+    /// mandatory for correctness, otherwise a cached id would be reused without a
+    /// backing dict row and reverse lookups would fail.
+    ///
+    /// New IDs are never reused (the writer only ever increments its counter), so
+    /// a later re-appearance of a removed string is safely assigned a fresh id.
+    pub fn gc_dict(&self, live_ids: &std::collections::HashSet<u32>) -> Result<Vec<String>, fjall::Error> {
+        let mut to_remove: Vec<(Vec<u8>, String)> = Vec::new();
+        for guard in self.dict.iter() {
+            let kv = guard.into_inner()?;
+            if let Ok(id) = bincode::deserialize::<u32>(&kv.1) {
+                if !live_ids.contains(&id) {
+                    let s = String::from_utf8_lossy(&kv.0).into_owned();
+                    to_remove.push((kv.0.to_vec(), s));
+                }
+            }
+        }
+        if !to_remove.is_empty() {
+            let mut batch = self.db.batch();
+            for (k, _) in &to_remove {
+                batch.remove(&self.dict, k.clone());
+            }
+            batch.commit()?;
+        }
+        Ok(to_remove.into_iter().map(|(_, s)| s).collect())
+    }
+
     /// Clean up old idx_msg entries where the referenced event is older than cutoff_ms.
     pub fn cleanup_old_idx_msg(&self, cutoff_ms: i64) -> Result<(), fjall::Error> {
         let mut batch = self.db.batch();
@@ -489,6 +584,36 @@ impl Database {
             eprintln!("[toki] cleaned up {count} old idx_msg entries");
         }
         Ok(())
+    }
+
+    // -- Retention GC bookkeeping --
+
+    /// Persisted "dict GC still owed" marker. Set when a retention pass deletes
+    /// events/index rows (which may orphan dict entries) and cleared only after a
+    /// dict GC completes, so a GC that fails after a successful deletion is retried
+    /// on the next pass instead of being silently lost.
+    pub fn set_pending_dict_gc(&self, pending: bool) -> Result<(), fjall::Error> {
+        if pending {
+            self.meta.insert(PENDING_DICT_GC_KEY, b"1")?;
+        } else {
+            self.meta.remove(PENDING_DICT_GC_KEY)?;
+        }
+        Ok(())
+    }
+
+    /// Whether a dict GC is owed (see [`set_pending_dict_gc`]).
+    pub fn pending_dict_gc(&self) -> Result<bool, fjall::Error> {
+        Ok(self.meta.get(PENDING_DICT_GC_KEY)?.is_some())
+    }
+
+    /// True when the events keyspace has no rows.
+    pub fn events_is_empty(&self) -> bool {
+        self.events.first_key_value().is_none()
+    }
+
+    /// True when the dict keyspace has no rows.
+    pub fn dict_is_empty(&self) -> bool {
+        self.dict.first_key_value().is_none()
     }
 
     /// Create a new batch.

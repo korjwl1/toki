@@ -52,19 +52,31 @@ fn get_latest_version(cache_path: &Path) -> Option<String> {
         .as_secs();
 
     // Check cache first
-    if let Some(cached) = load_cache(cache_path) {
-        if now - cached.checked_at < CHECK_INTERVAL_SECS {
-            return Some(cached.latest_version);
+    let cached = load_cache(cache_path);
+    if let Some(ref c) = cached {
+        if now - c.checked_at < CHECK_INTERVAL_SECS {
+            return Some(c.latest_version.clone());
         }
     }
 
     // Fetch from GitHub (non-blocking timeout)
-    let resp = ureq::get(GITHUB_LATEST_URL)
+    let resp = match ureq::get(GITHUB_LATEST_URL)
         .set("Accept", "application/vnd.github.v3+json")
         .set("User-Agent", "toki-update-check")
         .timeout(std::time::Duration::from_secs(3))
         .call()
-        .ok()?;
+    {
+        Ok(r) => r,
+        // Unauthenticated GitHub API is limited to 60 req/hr. When throttled it
+        // answers 403 (or 429); surface a warning instead of silently reporting
+        // "no update", and fall back to the last cached value if we have one.
+        Err(ureq::Error::Status(code, _)) if code == 403 || code == 429 => {
+            eprintln!("[toki] update check: GitHub API rate limit hit (HTTP {code}); \
+                       keeping last known version");
+            return cached.map(|c| c.latest_version);
+        }
+        Err(_) => return cached.map(|c| c.latest_version),
+    };
 
     let body_str = resp.into_string().ok()?;
     let body: serde_json::Value = serde_json::from_str(&body_str).ok()?;
@@ -100,7 +112,15 @@ fn save_cache(path: &Path, cache: &UpdateCache) {
 }
 
 /// Compare semver strings. Returns true if `latest` is newer than `current`.
+///
+/// Prereleases are never offered as updates: a `latest` carrying a prerelease
+/// suffix (e.g. "1.3.0-rc.1") returns false, so it counts as not-newer than the
+/// stable it derives from. This matches the Swift monitor, which explicitly
+/// excludes prereleases.
 fn version_newer(latest: &str, current: &str) -> bool {
+    if latest.contains('-') {
+        return false;
+    }
     let parse = |v: &str| -> (u32, u32, u32) {
         let parts: Vec<&str> = v.split('.').collect();
         let major = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -123,6 +143,17 @@ mod tests {
         assert!(!version_newer("1.1.5", "1.1.5"));
         assert!(!version_newer("1.1.4", "1.1.5"));
         assert!(!version_newer("1.1.5-alpha", "1.1.5"));
+    }
+
+    #[test]
+    fn test_version_newer_ignores_prereleases() {
+        // A prerelease is never offered as an update, even with a higher core.
+        assert!(!version_newer("1.2.0-beta", "1.1.5"));
+        assert!(!version_newer("2.0.0-rc.1", "1.0.0"));
+        assert!(!version_newer("1.2.0-alpha.2", "1.2.0"));
+        // Stable releases still compare normally, even past a prerelease current.
+        assert!(version_newer("1.1.6", "1.1.5-alpha"));
+        assert!(version_newer("1.2.0", "1.1.5"));
     }
 
     #[test]

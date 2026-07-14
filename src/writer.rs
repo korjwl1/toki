@@ -89,18 +89,33 @@ impl DbWriter {
         }
     }
 
-    /// Main run loop for the writer thread.
-    pub fn run(mut self) {
-        // Run retention on startup
+    /// Run a retention pass and evict any garbage-collected dictionary keys from
+    /// the in-memory cache. Eviction is mandatory: retention runs on this (the
+    /// writer) thread, so if a GC'd key stayed cached, resolve_dict_id would hand
+    /// back its old id without re-inserting a dict row, breaking reverse lookups.
+    /// After eviction a re-appearing string gets a fresh id on the next write.
+    fn run_retention_pass(&mut self, label: &str) {
         match run_retention(&self.db, &self.retention) {
             Ok(stats) => {
-                if stats.events_deleted > 0 {
-                    eprintln!("[toki:writer] retention cleanup: {} events deleted ({}ms)",
-                        stats.events_deleted, stats.elapsed.as_millis());
+                for key in &stats.dict_removed {
+                    self.dict_cache.remove(key);
+                }
+                if stats.events_deleted > 0 || stats.index_deleted > 0 || !stats.dict_removed.is_empty() {
+                    eprintln!(
+                        "[toki:writer] {}: {} events, {} index, {} dict entries removed ({}ms)",
+                        label, stats.events_deleted, stats.index_deleted,
+                        stats.dict_removed.len(), stats.elapsed.as_millis()
+                    );
                 }
             }
             Err(e) => eprintln!("[toki:writer] retention error: {}", e),
         }
+    }
+
+    /// Main run loop for the writer thread.
+    pub fn run(mut self) {
+        // Run retention on startup
+        self.run_retention_pass("retention cleanup");
 
         // Periodic flush: commit pending events even if batch isn't full (1s interval)
         let flush_tick = crossbeam_channel::tick(std::time::Duration::from_secs(1));
@@ -129,15 +144,7 @@ impl DbWriter {
                     self.flush_pending();
                 }
                 recv(retention_tick) -> _ => {
-                    match run_retention(&self.db, &self.retention) {
-                        Ok(stats) => {
-                            if stats.events_deleted > 0 {
-                                eprintln!("[toki:writer] daily retention: {} events deleted",
-                                    stats.events_deleted);
-                            }
-                        }
-                        Err(e) => eprintln!("[toki:writer] retention error: {}", e),
-                    }
+                    self.run_retention_pass("daily retention");
                 }
             }
         }
