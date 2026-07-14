@@ -135,6 +135,11 @@ impl BroadcastSink {
             let queue = Arc::clone(&queue);
             let queue_condvar = Arc::clone(&queue_condvar);
             let alive = Arc::clone(&alive);
+            // The receiver parks on the SHARED broadcast condvar; wake it whenever
+            // this writer flips `alive` false (e.g. the client disconnects and
+            // write_all fails) so client_count drops promptly instead of lingering
+            // until the receiver's 5s wait_timeout expires.
+            let broadcast_condvar = Arc::clone(&self.condvar);
             let mut stream = stream;
 
             std::thread::Builder::new()
@@ -160,6 +165,7 @@ impl BroadcastSink {
                         }
                         if stream.write_all(buf.as_bytes()).is_err() {
                             alive.store(false, Ordering::Relaxed);
+                            broadcast_condvar.notify_all();
                             break;
                         }
                     }
@@ -246,5 +252,43 @@ impl Sink for Arc<BroadcastSink> {
 
     fn emit_events_batch(&self, events: &[crate::common::types::RawEvent], pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
         (**self).emit_events_batch(events, pricing, schema);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn writer_death_wakes_receiver_promptly() {
+        // A trace client disconnects; the writer's next write_all fails and flips
+        // `alive` false. The receiver parks on the SHARED broadcast condvar, so it
+        // must be woken by the writer's notify — not linger until the 5s
+        // wait_timeout — and client_count must fall to 0 well inside that window.
+        let sink = BroadcastSink::new();
+        let (a, b) = UnixStream::pair().unwrap();
+        sink.add_client(a);
+        assert_eq!(sink.client_count(), 1);
+
+        // Client goes away.
+        drop(b);
+
+        // Publish until the writer observes the broken pipe. Each broadcast wakes
+        // the receiver → writer, so the failed write is reached quickly. The whole
+        // teardown must complete far under the 5s receiver timeout.
+        let start = Instant::now();
+        loop {
+            sink.broadcast(&serde_json::json!({ "x": 1 }));
+            if sink.client_count() == 0 {
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(3) {
+                panic!("client_count did not drop after writer death (receiver stuck on condvar)");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(start.elapsed() < Duration::from_secs(4), "teardown must beat the 5s timeout");
     }
 }
