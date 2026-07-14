@@ -29,6 +29,11 @@ permissions:
 
 jobs:
   bump-formula:
+    # `release: published` also fires for prereleases, but the version/filename
+    # regexes only handle numeric-dot versions — a tag like v2.2.0-rc.1 would hang
+    # waiting for assets or write broken keys. Never bump the formula for a
+    # prerelease (matches the CLI/app policy of never offering prereleases).
+    if: github.event.release.prerelease == false
     runs-on: ubuntu-latest
     steps:
       - name: Resolve version
