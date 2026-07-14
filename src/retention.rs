@@ -41,12 +41,27 @@ pub fn run_retention(db: &Database, policy: &RetentionPolicy) -> Result<Retentio
     // deleted events) drains, not just when this pass removed events.
     let index_deleted = db.delete_index_before(cutoff)?;
 
+    // Any deletion this pass may have orphaned dict entries — record that a GC is
+    // owed durably, so it survives a crash and is retried even if the GC below
+    // fails or a later pass sees no new deletions.
+    if events_deleted > 0 || index_deleted > 0 {
+        db.set_pending_dict_gc(true)?;
+    }
+
     // Dictionary GC: drop entries no longer referenced by any surviving event.
-    // Gated on something actually having been removed so the full event scan it
-    // requires only runs when there is work to do, keeping steady-state passes cheap.
-    let dict_removed = if events_deleted > 0 || index_deleted > 0 {
+    // The full event scan it needs is only worth running when there is work, so
+    // it is gated on the persisted pending marker rather than this pass's
+    // deletions alone. Also force it when the events keyspace is empty but the
+    // dict still has rows: those are all orphans, and an already-empty DB would
+    // never set the marker via a deletion. The marker is cleared ONLY after the
+    // GC completes — if collect/gc errors out below, the `?` returns before the
+    // clear, so the next pass retries.
+    let orphans_in_empty_db = db.events_is_empty() && !db.dict_is_empty();
+    let dict_removed = if db.pending_dict_gc()? || orphans_in_empty_db {
         let live = db.collect_live_dict_ids()?;
-        db.gc_dict(&live)?
+        let removed = db.gc_dict(&live)?;
+        db.set_pending_dict_gc(false)?;
+        removed
     } else {
         Vec::new()
     };
@@ -150,6 +165,68 @@ mod tests {
         assert!(dict.get(&4).is_none(), "proj-old dict entry must be GC'd");
         assert!(stats.dict_removed.contains(&"sess-old".to_string()));
         assert!(stats.dict_removed.contains(&"proj-old".to_string()));
+    }
+
+    #[test]
+    fn test_retention_gcs_orphans_in_empty_events_db() {
+        // No events at all, but the dict still holds entries — every one is an
+        // orphan. A deletion-gated GC would never fire (nothing to delete), so the
+        // empty-events force-path must clean them.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("test.fjall")).unwrap();
+
+        let mut batch = db.batch();
+        db.dict_put(&mut batch, "orphan-a", 1);
+        db.dict_put(&mut batch, "orphan-b", 2);
+        batch.commit().unwrap();
+        assert!(db.events_is_empty());
+        assert!(!db.dict_is_empty());
+
+        let policy = RetentionPolicy { event_retention_days: 90 };
+        let stats = run_retention(&db, &policy).unwrap();
+
+        assert_eq!(stats.events_deleted, 0);
+        assert!(db.load_dict_reverse().unwrap().is_empty(), "orphan dict entries must be GC'd in an empty events DB");
+        assert!(stats.dict_removed.contains(&"orphan-a".to_string()));
+        assert!(stats.dict_removed.contains(&"orphan-b".to_string()));
+    }
+
+    #[test]
+    fn test_retention_pending_marker_retries_gc_without_new_deletions() {
+        // Simulate a prior pass that deleted rows (marker set) but whose dict GC
+        // never completed. The next pass must run GC from the marker alone — even
+        // though it deletes nothing new — and clear the marker on success.
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("test.fjall")).unwrap();
+
+        let mut batch = db.batch();
+        db.dict_put(&mut batch, "model", 1);
+        db.dict_put(&mut batch, "orphan-2", 2);
+        db.dict_put(&mut batch, "orphan-3", 3);
+        batch.commit().unwrap();
+
+        // A recent event keeps id 1 (and the sentinel 0) live; nothing ages out.
+        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+        let recent_ts = now_ms - 1 * 86_400_000;
+        let ev = StoredEvent {
+            model_id: 1, session_id: 1, source_file_id: 0, project_name_id: 0,
+            input_tokens: 1, output_tokens: 0,
+            cache_creation_input_tokens: 0, cache_read_input_tokens: 0,
+        };
+        db.insert_event(recent_ts, "m1", &ev).unwrap();
+
+        db.set_pending_dict_gc(true).unwrap();
+
+        let policy = RetentionPolicy { event_retention_days: 90 };
+        let stats = run_retention(&db, &policy).unwrap();
+
+        assert_eq!(stats.events_deleted, 0, "recent event must survive");
+        assert!(stats.dict_removed.contains(&"orphan-2".to_string()), "pending marker must force the owed GC");
+        assert!(stats.dict_removed.contains(&"orphan-3".to_string()));
+        let dict = db.load_dict_reverse().unwrap();
+        assert_eq!(dict.get(&1).map(|s| s.as_str()), Some("model"), "live entry must survive");
+        assert!(dict.get(&2).is_none());
+        assert!(!db.pending_dict_gc().unwrap(), "marker must be cleared after a successful GC");
     }
 
     #[test]

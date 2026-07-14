@@ -31,6 +31,10 @@ pub struct Database {
 ///       rescan that re-aggregates the full (previously dropped) Codex history.
 pub const SCHEMA_VERSION: u32 = 4;
 
+/// meta-keyspace key for the persisted "dict GC owed" retention marker. An
+/// internal bookkeeping key, not a user setting, so it lives outside get/set_setting.
+const PENDING_DICT_GC_KEY: &str = "pending_dict_gc";
+
 impl Database {
     pub fn open(path: &Path) -> Result<Self, fjall::Error> {
         if let Some(parent) = path.parent() {
@@ -580,6 +584,36 @@ impl Database {
             eprintln!("[toki] cleaned up {count} old idx_msg entries");
         }
         Ok(())
+    }
+
+    // -- Retention GC bookkeeping --
+
+    /// Persisted "dict GC still owed" marker. Set when a retention pass deletes
+    /// events/index rows (which may orphan dict entries) and cleared only after a
+    /// dict GC completes, so a GC that fails after a successful deletion is retried
+    /// on the next pass instead of being silently lost.
+    pub fn set_pending_dict_gc(&self, pending: bool) -> Result<(), fjall::Error> {
+        if pending {
+            self.meta.insert(PENDING_DICT_GC_KEY, b"1")?;
+        } else {
+            self.meta.remove(PENDING_DICT_GC_KEY)?;
+        }
+        Ok(())
+    }
+
+    /// Whether a dict GC is owed (see [`set_pending_dict_gc`]).
+    pub fn pending_dict_gc(&self) -> Result<bool, fjall::Error> {
+        Ok(self.meta.get(PENDING_DICT_GC_KEY)?.is_some())
+    }
+
+    /// True when the events keyspace has no rows.
+    pub fn events_is_empty(&self) -> bool {
+        self.events.first_key_value().is_none()
+    }
+
+    /// True when the dict keyspace has no rows.
+    pub fn dict_is_empty(&self) -> bool {
+        self.dict.first_key_value().is_none()
     }
 
     /// Create a new batch.
