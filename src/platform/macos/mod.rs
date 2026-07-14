@@ -91,3 +91,33 @@ pub fn disable_autostart() -> Result<(), String> {
 pub fn is_autostart_enabled() -> bool {
     plist_path().exists()
 }
+
+/// When the LaunchAgent is installed, (re)start the daemon through launchd
+/// instead of spawning a detached process.
+///
+/// A plain `daemon start` double-spawns a detached child that launchd does not
+/// supervise, while the loaded launchd job sits stopped — and because a clean
+/// `daemon stop` exits 0, KeepAlive/SuccessfulExit never relaunches it, so
+/// crash-restart is dead. `launchctl kickstart` starts the job under launchd;
+/// `-k` force-restarts a running one (used for `daemon restart`).
+///
+/// Returns `None` when autostart is not enabled, so the caller falls back to the
+/// detached spawn; otherwise `Some` with the launchctl outcome.
+pub fn supervised_kickstart(force_restart: bool) -> Option<Result<(), String>> {
+    if !is_autostart_enabled() {
+        return None;
+    }
+    let uid = unsafe { libc::getuid() };
+    let target = format!("gui/{}/{}", uid, PLIST_LABEL);
+    let mut args: Vec<&str> = vec!["kickstart"];
+    if force_restart {
+        args.push("-k");
+    }
+    args.push(&target);
+    let result = match std::process::Command::new("launchctl").args(&args).status() {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(format!("launchctl kickstart failed ({})", s)),
+        Err(e) => Err(format!("failed to run launchctl: {}", e)),
+    };
+    Some(result)
+}

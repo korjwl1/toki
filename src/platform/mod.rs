@@ -37,6 +37,22 @@ pub fn is_autostart_enabled() -> bool {
     { false }
 }
 
+/// (Re)start the daemon through the OS service supervisor when it manages the
+/// daemon, so a supervised install is not left with a stopped job and a detached,
+/// unsupervised process. Returns `None` when the daemon is unmanaged (the caller
+/// should spawn a detached process instead), else `Some` with the supervisor's
+/// result. `force_restart` restarts a running instance; otherwise it is only
+/// started if stopped.
+///
+/// Only macOS/launchd is routed here today; the Linux systemd unit keeps its
+/// existing detached-start behaviour.
+pub fn supervised_kickstart(force_restart: bool) -> Option<Result<(), String>> {
+    #[cfg(target_os = "macos")]
+    { return macos::supervised_kickstart(force_restart); }
+    #[cfg(not(target_os = "macos"))]
+    { let _ = force_restart; None }
+}
+
 /// Stable wrapper symlinks a package manager keeps pointing at the current
 /// install across upgrades. Checked in order.
 const STABLE_BINARY_SYMLINKS: &[&str] = &[

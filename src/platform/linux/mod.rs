@@ -46,8 +46,11 @@ WantedBy=default.target\n", binary, binary);
         return Err("systemctl daemon-reload failed".to_string());
     }
 
+    // `--now` also starts the service in the current session, so `daemon enable`
+    // both installs autostart AND brings the daemon up immediately — otherwise it
+    // would only run after the next login. Mirrors disable_autostart's `--now`.
     let status = std::process::Command::new("systemctl")
-        .args(["--user", "enable", SERVICE_NAME])
+        .args(["--user", "enable", "--now", SERVICE_NAME])
         .status()
         .map_err(|e| e.to_string())?;
     if !status.success() {
@@ -64,8 +67,9 @@ pub fn disable_autostart() -> Result<(), String> {
         return Ok(());
     }
 
+    // `--now` also stops the running service, symmetric with enable's `--now`.
     let _ = std::process::Command::new("systemctl")
-        .args(["--user", "disable", SERVICE_NAME])
+        .args(["--user", "disable", "--now", SERVICE_NAME])
         .status();
 
     std::fs::remove_file(&path).map_err(|e| e.to_string())?;

@@ -673,6 +673,17 @@ fn stop_running_daemon(config: &Config) -> bool {
     }
 }
 
+/// Report the outcome of a supervisor-routed daemon (re)start.
+fn report_supervised(res: Result<(), String>, action: &str) {
+    match res {
+        Ok(()) => println!("[toki] Daemon {} via the service supervisor.", action),
+        Err(e) => {
+            eprintln!("[toki] Failed to {} daemon via the service supervisor: {}", action, e);
+            std::process::exit(1);
+        }
+    }
+}
+
 fn start_daemon_detached() {
     let toki_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("toki"));
 
@@ -823,6 +834,11 @@ fn handle_daemon(command: DaemonCommands, config: &Config) {
         DaemonCommands::Start { foreground } => {
             if foreground {
                 run_daemon_foreground(config);
+            } else if let Some(res) = toki::platform::supervised_kickstart(false) {
+                // Autostart is installed: start under the service supervisor so the
+                // loaded job runs (and crash-restart stays live), not a detached
+                // process the supervisor doesn't watch.
+                report_supervised(res, "started");
             } else {
                 start_daemon_detached();
             }
@@ -833,11 +849,17 @@ fn handle_daemon(command: DaemonCommands, config: &Config) {
         }
 
         DaemonCommands::Restart => {
-            stop_running_daemon(config);
-            // Brief pause to ensure DB file locks are fully released by the OS
-            std::thread::sleep(std::time::Duration::from_millis(500));
-            RUNNING.store(true, Ordering::Relaxed);
-            start_daemon_detached();
+            if let Some(res) = toki::platform::supervised_kickstart(true) {
+                // Supervised restart: `kickstart -k` kills and relaunches the job
+                // in place, keeping it under the supervisor.
+                report_supervised(res, "restarted");
+            } else {
+                stop_running_daemon(config);
+                // Brief pause to ensure DB file locks are fully released by the OS
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                RUNNING.store(true, Ordering::Relaxed);
+                start_daemon_detached();
+            }
         }
 
         DaemonCommands::Status => {
