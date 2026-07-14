@@ -494,7 +494,7 @@ fn main() {
             match response {
                 Ok(resp) => {
                     if output_format == toki::sink::OutputFormat::Json {
-                        emit_json_report(&resp, &config, pricing.as_ref());
+                        emit_json_report(&resp, &config, sow, pricing.as_ref());
                     } else {
                         for item in resp.data.as_array().unwrap_or(&vec![]) {
                             dispatch_result_to_sink(item, sink.as_ref(), pricing.as_ref());
@@ -1143,7 +1143,7 @@ fn handle_report(
     match response {
         Ok(resp) => {
             if output_format == toki::sink::OutputFormat::Json {
-                emit_json_report(&resp, &config, pricing.as_ref());
+                emit_json_report(&resp, &config, req_sow, pricing.as_ref());
             } else {
                 for item in resp.data.as_array().unwrap_or(&vec![]) {
                     dispatch_result_to_sink(item, sink.as_ref(), pricing.as_ref());
@@ -1163,6 +1163,7 @@ fn handle_report(
 fn emit_json_report(
     resp: &ReportResponse,
     config: &Config,
+    start_of_week: chrono::Weekday,
     pricing: Option<&toki::pricing::PricingTable>,
 ) {
     let items = resp.data.as_array().cloned().unwrap_or_default();
@@ -1172,29 +1173,10 @@ fn emit_json_report(
         .and_then(|item| item["type"].as_str())
         .unwrap_or("summary");
 
-    // Build information block
     let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
     let generated_at = chrono::DateTime::from_timestamp(now_secs as i64, 0)
         .unwrap().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-
-    // Convert data range epoch ms to ISO 8601
-    let data_since = resp.meta.get("data_since").and_then(|v| v.as_i64())
-        .and_then(|ms| chrono::DateTime::from_timestamp(ms / 1000, 0))
-        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
-    let data_until = resp.meta.get("data_until").and_then(|v| v.as_i64())
-        .and_then(|ms| chrono::DateTime::from_timestamp(ms / 1000, 0))
-        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
-
-    let information = serde_json::json!({
-        "type": report_type,
-        "since": data_since,
-        "until": data_until,
-        "query_since": resp.meta.get("since").and_then(|v| v.as_str()),
-        "query_until": resp.meta.get("until").and_then(|v| v.as_str()),
-        "timezone": config.tz.map(|t| t.to_string()),
-        "start_of_week": config.start_of_week.to_string().to_lowercase(),
-        "generated_at": generated_at,
-    });
+    let information = build_report_information(report_type, resp, config, start_of_week, &generated_at);
 
     // Group items by provider (schema field)
     let mut provider_map: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
@@ -1214,6 +1196,36 @@ fn emit_json_report(
     });
 
     println!("{}", serde_json::to_string_pretty(&output).unwrap_or_default());
+}
+
+/// Build the JSON report `information` block. `start_of_week` is the EFFECTIVE
+/// value (honouring a `--start-of-week` override), so the metadata matches the
+/// weekly buckets the query actually produced rather than the config default.
+fn build_report_information(
+    report_type: &str,
+    resp: &ReportResponse,
+    config: &Config,
+    start_of_week: chrono::Weekday,
+    generated_at: &str,
+) -> serde_json::Value {
+    // Convert data range epoch ms to ISO 8601
+    let data_since = resp.meta.get("data_since").and_then(|v| v.as_i64())
+        .and_then(|ms| chrono::DateTime::from_timestamp(ms / 1000, 0))
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+    let data_until = resp.meta.get("data_until").and_then(|v| v.as_i64())
+        .and_then(|ms| chrono::DateTime::from_timestamp(ms / 1000, 0))
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+
+    serde_json::json!({
+        "type": report_type,
+        "since": data_since,
+        "until": data_until,
+        "query_since": resp.meta.get("since").and_then(|v| v.as_str()),
+        "query_until": resp.meta.get("until").and_then(|v| v.as_str()),
+        "timezone": config.tz.map(|t| t.to_string()),
+        "start_of_week": start_of_week.to_string().to_lowercase(),
+        "generated_at": generated_at,
+    })
 }
 
 /// Re-process a daemon response item's data with correct schema.
@@ -2341,5 +2353,19 @@ mod tests {
         assert!(p.contains(&("start", "20240301")));
         assert!(p.contains(&("end", "20240315")));
         assert!(p.contains(&("start_of_week", "mon")));
+    }
+
+    #[test]
+    fn test_report_information_uses_effective_start_of_week() {
+        // Config defaults to Monday, but the query resolved Sunday via
+        // --start-of-week. The JSON metadata must report the effective value so it
+        // matches the weekly buckets actually produced, not the config default.
+        let config = Config { start_of_week: chrono::Weekday::Mon, tz: None, ..Default::default() };
+        let resp = ReportResponse {
+            data: serde_json::json!([]),
+            meta: serde_json::json!({ "since": "20240101", "until": "20240108" }),
+        };
+        let info = build_report_information("summary", &resp, &config, chrono::Weekday::Sun, "2024-01-01T00:00:00Z");
+        assert_eq!(info["start_of_week"], "sun", "must reflect the effective override, not the config default");
     }
 }
