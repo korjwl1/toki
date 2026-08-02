@@ -408,7 +408,9 @@ impl WindowTracker {
                 if obs.used_percent > w.peak_pct {
                     w.peak_pct = obs.used_percent;
                 }
-                if obs.ts_ms > w.last_sample_ts_ms {
+                // >= not >: same-millisecond observations arrive in file
+                // order, and the later line is the later observation.
+                if obs.ts_ms >= w.last_sample_ts_ms {
                     w.last_sample_ts_ms = obs.ts_ms;
                     w.raw_resets_at_ms = obs.resets_at_ms;
                     w.last_pct = obs.used_percent;
