@@ -342,6 +342,11 @@ fn parse_rate_limits_json(raw: &str, ts_ms: i64) -> Option<crate::common::types:
         })
     };
 
+    // Both slots share limit_id: window identity downstream is
+    // (kind, limit_id, account, anchor), which stays unambiguous because the
+    // observed slots always differ in kind (300m vs 10080m). If codex ever
+    // ships two same-kind windows under one limit_id, a slot discriminator
+    // must be added to WindowObservation.
     let out = crate::common::types::WindowObservations {
         primary: rl.primary.and_then(|w| mk(w, primary_reached)),
         secondary: rl.secondary.and_then(|w| mk(w, secondary_reached)),
@@ -616,6 +621,10 @@ impl LogParser for CodexParser {
 
 impl LogParserWithTs for CodexParser {
     fn parse_line_with_ts(&self, line: &str, source_file: &str) -> Option<UsageEventWithTs> {
+        // NOTE: delegates to the full parse and discards the window half —
+        // callers on this legacy path (single-provider watch, tests) pay the
+        // rate_limits parse for nothing. The production multi-provider watch
+        // path calls parse_line_full directly; keep it that way.
         self.parse_line_full(line, source_file).0
     }
 

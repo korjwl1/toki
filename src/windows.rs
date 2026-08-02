@@ -26,7 +26,8 @@ use crate::db::Database;
 /// Jitter tolerance when matching an observation to an open window (ms).
 pub const ANCHOR_EPSILON_MS: i64 = 120_000;
 /// Grace after a window's anchor passes before finalizing it (ms).
-const FINALIZE_GRACE_MS: i64 = 180_000;
+/// Shared with db::finalize_stale_windows — keep a single source of truth.
+pub const FINALIZE_GRACE_MS: i64 = 180_000;
 /// Activity gap threshold: consecutive events closer than this belong to one
 /// active period (GA session rule; any value in the 30–60min bimodal valley
 /// gives near-identical segmentation).
@@ -105,8 +106,10 @@ pub struct WindowSnapshotV1 {
     /// the recorded peak is a lower bound (e.g. machine was asleep at reset).
     pub last_sample_gap_ms: i64,
     /// Fraction (×1000) of the window's active time that had a sample nearby.
-    /// Passive extraction rides on token events, so it is 1000 by construction;
-    /// the active poller (Phase 2) reports real coverage.
+    /// Currently constant 1000 on every path: passive extraction rides on
+    /// token events by construction, and the active poller samples at ≤180s
+    /// while active. The row's real coverage signal is last_sample_gap_ms;
+    /// this field is reserved for a future finer-grained computation.
     pub sampled_active_fraction: u16,
     pub n_samples: u32,
     /// Inline strings, deliberately NOT dictionary ids: dict GC only scans the
@@ -299,6 +302,7 @@ struct OpenWindow {
     last_sample_ts_ms: i64,
     plan: String,
     last_written_floor: i32,
+    last_written_live_floor: i32,
     last_write_ts_ms: i64,
 }
 
@@ -315,7 +319,10 @@ impl OpenWindow {
             maxed_out: self.maxed_out,
             limit_reached_kind: self.limit_reached_kind,
             time_to_100_ms: self.time_to_100_ms,
-            active_ms: self.active_ms,
+            // Hard invariant: a window cannot be active longer than it
+            // exists. Defends the stored value against any future
+            // accounting bug (max-merge would make an excess permanent).
+            active_ms: self.active_ms.min(self.window_minutes as u64 * 60_000),
             last_sample_gap_ms: self.raw_resets_at_ms - self.last_sample_ts_ms,
             sampled_active_fraction: 1000,
             n_samples: self.n_samples,
@@ -433,12 +440,19 @@ impl WindowTracker {
                     w.limit_reached_kind = w.limit_reached_kind.max(kind_reached);
                 }
 
+                // The stored row is also the monitor's LIVE source: the raw
+                // percentage (last_pct) must flush on integer change too, or
+                // the widget lags up to MIN_WRITE_INTERVAL behind (peak alone
+                // is monotone and can sit still for the whole interval).
                 let floor = w.peak_pct.floor() as i32;
+                let live_floor = w.last_pct.floor() as i32;
                 let due = floor != w.last_written_floor
+                    || live_floor != w.last_written_live_floor
                     || obs.ts_ms - w.last_write_ts_ms >= MIN_WRITE_INTERVAL_MS;
                 if due {
                     let w = &mut self.open[i];
                     w.last_written_floor = floor;
+                    w.last_written_live_floor = live_floor;
                     w.last_write_ts_ms = obs.ts_ms;
                     let snap = w.to_snapshot(false);
                     let key = w.key();
@@ -486,6 +500,7 @@ impl WindowTracker {
                     last_sample_ts_ms: obs.ts_ms,
                     plan: obs.plan_type.clone().unwrap_or_default(),
                     last_written_floor: obs.used_percent.floor() as i32,
+                    last_written_live_floor: obs.used_percent.floor() as i32,
                     last_write_ts_ms: obs.ts_ms,
                 };
                 if w.maxed_out {
@@ -554,7 +569,10 @@ impl CachedAccountScope {
     pub fn resolve(&mut self) -> &str {
         let path = std::path::Path::new(&self.root).join("auth.json");
         let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-        if mtime != self.mtime || self.mtime.is_none() {
+        // Equality alone: an absent file stays None==None and keeps the
+        // cached "unknown" (an `is_none()` re-check re-read the file on
+        // every call — exactly the cost this cache exists to avoid).
+        if mtime != self.mtime {
             self.mtime = mtime;
             self.scope = codex_account_scope(&self.root);
         }
@@ -622,42 +640,47 @@ pub fn run_windows_backfill(
         .collect();
     paths.sort(); // filename order == chronological order for rollout files
 
+    let mut writes: Vec<WindowWrite> = Vec::new();
     for path in paths {
-        let file = match std::fs::File::open(&path) {
-            Ok(f) => f,
-            Err(_) => {
-                io_errors += 1;
-                continue;
-            }
-        };
-        use std::io::BufRead;
-        let reader = std::io::BufReader::new(file);
-        for line in reader.lines().map_while(Result::ok) {
+        let path_str = path.to_string_lossy();
+        // Zero-alloc line reader (mmap + memchr) — the same one the watch hot
+        // path uses; BufReader::lines() heap-allocated a String per line
+        // across 60 days of history.
+        let scan = crate::checkpoint::process_lines_streaming(&path_str, 0, |line| {
             if !line.contains("\"rate_limits\"") {
-                continue;
+                return;
             }
-            let Some(obs) = crate::providers::codex::parse_rate_limits_line(&line) else {
-                continue;
+            let Some(obs) = crate::providers::codex::parse_rate_limits_line(line) else {
+                return;
             };
             for o in [obs.primary, obs.secondary].into_iter().flatten() {
-                // Intermediate writes are discarded (the tracker still updates
-                // its open windows); only the final per-key snapshots below
-                // are sent, instead of one write per integer-percent step
-                // across 60 days of history.
+                // Replay time advances with the observations: windows whose
+                // reset has passed must close AS THE SCAN PROGRESSES.
+                // Finalizing only after the loop left every window of the
+                // whole range open simultaneously, and observe_activity
+                // credits ALL open windows — the earliest 5h window absorbed
+                // hundreds of hours of activity, and the max-merge made that
+                // permanent (duty cycle then read 100% forever).
+                writes.extend(tracker.finalize_expired(o.ts_ms));
+                // Intermediate observe() writes are discarded (the tracker
+                // still updates its open windows); finalized + final
+                // snapshots are the only ones sent.
                 let _ = tracker.observe(&o);
                 // AFTER observe: rate_limits rides token_count lines, so each
                 // observation IS a token-activity instant, and the window this
-                // very line opened must receive its credit (activity-first
-                // lost the first burst — the smoke test caught it). Without
-                // this call, backfilled windows carried active_ms = 0.
+                // very line opened must receive its credit.
                 tracker.observe_activity(o.ts_ms);
             }
+        });
+        if scan.is_err() {
+            io_errors += 1;
+            continue;
         }
         files_scanned += 1;
         // Deliberate throttle: this is background work, never a startup burst.
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    let mut writes: Vec<WindowWrite> = tracker.finalize_expired(now_ms);
+    writes.extend(tracker.finalize_expired(now_ms));
     writes.extend(tracker.flush_all());
 
     // All window writes flow through the writer thread: upsert_window_merge

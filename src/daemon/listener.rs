@@ -253,11 +253,7 @@ fn handle_windows_client(
                     hub.claude_auth_cached().label().to_string()
                 }
             }
-            "codex" => hub
-                .codex_root
-                .as_deref()
-                .map(|r| crate::claude_poll::codex_auth_status(r).label().to_string())
-                .unwrap_or_else(|| "missing".to_string()),
+            "codex" => hub.codex_auth_cached().label().to_string(),
             _ => "unknown".to_string(),
         };
 

@@ -21,7 +21,6 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::common::types::WindowObservation;
-use crate::db::Database;
 use crate::windows::WindowTracker;
 use crate::writer::DbOp;
 
@@ -127,6 +126,9 @@ pub struct PollerHub {
     /// the WINDOWS handler would otherwise spawn a `security` subprocess per
     /// widget poll. (ts_ms, status)
     fallback_auth: Mutex<(i64, AuthStatus)>,
+    /// Same 30s cache for Codex: auth.json was re-read and DOM-parsed on
+    /// every WINDOWS request.
+    codex_auth_cache: Mutex<(i64, AuthStatus)>,
 }
 
 impl PollerHub {
@@ -140,7 +142,27 @@ impl PollerHub {
             polling_enabled: std::sync::atomic::AtomicBool::new(polling_enabled),
             poller_running: std::sync::atomic::AtomicBool::new(false),
             fallback_auth: Mutex::new((0, AuthStatus::Missing)),
+            codex_auth_cache: Mutex::new((0, AuthStatus::Missing)),
         }
+    }
+
+    /// Codex auth classification with a 30s cache (WINDOWS-handler rate).
+    pub fn codex_auth_cached(&self) -> AuthStatus {
+        const TTL_MS: i64 = 30_000;
+        let now = now_ms();
+        {
+            let cached = self.codex_auth_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if now - cached.0 < TTL_MS {
+                return cached.1;
+            }
+        }
+        let status = self
+            .codex_root
+            .as_deref()
+            .map(codex_auth_status)
+            .unwrap_or(AuthStatus::Missing);
+        *self.codex_auth_cache.lock().unwrap_or_else(|e| e.into_inner()) = (now, status);
+        status
     }
 
     pub fn poller_running(&self) -> bool {
@@ -482,7 +504,6 @@ fn observations_from_usage(
 
 pub fn run_claude_poller(
     hub: Arc<PollerHub>,
-    _db: Arc<Database>,
     db_tx: crossbeam_channel::Sender<DbOp>,
     claude_root: String,
 ) {

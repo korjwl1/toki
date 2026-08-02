@@ -266,6 +266,11 @@ impl Database {
     /// value decode entirely — with multi-year retention the hot callers
     /// (UDS WINDOWS every widget poll, sync every 5min) only pay for the
     /// recent handful instead of decoding the whole keyspace.
+    ///
+    /// Known tradeoff: the anchor is the key's LAST component, so this is a
+    /// full key iteration (no range seek). At ~2 rows/day/limit that is a few
+    /// thousand key touches per call — accepted; a time-leading key order
+    /// would cost a value-version migration for a µs-scale win.
     pub fn for_each_window_in<F>(
         &self,
         since_ms: i64,
@@ -295,7 +300,7 @@ impl Database {
     /// restart between shutdown-flush and finalize): without this they stay
     /// finalized=false forever and the statistics exclude them.
     pub fn finalize_stale_windows(&self, now_ms: i64) -> Result<usize, fjall::Error> {
-        const GRACE_MS: i64 = 180_000;
+        const GRACE_MS: i64 = crate::windows::FINALIZE_GRACE_MS;
         let mut fixed = 0usize;
         let mut updates: Vec<(Vec<u8>, crate::windows::WindowSnapshotV1)> = Vec::new();
         for guard in self.windows.iter() {

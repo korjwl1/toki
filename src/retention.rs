@@ -29,12 +29,17 @@ pub fn run_retention(db: &Database, policy: &RetentionPolicy) -> Result<Retentio
     // Window rows age out on their own horizon, before the event-retention
     // early return: event retention defaults to disabled, window retention
     // does not.
-    let windows_deleted = if policy.window_retention_days > 0 {
+    // Close out rows orphaned open by a restart. Deliberately OUTSIDE the
+    // retention toggle below: disabling retention must not leave restart
+    // orphans finalized=false forever.
+    {
         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
-        // Close out rows orphaned open by a restart before sweeping.
         if let Err(e) = db.finalize_stale_windows(now_ms) {
             eprintln!("[toki] stale-window finalize error (continuing): {}", e);
         }
+    }
+    let windows_deleted = if policy.window_retention_days > 0 {
+        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
         let cutoff = now_ms - (policy.window_retention_days as i64) * 86_400_000;
         // A windows sweep failure must never suppress the pre-existing event
         // retention below (audit: `?` here would early-return the whole pass).

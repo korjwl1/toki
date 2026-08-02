@@ -341,11 +341,10 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
             if let Some(rt) = runtimes.iter().find(|rt| rt.provider.name() == "claude_code") {
                 if let Some(root) = rt.provider.root_dir() {
                     let hub = hub.clone();
-                    let db = rt.db.clone();
                     let db_tx = rt.db_tx.clone();
                     match std::thread::Builder::new()
                         .name("toki-claude-poll".to_string())
-                        .spawn(move || claude_poll::run_claude_poller(hub, db, db_tx, root))
+                        .spawn(move || claude_poll::run_claude_poller(hub, db_tx, root))
                     {
                         Ok(h) => poller_handle = Some(h),
                         Err(e) => eprintln!("[toki] claude poller spawn failed: {}", e),

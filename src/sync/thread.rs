@@ -502,9 +502,13 @@ fn run_sync_inner(
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as i64)
                     .unwrap_or(0);
-                let mut items = Vec::new();
+                // Pass 1: fingerprint only (no WireWindow/String allocation) —
+                // the common steady-state outcome is "unchanged, skip", and it
+                // shouldn't pay the full item build every 5 minutes.
+                let mut count = 0usize;
                 let mut acc: u64 = 0;
                 let _ = db.for_each_window_in(now_ms - WINDOWS_SYNC_HORIZON_MS, i64::MAX, |key, snap| {
+                    count += 1;
                     let mut fold = |v: u64| acc = acc.wrapping_mul(31).wrapping_add(v);
                     for &b in key {
                         fold(b as u64);
@@ -512,22 +516,29 @@ fn run_sync_inner(
                     fold(snap.peak_pct_x100 as u64);
                     fold(snap.last_pct_x100 as u64);
                     fold(snap.observed_ts_ms as u64);
+                    fold(snap.raw_resets_at_ms as u64);
                     fold(snap.first_seen_ms as u64);
+                    fold(snap.window_minutes as u64);
                     fold(snap.finalized as u64);
                     fold(snap.maxed_out as u64);
                     fold(snap.limit_reached_kind as u64);
                     fold(snap.active_ms);
                     fold(snap.time_to_100_ms as u64);
+                    fold(snap.last_sample_gap_ms as u64);
                     fold(snap.sampled_active_fraction as u64);
                     fold(snap.n_samples as u64);
                     fold(crate::windows::hash_str(&snap.plan));
-                    items.push(crate::windows::wire_from_stored(key, &snap));
                 });
                 // Unchanged set: nothing to say — skip the upload, keep the throttle.
-                let fingerprint = (items.len(), acc);
+                let fingerprint = (count, acc);
                 if fingerprint == last_windows_fingerprint {
                     last_windows_sync = Instant::now();
-                } else if !items.is_empty() {
+                } else if count > 0 {
+                    // Pass 2 (rare): the set changed — build the wire items.
+                    let mut items = Vec::with_capacity(count);
+                    let _ = db.for_each_window_in(now_ms - WINDOWS_SYNC_HORIZON_MS, i64::MAX, |key, snap| {
+                        items.push(crate::windows::wire_from_stored(key, &snap));
+                    });
                     if let Some(ref mut c) = client {
                         let n = items.len();
                         match c.sync_windows(&config.provider, items) {
@@ -540,6 +551,9 @@ fn run_sync_inner(
                                 // A SyncErr keeps the connection; an IO error
                                 // means the link is gone (reconnect path).
                                 eprintln!("[toki:sync] windows sync error: {e}");
+                                // Surface in `toki settings sync status` —
+                                // eprintln alone left rejections invisible.
+                                sw.set("sync_last_error", &format!("windows: {e}"));
                                 if e.kind() != std::io::ErrorKind::Other {
                                     client = None;
                                     continue;
