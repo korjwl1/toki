@@ -1568,6 +1568,13 @@ fn dispatch_result_to_sink(
         .map(toki::common::schema::schema_for_provider);
 
     match item["type"].as_str() {
+        Some("windows") => {
+            // Typed pass-through — the grouped catch-all below would look for
+            // usage_per_models, find none, and silently print nothing.
+            if let Ok(rows) = serde_json::from_value::<Vec<toki::windows::WindowRow>>(item["data"].clone()) {
+                sink.emit_windows(&rows);
+            }
+        }
         Some("summary") => {
             // data is an array of model summaries → convert to HashMap
             if let Ok(summaries_vec) = serde_json::from_value::<Vec<toki::ModelUsageSummary>>(item["data"].clone()) {

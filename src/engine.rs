@@ -84,8 +84,9 @@ pub struct TrackerEngine {
     /// Per-provider rate-limit window trackers (populated only for providers
     /// enabled via `enable_window_tracking`; empty map = feature off, zero cost).
     window_trackers: HashMap<String, crate::windows::WindowTracker>,
-    /// provider_name -> provider root dir, for periodic account re-resolution.
-    window_account_roots: HashMap<String, String>,
+    /// provider_name -> mtime-cached account resolver (re-parses auth.json
+    /// only when the file actually changed).
+    window_account_roots: HashMap<String, crate::windows::CachedAccountScope>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -145,8 +146,9 @@ impl TrackerEngine {
     pub fn enable_window_tracking(&mut self, provider_name: &str, account_root: Option<String>) {
         let mut tracker = crate::windows::WindowTracker::new();
         if let Some(root) = &account_root {
-            tracker.set_account(&crate::windows::codex_account_scope(root));
-            self.window_account_roots.insert(provider_name.to_string(), root.clone());
+            let mut cache = crate::windows::CachedAccountScope::new(root.clone());
+            tracker.set_account(cache.resolve());
+            self.window_account_roots.insert(provider_name.to_string(), cache);
         }
         self.window_trackers.insert(provider_name.to_string(), tracker);
     }
@@ -815,8 +817,9 @@ impl TrackerEngine {
             .unwrap_or(0);
         for (provider, tx) in providers {
             if let Some(tracker) = self.window_trackers.get_mut(provider.name()) {
-                if let Some(root) = self.window_account_roots.get(provider.name()) {
-                    tracker.set_account(&crate::windows::codex_account_scope(root));
+                if let Some(cache) = self.window_account_roots.get_mut(provider.name()) {
+                    let scope = cache.resolve().to_string();
+                    tracker.set_account(&scope);
                 }
                 for w in tracker.finalize_expired(now_ms) {
                     let _ = tx.send(DbOp::WriteWindow(Box::new(w)));

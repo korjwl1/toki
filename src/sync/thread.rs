@@ -243,7 +243,10 @@ fn run_sync_inner(
     let mut next_cap_probe = Instant::now();
     // Fingerprint of the last uploaded window set — identical sets skip the
     // resend entirely (serialization + network) while staying cursorless.
-    let mut last_windows_fingerprint: (usize, i64, u64) = (0, 0, 0);
+    // Folds every merge-visible field: a finalize-only change keeps count,
+    // observed_ts, and peak identical, and skipping it would leave the
+    // server's copy unfinalized forever.
+    let mut last_windows_fingerprint: (usize, u64) = (0, 0);
 
     loop {
         // Check stop signal
@@ -495,16 +498,21 @@ fn run_sync_inner(
                     .map(|d| d.as_millis() as i64)
                     .unwrap_or(0);
                 let mut items = Vec::new();
-                let mut peak_sum: u64 = 0;
-                let mut max_observed: i64 = 0;
+                let mut acc: u64 = 0;
+                let mut fold = |v: u64| acc = acc.wrapping_mul(31).wrapping_add(v);
                 let _ = db.for_each_window_in(now_ms - WINDOWS_SYNC_HORIZON_MS, i64::MAX, |key, snap| {
-                    peak_sum = peak_sum.wrapping_add(snap.peak_pct_x100 as u64);
-                    max_observed = max_observed.max(snap.observed_ts_ms);
+                    fold(snap.peak_pct_x100 as u64);
+                    fold(snap.last_pct_x100 as u64);
+                    fold(snap.observed_ts_ms as u64);
+                    fold(snap.finalized as u64);
+                    fold(snap.maxed_out as u64);
+                    fold(snap.limit_reached_kind as u64);
+                    fold(snap.active_ms);
+                    fold(snap.time_to_100_ms as u64);
                     items.push(crate::windows::wire_from_stored(key, &snap));
                 });
-                // Unchanged set (same row count, newest observation, and peak
-                // sum): nothing to say — skip the upload, keep the throttle.
-                let fingerprint = (items.len(), max_observed, peak_sum);
+                // Unchanged set: nothing to say — skip the upload, keep the throttle.
+                let fingerprint = (items.len(), acc);
                 if fingerprint == last_windows_fingerprint {
                     last_windows_sync = Instant::now();
                 } else if !items.is_empty() {

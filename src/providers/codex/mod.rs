@@ -3,6 +3,47 @@ pub mod parser;
 pub use parser::CodexParser;
 pub(crate) use parser::parse_rate_limits_line;
 
+/// Resolve the Codex account scope from `<codex_root>/auth.json`, as a
+/// privacy-safe hash string. Returns "unknown" when unreadable.
+pub fn account_scope(codex_root: &str) -> String {
+    let path = std::path::Path::new(codex_root).join("auth.json");
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(_) => return "unknown".to_string(),
+    };
+    #[derive(serde::Deserialize)]
+    struct Auth {
+        tokens: Option<AuthTokens>,
+    }
+    #[derive(serde::Deserialize)]
+    struct AuthTokens {
+        account_id: Option<String>,
+    }
+    match serde_json::from_str::<Auth>(&raw) {
+        Ok(a) => match a.tokens.and_then(|t| t.account_id) {
+            Some(id) if !id.is_empty() => format!("{:016x}", crate::windows::hash_str(&id)),
+            _ => "unknown".to_string(),
+        },
+        Err(_) => "unknown".to_string(),
+    }
+}
+
+/// Classify Codex auth by reading auth.json on demand (always current — the
+/// monitor's old inode watcher existed only to trigger its own HTTP re-polls).
+pub fn auth_status(codex_root: &str) -> crate::claude_poll::AuthStatus {
+    use crate::claude_poll::AuthStatus;
+    let path = std::path::Path::new(codex_root).join("auth.json");
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(v) if v.get("tokens").map(|t| !t.is_null()).unwrap_or(false) => AuthStatus::Ok,
+            Ok(_) => AuthStatus::Missing,
+            Err(_) => AuthStatus::Unreadable,
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => AuthStatus::Missing,
+        Err(_) => AuthStatus::Unreadable,
+    }
+}
+
 /// Fast-mode pricing multipliers for Codex models.
 /// Empty placeholder: Codex JSONL carries no service_tier marker and the
 /// OpenAI API response does not echo it back, so per-event Fast detection

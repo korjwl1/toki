@@ -532,28 +532,33 @@ impl WindowTracker {
     }
 }
 
-/// Resolve the Codex account scope from `<codex_root>/auth.json`, as a
-/// privacy-safe hash string. Returns "unknown" when unreadable.
+/// Resolve the Codex account scope. Kept as a thin delegate: provider
+/// specifics live in providers::codex (established home for provider I/O).
 pub fn codex_account_scope(codex_root: &str) -> String {
-    let path = std::path::Path::new(codex_root).join("auth.json");
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(_) => return "unknown".to_string(),
-    };
-    #[derive(Deserialize)]
-    struct Auth {
-        tokens: Option<AuthTokens>,
+    crate::providers::codex::account_scope(codex_root)
+}
+
+/// mtime-cached account scope for periodic callers: auth.json only changes on
+/// login/logout, so the 60s engine tick shouldn't re-read and re-parse it.
+pub struct CachedAccountScope {
+    root: String,
+    mtime: Option<std::time::SystemTime>,
+    scope: String,
+}
+
+impl CachedAccountScope {
+    pub fn new(root: String) -> Self {
+        CachedAccountScope { root, mtime: None, scope: "unknown".to_string() }
     }
-    #[derive(Deserialize)]
-    struct AuthTokens {
-        account_id: Option<String>,
-    }
-    match serde_json::from_str::<Auth>(&raw) {
-        Ok(a) => match a.tokens.and_then(|t| t.account_id) {
-            Some(id) if !id.is_empty() => format!("{:016x}", hash_str(&id)),
-            _ => "unknown".to_string(),
-        },
-        Err(_) => "unknown".to_string(),
+
+    pub fn resolve(&mut self) -> &str {
+        let path = std::path::Path::new(&self.root).join("auth.json");
+        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        if mtime != self.mtime || self.mtime.is_none() {
+            self.mtime = mtime;
+            self.scope = codex_account_scope(&self.root);
+        }
+        &self.scope
     }
 }
 
@@ -917,6 +922,55 @@ mod tests {
         assert!(a.finalized && a.maxed_out); // OR
         assert_eq!(a.time_to_100_ms, 7_200_000); // -1 loses to a real value
         assert_eq!(a.active_ms, 500); // max
+    }
+
+    /// Drift guard for the two hand-maintained field mappings in this file:
+    /// WindowRow::from_stored (query/UDS shape) and wire_from_stored (sync
+    /// shape) must agree field-by-field for the same stored row.
+    #[test]
+    fn row_and_wire_conversions_stay_in_lockstep() {
+        let key = window_key(WindowKind::Weekly, 7, 9, 1_786_000_020_000);
+        let snap = WindowSnapshotV1 {
+            peak_pct_x100: 4321,
+            last_pct_x100: 1234,
+            observed_ts_ms: 11,
+            raw_resets_at_ms: 22,
+            first_seen_ms: 33,
+            window_minutes: 10080,
+            finalized: true,
+            maxed_out: true,
+            limit_reached_kind: REACHED_ON_CREDITS,
+            time_to_100_ms: 44,
+            active_ms: 55,
+            last_sample_gap_ms: 66,
+            sampled_active_fraction: 777,
+            n_samples: 88,
+            limit_id: "codex".into(),
+            plan: "prolite".into(),
+            account: "acct".into(),
+        };
+        let row = WindowRow::from_stored(&key, &snap);
+        let wire = wire_from_stored(&key, &snap);
+        assert_eq!(row.kind, "weekly");
+        assert_eq!(wire.window_kind, 1);
+        assert_eq!(row.window_end_ms, wire.window_end_ms);
+        assert_eq!((row.peak_pct * 100.0).round() as u16, wire.peak_pct_x100);
+        assert_eq!((row.last_pct * 100.0).round() as u16, wire.last_pct_x100);
+        assert_eq!(row.raw_resets_at_ms, wire.raw_resets_at_ms);
+        assert_eq!(row.first_seen_ms, wire.first_seen_ms);
+        assert_eq!(row.observed_ts_ms, wire.observed_ts_ms);
+        assert_eq!(row.window_minutes, wire.window_minutes);
+        assert_eq!(row.finalized, wire.finalized);
+        assert_eq!(row.maxed_out, wire.maxed_out);
+        assert_eq!(row.limit_reached_kind, wire.limit_reached_kind);
+        assert_eq!(row.time_to_100_ms, wire.time_to_100_ms);
+        assert_eq!(row.active_ms, wire.active_ms);
+        assert_eq!(row.last_sample_gap_ms, wire.last_sample_gap_ms);
+        assert_eq!(row.sampled_active_fraction, wire.sampled_active_fraction);
+        assert_eq!(row.n_samples, wire.n_samples);
+        assert_eq!(row.limit_id, wire.limit_id);
+        assert_eq!(row.plan, wire.plan);
+        assert_eq!(row.account, wire.account);
     }
 
     #[test]

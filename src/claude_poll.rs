@@ -119,6 +119,10 @@ pub struct PollerHub {
     /// Whether active Claude polling is currently enabled (window_polling
     /// setting; hot-reloadable via the settings watcher).
     polling_enabled: std::sync::atomic::AtomicBool,
+    /// Cached fallback auth classification for the polling-disabled path:
+    /// the WINDOWS handler would otherwise spawn a `security` subprocess per
+    /// widget poll. (ts_ms, status)
+    fallback_auth: Mutex<(i64, AuthStatus)>,
 }
 
 impl PollerHub {
@@ -130,7 +134,31 @@ impl PollerHub {
             claude_root,
             codex_root,
             polling_enabled: std::sync::atomic::AtomicBool::new(polling_enabled),
+            fallback_auth: Mutex::new((0, AuthStatus::Missing)),
         }
+    }
+
+    /// Claude auth classification with a 30s cache — used only when active
+    /// polling is disabled (the poller's published state is authoritative
+    /// otherwise).
+    pub fn claude_auth_cached(&self) -> AuthStatus {
+        const TTL_MS: i64 = 30_000;
+        let now = now_ms();
+        {
+            let cached = self.fallback_auth.lock().unwrap_or_else(|e| e.into_inner());
+            if now - cached.0 < TTL_MS {
+                return cached.1;
+            }
+        }
+        let status = match &self.claude_root {
+            Some(root) => match read_claude_credentials(root) {
+                Ok(_) => AuthStatus::Ok,
+                Err(s) => s,
+            },
+            None => AuthStatus::Missing,
+        };
+        *self.fallback_auth.lock().unwrap_or_else(|e| e.into_inner()) = (now, status);
+        status
     }
 
     pub fn polling_enabled(&self) -> bool {
@@ -147,25 +175,25 @@ impl PollerHub {
     }
 
     /// Called by the writer after each flush: tokens are flowing.
+    /// Poison recovery everywhere in this struct (into_inner, never a silent
+    /// drop): a dropped stop() would wedge Handle::shutdown on the poller join.
     pub fn notify_token_flow(&self) {
         self.last_token_flow_ms.store(now_ms(), Ordering::Relaxed);
         let (lock, cvar) = &self.signal;
-        if let Ok(mut s) = lock.lock() {
-            s.token_flow = true;
-            cvar.notify_all();
-        }
+        let mut s = lock.lock().unwrap_or_else(|e| e.into_inner());
+        s.token_flow = true;
+        cvar.notify_all();
     }
 
     pub fn stop(&self) {
         let (lock, cvar) = &self.signal;
-        if let Ok(mut s) = lock.lock() {
-            s.stop = true;
-            cvar.notify_all();
-        }
+        let mut s = lock.lock().unwrap_or_else(|e| e.into_inner());
+        s.stop = true;
+        cvar.notify_all();
     }
 
     pub fn state_snapshot(&self) -> PublishedState {
-        self.state.0.lock().map(|s| s.clone()).unwrap_or_default()
+        self.state.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Request a fresh poll and wait (bounded) for the poller to complete one
@@ -204,10 +232,9 @@ impl PollerHub {
 
     fn publish<F: FnOnce(&mut PublishedState)>(&self, f: F) {
         let (lock, cvar) = &self.state;
-        if let Ok(mut st) = lock.lock() {
-            f(&mut st);
-            cvar.notify_all();
-        }
+        let mut st = lock.lock().unwrap_or_else(|e| e.into_inner());
+        f(&mut st);
+        cvar.notify_all();
     }
 
     fn last_token_flow(&self) -> i64 {
@@ -297,20 +324,9 @@ fn parse_credentials(raw: &str) -> Result<ClaudeCredentials, AuthStatus> {
     Ok(ClaudeCredentials { access_token, expires_at_ms })
 }
 
-/// Codex auth classification for the WINDOWS handler: read on demand — always
-/// current, no inode watcher needed (the monitor's watcher existed to trigger
-/// its own HTTP re-polls; the daemon reads the file per request instead).
+/// Codex auth classification (thin delegate — see providers::codex).
 pub fn codex_auth_status(codex_root: &str) -> AuthStatus {
-    let path = std::path::Path::new(codex_root).join("auth.json");
-    match std::fs::read_to_string(&path) {
-        Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw) {
-            Ok(v) if v.get("tokens").map(|t| !t.is_null()).unwrap_or(false) => AuthStatus::Ok,
-            Ok(_) => AuthStatus::Missing,
-            Err(_) => AuthStatus::Unreadable,
-        },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => AuthStatus::Missing,
-        Err(_) => AuthStatus::Unreadable,
-    }
+    crate::providers::codex::auth_status(codex_root)
 }
 
 // ---- Usage / profile clients ----
@@ -479,17 +495,26 @@ pub fn run_claude_poller(
         let active = now - hub.last_token_flow() < ACTIVE_HORIZON_MS;
         let interval = if peak_hint > 90.0 { POLL_DENSE_MS } else { POLL_STEADY_MS };
 
-        // Compute how long to sleep. Idle with no pending confirm: hourly
-        // housekeeping only (finalize stale windows). The scheduled deadline
-        // respects an active backoff — otherwise an active session under
-        // backoff would wake at the 50ms clamp in a busy loop, burning CPU.
-        let mut deadline = if active {
+        // Compute how long to sleep. Idle, or polling disabled at runtime
+        // (set_polling_enabled notifies the condvar to re-evaluate): hourly
+        // housekeeping only. The scheduled deadline respects an active
+        // backoff, and a past-due confirm retries on the 30s floor — never
+        // the 50ms clamp (each of those was a measured ~20Hz busy loop).
+        let polling_on = hub.polling_enabled();
+        let mut deadline = if !polling_on {
+            now + 3_600_000
+        } else if active {
             (last_poll_ms + interval).max(backoff_until_ms)
         } else {
             now + 3_600_000
         };
-        if let Some(c) = next_confirm {
-            deadline = deadline.min(c.max(now));
+        if polling_on {
+            if let Some(c) = next_confirm {
+                let confirm_deadline = c
+                    .max(last_poll_ms + POLL_FLOOR_MS)
+                    .max(backoff_until_ms);
+                deadline = deadline.min(confirm_deadline.max(now));
+            }
         }
         let wait = Duration::from_millis((deadline - now).clamp(50, 3_600_000) as u64);
 
@@ -528,13 +553,24 @@ pub fn run_claude_poller(
         }
 
         // ---- Decide whether to poll now ----
-        let confirm_due = next_confirm.map(|c| now >= c).unwrap_or(false);
+        // Confirm retries share the 30s floor and honor backoff: a failing
+        // confirm poll (offline, 429) must not retry at the wake clamp.
+        let confirm_due = next_confirm.map(|c| now >= c).unwrap_or(false)
+            && now - last_poll_ms >= POLL_FLOOR_MS
+            && now >= backoff_until_ms;
         let active = now - hub.last_token_flow() < ACTIVE_HORIZON_MS;
         let since_last = now - last_poll_ms;
 
-        // Immediate path: a token-flow wake while auth was failing (or before
-        // any successful poll) implies re-login — bypass the floor once.
-        let relogin_probe = token_flow && !last_auth_ok;
+        // Re-login path: a token-flow wake while auth is failing implies a
+        // possible re-login. Rate-limited to the monitor's legacy 20s auth
+        // cadence and honoring backoff — the writer wakes this loop on every
+        // flush (~1/s while streaming), and an unbounded probe would hammer
+        // the endpoint for the whole failure episode.
+        const RELOGIN_PROBE_MS: i64 = 20_000;
+        let relogin_probe = token_flow
+            && !last_auth_ok
+            && since_last >= RELOGIN_PROBE_MS
+            && now >= backoff_until_ms;
 
         let scheduled = active && since_last >= interval;
         let refresh_due = refresh && since_last >= POLL_FLOOR_MS;
@@ -564,22 +600,24 @@ pub fn run_claude_poller(
             Err(status) => Err((status, None)),
             Ok(creds) => {
                 // Auth just recovered — possibly a different account. Drop the
-                // cached profile BEFORE the fetch below so this same poll
-                // re-resolves it (invalidating after the poll would wipe the
-                // profile the first successful poll just fetched).
+                // cached profile so it re-resolves below (after the usage
+                // fetch proves the token, so failure episodes never pay a
+                // second request per attempt).
                 if !last_auth_ok {
                     profile = None;
                 }
-                // Account/plan resolution piggybacks on a valid token.
-                if profile.is_none() || now - profile_fetched_ms > PROFILE_REFRESH_MS {
-                    if let Some(p) = fetch_profile(&creds.access_token) {
-                        tracker.set_account(&p.account_scope);
-                        profile = Some(p);
-                        profile_fetched_ms = now;
-                    }
-                }
                 match fetch_usage(&creds.access_token) {
-                    Ok(usage) => Ok(usage),
+                    Ok(usage) => {
+                        // Account/plan resolution piggybacks on a proven token.
+                        if profile.is_none() || now - profile_fetched_ms > PROFILE_REFRESH_MS {
+                            if let Some(p) = fetch_profile(&creds.access_token) {
+                                tracker.set_account(&p.account_scope);
+                                profile = Some(p);
+                                profile_fetched_ms = now;
+                            }
+                        }
+                        Ok(usage)
+                    }
                     Err(PollError::AuthRejected) => Err((AuthStatus::Expired, None)),
                     Err(PollError::RateLimited) => {
                         Err((AuthStatus::Ok, Some(RATE_LIMITED_BACKOFF_MS)))
@@ -609,13 +647,19 @@ pub fn run_claude_poller(
                     .map(|o| o.used_percent)
                     .fold(0.0, f64::max);
                 for obs in &observations {
-                    if confirm_due {
+                    // Mark ONLY the window whose confirm span this sample
+                    // actually covers — a five_hour confirm must not mark the
+                    // weekly buckets (days out) as already confirmed.
+                    if confirm_due && obs.resets_at_ms - now <= CONFIRM_BEFORE_RESET_MS {
                         confirmed.insert(crate::windows::floor_to_minute(obs.resets_at_ms));
                     }
                     if let Some(w) = tracker.observe(obs) {
                         let _ = db_tx.send(DbOp::WriteWindow(Box::new(w)));
                     }
                 }
+                // Entries whose reset passed are dead (jittered inserts can
+                // miss the finalize-time removal) — prune, don't leak.
+                confirmed.retain(|&t| t > now - 86_400_000);
                 let extra_enabled = usage
                     .extra_usage
                     .as_ref()

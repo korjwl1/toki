@@ -247,13 +247,10 @@ fn handle_windows_client(
             "claude_code" => {
                 if hub.polling_enabled() {
                     claude_state.auth_status.label().to_string()
-                } else if let Some(root) = &hub.claude_root {
-                    match crate::claude_poll::read_claude_credentials(root) {
-                        Ok(_) => "ok".to_string(),
-                        Err(status) => status.label().to_string(),
-                    }
                 } else {
-                    "missing".to_string()
+                    // 30s-cached: this runs at widget-poll rate and would
+                    // otherwise spawn a `security` subprocess per request.
+                    hub.claude_auth_cached().label().to_string()
                 }
             }
             "codex" => hub

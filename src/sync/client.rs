@@ -266,8 +266,11 @@ impl SyncClient {
             provider: provider.to_string(),
             items,
         };
+        // ErrorKind::Other, deliberately: the caller reconnects on any other
+        // kind, and a purely local serialization bug must not cycle the TCP
+        // connection that event sync is using.
         let bytes = bincode::serialize(&payload)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            .map_err(|e| io::Error::other(e))?;
         write_frame(&mut self.writer, MsgType::SyncWindows, &bytes)?;
         let (msg_type, resp) = read_frame(&mut self.reader)?;
         match msg_type {
