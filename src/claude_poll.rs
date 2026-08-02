@@ -308,10 +308,35 @@ fn read_credentials_raw(claude_root: &str) -> Result<String, AuthStatus> {
     #[cfg(target_os = "macos")]
     {
         let _ = claude_root;
-        let out = std::process::Command::new("security")
+        // Bounded wait: a locked keychain / pending ACL prompt can block
+        // `security` indefinitely, which would wedge the poller AND
+        // Handle::shutdown's join. 10s then kill → transient Unreadable.
+        let mut child = std::process::Command::new("security")
             .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
-            .output()
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
             .map_err(|_| AuthStatus::Unreadable)?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(st)) => break st,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(AuthStatus::Unreadable);
+                }
+            }
+        };
+        let mut stdout = Vec::new();
+        if let Some(mut out_pipe) = child.stdout.take() {
+            use std::io::Read;
+            let _ = out_pipe.read_to_end(&mut stdout);
+        }
+        let out = std::process::Output { status, stdout, stderr: Vec::new() };
         if !out.status.success() {
             // Parity with the monitor's ClaudeAuthReader.classify: exit 44 is
             // errSecItemNotFound (logged out); any other failure — ACL denial,
@@ -516,6 +541,10 @@ pub fn run_claude_poller(
     let mut peak_hint: f64 = 0.0;
     let mut profile: Option<ProfileInfo> = None;
     let mut profile_fetched_ms: i64 = 0;
+    // Negative cache: a failing profile endpoint must not add a second API
+    // request to every poll (10-min retry backoff; token changes bypass it).
+    let mut profile_attempt_ms: i64 = 0;
+    const PROFILE_RETRY_MS: i64 = 600_000;
     // Detects an atomic valid-token→valid-token swap (logout+login between
     // polls never trips an auth failure, but the account may have changed).
     let mut last_token_hash: u64 = 0;
@@ -657,12 +686,23 @@ pub fn run_claude_poller(
                 let token_hash = crate::windows::hash_str(&creds.access_token);
                 if !last_auth_ok || token_hash != last_token_hash {
                     profile = None;
+                    profile_attempt_ms = 0; // token change bypasses the retry backoff
+                    // Until the NEW token's profile resolves, attribution must
+                    // not continue into the previous account's rows: quarantine
+                    // under "unknown" (consistent with backfill's policy —
+                    // unknown segments are excluded from advice).
+                    if token_hash != last_token_hash && last_token_hash != 0 {
+                        tracker.set_account("unknown");
+                    }
                 }
                 last_token_hash = token_hash;
                 match fetch_usage(&creds.access_token) {
                     Ok(usage) => {
                         // Account/plan resolution piggybacks on a proven token.
-                        if profile.is_none() || now - profile_fetched_ms > PROFILE_REFRESH_MS {
+                        if (profile.is_none() || now - profile_fetched_ms > PROFILE_REFRESH_MS)
+                            && now - profile_attempt_ms > PROFILE_RETRY_MS
+                        {
+                            profile_attempt_ms = now;
                             if let Some(p) = fetch_profile(&creds.access_token) {
                                 tracker.set_account(&p.account_scope);
                                 profile = Some(p);

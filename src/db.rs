@@ -238,14 +238,20 @@ impl Database {
         snap: &crate::windows::WindowSnapshotV1,
     ) -> Result<(), fjall::Error> {
         let merged = match self.windows.get(key)? {
-            Some(existing) => match crate::windows::WindowSnapshotV1::decode(&existing) {
-                Some(mut prev) => {
+            Some(existing) => match crate::windows::WindowSnapshotV1::decode_versioned(&existing) {
+                crate::windows::WindowDecode::Valid(mut prev) => {
                     prev.merge_from(snap);
                     prev
                 }
-                // Unknown (future) value version — a downgraded daemon must
-                // PRESERVE it, not clobber a richer row it cannot read.
-                None => return Ok(()),
+                // Future version — a downgraded daemon must PRESERVE it, not
+                // clobber a richer row it cannot read.
+                crate::windows::WindowDecode::FutureVersion => return Ok(()),
+                // Corrupt current-version value: recover with the incoming
+                // snapshot (preserving corruption hides the row forever).
+                crate::windows::WindowDecode::Corrupt => {
+                    eprintln!("[toki] corrupt window value replaced");
+                    snap.clone()
+                }
             },
             None => snap.clone(),
         };

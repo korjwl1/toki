@@ -92,10 +92,13 @@ enum WindowsCapability {
     /// Not yet determined (probe failed transiently, or not probed).
     Unknown,
     Supported,
-    /// Authoritative 404 / missing flag — latched for this daemon run;
-    /// a restart (or server change) re-probes.
+    /// Authoritative 404 / missing flag. Re-probed after a long TTL so a
+    /// rolling server upgrade doesn't require every daemon to restart.
     Unsupported,
 }
+
+/// How long an authoritative "unsupported" verdict holds before re-probing.
+const CAP_UNSUPPORTED_TTL: Duration = Duration::from_secs(6 * 3600);
 
 /// Probe the server's capabilities endpoint. Ok(Some(bool)) is authoritative;
 /// Ok(None)/Err are transient (retry later, never latch).
@@ -476,6 +479,11 @@ fn run_sync_inner(
         // makes the resend idempotent, so no cursor exists (a cursor on
         // window_end would permanently miss peak updates under a fixed key).
         if last_windows_sync.elapsed() >= WINDOWS_SYNC_INTERVAL {
+            if windows_cap == WindowsCapability::Unsupported
+                && Instant::now() >= next_cap_probe
+            {
+                windows_cap = WindowsCapability::Unknown;
+            }
             if windows_cap == WindowsCapability::Unknown && Instant::now() >= next_cap_probe {
                 if let Some(creds) = crate::sync::credentials::load() {
                     if !creds.http_url.is_empty() {
@@ -486,7 +494,8 @@ fn run_sync_inner(
                             }
                             Some(false) => {
                                 windows_cap = WindowsCapability::Unsupported;
-                                eprintln!("[toki:sync] server predates windows sync (skipping until restart)");
+                                next_cap_probe = Instant::now() + CAP_UNSUPPORTED_TTL;
+                                eprintln!("[toki:sync] server predates windows sync (re-probe in 6h)");
                             }
                             None => {
                                 // Transient (network/TLS/5xx): back off instead

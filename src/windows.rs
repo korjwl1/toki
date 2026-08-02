@@ -122,6 +122,13 @@ pub struct WindowSnapshotV1 {
 
 pub const WINDOW_VALUE_VERSION: u8 = 1;
 
+/// Outcome of decoding a stored window value (see decode_versioned).
+pub enum WindowDecode {
+    Valid(WindowSnapshotV1),
+    FutureVersion,
+    Corrupt,
+}
+
 impl WindowSnapshotV1 {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(96);
@@ -132,11 +139,26 @@ impl WindowSnapshotV1 {
     }
 
     pub fn decode(bytes: &[u8]) -> Option<WindowSnapshotV1> {
-        let (&version, body) = bytes.split_first()?;
-        if version != WINDOW_VALUE_VERSION {
-            return None;
+        match Self::decode_versioned(bytes) {
+            WindowDecode::Valid(s) => Some(s),
+            _ => None,
         }
-        bincode::deserialize(body).ok()
+    }
+
+    /// Distinguishes a FUTURE version (preserve — a newer binary wrote it)
+    /// from a CORRUPT current-version value (recover — let fresh data replace
+    /// it; preserving corruption would hide the row from queries forever).
+    pub fn decode_versioned(bytes: &[u8]) -> WindowDecode {
+        let Some((&version, body)) = bytes.split_first() else {
+            return WindowDecode::Corrupt;
+        };
+        if version > WINDOW_VALUE_VERSION {
+            return WindowDecode::FutureVersion;
+        }
+        match bincode::deserialize(body) {
+            Ok(s) => WindowDecode::Valid(s),
+            Err(_) => WindowDecode::Corrupt,
+        }
     }
 
     /// Field-wise merge with a newer/other snapshot of the same window. Never
@@ -653,24 +675,29 @@ pub fn run_windows_backfill(
             let Some(obs) = crate::providers::codex::parse_rate_limits_line(line) else {
                 return;
             };
-            for o in [obs.primary, obs.secondary].into_iter().flatten() {
-                // Replay time advances with the observations: windows whose
-                // reset has passed must close AS THE SCAN PROGRESSES.
-                // Finalizing only after the loop left every window of the
-                // whole range open simultaneously, and observe_activity
-                // credits ALL open windows — the earliest 5h window absorbed
-                // hundreds of hours of activity, and the max-merge made that
-                // permanent (duty cycle then read 100% forever).
-                writes.extend(tracker.finalize_expired(o.ts_ms));
+            // Replay time advances with the observations: windows whose
+            // reset has passed must close AS THE SCAN PROGRESSES (leaving the
+            // whole range open at once made the earliest window absorb every
+            // hour of activity, permanently, via the max-merge).
+            let line_ts = obs
+                .primary
+                .as_ref()
+                .or(obs.secondary.as_ref())
+                .map(|o| o.ts_ms)
+                .unwrap_or(0);
+            writes.extend(tracker.finalize_expired(line_ts));
+            // Open BOTH slots of the line before crediting its activity once:
+            // per-slot interleaving gave the first slot the line's credit and
+            // the second slot nothing.
+            for o in [obs.primary.as_ref(), obs.secondary.as_ref()].into_iter().flatten() {
                 // Intermediate observe() writes are discarded (the tracker
                 // still updates its open windows); finalized + final
                 // snapshots are the only ones sent.
-                let _ = tracker.observe(&o);
-                // AFTER observe: rate_limits rides token_count lines, so each
-                // observation IS a token-activity instant, and the window this
-                // very line opened must receive its credit.
-                tracker.observe_activity(o.ts_ms);
+                let _ = tracker.observe(o);
             }
+            // rate_limits rides token_count lines: the line IS one
+            // token-activity instant.
+            tracker.observe_activity(line_ts);
         });
         if scan.is_err() {
             io_errors += 1;
