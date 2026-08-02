@@ -210,6 +210,20 @@ pub fn execute_parsed_query(
     let until_ms = until_ms - offset_ms;
 
     match parsed.metric {
+        Metric::Windows => {
+            // One row per window instance; whole-keyspace scan is a few
+            // hundred rows. Range filters apply to the window anchor.
+            let mut rows: Vec<crate::windows::WindowRow> = Vec::new();
+            db.for_each_window(|key, snap| {
+                let anchor = crate::windows::window_key_anchor_ms(key).unwrap_or(0);
+                if anchor >= since_ms && anchor <= until_ms {
+                    rows.push(crate::windows::WindowRow::from_stored(key, &snap));
+                }
+            })
+            .map_err(|e| e.to_string())?;
+            rows.sort_by_key(|r| r.window_end_ms);
+            sink.emit_windows(&rows);
+        }
         Metric::Sessions => {
             let session_filter = parsed.get_filter("session");
             let project_filter = parsed.get_filter("project");
@@ -1097,6 +1111,7 @@ mod tests {
     struct CaptureSink {
         summaries: Mutex<Vec<SummaryMap>>,
         grouped: Mutex<Vec<GroupedSummaryMap>>,
+        windows: Mutex<Vec<Vec<crate::windows::WindowRow>>>,
     }
 
     impl crate::sink::Sink for CaptureSink {
@@ -1109,6 +1124,49 @@ mod tests {
         fn emit_event(&self, _e: &crate::common::types::UsageEventWithTs, _p: Option<&crate::pricing::PricingTable>, _s: Option<&dyn crate::common::schema::ProviderSchema>) {}
         fn emit_list(&self, _items: &[String], _t: &str) {}
         fn emit_events_batch(&self, _e: &[RawEvent], _p: Option<&crate::pricing::PricingTable>, _s: Option<&dyn crate::common::schema::ProviderSchema>) {}
+        fn emit_windows(&self, rows: &[crate::windows::WindowRow]) {
+            self.windows.lock().unwrap().push(rows.to_vec());
+        }
+    }
+
+    #[test]
+    fn windows_metric_lists_rows_in_range() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join("t.fjall")).unwrap();
+        use crate::windows::{window_key, WindowKind, WindowSnapshotV1, REACHED_NONE};
+        let snap = |peak: u16, reset: i64| WindowSnapshotV1 {
+            peak_pct_x100: peak,
+            observed_ts_ms: reset - 1000,
+            raw_resets_at_ms: reset,
+            first_seen_ms: reset - 3_600_000,
+            window_minutes: 300,
+            finalized: true,
+            maxed_out: peak >= 10_000,
+            limit_reached_kind: REACHED_NONE,
+            time_to_100_ms: -1,
+            active_ms: 60_000,
+            last_sample_gap_ms: 1000,
+            sampled_active_fraction: 1000,
+            n_samples: 5,
+            limit_id: "five_hour".into(),
+            plan: "max_5x".into(),
+            account: "a".into(),
+        };
+        db.upsert_window_merge(&window_key(WindowKind::Session, 1, 2, 1_000_000_000_000), &snap(4200, 1_000_000_000_000)).unwrap();
+        db.upsert_window_merge(&window_key(WindowKind::Session, 1, 2, 2_000_000_000_000), &snap(10_000, 2_000_000_000_000)).unwrap();
+
+        let sink = CaptureSink::default();
+        let q = crate::query_parser::parse("windows").unwrap();
+        // Range excludes the first row.
+        execute_parsed_query(&db, &q, None, chrono::Weekday::Mon, None, &sink, 1_500_000_000_000, i64::MAX).unwrap();
+        let captured = sink.windows.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].len(), 1);
+        let row = &captured[0][0];
+        assert_eq!(row.peak_pct, 100.0);
+        assert!(row.maxed_out);
+        assert_eq!(row.kind, "session");
+        assert_eq!(row.limit_id, "five_hour");
     }
 
     /// Build a small DB with two sessions across two projects for filter tests.

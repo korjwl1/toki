@@ -62,6 +62,8 @@ pub enum Metric {
     Projects,
     /// Raw event data (individual API calls).
     Events,
+    /// Rate-limit window instances (peak utilization per window).
+    Windows,
 }
 
 /// Parsed label filter.
@@ -174,6 +176,7 @@ impl Query {
             Metric::Sessions => "sessions".to_string(),
             Metric::Projects => "projects".to_string(),
             Metric::Events => "events".to_string(),
+            Metric::Windows => "windows".to_string(),
         };
 
         let mut filters: Vec<(&str, &str, bool)> = self.filters.iter()
@@ -279,13 +282,15 @@ pub fn parse(input: &str) -> Result<Query, String> {
         Metric::Cost
     } else if p.consume_literal("events") {
         Metric::Events
+    } else if p.consume_literal("windows") {
+        Metric::Windows
     } else if p.consume_literal("sessions") {
         Metric::Sessions
     } else if p.consume_literal("projects") {
         Metric::Projects
     } else {
         return Err(
-            "expected metric name ('toki_tokens_total', 'usage', 'cost', 'events', 'sessions', 'projects') \
+            "expected metric name ('toki_tokens_total', 'usage', 'cost', 'events', 'windows', 'sessions', 'projects') \
              or aggregation function ('sum', 'avg', 'count')"
                 .into(),
         );
@@ -622,6 +627,21 @@ impl<'a> Parser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_windows_metric_parses_plain() {
+        let q = parse("windows").unwrap();
+        assert_eq!(q.metric, Metric::Windows);
+        assert_eq!(q.to_query_string(), "windows");
+    }
+
+    #[test]
+    fn test_windows_metric_rejects_bucket_and_group_by() {
+        // Range brackets are bucket steps, not lookbacks — windows has exactly
+        // one row per instance and no meaningful bucketing.
+        assert!(parse("windows[1d]").is_err());
+        assert!(parse("sum by (model) (windows)").is_err());
+    }
 
     #[test]
     fn test_bare_usage() {

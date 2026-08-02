@@ -237,32 +237,14 @@ fn handle_windows_client(
     const ROW_HORIZON_MS: i64 = 8 * 86_400_000;
     let mut providers = serde_json::Map::new();
     for (name, db) in dbs {
-        let mut rows = Vec::new();
+        let mut rows: Vec<crate::windows::WindowRow> = Vec::new();
         let _ = db.for_each_window(|key, snap| {
             let anchor = crate::windows::window_key_anchor_ms(key).unwrap_or(0);
             if anchor >= now_ms - ROW_HORIZON_MS {
-                rows.push(serde_json::json!({
-                    "kind": crate::windows::WindowKind::from_u8(key[0])
-                        .map(|k| k.label()).unwrap_or("unknown"),
-                    "limit_id": snap.limit_id,
-                    "account": snap.account,
-                    "window_end_ms": anchor,
-                    "raw_resets_at_ms": snap.raw_resets_at_ms,
-                    "window_minutes": snap.window_minutes,
-                    "peak_pct": (snap.peak_pct_x100 as f64) / 100.0,
-                    "observed_ts_ms": snap.observed_ts_ms,
-                    "first_seen_ms": snap.first_seen_ms,
-                    "finalized": snap.finalized,
-                    "maxed_out": snap.maxed_out,
-                    "limit_reached_kind": snap.limit_reached_kind,
-                    "time_to_100_ms": snap.time_to_100_ms,
-                    "active_ms": snap.active_ms,
-                    "last_sample_gap_ms": snap.last_sample_gap_ms,
-                    "n_samples": snap.n_samples,
-                    "plan": snap.plan,
-                }));
+                rows.push(crate::windows::WindowRow::from_stored(key, &snap));
             }
         });
+        rows.sort_by_key(|r| r.window_end_ms);
 
         let auth = match name.as_str() {
             "claude_code" => {
@@ -286,7 +268,7 @@ fn handle_windows_client(
         };
 
         let mut entry = serde_json::json!({
-            "windows": rows,
+            "windows": serde_json::to_value(&rows).unwrap_or(serde_json::Value::Array(vec![])),
             "auth_status": auth,
         });
         if name == "claude_code" {
@@ -458,6 +440,14 @@ impl CollectorSink {
 }
 
 impl crate::sink::Sink for CollectorSink {
+    fn emit_windows(&self, rows: &[crate::windows::WindowRow]) {
+        let data = serde_json::to_value(rows).unwrap_or(serde_json::Value::Array(vec![]));
+        self.collected.lock().unwrap().push(serde_json::json!({
+            "type": "windows",
+            "data": data,
+        }));
+    }
+
     fn emit_summary(
         &self,
         summaries: &std::collections::HashMap<String, crate::common::types::ModelUsageSummary>,

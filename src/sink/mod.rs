@@ -24,6 +24,15 @@ pub trait Sink: Send + Sync {
     fn emit_events_batch(&self, events: &[RawEvent], pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>);
     /// Emit a pre-formatted JSONL line (used by trace passthrough).
     fn emit_raw(&self, line: &str) { println!("{}", line); }
+    /// Emit rate-limit window rows (`windows` metric). Default: one JSON
+    /// object per line through emit_raw; structured sinks override.
+    fn emit_windows(&self, rows: &[crate::windows::WindowRow]) {
+        for row in rows {
+            if let Ok(json) = serde_json::to_string(row) {
+                self.emit_raw(&json);
+            }
+        }
+    }
 }
 
 /// Dispatch to multiple sinks simultaneously.
@@ -38,6 +47,11 @@ impl MultiSink {
 }
 
 impl Sink for MultiSink {
+    fn emit_windows(&self, rows: &[crate::windows::WindowRow]) {
+        for sink in &self.sinks {
+            sink.emit_windows(rows);
+        }
+    }
     fn emit_summary(&self, summaries: &HashMap<String, ModelUsageSummary>, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
         for s in &self.sinks { s.emit_summary(summaries, pricing, schema); }
     }

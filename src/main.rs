@@ -1283,6 +1283,7 @@ fn reprocess_item_data(
         Some(type_name) if type_name == "sessions" || type_name == "projects" => {
             item["items"].clone()
         }
+        Some("windows") => item["data"].clone(),
         Some(_) => {
             // Grouped data (daily, weekly, etc.)
             if let Some(data_arr) = item["data"].as_array() {

@@ -184,6 +184,58 @@ pub fn hash_str(s: &str) -> u64 {
     xxh3_64(s.as_bytes())
 }
 
+/// Query/UDS output row for one window instance — the versioned public shape
+/// (`schema: 1` at the response level). Field names are the wire contract for
+/// the WINDOWS command, `toki query windows`, and the monitor's decoder.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowRow {
+    pub kind: String,
+    pub limit_id: String,
+    pub account: String,
+    pub window_end_ms: i64,
+    pub raw_resets_at_ms: i64,
+    pub window_minutes: u32,
+    pub peak_pct: f64,
+    pub observed_ts_ms: i64,
+    pub first_seen_ms: i64,
+    pub finalized: bool,
+    pub maxed_out: bool,
+    pub limit_reached_kind: u8,
+    pub time_to_100_ms: i64,
+    pub active_ms: u64,
+    pub last_sample_gap_ms: i64,
+    pub n_samples: u32,
+    pub plan: String,
+}
+
+impl WindowRow {
+    pub fn from_stored(key: &[u8], snap: &WindowSnapshotV1) -> WindowRow {
+        WindowRow {
+            kind: key
+                .first()
+                .and_then(|&b| WindowKind::from_u8(b))
+                .map(|k| k.label().to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            limit_id: snap.limit_id.clone(),
+            account: snap.account.clone(),
+            window_end_ms: window_key_anchor_ms(key).unwrap_or(0),
+            raw_resets_at_ms: snap.raw_resets_at_ms,
+            window_minutes: snap.window_minutes,
+            peak_pct: (snap.peak_pct_x100 as f64) / 100.0,
+            observed_ts_ms: snap.observed_ts_ms,
+            first_seen_ms: snap.first_seen_ms,
+            finalized: snap.finalized,
+            maxed_out: snap.maxed_out,
+            limit_reached_kind: snap.limit_reached_kind,
+            time_to_100_ms: snap.time_to_100_ms,
+            active_ms: snap.active_ms,
+            last_sample_gap_ms: snap.last_sample_gap_ms,
+            n_samples: snap.n_samples,
+            plan: snap.plan.clone(),
+        }
+    }
+}
+
 /// A pending durable write produced by the tracker.
 #[derive(Debug, Clone)]
 pub struct WindowWrite {
