@@ -640,15 +640,17 @@ pub fn run_windows_backfill(
                 continue;
             };
             for o in [obs.primary, obs.secondary].into_iter().flatten() {
-                // rate_limits rides token_count lines, so each observation IS
-                // a token-activity instant — without this, backfilled windows
-                // carried active_ms = 0 and historical duty cycles read zero.
-                tracker.observe_activity(o.ts_ms);
                 // Intermediate writes are discarded (the tracker still updates
                 // its open windows); only the final per-key snapshots below
                 // are sent, instead of one write per integer-percent step
                 // across 60 days of history.
                 let _ = tracker.observe(&o);
+                // AFTER observe: rate_limits rides token_count lines, so each
+                // observation IS a token-activity instant, and the window this
+                // very line opened must receive its credit (activity-first
+                // lost the first burst — the smoke test caught it). Without
+                // this call, backfilled windows carried active_ms = 0.
+                tracker.observe_activity(o.ts_ms);
             }
         }
         files_scanned += 1;
