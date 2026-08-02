@@ -241,7 +241,7 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
         let flush_notify: sync::FlushNotify = Arc::new((Mutex::new(false), Condvar::new()));
         let mut writer = DbWriter::new(db.clone(), db_rx, retention.clone());
         writer.flush_notify = Some(flush_notify.clone());
-        if provider.name() == "claude_code" && config.window_polling {
+        if provider.name() == "claude_code" && config.window_tracking {
             writer.poll_notify = windows_hub.clone();
         }
         let provider_name = provider.name().to_string();
@@ -334,7 +334,10 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
     // refresh requests; sleeps indefinitely while idle.
     let mut poller_handle: Option<JoinHandle<()>> = None;
     if let Some(hub) = &windows_hub {
-        if config.window_polling {
+        // Spawned whenever tracking is on (not just when polling is): the loop
+        // itself gates on the hot-reloadable polling flag, so enabling
+        // window_polling at runtime works without a restart.
+        {
             if let Some(rt) = runtimes.iter().find(|rt| rt.provider.name() == "claude_code") {
                 if let Some(root) = rt.provider.root_dir() {
                     let hub = hub.clone();

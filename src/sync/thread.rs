@@ -308,6 +308,11 @@ fn run_sync_inner(
                             last_ping = Instant::now();
                             last_refresh = Instant::now();
                             needs_initial_sync = true;
+                            // A reconnect may face a restored/reset server:
+                            // never let a stale fingerprint suppress the first
+                            // upload of the new session.
+                            last_windows_fingerprint = (0, 0);
+                            last_windows_sync = Instant::now() - WINDOWS_SYNC_INTERVAL;
                             auth_failure_notified = false;
                             sw.set("sync_status", "connected");
                             sw.set("sync_last_success", &now_epoch().to_string());
@@ -499,16 +504,23 @@ fn run_sync_inner(
                     .unwrap_or(0);
                 let mut items = Vec::new();
                 let mut acc: u64 = 0;
-                let mut fold = |v: u64| acc = acc.wrapping_mul(31).wrapping_add(v);
                 let _ = db.for_each_window_in(now_ms - WINDOWS_SYNC_HORIZON_MS, i64::MAX, |key, snap| {
+                    let mut fold = |v: u64| acc = acc.wrapping_mul(31).wrapping_add(v);
+                    for &b in key {
+                        fold(b as u64);
+                    }
                     fold(snap.peak_pct_x100 as u64);
                     fold(snap.last_pct_x100 as u64);
                     fold(snap.observed_ts_ms as u64);
+                    fold(snap.first_seen_ms as u64);
                     fold(snap.finalized as u64);
                     fold(snap.maxed_out as u64);
                     fold(snap.limit_reached_kind as u64);
                     fold(snap.active_ms);
                     fold(snap.time_to_100_ms as u64);
+                    fold(snap.sampled_active_fraction as u64);
+                    fold(snap.n_samples as u64);
+                    fold(crate::windows::hash_str(&snap.plan));
                     items.push(crate::windows::wire_from_stored(key, &snap));
                 });
                 // Unchanged set: nothing to say — skip the upload, keep the throttle.

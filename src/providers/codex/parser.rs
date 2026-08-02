@@ -313,10 +313,15 @@ fn parse_rate_limits_json(raw: &str, ts_ms: i64) -> Option<crate::common::types:
     let rl: RateLimitsRaw = serde_json::from_str(raw).ok()?;
     let limit_id = rl.limit_id.unwrap_or_default();
     let plan_type = rl.plan_type;
-    let limit_reached = rl.rate_limit_reached_type.is_some();
+    // The reached marker names WHICH window hit its limit; applying it to both
+    // would record the untouched window as exhausted. Unknown discriminators
+    // are ignored conservatively (peak>=100 still sets maxed_out).
+    let reached = rl.rate_limit_reached_type.as_deref();
+    let primary_reached = reached == Some("primary");
+    let secondary_reached = reached == Some("secondary");
     let has_credits = rl.credits.and_then(|c| c.has_credits).unwrap_or(false);
 
-    let mk = |w: RateLimitWindowRaw| -> Option<crate::common::types::WindowObservation> {
+    let mk = |w: RateLimitWindowRaw, limit_reached: bool| -> Option<crate::common::types::WindowObservation> {
         let used_percent = w.used_percent?;
         let window_minutes = w.window_minutes?;
         let resets_at_ms = match (w.resets_at, w.resets_in_seconds) {
@@ -338,8 +343,8 @@ fn parse_rate_limits_json(raw: &str, ts_ms: i64) -> Option<crate::common::types:
     };
 
     let out = crate::common::types::WindowObservations {
-        primary: rl.primary.and_then(&mk),
-        secondary: rl.secondary.and_then(&mk),
+        primary: rl.primary.and_then(|w| mk(w, primary_reached)),
+        secondary: rl.secondary.and_then(|w| mk(w, secondary_reached)),
     };
     if out.primary.is_none() && out.secondary.is_none() {
         None

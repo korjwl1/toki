@@ -587,16 +587,25 @@ pub fn run_windows_backfill(
         .flatten()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let lookback_days = if last_scan_ms == 0 { FIRST_RUN_DAYS } else { CATCHUP_DAYS };
-    let cutoff_ms = now_ms - lookback_days * 86_400_000;
+    // Catch-up covers max(8d, time since the last completed scan + 1d overlap),
+    // capped at the first-run depth — a daemon down for >8 days must not
+    // permanently lose the gap.
+    let lookback_ms = if last_scan_ms == 0 {
+        FIRST_RUN_DAYS * 86_400_000
+    } else {
+        (now_ms - last_scan_ms + 86_400_000)
+            .max(CATCHUP_DAYS * 86_400_000)
+            .min(FIRST_RUN_DAYS * 86_400_000)
+    };
+    let cutoff_ms = now_ms - lookback_ms;
     // First run replays months of history that cannot be attributed to the
     // current login with confidence; catch-up scans cover recent days only.
     let scan_account = if last_scan_ms == 0 { "unknown".to_string() } else { account };
 
     let mut tracker = WindowTracker::new();
     tracker.set_account(&scan_account);
-    let mut writes: Vec<WindowWrite> = Vec::new();
     let mut files_scanned = 0u32;
+    let mut io_errors = 0u32;
 
     let mut paths: Vec<std::path::PathBuf> = glob::glob(&sessions_glob)
         .into_iter()
@@ -616,7 +625,10 @@ pub fn run_windows_backfill(
     for path in paths {
         let file = match std::fs::File::open(&path) {
             Ok(f) => f,
-            Err(_) => continue,
+            Err(_) => {
+                io_errors += 1;
+                continue;
+            }
         };
         use std::io::BufRead;
         let reader = std::io::BufReader::new(file);
@@ -628,16 +640,22 @@ pub fn run_windows_backfill(
                 continue;
             };
             for o in [obs.primary, obs.secondary].into_iter().flatten() {
-                if let Some(w) = tracker.observe(&o) {
-                    writes.push(w);
-                }
+                // rate_limits rides token_count lines, so each observation IS
+                // a token-activity instant — without this, backfilled windows
+                // carried active_ms = 0 and historical duty cycles read zero.
+                tracker.observe_activity(o.ts_ms);
+                // Intermediate writes are discarded (the tracker still updates
+                // its open windows); only the final per-key snapshots below
+                // are sent, instead of one write per integer-percent step
+                // across 60 days of history.
+                let _ = tracker.observe(&o);
             }
         }
         files_scanned += 1;
         // Deliberate throttle: this is background work, never a startup burst.
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    writes.extend(tracker.finalize_expired(now_ms));
+    let mut writes: Vec<WindowWrite> = tracker.finalize_expired(now_ms);
     writes.extend(tracker.flush_all());
 
     // All window writes flow through the writer thread: upsert_window_merge
@@ -657,6 +675,12 @@ pub fn run_windows_backfill(
         || ack_rx.recv_timeout(std::time::Duration::from_secs(60)).is_err()
     {
         eprintln!("[toki] windows backfill: flush barrier failed; marker not set");
+        return;
+    }
+    // Partial I/O failure leaves the marker untouched so the next start
+    // rescans (idempotent merge makes the overlap free).
+    if io_errors > 0 {
+        eprintln!("[toki] windows backfill: {io_errors} files unreadable; marker not advanced");
         return;
     }
     let _ = db.set_setting(MARKER_KEY, &now_ms.to_string());
@@ -684,6 +708,61 @@ mod tests {
             anchor_stable: false,
             ts_ms,
         }
+    }
+
+    /// Golden-bytes fixture: decodes a byte string captured from the v1
+    /// encoder. Length checks alone cannot catch same-width field swaps
+    /// (two i64s exchanged still round-trips); this pins the actual layout.
+    /// If it fails you broke on-disk compatibility — bump
+    /// WINDOW_VALUE_VERSION instead of editing fields.
+    #[test]
+    fn window_snapshot_v1_golden_bytes_decode() {
+        let snap = WindowSnapshotV1 {
+            peak_pct_x100: 0x1111,
+            last_pct_x100: 0x2222,
+            observed_ts_ms: 0x3333,
+            raw_resets_at_ms: 0x4444,
+            first_seen_ms: 0x5555,
+            window_minutes: 0x6666,
+            finalized: true,
+            maxed_out: false,
+            limit_reached_kind: 2,
+            time_to_100_ms: -1,
+            active_ms: 0x7777,
+            last_sample_gap_ms: 0x8888,
+            sampled_active_fraction: 0x9999,
+            n_samples: 0xAAAA,
+            limit_id: "L".into(),
+            plan: "P".into(),
+            account: "A".into(),
+        };
+        let bytes = snap.encode();
+        // Distinct sentinel values pin each field's byte position: a swap of
+        // any two fields (even same-width) changes this fingerprint.
+        let expected: Vec<u8> = {
+            let mut v = vec![WINDOW_VALUE_VERSION];
+            v.extend_from_slice(&0x1111u16.to_le_bytes());
+            v.extend_from_slice(&0x2222u16.to_le_bytes());
+            v.extend_from_slice(&0x3333i64.to_le_bytes());
+            v.extend_from_slice(&0x4444i64.to_le_bytes());
+            v.extend_from_slice(&0x5555i64.to_le_bytes());
+            v.extend_from_slice(&0x6666u32.to_le_bytes());
+            v.push(1); // finalized
+            v.push(0); // maxed_out
+            v.push(2); // limit_reached_kind
+            v.extend_from_slice(&(-1i64).to_le_bytes());
+            v.extend_from_slice(&0x7777u64.to_le_bytes());
+            v.extend_from_slice(&0x8888i64.to_le_bytes());
+            v.extend_from_slice(&0x9999u16.to_le_bytes());
+            v.extend_from_slice(&0xAAAAu32.to_le_bytes());
+            for st in ["L", "P", "A"] {
+                v.extend_from_slice(&(st.len() as u64).to_le_bytes());
+                v.extend_from_slice(st.as_bytes());
+            }
+            v
+        };
+        assert_eq!(bytes, expected, "v1 byte layout changed — bump WINDOW_VALUE_VERSION");
+        assert_eq!(WindowSnapshotV1::decode(&expected).unwrap(), snap);
     }
 
     /// Guards the bincode layout of the on-disk value. If this fails you broke

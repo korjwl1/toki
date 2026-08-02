@@ -243,8 +243,9 @@ impl Database {
                     prev.merge_from(snap);
                     prev
                 }
-                // Unknown (future) value version: replace rather than corrupt.
-                None => snap.clone(),
+                // Unknown (future) value version — a downgraded daemon must
+                // PRESERVE it, not clobber a richer row it cannot read.
+                None => return Ok(()),
             },
             None => snap.clone(),
         };
@@ -288,6 +289,29 @@ impl Database {
             }
         }
         Ok(())
+    }
+
+    /// Finalize rows whose reset passed while no tracker was watching (daemon
+    /// restart between shutdown-flush and finalize): without this they stay
+    /// finalized=false forever and the statistics exclude them.
+    pub fn finalize_stale_windows(&self, now_ms: i64) -> Result<usize, fjall::Error> {
+        const GRACE_MS: i64 = 180_000;
+        let mut fixed = 0usize;
+        let mut updates: Vec<(Vec<u8>, crate::windows::WindowSnapshotV1)> = Vec::new();
+        for guard in self.windows.iter() {
+            let kv = guard.into_inner()?;
+            if let Some(mut snap) = crate::windows::WindowSnapshotV1::decode(&kv.1) {
+                if !snap.finalized && snap.raw_resets_at_ms + GRACE_MS < now_ms {
+                    snap.finalized = true;
+                    updates.push((kv.0.to_vec(), snap));
+                }
+            }
+        }
+        for (key, snap) in updates {
+            self.windows.insert(key, snap.encode())?;
+            fixed += 1;
+        }
+        Ok(fixed)
     }
 
     /// Delete window rows whose anchor is older than the cutoff (retention).

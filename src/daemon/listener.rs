@@ -222,7 +222,7 @@ fn handle_windows_client(
     // fresher data than we have.
     let mut refreshing = false;
     let mut claude_state = hub.state_snapshot();
-    if hub.polling_enabled() {
+    if hub.polling_enabled() && hub.poller_running() {
         if let Some(max_age) = req.max_age_ms {
             if now_ms - claude_state.last_success_ms > max_age.max(0) {
                 let (st, timed_out) =

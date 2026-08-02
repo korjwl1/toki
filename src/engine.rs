@@ -645,6 +645,31 @@ impl TrackerEngine {
                 // resolve_project_name lets Codex supply the cwd it discovered from
                 // session_meta; for other providers this is the path-based name.
                 let project_name = provider.resolve_project_name(path);
+                // Window observations apply BEFORE this batch's events so a
+                // window opened by line N receives the activity of lines >= N
+                // (both orderings are batch-granular approximations; this one
+                // never loses a fresh window's first activity burst).
+                if !window_obs.is_empty() {
+                    // Refresh the account scope right before attribution: the
+                    // 60s maintenance tick alone let up to a minute of a new
+                    // account's usage merge into the previous account's rows.
+                    // (mtime stat only — parses auth.json solely on change.)
+                    if let Some(cache) = self.window_account_roots.get_mut(provider.name()) {
+                        let scope = cache.resolve().to_string();
+                        if let Some(tracker) = self.window_trackers.get_mut(provider.name()) {
+                            tracker.set_account(&scope);
+                        }
+                    }
+                    if let Some(tracker) = self.window_trackers.get_mut(provider.name()) {
+                        for obs in &window_obs {
+                            if let Some(write) = tracker.observe(obs) {
+                                if let Err(e) = db_tx.send(DbOp::WriteWindow(Box::new(write))) {
+                                    debug_log!("writer channel closed: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
                 for event in events {
                     let ts_ms = crate::common::time::parse_ts_to_ms(&event.timestamp)
                         .unwrap_or_else(|| {
@@ -678,17 +703,6 @@ impl TrackerEngine {
                     // Use blocking send to apply backpressure instead of dropping events
                     if let Err(e) = db_tx.send(op) {
                         debug_log!("writer channel closed: {}", e);
-                    }
-                }
-                if !window_obs.is_empty() {
-                    if let Some(tracker) = self.window_trackers.get_mut(provider.name()) {
-                        for obs in &window_obs {
-                            if let Some(write) = tracker.observe(obs) {
-                                if let Err(e) = db_tx.send(DbOp::WriteWindow(Box::new(write))) {
-                                    debug_log!("writer channel closed: {}", e);
-                                }
-                            }
-                        }
                     }
                 }
                 // dirty is already marked inside process_file_with_ts_dyn with the correct provider name

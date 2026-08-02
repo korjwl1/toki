@@ -119,6 +119,10 @@ pub struct PollerHub {
     /// Whether active Claude polling is currently enabled (window_polling
     /// setting; hot-reloadable via the settings watcher).
     polling_enabled: std::sync::atomic::AtomicBool,
+    /// Set by the poller thread on startup — false means no poller exists
+    /// (Codex-only config, or spawn failure), so freshness waits must fail
+    /// fast instead of burning the 2s timeout on every forced refresh.
+    poller_running: std::sync::atomic::AtomicBool,
     /// Cached fallback auth classification for the polling-disabled path:
     /// the WINDOWS handler would otherwise spawn a `security` subprocess per
     /// widget poll. (ts_ms, status)
@@ -134,8 +138,17 @@ impl PollerHub {
             claude_root,
             codex_root,
             polling_enabled: std::sync::atomic::AtomicBool::new(polling_enabled),
+            poller_running: std::sync::atomic::AtomicBool::new(false),
             fallback_auth: Mutex::new((0, AuthStatus::Missing)),
         }
+    }
+
+    pub fn poller_running(&self) -> bool {
+        self.poller_running.load(Ordering::Relaxed)
+    }
+
+    fn set_poller_running(&self, running: bool) {
+        self.poller_running.store(running, Ordering::Relaxed);
     }
 
     /// Claude auth classification with a 30s cache — used only when active
@@ -198,8 +211,11 @@ impl PollerHub {
 
     /// Request a fresh poll and wait (bounded) for the poller to complete one
     /// attempt. Returns the resulting state; on timeout the caller serves stale
-    /// data marked `refreshing: true`.
+    /// data marked `refreshing: true`. Fails fast when no poller thread exists.
     pub fn request_refresh(&self, wait: Duration) -> (PublishedState, bool) {
+        if !self.poller_running() {
+            return (self.state_snapshot(), false);
+        }
         let want = {
             let mut st = match self.state.0.lock() {
                 Ok(g) => g,
@@ -470,6 +486,7 @@ pub fn run_claude_poller(
     db_tx: crossbeam_channel::Sender<DbOp>,
     claude_root: String,
 ) {
+    hub.set_poller_running(true);
     let mut tracker = WindowTracker::new();
     let mut last_poll_ms: i64 = 0;
     let mut consecutive_failures: u32 = 0;
@@ -478,6 +495,9 @@ pub fn run_claude_poller(
     let mut peak_hint: f64 = 0.0;
     let mut profile: Option<ProfileInfo> = None;
     let mut profile_fetched_ms: i64 = 0;
+    // Detects an atomic valid-token→valid-token swap (logout+login between
+    // polls never trips an auth failure, but the account may have changed).
+    let mut last_token_hash: u64 = 0;
     // Reset instants (minute-floored) whose pre-reset confirm sample was taken.
     let mut confirmed: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
@@ -538,6 +558,7 @@ pub fn run_claude_poller(
         };
 
         if stop {
+            hub.set_poller_running(false);
             for w in tracker.flush_all() {
                 let _ = db_tx.send(DbOp::WriteWindow(Box::new(w)));
             }
@@ -545,6 +566,14 @@ pub fn run_claude_poller(
         }
 
         let now = now_ms();
+
+        // Token-flow wakes arrive per writer flush (~1/s during activity):
+        // feed them into the 30-min-gap active-time accounting. Without this
+        // every Claude window carried active_ms = 0 and the duty-cycle /
+        // active-mean statistics — a core product requirement — read zero.
+        if token_flow {
+            tracker.observe_activity(now);
+        }
 
         // Finalize expired windows regardless of polling decisions.
         for w in tracker.finalize_expired(now) {
@@ -599,13 +628,16 @@ pub fn run_claude_poller(
         let result = match read_claude_credentials(&claude_root) {
             Err(status) => Err((status, None)),
             Ok(creds) => {
-                // Auth just recovered — possibly a different account. Drop the
+                // Auth just recovered OR the token changed under us (atomic
+                // re-login to a different account trips no failure) — drop the
                 // cached profile so it re-resolves below (after the usage
                 // fetch proves the token, so failure episodes never pay a
                 // second request per attempt).
-                if !last_auth_ok {
+                let token_hash = crate::windows::hash_str(&creds.access_token);
+                if !last_auth_ok || token_hash != last_token_hash {
                     profile = None;
                 }
+                last_token_hash = token_hash;
                 match fetch_usage(&creds.access_token) {
                     Ok(usage) => {
                         // Account/plan resolution piggybacks on a proven token.
@@ -751,7 +783,15 @@ mod tests {
     #[test]
     fn hub_refresh_completes_or_times_out() {
         let hub = Arc::new(PollerHub::new(None, None, true));
-        // No poller running: request times out and reports refreshing=true.
+        // No poller thread exists (Codex-only config): fail fast with the
+        // cached state instead of burning the wait on every forced refresh.
+        let t0 = std::time::Instant::now();
+        let (_st, timed_out) = hub.request_refresh(Duration::from_millis(500));
+        assert!(!timed_out);
+        assert!(t0.elapsed() < Duration::from_millis(100));
+
+        // With a poller: an unanswered request times out (stale + refreshing).
+        hub.set_poller_running(true);
         let (_st, timed_out) = hub.request_refresh(Duration::from_millis(50));
         assert!(timed_out);
 
