@@ -214,11 +214,8 @@ pub fn execute_parsed_query(
             // One row per window instance; whole-keyspace scan is a few
             // hundred rows. Range filters apply to the window anchor.
             let mut rows: Vec<crate::windows::WindowRow> = Vec::new();
-            db.for_each_window(|key, snap| {
-                let anchor = crate::windows::window_key_anchor_ms(key).unwrap_or(0);
-                if anchor >= since_ms && anchor <= until_ms {
-                    rows.push(crate::windows::WindowRow::from_stored(key, &snap));
-                }
+            db.for_each_window_in(since_ms, until_ms, |key, snap| {
+                rows.push(crate::windows::WindowRow::from_stored(key, &snap));
             })
             .map_err(|e| e.to_string())?;
             rows.sort_by_key(|r| r.window_end_ms);

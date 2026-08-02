@@ -480,8 +480,14 @@ pub fn run_claude_poller(
         let interval = if peak_hint > 90.0 { POLL_DENSE_MS } else { POLL_STEADY_MS };
 
         // Compute how long to sleep. Idle with no pending confirm: hourly
-        // housekeeping only (finalize stale windows).
-        let mut deadline = if active { last_poll_ms + interval } else { now + 3_600_000 };
+        // housekeeping only (finalize stale windows). The scheduled deadline
+        // respects an active backoff — otherwise an active session under
+        // backoff would wake at the 50ms clamp in a busy loop, burning CPU.
+        let mut deadline = if active {
+            (last_poll_ms + interval).max(backoff_until_ms)
+        } else {
+            now + 3_600_000
+        };
         if let Some(c) = next_confirm {
             deadline = deadline.min(c.max(now));
         }
@@ -557,6 +563,13 @@ pub fn run_claude_poller(
         let result = match read_claude_credentials(&claude_root) {
             Err(status) => Err((status, None)),
             Ok(creds) => {
+                // Auth just recovered — possibly a different account. Drop the
+                // cached profile BEFORE the fetch below so this same poll
+                // re-resolves it (invalidating after the poll would wipe the
+                // profile the first successful poll just fetched).
+                if !last_auth_ok {
+                    profile = None;
+                }
                 // Account/plan resolution piggybacks on a valid token.
                 if profile.is_none() || now - profile_fetched_ms > PROFILE_REFRESH_MS {
                     if let Some(p) = fetch_profile(&creds.access_token) {
@@ -588,12 +601,6 @@ pub fn run_claude_poller(
             Ok(usage) => {
                 consecutive_failures = 0;
                 backoff_until_ms = 0;
-                if !last_auth_ok {
-                    // Auth just recovered — possibly a different account.
-                    // Invalidate the cached profile so the account scope and
-                    // plan re-resolve immediately instead of after 24h.
-                    profile = None;
-                }
                 last_auth_ok = true;
                 let plan = profile.as_ref().map(|p| p.plan.as_str()).unwrap_or("");
                 let observations = observations_from_usage(&usage, plan, now);

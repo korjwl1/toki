@@ -241,6 +241,9 @@ fn run_sync_inner(
     let mut last_windows_sync = Instant::now() - WINDOWS_SYNC_INTERVAL;
     // Transient capability-probe failures retry with a backoff, not per-wake.
     let mut next_cap_probe = Instant::now();
+    // Fingerprint of the last uploaded window set — identical sets skip the
+    // resend entirely (serialization + network) while staying cursorless.
+    let mut last_windows_fingerprint: (usize, i64, u64) = (0, 0, 0);
 
     loop {
         // Check stop signal
@@ -492,18 +495,25 @@ fn run_sync_inner(
                     .map(|d| d.as_millis() as i64)
                     .unwrap_or(0);
                 let mut items = Vec::new();
-                let _ = db.for_each_window(|key, snap| {
-                    let anchor = crate::windows::window_key_anchor_ms(key).unwrap_or(0);
-                    if anchor >= now_ms - WINDOWS_SYNC_HORIZON_MS {
-                        items.push(crate::windows::wire_from_stored(key, &snap));
-                    }
+                let mut peak_sum: u64 = 0;
+                let mut max_observed: i64 = 0;
+                let _ = db.for_each_window_in(now_ms - WINDOWS_SYNC_HORIZON_MS, i64::MAX, |key, snap| {
+                    peak_sum = peak_sum.wrapping_add(snap.peak_pct_x100 as u64);
+                    max_observed = max_observed.max(snap.observed_ts_ms);
+                    items.push(crate::windows::wire_from_stored(key, &snap));
                 });
-                if !items.is_empty() {
+                // Unchanged set (same row count, newest observation, and peak
+                // sum): nothing to say — skip the upload, keep the throttle.
+                let fingerprint = (items.len(), max_observed, peak_sum);
+                if fingerprint == last_windows_fingerprint {
+                    last_windows_sync = Instant::now();
+                } else if !items.is_empty() {
                     if let Some(ref mut c) = client {
                         let n = items.len();
                         match c.sync_windows(&config.provider, items) {
                             Ok(()) => {
                                 last_windows_sync = Instant::now();
+                                last_windows_fingerprint = fingerprint;
                                 eprintln!("[toki:sync] synced {n} window snapshots");
                             }
                             Err(e) => {

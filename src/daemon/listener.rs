@@ -238,11 +238,8 @@ fn handle_windows_client(
     let mut providers = serde_json::Map::new();
     for (name, db) in dbs {
         let mut rows: Vec<crate::windows::WindowRow> = Vec::new();
-        let _ = db.for_each_window(|key, snap| {
-            let anchor = crate::windows::window_key_anchor_ms(key).unwrap_or(0);
-            if anchor >= now_ms - ROW_HORIZON_MS {
-                rows.push(crate::windows::WindowRow::from_stored(key, &snap));
-            }
+        let _ = db.for_each_window_in(now_ms - ROW_HORIZON_MS, i64::MAX, |key, snap| {
+            rows.push(crate::windows::WindowRow::from_stored(key, &snap));
         });
         rows.sort_by_key(|r| r.window_end_ms);
 

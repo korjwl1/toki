@@ -253,12 +253,36 @@ impl Database {
     }
 
     /// Iterate all window rows (they number in the hundreds; full scans are fine).
-    pub fn for_each_window<F>(&self, mut f: F) -> Result<(), fjall::Error>
+    pub fn for_each_window<F>(&self, f: F) -> Result<(), fjall::Error>
+    where
+        F: FnMut(&[u8], crate::windows::WindowSnapshotV1),
+    {
+        self.for_each_window_in(i64::MIN, i64::MAX, f)
+    }
+
+    /// Iterate window rows whose anchor lies in [since_ms, until_ms]. The
+    /// anchor is read from the KEY, so rows outside the range skip the bincode
+    /// value decode entirely — with multi-year retention the hot callers
+    /// (UDS WINDOWS every widget poll, sync every 5min) only pay for the
+    /// recent handful instead of decoding the whole keyspace.
+    pub fn for_each_window_in<F>(
+        &self,
+        since_ms: i64,
+        until_ms: i64,
+        mut f: F,
+    ) -> Result<(), fjall::Error>
     where
         F: FnMut(&[u8], crate::windows::WindowSnapshotV1),
     {
         for guard in self.windows.iter() {
             let kv = guard.into_inner()?;
+            let anchor = match crate::windows::window_key_anchor_ms(&kv.0) {
+                Some(a) => a,
+                None => continue,
+            };
+            if anchor < since_ms || anchor > until_ms {
+                continue;
+            }
             if let Some(snap) = crate::windows::WindowSnapshotV1::decode(&kv.1) {
                 f(&kv.0, snap);
             }
