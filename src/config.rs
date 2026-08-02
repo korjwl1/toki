@@ -13,6 +13,10 @@ pub struct Config {
     pub db_base_dir: PathBuf,
     pub tz: Option<Tz>,
     pub retention_days: u32,
+    /// Rate-limit window tracking (passive extraction from provider logs).
+    pub window_tracking: bool,
+    /// Retention horizon for window rows (days). Independent of retention_days.
+    pub window_retention_days: u32,
     pub daemon_sock: PathBuf,
     pub no_cost: bool,
     pub output_format: String,
@@ -41,6 +45,8 @@ impl Config {
             db_base_dir: config_dir.clone(),
             tz: None,
             retention_days: 0,
+            window_tracking: true,
+            window_retention_days: 730,
             daemon_sock: crate::daemon::default_sock_path(),
             no_cost: false,
             output_format: "table".to_string(),
@@ -104,6 +110,12 @@ impl Config {
 
         if let Some(v) = settings.get("retention_days").and_then(|v| v.as_str()) {
             if let Ok(n) = v.parse::<u32>() { self.retention_days = n; }
+        }
+        if let Some(v) = settings.get("window_tracking").and_then(|v| v.as_str()) {
+            self.window_tracking = v != "false" && v != "0";
+        }
+        if let Some(v) = settings.get("window_retention_days").and_then(|v| v.as_str()) {
+            if let Ok(n) = v.parse::<u32>() { self.window_retention_days = n; }
         }
         if let Some(v) = settings.get("daemon_sock").and_then(|v| v.as_str()) {
             self.daemon_sock = PathBuf::from(v);
@@ -406,6 +418,8 @@ mod tests {
             db_base_dir: PathBuf::from("."),
             tz: None,
             retention_days: 0,
+            window_tracking: true,
+            window_retention_days: 730,
             daemon_sock: PathBuf::from("daemon.sock"),
             no_cost: false,
             output_format: "table".to_string(),
@@ -427,6 +441,8 @@ mod tests {
             db_base_dir: PathBuf::new(),
             tz: None,
             retention_days: 0,
+            window_tracking: true,
+            window_retention_days: 730,
             daemon_sock: PathBuf::new(),
             no_cost: false,
             output_format: "table".to_string(),

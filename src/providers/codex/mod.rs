@@ -1,6 +1,7 @@
 pub mod parser;
 
 pub use parser::CodexParser;
+pub(crate) use parser::parse_rate_limits_line;
 
 /// Fast-mode pricing multipliers for Codex models.
 /// Empty placeholder: Codex JSONL carries no service_tier marker and the

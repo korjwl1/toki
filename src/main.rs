@@ -536,6 +536,7 @@ fn main() {
 const VALID_SETTINGS: &[&str] = &[
     "claude_code_root", "codex_root", "daemon_sock", "timezone", "output_format",
     "start_of_week", "no_cost", "retention_days",
+    "window_tracking", "window_retention_days",
     "providers", "daemon_autostart",
     "sync_enabled", "sync_server", "sync_access_token", "sync_device_name",
     "sync_tls", "sync_tls_insecure",
@@ -546,6 +547,8 @@ const VALID_SETTINGS: &[&str] = &[
 /// because the daemon picks them up automatically via the settings file watcher.
 const RESTART_SETTINGS: &[&str] = &[
     "claude_code_root", "codex_root", "daemon_sock", "providers",
+    // Window tracking is wired into the engine/writer at startup.
+    "window_tracking", "window_retention_days",
 ];
 
 /// Settings that are hot-reloadable by the daemon (no restart needed).

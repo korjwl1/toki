@@ -148,9 +148,47 @@ pub trait LogParser: Send + Sync {
     fn discover_sessions(&self, root_dir: &str) -> Vec<SessionGroup>;
 }
 
+/// One rate-limit window observation extracted from a provider log line or an
+/// API response: "this limit is X% used and resets at T".
+#[derive(Debug, Clone)]
+pub struct WindowObservation {
+    /// Provider-side limit identifier (e.g. "codex"); "" when unnamed.
+    pub limit_id: String,
+    pub window_minutes: u32,
+    pub used_percent: f64,
+    /// Reset instant, epoch ms.
+    pub resets_at_ms: i64,
+    pub plan_type: Option<String>,
+    /// The provider reported the limit boundary as reached.
+    pub limit_reached: bool,
+    /// Purchasable/reset credits were available (100% is then not a hard stop).
+    pub has_credits: bool,
+    /// Observation timestamp (the log line's ts), epoch ms.
+    pub ts_ms: i64,
+}
+
+/// Up to two windows per observation point (primary ≈ 5h, secondary ≈ weekly).
+#[derive(Debug, Clone, Default)]
+pub struct WindowObservations {
+    pub primary: Option<WindowObservation>,
+    pub secondary: Option<WindowObservation>,
+}
+
 /// Optional extension for parsers that can extract timestamps.
 pub trait LogParserWithTs: Send + Sync {
     fn parse_line_with_ts(&self, line: &str, source_file: &str) -> Option<UsageEventWithTs>;
+
+    /// Parse a line for both the usage event and any rate-limit window
+    /// observations it carries. Default: token event only — providers whose
+    /// logs carry rate-limit state (Codex) override this with a single-pass
+    /// implementation; the engine's watch path calls this method.
+    fn parse_line_full(
+        &self,
+        line: &str,
+        source_file: &str,
+    ) -> (Option<UsageEventWithTs>, Option<WindowObservations>) {
+        (self.parse_line_with_ts(line, source_file), None)
+    }
 }
 
 /// Toki error types.

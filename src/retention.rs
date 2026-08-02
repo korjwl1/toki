@@ -5,6 +5,10 @@ use crate::db::Database;
 #[derive(Debug, Clone, Default)]
 pub struct RetentionPolicy {
     pub event_retention_days: u32,
+    /// Retention for rate-limit window rows. Independent of event retention:
+    /// windows are ~2 rows/day and power long-horizon statistics, so they keep
+    /// their own (much longer) horizon. 0 = disabled.
+    pub window_retention_days: u32,
 }
 
 // Default: all zeros (disabled). Derive is sufficient.
@@ -12,6 +16,7 @@ pub struct RetentionPolicy {
 pub struct RetentionStats {
     pub events_deleted: u64,
     pub index_deleted: u64,
+    pub windows_deleted: u64,
     /// Dictionary keys garbage-collected this pass. Returned (not just counted)
     /// so the writer can evict them from its in-memory dict cache.
     pub dict_removed: Vec<String>,
@@ -21,11 +26,23 @@ pub struct RetentionStats {
 pub fn run_retention(db: &Database, policy: &RetentionPolicy) -> Result<RetentionStats, fjall::Error> {
     let t = Instant::now();
 
+    // Window rows age out on their own horizon, before the event-retention
+    // early return: event retention defaults to disabled, window retention
+    // does not.
+    let windows_deleted = if policy.window_retention_days > 0 {
+        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+        let cutoff = now_ms - (policy.window_retention_days as i64) * 86_400_000;
+        db.delete_windows_before(cutoff)? as u64
+    } else {
+        0
+    };
+
     // 0 = disabled
     if policy.event_retention_days == 0 {
         return Ok(RetentionStats {
             events_deleted: 0,
             index_deleted: 0,
+            windows_deleted,
             dict_removed: Vec::new(),
             elapsed: t.elapsed(),
         });
@@ -68,6 +85,7 @@ pub fn run_retention(db: &Database, policy: &RetentionPolicy) -> Result<Retentio
 
     Ok(RetentionStats {
         events_deleted,
+        windows_deleted,
         index_deleted,
         dict_removed,
         elapsed: t.elapsed(),
@@ -99,6 +117,7 @@ mod tests {
 
         let policy = RetentionPolicy {
             event_retention_days: 90,
+            ..Default::default()
         };
 
         let stats = run_retention(&db, &policy).unwrap();
@@ -147,7 +166,7 @@ mod tests {
         db.insert_project_index(&mut idx, "proj-recent", recent_ts, "recent");
         idx.commit().unwrap();
 
-        let policy = RetentionPolicy { event_retention_days: 90 };
+        let policy = RetentionPolicy { event_retention_days: 90, ..Default::default() };
         let stats = run_retention(&db, &policy).unwrap();
 
         assert_eq!(stats.events_deleted, 1);
@@ -182,7 +201,7 @@ mod tests {
         assert!(db.events_is_empty());
         assert!(!db.dict_is_empty());
 
-        let policy = RetentionPolicy { event_retention_days: 90 };
+        let policy = RetentionPolicy { event_retention_days: 90, ..Default::default() };
         let stats = run_retention(&db, &policy).unwrap();
 
         assert_eq!(stats.events_deleted, 0);
@@ -217,7 +236,7 @@ mod tests {
 
         db.set_pending_dict_gc(true).unwrap();
 
-        let policy = RetentionPolicy { event_retention_days: 90 };
+        let policy = RetentionPolicy { event_retention_days: 90, ..Default::default() };
         let stats = run_retention(&db, &policy).unwrap();
 
         assert_eq!(stats.events_deleted, 0, "recent event must survive");
@@ -233,7 +252,7 @@ mod tests {
     fn test_retention_disabled_noop() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(&dir.path().join("test.fjall")).unwrap();
-        let policy = RetentionPolicy { event_retention_days: 0 };
+        let policy = RetentionPolicy { event_retention_days: 0, ..Default::default() };
         let stats = run_retention(&db, &policy).unwrap();
         assert_eq!(stats.events_deleted, 0);
         assert_eq!(stats.index_deleted, 0);

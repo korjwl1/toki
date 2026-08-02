@@ -81,6 +81,11 @@ pub struct TrackerEngine {
     sink: Box<dyn Sink>,
     /// Pricing table for cost calculation (None = costs disabled).
     pricing: Option<crate::pricing::PricingTable>,
+    /// Per-provider rate-limit window trackers (populated only for providers
+    /// enabled via `enable_window_tracking`; empty map = feature off, zero cost).
+    window_trackers: HashMap<String, crate::windows::WindowTracker>,
+    /// provider_name -> provider root dir, for periodic account re-resolution.
+    window_account_roots: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -129,7 +134,21 @@ impl TrackerEngine {
             dirty: HashMap::new(),
             sink,
             pricing,
+            window_trackers: HashMap::new(),
+            window_account_roots: HashMap::new(),
         }
+    }
+
+    /// Turn on rate-limit window tracking for a provider. `account_root` is the
+    /// provider's config root used to resolve the account scope (Codex:
+    /// auth.json); None keeps the "unknown" scope.
+    pub fn enable_window_tracking(&mut self, provider_name: &str, account_root: Option<String>) {
+        let mut tracker = crate::windows::WindowTracker::new();
+        if let Some(root) = &account_root {
+            tracker.set_account(&crate::windows::codex_account_scope(root));
+            self.window_account_roots.insert(provider_name.to_string(), root.clone());
+        }
+        self.window_trackers.insert(provider_name.to_string(), tracker);
     }
 
     /// Backward-compatible constructor for single-provider use (tests).
@@ -144,6 +163,8 @@ impl TrackerEngine {
             dirty: HashMap::new(),
             sink,
             pricing: None,
+            window_trackers: HashMap::new(),
+            window_account_roots: HashMap::new(),
         }
     }
 
@@ -515,7 +536,10 @@ impl TrackerEngine {
         path: &str,
         parser_ts: &dyn LogParserWithTs,
         provider_name: &str,
-    ) -> Result<Vec<crate::common::types::UsageEventWithTs>, Box<dyn std::error::Error>> {
+    ) -> Result<
+        (Vec<crate::common::types::UsageEventWithTs>, Vec<crate::common::types::WindowObservation>),
+        Box<dyn std::error::Error>,
+    > {
         let now = Instant::now();
 
         let state = match self.activity.get(path) {
@@ -529,7 +553,7 @@ impl TrackerEngine {
                 }
                 let cd = if s == FileState::Active { ACTIVE_COOLDOWN } else { IDLE_COOLDOWN };
                 if now.duration_since(act.last_checked) < cd {
-                    return Ok(Vec::new());
+                    return Ok((Vec::new(), Vec::new()));
                 }
                 s
             }
@@ -550,7 +574,7 @@ impl TrackerEngine {
                             state, last_active: now, last_checked: now,
                         });
                     }
-                    return Ok(Vec::new());
+                    return Ok((Vec::new(), Vec::new()));
                 }
             }
         }
@@ -563,10 +587,15 @@ impl TrackerEngine {
 
         let t1 = Instant::now();
         let mut events = Vec::new();
+        let mut window_obs: Vec<crate::common::types::WindowObservation> = Vec::new();
         let mut line_count: u64 = 0;
         let result = process_lines_streaming(path, offset, |line| {
-            if let Some(event) = parser_ts.parse_line_with_ts(line, path) {
+            let (event, windows) = parser_ts.parse_line_full(line, path);
+            if let Some(event) = event {
                 events.push(event);
+            }
+            if let Some(w) = windows {
+                window_obs.extend([w.primary, w.secondary].into_iter().flatten());
             }
             line_count += 1;
         })?;
@@ -581,7 +610,7 @@ impl TrackerEngine {
                 });
                 act.last_checked = now;
                 act.state = state;
-                Ok(Vec::new())
+                Ok((Vec::new(), window_obs))
             }
             Some((bytes_read, last_line_len, last_line_hash)) => {
                 self.file_sizes.insert(path_owned.clone(), offset + bytes_read);
@@ -601,7 +630,7 @@ impl TrackerEngine {
                 debug_log!("process_file {} -- {} lines, {} bytes, {} events, Active | find_resume: {}us, read: {}us, total: {}us",
                     path, line_count, bytes_read, events.len(),
                     find_us, read_us, t_total.elapsed().as_micros());
-                Ok(events)
+                Ok((events, window_obs))
             }
         }
     }
@@ -609,7 +638,7 @@ impl TrackerEngine {
     fn process_and_print_provider(&mut self, path: &str, provider: &dyn Provider, db_tx: &Sender<DbOp>) {
         let event_schema = crate::common::schema::schema_for_provider(provider.name());
         match self.process_file_with_ts_dyn(path, provider.parser_with_ts(), provider.name()) {
-            Ok(events) => {
+            Ok((events, window_obs)) => {
                 let session_id = provider.extract_session_id(path).unwrap_or_default();
                 // resolve_project_name lets Codex supply the cwd it discovered from
                 // session_meta; for other providers this is the path-based name.
@@ -640,9 +669,24 @@ impl TrackerEngine {
                             cache_read_input_tokens: usage.cache_read_input_tokens,
                         },
                     }));
+                    if let Some(tracker) = self.window_trackers.get_mut(provider.name()) {
+                        tracker.observe_activity(ts_ms);
+                    }
+
                     // Use blocking send to apply backpressure instead of dropping events
                     if let Err(e) = db_tx.send(op) {
                         debug_log!("writer channel closed: {}", e);
+                    }
+                }
+                if !window_obs.is_empty() {
+                    if let Some(tracker) = self.window_trackers.get_mut(provider.name()) {
+                        for obs in &window_obs {
+                            if let Some(write) = tracker.observe(obs) {
+                                if let Err(e) = db_tx.send(DbOp::WriteWindow(Box::new(write))) {
+                                    debug_log!("writer channel closed: {}", e);
+                                }
+                            }
+                        }
                     }
                 }
                 // dirty is already marked inside process_file_with_ts_dyn with the correct provider name
@@ -758,6 +802,40 @@ impl TrackerEngine {
         }
     }
 
+    /// Periodic window-tracker maintenance: refresh the account scope (auth
+    /// files change on re-login) and finalize windows whose reset time passed.
+    /// Runs on the 60s prune tick — no cost when tracking is disabled.
+    fn windows_tick(&mut self, providers: &[(Box<dyn Provider>, Sender<DbOp>)]) {
+        if self.window_trackers.is_empty() {
+            return;
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        for (provider, tx) in providers {
+            if let Some(tracker) = self.window_trackers.get_mut(provider.name()) {
+                if let Some(root) = self.window_account_roots.get(provider.name()) {
+                    tracker.set_account(&crate::windows::codex_account_scope(root));
+                }
+                for w in tracker.finalize_expired(now_ms) {
+                    let _ = tx.send(DbOp::WriteWindow(Box::new(w)));
+                }
+            }
+        }
+    }
+
+    /// Flush open (unfinalized) windows on shutdown so their latest peaks survive.
+    fn windows_flush_all(&mut self, providers: &[(Box<dyn Provider>, Sender<DbOp>)]) {
+        for (provider, tx) in providers {
+            if let Some(tracker) = self.window_trackers.get_mut(provider.name()) {
+                for w in tracker.flush_all() {
+                    let _ = tx.send(DbOp::WriteWindow(Box::new(w)));
+                }
+            }
+        }
+    }
+
     /// Multi-provider watch loop: receive file change events, route to owning provider,
     /// flush dirty checkpoints periodically.
     pub fn watch_loop_providers(
@@ -785,11 +863,13 @@ impl TrackerEngine {
         loop {
             crossbeam_channel::select! {
                 recv(stop_rx) -> _ => {
+                    self.windows_flush_all(providers);
                     self.flush_dirty();
                     break;
                 }
                 recv(prune_tick) -> _ => {
                     self.prune_stale_entries();
+                    self.windows_tick(providers);
                 }
                 recv(event_rx) -> msg => {
                     match msg {
@@ -817,6 +897,7 @@ impl TrackerEngine {
                             }
                         }
                         Err(_) => {
+                            self.windows_flush_all(providers);
                             self.flush_dirty();
                             break;
                         }

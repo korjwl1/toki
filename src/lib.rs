@@ -14,6 +14,7 @@ pub mod settings;
 pub mod sink;
 pub mod sync;
 pub mod update;
+pub mod windows;
 pub mod writer;
 
 pub use common::types::{UsageEvent, UsageEventWithTs, ModelUsageSummary, SessionGroup, TokiError};
@@ -147,6 +148,7 @@ impl Drop for Handle {
 pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
     let retention = RetentionPolicy {
         event_retention_days: config.retention_days,
+        window_retention_days: if config.window_tracking { config.window_retention_days } else { 0 },
     };
 
     // Migrate legacy toki.fjall → claude_code.fjall if needed
@@ -232,6 +234,19 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
     // Create engine with all channels
     let mut engine = TrackerEngine::new(channel_map, all_checkpoints, sink, pricing);
 
+    // Rate-limit window tracking: Codex rollout files carry rate_limits inline,
+    // so the watch parser extracts them at zero extra I/O. The account scope
+    // comes from the provider root's auth.json.
+    if config.window_tracking {
+        for rt in &runtimes {
+            if rt.provider.name() == "codex" {
+                if let Some(root) = rt.provider.root_dir() {
+                    engine.enable_window_tracking("codex", Some(root));
+                }
+            }
+        }
+    }
+
     // Sequential cold start per provider
     println!("[toki] Running initial scan...");
     for rt in &runtimes {
@@ -248,6 +263,29 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
             .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64 - 24 * 3600 * 1000;
         if let Err(e) = rt.db.cleanup_old_idx_msg(cutoff) {
             eprintln!("[toki] idx_msg cleanup error for {}: {}", rt.provider.name(), e);
+        }
+    }
+
+    // Windows backfill: replay historical Codex rate_limits into window rows on
+    // a background thread. Deliberately separate from the checkpointed cold
+    // start (which never revisits consumed files): first run reaches back 60
+    // days, later runs re-cover the last 8 days to absorb daemon-down gaps.
+    // Idempotent via field-wise merge, throttled, and off the startup path.
+    if config.window_tracking {
+        for rt in &runtimes {
+            if rt.provider.name() == "codex" {
+                if let Some(root) = rt.provider.root_dir() {
+                    let db = rt.db.clone();
+                    let sessions_glob = format!("{}/sessions/**/*.jsonl", root);
+                    let account = windows::codex_account_scope(&root);
+                    if let Err(e) = std::thread::Builder::new()
+                        .name("toki-windows-backfill".to_string())
+                        .spawn(move || windows::run_windows_backfill(db, sessions_glob, account))
+                    {
+                        eprintln!("[toki] windows backfill thread spawn failed: {}", e);
+                    }
+                }
+            }
         }
     }
 

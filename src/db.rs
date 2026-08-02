@@ -13,6 +13,11 @@ pub struct Database {
     idx_sessions: Keyspace,
     idx_projects: Keyspace,
     dict: Keyspace,
+    /// Rate-limit window snapshots: one row per window instance.
+    /// Key: [kind u8][limit_id_hash u64][account_hash u64][anchor_min_ms i64] (all BE).
+    /// Value: versioned WindowSnapshotV1 (see windows.rs). Additive keyspace —
+    /// deliberately NOT part of SCHEMA_VERSION (see CLAUDE.md).
+    windows: Keyspace,
     /// Maps bare msg_id → event key [ts_ms(8bytes) + event_key] for dedup.
     /// When a new event arrives with the same msg_id, the previous event is
     /// deleted from events keyspace and its tokens are no longer counted.
@@ -76,11 +81,12 @@ impl Database {
         let idx_projects = db.keyspace("idx_projects", opts)?;
         let dict = db.keyspace("dict", opts)?;
         let idx_msg = db.keyspace("idx_msg", opts)?;
+        let windows = db.keyspace("windows", opts)?;
 
         // Write current schema version
         meta.insert("schema_version", SCHEMA_VERSION.to_string().as_bytes())?;
 
-        Ok(Database { db, checkpoints, meta, events, idx_sessions, idx_projects, dict, idx_msg })
+        Ok(Database { db, checkpoints, meta, events, idx_sessions, idx_projects, dict, idx_msg, windows })
     }
 
     pub fn inner(&self) -> &FjallDatabase {
@@ -219,6 +225,63 @@ impl Database {
         batch.insert(&self.idx_msg, bare_id.as_bytes(), new_key);
 
         prev
+    }
+
+    // -- Rate-limit window operations --
+
+    /// Field-wise merge upsert for a window snapshot. Never whole-row LWW:
+    /// an existing row's peak/maxed/first_seen survive a snapshot taken later
+    /// but knowing less (daemon restart, other-device replay via sync).
+    pub fn upsert_window_merge(
+        &self,
+        key: &[u8],
+        snap: &crate::windows::WindowSnapshotV1,
+    ) -> Result<(), fjall::Error> {
+        let merged = match self.windows.get(key)? {
+            Some(existing) => match crate::windows::WindowSnapshotV1::decode(&existing) {
+                Some(mut prev) => {
+                    prev.merge_from(snap);
+                    prev
+                }
+                // Unknown (future) value version: replace rather than corrupt.
+                None => snap.clone(),
+            },
+            None => snap.clone(),
+        };
+        self.windows.insert(key, merged.encode())?;
+        Ok(())
+    }
+
+    /// Iterate all window rows (they number in the hundreds; full scans are fine).
+    pub fn for_each_window<F>(&self, mut f: F) -> Result<(), fjall::Error>
+    where
+        F: FnMut(&[u8], crate::windows::WindowSnapshotV1),
+    {
+        for guard in self.windows.iter() {
+            let kv = guard.into_inner()?;
+            if let Some(snap) = crate::windows::WindowSnapshotV1::decode(&kv.1) {
+                f(&kv.0, snap);
+            }
+        }
+        Ok(())
+    }
+
+    /// Delete window rows whose anchor is older than the cutoff (retention).
+    pub fn delete_windows_before(&self, cutoff_ms: i64) -> Result<usize, fjall::Error> {
+        let mut stale: Vec<Vec<u8>> = Vec::new();
+        for guard in self.windows.iter() {
+            let kv = guard.into_inner()?;
+            if let Some(anchor) = crate::windows::window_key_anchor_ms(&kv.0) {
+                if anchor < cutoff_ms {
+                    stale.push(kv.0.to_vec());
+                }
+            }
+        }
+        let n = stale.len();
+        for key in stale {
+            self.windows.remove(key)?;
+        }
+        Ok(n)
     }
 
     // -- Index operations --
@@ -631,6 +694,55 @@ mod tests {
         let db_path = dir.path().join("test.fjall");
         let db = Database::open(&db_path).unwrap();
         (db, dir)
+    }
+
+    #[test]
+    fn test_window_upsert_merge_and_retention() {
+        use crate::windows::{window_key, WindowKind, WindowSnapshotV1, REACHED_NONE};
+        let (db, _dir) = temp_db();
+
+        let key = window_key(WindowKind::Session, 1, 2, 1_786_000_000_000);
+        let base = WindowSnapshotV1 {
+            peak_pct_x100: 4000,
+            observed_ts_ms: 100,
+            raw_resets_at_ms: 1_786_000_000_000,
+            first_seen_ms: 50,
+            window_minutes: 300,
+            finalized: false,
+            maxed_out: false,
+            limit_reached_kind: REACHED_NONE,
+            time_to_100_ms: -1,
+            active_ms: 100,
+            last_sample_gap_ms: 0,
+            sampled_active_fraction: 1000,
+            n_samples: 1,
+            limit_id: "codex".into(),
+            plan: "prolite".into(),
+            account: "a".into(),
+        };
+        db.upsert_window_merge(&key, &base).unwrap();
+        // A later snapshot with a LOWER peak (post server-reset) must not clobber.
+        let mut later = base.clone();
+        later.peak_pct_x100 = 1000;
+        later.observed_ts_ms = 200;
+        later.finalized = true;
+        db.upsert_window_merge(&key, &later).unwrap();
+
+        let mut rows = Vec::new();
+        db.for_each_window(|k, v| rows.push((k.to_vec(), v))).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].1.peak_pct_x100, 4000); // max survived
+        assert!(rows[0].1.finalized); // OR merged
+        assert_eq!(rows[0].1.observed_ts_ms, 200); // latest metadata
+
+        // Retention: an old anchor is swept, a recent one survives.
+        let old_key = window_key(WindowKind::Weekly, 9, 9, 1_000_000);
+        db.upsert_window_merge(&old_key, &base).unwrap();
+        let n = db.delete_windows_before(1_700_000_000_000).unwrap();
+        assert_eq!(n, 1);
+        let mut count = 0;
+        db.for_each_window(|_, _| count += 1).unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]

@@ -19,7 +19,7 @@ path = "src/main.rs"
 notify = "6"
 fjall = "3"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["raw_value"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 bincode = "1"
 crossbeam-channel = "0.5"

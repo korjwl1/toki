@@ -35,6 +35,11 @@ pub struct WriteEventData {
 /// Operations sent to the writer thread via bounded channel.
 pub enum DbOp {
     WriteEvent(Box<WriteEventData>),
+    /// Upsert one rate-limit window snapshot (field-wise merge in the DB).
+    /// Low-frequency by contract: the engine's WindowTracker caps emission at
+    /// integer-percent changes / 5-min heartbeats, so this never competes with
+    /// token-event throughput on the channel.
+    WriteWindow(Box<crate::windows::WindowWrite>),
     /// Bulk write chunk for cold start -- events from one file.
     BulkWrite(Vec<ColdStartEvent>),
     /// Flush remaining bulk events from cold start. Signals done.
@@ -175,6 +180,12 @@ impl DbWriter {
             DbOp::FlushBulkEvents(done_tx) => {
                 self.flush_bulk_events();
                 let _ = done_tx.send(());
+                true
+            }
+            DbOp::WriteWindow(write) => {
+                if let Err(e) = self.db.upsert_window_merge(&write.key, &write.snapshot) {
+                    eprintln!("[toki:writer] window write error: {}", e);
+                }
                 true
             }
             DbOp::WriteCheckpoint(cp) => {
