@@ -140,7 +140,9 @@ impl WindowSnapshotV1 {
     /// whole-row LWW: peaks are max, flags are OR, first timestamps are min.
     pub fn merge_from(&mut self, other: &WindowSnapshotV1) {
         self.peak_pct_x100 = self.peak_pct_x100.max(other.peak_pct_x100);
-        if other.observed_ts_ms > self.observed_ts_ms {
+        // >= not >: writes for the same observation instant apply in arrival
+        // order, and the later write carries the later state.
+        if other.observed_ts_ms >= self.observed_ts_ms {
             self.observed_ts_ms = other.observed_ts_ms;
             self.raw_resets_at_ms = other.raw_resets_at_ms;
             self.last_sample_gap_ms = other.last_sample_gap_ms;
