@@ -536,7 +536,7 @@ fn main() {
 const VALID_SETTINGS: &[&str] = &[
     "claude_code_root", "codex_root", "daemon_sock", "timezone", "output_format",
     "start_of_week", "no_cost", "retention_days",
-    "window_tracking", "window_retention_days",
+    "window_tracking", "window_polling", "window_retention_days",
     "providers", "daemon_autostart",
     "sync_enabled", "sync_server", "sync_access_token", "sync_device_name",
     "sync_tls", "sync_tls_insecure",
@@ -548,7 +548,7 @@ const VALID_SETTINGS: &[&str] = &[
 const RESTART_SETTINGS: &[&str] = &[
     "claude_code_root", "codex_root", "daemon_sock", "providers",
     // Window tracking is wired into the engine/writer at startup.
-    "window_tracking", "window_retention_days",
+    "window_tracking", "window_polling", "window_retention_days",
 ];
 
 /// Settings that are hot-reloadable by the daemon (no restart needed).
@@ -797,10 +797,11 @@ fn run_daemon_foreground(config: &Config) {
     let listener_dbs: Vec<(String, Arc<toki::db::Database>)> = handle.dbs().into_iter()
         .map(|(name, db)| (name.to_string(), db.clone()))
         .collect();
+    let listener_hub = handle.windows_hub();
     let listener_handle = std::thread::Builder::new()
         .name("toki-listener".to_string())
         .spawn(move || {
-            toki::daemon::run_listener(&listener_sock, listener_broadcast, listener_dbs, listener_stop_rx);
+            toki::daemon::run_listener(&listener_sock, listener_broadcast, listener_dbs, listener_stop_rx, listener_hub);
         })
         .expect("Failed to spawn listener thread");
 

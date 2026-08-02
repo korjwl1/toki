@@ -402,6 +402,11 @@ impl WindowTracker {
         }
     }
 
+    /// Raw reset instants of currently open windows (poller confirm scheduling).
+    pub fn open_reset_times(&self) -> Vec<i64> {
+        self.open.iter().map(|w| w.raw_resets_at_ms).collect()
+    }
+
     /// Close out windows whose reset time has passed. Returns their final writes.
     pub fn finalize_expired(&mut self, now_ms: i64) -> Vec<WindowWrite> {
         let mut writes = Vec::new();

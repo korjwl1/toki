@@ -64,6 +64,11 @@ pub struct DbWriter {
     /// Sync notification: set dirty=true + notify after each flush so the sync thread wakes.
     /// None when sync is not configured.
     pub flush_notify: Option<Arc<(Mutex<bool>, Condvar)>>,
+    /// Window-poller wake: notified after each flush so the Claude poller knows
+    /// tokens are flowing. Deliberately a separate channel from flush_notify —
+    /// that one is notify_one with a single dirty bit consumed by the sync
+    /// thread; sharing it would drop wakeups for one of the two consumers.
+    pub poll_notify: Option<Arc<crate::claude_poll::PollerHub>>,
 }
 
 struct PendingEvent {
@@ -91,6 +96,7 @@ impl DbWriter {
             retention,
             bulk_pending: Vec::new(),
             flush_notify: None,
+            poll_notify: None,
         }
     }
 
@@ -281,6 +287,12 @@ impl DbWriter {
             let (lock, cvar) = notify.as_ref();
             *lock.lock().unwrap() = true;
             cvar.notify_one();
+        }
+
+        // Wake the window poller: tokens are flowing (atomic + notify, no lock
+        // held while the poller works).
+        if let Some(ref hub) = self.poll_notify {
+            hub.notify_token_flow();
         }
     }
 

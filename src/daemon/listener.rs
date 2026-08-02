@@ -52,6 +52,7 @@ pub fn run_listener(
     broadcast: Arc<BroadcastSink>,
     dbs: Vec<(String, Arc<Database>)>,
     stop_rx: crossbeam_channel::Receiver<()>,
+    windows_hub: Option<Arc<crate::claude_poll::PollerHub>>,
 ) {
     // Clean up stale socket
     if sock_path.exists() {
@@ -104,13 +105,14 @@ pub fn run_listener(
                 // would let one idle client stall every other pending connection.
                 let broadcast = Arc::clone(&broadcast);
                 let dbs = dbs.clone();
+                let hub = windows_hub.clone();
                 let spawned = std::thread::Builder::new()
                     .name("toki-conn".to_string())
                     .spawn(move || {
                         // `_permit` releases the worker slot when this returns; on
                         // spawn failure below the closure (and permit) is dropped.
                         let _permit = permit;
-                        handle_connection(stream, &broadcast, &dbs);
+                        handle_connection(stream, &broadcast, &dbs, hub.as_ref());
                     });
                 if let Err(e) = spawned {
                     eprintln!("[toki:daemon] Failed to spawn connection thread: {}", e);
@@ -136,6 +138,7 @@ fn handle_connection(
     stream: UnixStream,
     broadcast: &Arc<BroadcastSink>,
     dbs: &[(String, Arc<Database>)],
+    windows_hub: Option<&Arc<crate::claude_poll::PollerHub>>,
 ) {
     // 5 second timeout to read the command line
     stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
@@ -166,6 +169,14 @@ fn handle_connection(
             }
             handle_report_client(stream, &payload_line, dbs);
         }
+        "WINDOWS" => {
+            // Optional JSON request line: {"max_age_ms": 0} forces a bounded
+            // revalidation; absent/large max_age serves the cached state.
+            stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+            let mut payload_line = String::new();
+            let _ = reader.read_line(&mut payload_line);
+            handle_windows_client(stream, &payload_line, dbs, windows_hub);
+        }
         _ => {
             let error_resp = serde_json::json!({
                 "ok": false,
@@ -174,6 +185,127 @@ fn handle_connection(
             let _ = writeln!(&stream, "{}", serde_json::to_string(&error_resp).unwrap_or_default());
         }
     }
+}
+
+/// Serve the latest rate-limit window state: recent window rows from each
+/// provider DB plus per-provider auth status. `max_age_ms=0` joins the
+/// poller's single-flight refresh with a bounded wait (2s) — the response is
+/// flagged `refreshing:true` when it returns stale data instead of blocking.
+fn handle_windows_client(
+    stream: UnixStream,
+    payload_line: &str,
+    dbs: &[(String, Arc<Database>)],
+    windows_hub: Option<&Arc<crate::claude_poll::PollerHub>>,
+) {
+    #[derive(serde::Deserialize, Default)]
+    struct WindowsRequest {
+        #[serde(default)]
+        max_age_ms: Option<i64>,
+    }
+    let req: WindowsRequest = serde_json::from_str(payload_line.trim()).unwrap_or_default();
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    let Some(hub) = windows_hub else {
+        let resp = serde_json::json!({
+            "ok": false,
+            "error": "window tracking is disabled (settings set window_tracking true)"
+        });
+        let _ = writeln!(&stream, "{}", serde_json::to_string(&resp).unwrap_or_default());
+        return;
+    };
+
+    // Claude live-state freshness: join the poller when the caller asked for
+    // fresher data than we have.
+    let mut refreshing = false;
+    let mut claude_state = hub.state_snapshot();
+    if hub.polling_enabled {
+        if let Some(max_age) = req.max_age_ms {
+            if now_ms - claude_state.last_success_ms > max_age.max(0) {
+                let (st, timed_out) =
+                    hub.request_refresh(std::time::Duration::from_secs(2));
+                claude_state = st;
+                refreshing = timed_out;
+            }
+        }
+    }
+
+    // Recent window rows (8 days) from each provider DB — a handful of rows.
+    const ROW_HORIZON_MS: i64 = 8 * 86_400_000;
+    let mut providers = serde_json::Map::new();
+    for (name, db) in dbs {
+        let mut rows = Vec::new();
+        let _ = db.for_each_window(|key, snap| {
+            let anchor = crate::windows::window_key_anchor_ms(key).unwrap_or(0);
+            if anchor >= now_ms - ROW_HORIZON_MS {
+                rows.push(serde_json::json!({
+                    "kind": crate::windows::WindowKind::from_u8(key[0])
+                        .map(|k| k.label()).unwrap_or("unknown"),
+                    "limit_id": snap.limit_id,
+                    "account": snap.account,
+                    "window_end_ms": anchor,
+                    "raw_resets_at_ms": snap.raw_resets_at_ms,
+                    "window_minutes": snap.window_minutes,
+                    "peak_pct": (snap.peak_pct_x100 as f64) / 100.0,
+                    "observed_ts_ms": snap.observed_ts_ms,
+                    "first_seen_ms": snap.first_seen_ms,
+                    "finalized": snap.finalized,
+                    "maxed_out": snap.maxed_out,
+                    "limit_reached_kind": snap.limit_reached_kind,
+                    "time_to_100_ms": snap.time_to_100_ms,
+                    "active_ms": snap.active_ms,
+                    "last_sample_gap_ms": snap.last_sample_gap_ms,
+                    "n_samples": snap.n_samples,
+                    "plan": snap.plan,
+                }));
+            }
+        });
+
+        let auth = match name.as_str() {
+            "claude_code" => {
+                if hub.polling_enabled {
+                    claude_state.auth_status.label().to_string()
+                } else if let Some(root) = &hub.claude_root {
+                    match crate::claude_poll::read_claude_credentials(root) {
+                        Ok(_) => "ok".to_string(),
+                        Err(status) => status.label().to_string(),
+                    }
+                } else {
+                    "missing".to_string()
+                }
+            }
+            "codex" => hub
+                .codex_root
+                .as_deref()
+                .map(|r| crate::claude_poll::codex_auth_status(r).label().to_string())
+                .unwrap_or_else(|| "missing".to_string()),
+            _ => "unknown".to_string(),
+        };
+
+        let mut entry = serde_json::json!({
+            "windows": rows,
+            "auth_status": auth,
+        });
+        if name == "claude_code" {
+            entry["last_success_ms"] = serde_json::json!(claude_state.last_success_ms);
+            entry["last_poll_ms"] = serde_json::json!(claude_state.last_poll_ms);
+            entry["plan"] = serde_json::json!(claude_state.plan);
+            entry["polling_enabled"] = serde_json::json!(hub.polling_enabled);
+        }
+        providers.insert(name.clone(), entry);
+    }
+
+    let resp = serde_json::json!({
+        "ok": true,
+        "schema": 1,
+        "now_ms": now_ms,
+        "refreshing": refreshing,
+        "providers": providers,
+    });
+    let _ = writeln!(&stream, "{}", serde_json::to_string(&resp).unwrap_or_default());
 }
 
 /// Handle a report query: parse request, execute query, send response.

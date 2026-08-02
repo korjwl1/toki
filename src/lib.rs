@@ -1,3 +1,4 @@
+pub mod claude_poll;
 pub mod common;
 pub mod config;
 pub mod daemon;
@@ -64,6 +65,11 @@ pub struct Handle {
     settings_watcher_handle: Option<JoinHandle<()>>,
     /// Settings watcher stop channel.
     settings_watcher_stop: Option<crossbeam_channel::Sender<()>>,
+    /// Window-tracking hub (auth state + refresh coordination for the UDS
+    /// WINDOWS command). Present when window_tracking is enabled.
+    windows_hub: Option<Arc<claude_poll::PollerHub>>,
+    /// Claude poller thread join handle.
+    poller_handle: Option<JoinHandle<()>>,
 }
 
 struct ProviderRuntimeHandle {
@@ -86,6 +92,11 @@ impl Handle {
     /// Returns (provider_name, db) pairs.
     pub fn dbs(&self) -> Vec<(&str, &Arc<Database>)> {
         self.provider_dbs.iter().map(|(name, db)| (name.as_str(), db)).collect()
+    }
+
+    /// Window-tracking hub for the daemon listener (None when disabled).
+    pub fn windows_hub(&self) -> Option<Arc<claude_poll::PollerHub>> {
+        self.windows_hub.clone()
     }
 
     fn shutdown(&mut self) {
@@ -114,6 +125,15 @@ impl Handle {
             if let Some(handle) = handle_opt.take() {
                 let _ = handle.join();
             }
+        }
+
+        // Stop the Claude poller before the writers: it flushes its open
+        // windows through a writer channel on the way out.
+        if let Some(hub) = &self.windows_hub {
+            hub.stop();
+        }
+        if let Some(handle) = self.poller_handle.take() {
+            let _ = handle.join();
         }
 
         // Stop the worker thread (sends remaining ops to writers)
@@ -177,6 +197,22 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
         )));
     }
 
+    // Window-tracking hub: created up front so the Claude writer can carry the
+    // token-flow wake from birth. Roots come from the configured providers.
+    let windows_hub: Option<Arc<claude_poll::PollerHub>> = if config.window_tracking {
+        let claude_root = provider_list.iter()
+            .find(|p| p.name() == "claude_code")
+            .and_then(|p| p.root_dir());
+        let codex_root = provider_list.iter()
+            .find(|p| p.name() == "codex")
+            .and_then(|p| p.root_dir());
+        Some(Arc::new(claude_poll::PollerHub::new(
+            claude_root, codex_root, config.window_polling,
+        )))
+    } else {
+        None
+    };
+
     // Set up per-provider DB + writer
     let mut runtimes: Vec<ProviderRuntime> = Vec::new();
     let mut channel_map: HashMap<String, crossbeam_channel::Sender<DbOp>> = HashMap::new();
@@ -205,6 +241,9 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
         let flush_notify: sync::FlushNotify = Arc::new((Mutex::new(false), Condvar::new()));
         let mut writer = DbWriter::new(db.clone(), db_rx, retention.clone());
         writer.flush_notify = Some(flush_notify.clone());
+        if provider.name() == "claude_code" && config.window_polling {
+            writer.poll_notify = windows_hub.clone();
+        }
         let provider_name = provider.name().to_string();
         let writer_handle = std::thread::Builder::new()
             .name(format!("toki-writer-{}", provider_name))
@@ -283,6 +322,29 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
                         .spawn(move || windows::run_windows_backfill(db, sessions_glob, account))
                     {
                         eprintln!("[toki] windows backfill thread spawn failed: {}", e);
+                    }
+                }
+            }
+        }
+    }
+
+    // Claude active poller: the only way to observe Claude's windows. Runs on
+    // its own thread, woken by the writer's flush (activity gate) and by UDS
+    // refresh requests; sleeps indefinitely while idle.
+    let mut poller_handle: Option<JoinHandle<()>> = None;
+    if let Some(hub) = &windows_hub {
+        if config.window_polling {
+            if let Some(rt) = runtimes.iter().find(|rt| rt.provider.name() == "claude_code") {
+                if let Some(root) = rt.provider.root_dir() {
+                    let hub = hub.clone();
+                    let db = rt.db.clone();
+                    let db_tx = rt.db_tx.clone();
+                    match std::thread::Builder::new()
+                        .name("toki-claude-poll".to_string())
+                        .spawn(move || claude_poll::run_claude_poller(hub, db, db_tx, root))
+                    {
+                        Ok(h) => poller_handle = Some(h),
+                        Err(e) => eprintln!("[toki] claude poller spawn failed: {}", e),
                     }
                 }
             }
@@ -446,6 +508,8 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
         flush_notifies,
         settings_watcher_handle: Some(settings_watcher_handle),
         settings_watcher_stop: Some(settings_stop_tx),
+        windows_hub,
+        poller_handle,
     })
 }
 

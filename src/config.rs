@@ -15,6 +15,9 @@ pub struct Config {
     pub retention_days: u32,
     /// Rate-limit window tracking (passive extraction from provider logs).
     pub window_tracking: bool,
+    /// Active polling of Claude's usage endpoint (requires window_tracking).
+    /// Activity-gated: fires only while Claude Code itself is making API calls.
+    pub window_polling: bool,
     /// Retention horizon for window rows (days). Independent of retention_days.
     pub window_retention_days: u32,
     pub daemon_sock: PathBuf,
@@ -46,6 +49,7 @@ impl Config {
             tz: None,
             retention_days: 0,
             window_tracking: true,
+            window_polling: true,
             window_retention_days: 730,
             daemon_sock: crate::daemon::default_sock_path(),
             no_cost: false,
@@ -113,6 +117,9 @@ impl Config {
         }
         if let Some(v) = settings.get("window_tracking").and_then(|v| v.as_str()) {
             self.window_tracking = v != "false" && v != "0";
+        }
+        if let Some(v) = settings.get("window_polling").and_then(|v| v.as_str()) {
+            self.window_polling = v != "false" && v != "0";
         }
         if let Some(v) = settings.get("window_retention_days").and_then(|v| v.as_str()) {
             if let Ok(n) = v.parse::<u32>() { self.window_retention_days = n; }
@@ -419,6 +426,7 @@ mod tests {
             tz: None,
             retention_days: 0,
             window_tracking: true,
+            window_polling: true,
             window_retention_days: 730,
             daemon_sock: PathBuf::from("daemon.sock"),
             no_cost: false,
@@ -442,6 +450,7 @@ mod tests {
             tz: None,
             retention_days: 0,
             window_tracking: true,
+            window_polling: true,
             window_retention_days: 730,
             daemon_sock: PathBuf::new(),
             no_cost: false,
