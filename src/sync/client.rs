@@ -253,6 +253,37 @@ impl SyncClient {
     }
 
     /// Send PING and expect PONG.
+    /// Send rate-limit window snapshots (capability sync_windows_v1 — the
+    /// caller MUST have confirmed support via /api/v1/capabilities first;
+    /// older servers drop the connection on this frame without a reply).
+    pub fn sync_windows(
+        &mut self,
+        provider: &str,
+        items: Vec<toki_sync_protocol::WireWindow>,
+    ) -> io::Result<()> {
+        let payload = toki_sync_protocol::SyncWindowsPayload {
+            windows_schema: toki_sync_protocol::WINDOWS_SCHEMA_VERSION,
+            provider: provider.to_string(),
+            items,
+        };
+        let bytes = bincode::serialize(&payload)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        write_frame(&mut self.writer, MsgType::SyncWindows, &bytes)?;
+        let (msg_type, resp) = read_frame(&mut self.reader)?;
+        match msg_type {
+            MsgType::SyncAck => Ok(()),
+            MsgType::SyncErr => {
+                let err: SyncErrPayload = bincode::deserialize(&resp)
+                    .unwrap_or(SyncErrPayload { reason: "unknown".into() });
+                Err(io::Error::other(format!("server rejected windows: {}", err.reason)))
+            }
+            other => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected SyncAck, got {other:?}"),
+            )),
+        }
+    }
+
     pub fn ping(&mut self) -> io::Result<()> {
         write_empty_frame(&mut self.writer, MsgType::Ping)?;
         let (msg_type, _) = read_frame(&mut self.reader)?;

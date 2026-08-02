@@ -48,3 +48,9 @@ tikv-jemallocator = "0.6"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Local override for feature-branch development of the protocol crate.
+# Release process: publish/tag toki-sync-protocol, re-pin the tag above,
+# and drop this patch section.
+[patch."https://github.com/korjwl1/toki-sync-protocol.git"]
+toki-sync-protocol = { path = "../toki_sync_protocol" }

@@ -79,6 +79,37 @@ fn gethostname() -> String {
 }
 
 const PING_INTERVAL: Duration = Duration::from_secs(60);
+/// Minimum interval between window-set uploads (full recent set, idempotent).
+const WINDOWS_SYNC_INTERVAL: Duration = Duration::from_secs(300);
+/// Window rows younger than this are (re)sent each cycle.
+const WINDOWS_SYNC_HORIZON_MS: i64 = 60 * 86_400_000;
+
+/// Whether the server supports SyncWindows (0x24). Older servers DROP the TCP
+/// connection on unknown frames without any SyncErr, so support must be
+/// confirmed out of band via HTTP GET /api/v1/capabilities before sending.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum WindowsCapability {
+    /// Not yet determined (probe failed transiently, or not probed).
+    Unknown,
+    Supported,
+    /// Authoritative 404 / missing flag — latched for this daemon run;
+    /// a restart (or server change) re-probes.
+    Unsupported,
+}
+
+/// Probe the server's capabilities endpoint. Ok(Some(bool)) is authoritative;
+/// Ok(None)/Err are transient (retry later, never latch).
+fn probe_windows_capability(http_url: &str) -> Option<bool> {
+    let url = format!("{}/api/v1/capabilities", http_url.trim_end_matches('/'));
+    match ureq::get(&url).timeout(Duration::from_secs(5)).call() {
+        Ok(resp) => {
+            let body: serde_json::Value = resp.into_json().ok()?;
+            Some(body.get("sync_windows_v1").and_then(|v| v.as_bool()).unwrap_or(false))
+        }
+        Err(ureq::Error::Status(404, _)) => Some(false),
+        Err(_) => None,
+    }
+}
 
 /// Flush notification handle: a Condvar + dirty flag shared with DbWriter.
 pub type FlushNotify = Arc<(Mutex<bool>, Condvar)>;
@@ -205,6 +236,9 @@ fn run_sync_inner(
     let mut last_refresh = Instant::now();
     let mut auth_failure_notified = false;
     let mut sw = SyncStateWriter::new();
+    let mut windows_cap = WindowsCapability::Unknown;
+    // Start "due": first successful connection uploads the window set right away.
+    let mut last_windows_sync = Instant::now() - WINDOWS_SYNC_INTERVAL;
 
     loop {
         // Check stop signal
@@ -400,6 +434,65 @@ fn run_sync_inner(
             }
             sw.set("sync_status", "connected");
             sw.set("sync_last_success", &now_epoch().to_string());
+        }
+
+        // Windows sync: full recent set, throttled; field-wise server merge
+        // makes the resend idempotent, so no cursor exists (a cursor on
+        // window_end would permanently miss peak updates under a fixed key).
+        if last_windows_sync.elapsed() >= WINDOWS_SYNC_INTERVAL {
+            if windows_cap == WindowsCapability::Unknown {
+                if let Some(creds) = crate::sync::credentials::load() {
+                    if !creds.http_url.is_empty() {
+                        match probe_windows_capability(&creds.http_url) {
+                            Some(true) => {
+                                windows_cap = WindowsCapability::Supported;
+                                eprintln!("[toki:sync] server supports windows sync");
+                            }
+                            Some(false) => {
+                                windows_cap = WindowsCapability::Unsupported;
+                                eprintln!("[toki:sync] server predates windows sync (skipping until restart)");
+                            }
+                            None => { /* transient — retry next interval */ }
+                        }
+                    }
+                }
+            }
+            if windows_cap == WindowsCapability::Supported {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                let mut items = Vec::new();
+                let _ = db.for_each_window(|key, snap| {
+                    let anchor = crate::windows::window_key_anchor_ms(key).unwrap_or(0);
+                    if anchor >= now_ms - WINDOWS_SYNC_HORIZON_MS {
+                        items.push(crate::windows::wire_from_stored(key, &snap));
+                    }
+                });
+                if !items.is_empty() {
+                    if let Some(ref mut c) = client {
+                        let n = items.len();
+                        match c.sync_windows(&config.provider, items) {
+                            Ok(()) => {
+                                last_windows_sync = Instant::now();
+                                eprintln!("[toki:sync] synced {n} window snapshots");
+                            }
+                            Err(e) => {
+                                // A SyncErr keeps the connection; an IO error
+                                // means the link is gone (reconnect path).
+                                eprintln!("[toki:sync] windows sync error: {e}");
+                                if e.kind() != std::io::ErrorKind::Other {
+                                    client = None;
+                                    continue;
+                                }
+                                last_windows_sync = Instant::now();
+                            }
+                        }
+                    }
+                } else {
+                    last_windows_sync = Instant::now();
+                }
+            }
         }
 
         // Proactive token refresh: keep the refresh token rotated to prevent expiry

@@ -236,6 +236,30 @@ impl WindowRow {
     }
 }
 
+/// Convert a stored window row into the sync wire shape.
+pub fn wire_from_stored(key: &[u8], snap: &WindowSnapshotV1) -> toki_sync_protocol::WireWindow {
+    toki_sync_protocol::WireWindow {
+        window_kind: key.first().copied().unwrap_or(0),
+        limit_id: snap.limit_id.clone(),
+        account: snap.account.clone(),
+        window_end_ms: window_key_anchor_ms(key).unwrap_or(0),
+        raw_resets_at_ms: snap.raw_resets_at_ms,
+        window_minutes: snap.window_minutes,
+        peak_pct_x100: snap.peak_pct_x100,
+        observed_ts_ms: snap.observed_ts_ms,
+        first_seen_ms: snap.first_seen_ms,
+        finalized: snap.finalized,
+        maxed_out: snap.maxed_out,
+        limit_reached_kind: snap.limit_reached_kind,
+        time_to_100_ms: snap.time_to_100_ms,
+        active_ms: snap.active_ms,
+        last_sample_gap_ms: snap.last_sample_gap_ms,
+        sampled_active_fraction: snap.sampled_active_fraction,
+        n_samples: snap.n_samples,
+        plan: snap.plan.clone(),
+    }
+}
+
 /// A pending durable write produced by the tracker.
 #[derive(Debug, Clone)]
 pub struct WindowWrite {
