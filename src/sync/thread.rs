@@ -239,6 +239,8 @@ fn run_sync_inner(
     let mut windows_cap = WindowsCapability::Unknown;
     // Start "due": first successful connection uploads the window set right away.
     let mut last_windows_sync = Instant::now() - WINDOWS_SYNC_INTERVAL;
+    // Transient capability-probe failures retry with a backoff, not per-wake.
+    let mut next_cap_probe = Instant::now();
 
     loop {
         // Check stop signal
@@ -436,11 +438,34 @@ fn run_sync_inner(
             sw.set("sync_last_success", &now_epoch().to_string());
         }
 
+        // Proactive token refresh: keep the refresh token rotated to prevent expiry
+        if last_refresh.elapsed() > PROACTIVE_REFRESH_INTERVAL {
+            if try_refresh_token(config) {
+                eprintln!("[toki:sync] proactive token refresh succeeded");
+                last_refresh = Instant::now();
+            } else {
+                eprintln!("[toki:sync] proactive token refresh failed (will retry)");
+            }
+        }
+
+        // PING keepalive
+        if last_ping.elapsed() >= PING_INTERVAL {
+            if let Some(ref mut c) = client {
+                match c.ping() {
+                    Ok(()) => { last_ping = Instant::now(); }
+                    Err(e) => {
+                        eprintln!("[toki:sync] ping failed: {e}");
+                        client = None;
+                    }
+                }
+            }
+        }
+
         // Windows sync: full recent set, throttled; field-wise server merge
         // makes the resend idempotent, so no cursor exists (a cursor on
         // window_end would permanently miss peak updates under a fixed key).
         if last_windows_sync.elapsed() >= WINDOWS_SYNC_INTERVAL {
-            if windows_cap == WindowsCapability::Unknown {
+            if windows_cap == WindowsCapability::Unknown && Instant::now() >= next_cap_probe {
                 if let Some(creds) = crate::sync::credentials::load() {
                     if !creds.http_url.is_empty() {
                         match probe_windows_capability(&creds.http_url) {
@@ -452,7 +477,11 @@ fn run_sync_inner(
                                 windows_cap = WindowsCapability::Unsupported;
                                 eprintln!("[toki:sync] server predates windows sync (skipping until restart)");
                             }
-                            None => { /* transient — retry next interval */ }
+                            None => {
+                                // Transient (network/TLS/5xx): back off instead
+                                // of re-probing on every flush wake.
+                                next_cap_probe = Instant::now() + Duration::from_secs(60);
+                            }
                         }
                     }
                 }
@@ -495,28 +524,6 @@ fn run_sync_inner(
             }
         }
 
-        // Proactive token refresh: keep the refresh token rotated to prevent expiry
-        if last_refresh.elapsed() > PROACTIVE_REFRESH_INTERVAL {
-            if try_refresh_token(config) {
-                eprintln!("[toki:sync] proactive token refresh succeeded");
-                last_refresh = Instant::now();
-            } else {
-                eprintln!("[toki:sync] proactive token refresh failed (will retry)");
-            }
-        }
-
-        // PING keepalive
-        if last_ping.elapsed() >= PING_INTERVAL {
-            if let Some(ref mut c) = client {
-                match c.ping() {
-                    Ok(()) => { last_ping = Instant::now(); }
-                    Err(e) => {
-                        eprintln!("[toki:sync] ping failed: {e}");
-                        client = None;
-                    }
-                }
-            }
-        }
     }
 }
 

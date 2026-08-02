@@ -547,14 +547,16 @@ const VALID_SETTINGS: &[&str] = &[
 /// because the daemon picks them up automatically via the settings file watcher.
 const RESTART_SETTINGS: &[&str] = &[
     "claude_code_root", "codex_root", "daemon_sock", "providers",
-    // Window tracking is wired into the engine/writer at startup.
-    "window_tracking", "window_polling", "window_retention_days",
+    // Passive window tracking is wired into the engine/writer at startup;
+    // window_polling is hot-reloaded via the settings watcher.
+    "window_tracking", "window_retention_days",
 ];
 
 /// Settings that are hot-reloadable by the daemon (no restart needed).
 const HOT_RELOAD_SETTINGS: &[&str] = &[
     "sync_enabled", "sync_server", "sync_access_token", "sync_device_name",
     "sync_tls", "sync_tls_insecure",
+    "window_polling",
     "retention_days",
     "timezone", "output_format", "start_of_week", "no_cost",
 ];
@@ -1442,6 +1444,24 @@ fn send_remote_query(
 
     let body: serde_json::Value = resp.into_json()
         .map_err(|e| format!("Invalid remote query response: {e}"))?;
+
+    // Windows metric: the server answers {"schema":1,"windows":{provider:[rows]}}
+    // — pass rows through as typed items instead of feeding them to the
+    // Prometheus converter (which would silently produce an empty summary).
+    if let Some(windows) = body.get("windows").and_then(|w| w.as_object()) {
+        let items: Vec<serde_json::Value> = windows
+            .iter()
+            .map(|(provider, rows)| serde_json::json!({
+                "type": "windows",
+                "schema": provider,
+                "data": rows,
+            }))
+            .collect();
+        return Ok(ReportResponse {
+            data: serde_json::Value::Array(items),
+            meta: serde_json::json!({}),
+        });
+    }
 
     // The toki-sync /api/v1/query_range proxies to VictoriaMetrics and returns
     // Prometheus-compatible JSON. Convert it into toki's ReportResponse format

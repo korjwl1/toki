@@ -332,6 +332,7 @@ fn parse_rate_limits_json(raw: &str, ts_ms: i64) -> Option<crate::common::types:
             plan_type: plan_type.clone(),
             limit_reached,
             has_credits,
+            anchor_stable: false,
             ts_ms,
         })
     };

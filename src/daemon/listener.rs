@@ -222,7 +222,7 @@ fn handle_windows_client(
     // fresher data than we have.
     let mut refreshing = false;
     let mut claude_state = hub.state_snapshot();
-    if hub.polling_enabled {
+    if hub.polling_enabled() {
         if let Some(max_age) = req.max_age_ms {
             if now_ms - claude_state.last_success_ms > max_age.max(0) {
                 let (st, timed_out) =
@@ -248,7 +248,7 @@ fn handle_windows_client(
 
         let auth = match name.as_str() {
             "claude_code" => {
-                if hub.polling_enabled {
+                if hub.polling_enabled() {
                     claude_state.auth_status.label().to_string()
                 } else if let Some(root) = &hub.claude_root {
                     match crate::claude_poll::read_claude_credentials(root) {
@@ -272,10 +272,11 @@ fn handle_windows_client(
             "auth_status": auth,
         });
         if name == "claude_code" {
+            entry["extra_usage_enabled"] = serde_json::json!(claude_state.extra_usage_enabled);
             entry["last_success_ms"] = serde_json::json!(claude_state.last_success_ms);
             entry["last_poll_ms"] = serde_json::json!(claude_state.last_poll_ms);
             entry["plan"] = serde_json::json!(claude_state.plan);
-            entry["polling_enabled"] = serde_json::json!(hub.polling_enabled);
+            entry["polling_enabled"] = serde_json::json!(hub.polling_enabled());
         }
         providers.insert(name.clone(), entry);
     }

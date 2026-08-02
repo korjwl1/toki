@@ -32,7 +32,15 @@ pub fn run_retention(db: &Database, policy: &RetentionPolicy) -> Result<Retentio
     let windows_deleted = if policy.window_retention_days > 0 {
         let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
         let cutoff = now_ms - (policy.window_retention_days as i64) * 86_400_000;
-        db.delete_windows_before(cutoff)? as u64
+        // A windows sweep failure must never suppress the pre-existing event
+        // retention below (audit: `?` here would early-return the whole pass).
+        match db.delete_windows_before(cutoff) {
+            Ok(n) => n as u64,
+            Err(e) => {
+                eprintln!("[toki] windows retention error (continuing): {}", e);
+                0
+            }
+        }
     } else {
         0
     };

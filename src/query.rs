@@ -1136,6 +1136,7 @@ mod tests {
         use crate::windows::{window_key, WindowKind, WindowSnapshotV1, REACHED_NONE};
         let snap = |peak: u16, reset: i64| WindowSnapshotV1 {
             peak_pct_x100: peak,
+            last_pct_x100: peak,
             observed_ts_ms: reset - 1000,
             raw_resets_at_ms: reset,
             first_seen_ms: reset - 3_600_000,

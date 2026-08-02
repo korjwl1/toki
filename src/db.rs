@@ -704,6 +704,7 @@ mod tests {
         let key = window_key(WindowKind::Session, 1, 2, 1_786_000_000_000);
         let base = WindowSnapshotV1 {
             peak_pct_x100: 4000,
+            last_pct_x100: 4000,
             observed_ts_ms: 100,
             raw_resets_at_ms: 1_786_000_000_000,
             first_seen_ms: 50,

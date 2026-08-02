@@ -163,6 +163,10 @@ pub struct WindowObservation {
     pub limit_reached: bool,
     /// Purchasable/reset credits were available (100% is then not a hard stop).
     pub has_credits: bool,
+    /// The source guarantees resets_at identifies a real window even at 0%
+    /// utilization (active pollers). Passive extraction leaves this false:
+    /// unused limits slide their resets_at, so 0% must not open a window.
+    pub anchor_stable: bool,
     /// Observation timestamp (the log line's ts), epoch ms.
     pub ts_ms: i64,
 }

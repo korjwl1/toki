@@ -83,6 +83,8 @@ pub struct PublishedState {
     pub last_success_ms: i64,
     pub last_poll_ms: i64,
     pub plan: String,
+    /// Claude extra-usage (pay-per-overflow) enabled on the account.
+    pub extra_usage_enabled: bool,
     /// Refresh bookkeeping: a WINDOWS request with max_age=0 bumps want_seq;
     /// the poller bumps done_seq after the next completed poll attempt.
     want_seq: u64,
@@ -96,6 +98,7 @@ impl Default for PublishedState {
             last_success_ms: 0,
             last_poll_ms: 0,
             plan: String::new(),
+            extra_usage_enabled: false,
             want_seq: 0,
             done_seq: 0,
         }
@@ -113,8 +116,9 @@ pub struct PollerHub {
     /// Provider roots for auth classification in the WINDOWS handler.
     pub claude_root: Option<String>,
     pub codex_root: Option<String>,
-    /// Whether the active Claude poller is running (window_polling setting).
-    pub polling_enabled: bool,
+    /// Whether active Claude polling is currently enabled (window_polling
+    /// setting; hot-reloadable via the settings watcher).
+    polling_enabled: std::sync::atomic::AtomicBool,
 }
 
 impl PollerHub {
@@ -125,8 +129,21 @@ impl PollerHub {
             last_token_flow_ms: AtomicI64::new(0),
             claude_root,
             codex_root,
-            polling_enabled,
+            polling_enabled: std::sync::atomic::AtomicBool::new(polling_enabled),
         }
+    }
+
+    pub fn polling_enabled(&self) -> bool {
+        self.polling_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Hot-reload hook: flips active polling without a daemon restart. The
+    /// poller thread checks this before each provider call; the passive
+    /// (window_tracking) pipeline is engine-embedded and stays restart-bound.
+    pub fn set_polling_enabled(&self, enabled: bool) {
+        self.polling_enabled.store(enabled, Ordering::Relaxed);
+        let (_, cvar) = &self.signal;
+        cvar.notify_all();
     }
 
     /// Called by the writer after each flush: tokens are flowing.
@@ -231,8 +248,15 @@ fn read_credentials_raw(claude_root: &str) -> Result<String, AuthStatus> {
             .output()
             .map_err(|_| AuthStatus::Unreadable)?;
         if !out.status.success() {
-            // Item absent (or ACL-denied): logged out.
-            return Err(AuthStatus::Missing);
+            // Parity with the monitor's ClaudeAuthReader.classify: exit 44 is
+            // errSecItemNotFound (logged out); any other failure — ACL denial,
+            // keychain locked, signal — is transient and must NOT be treated
+            // as "missing" (that would wipe valid UI state).
+            return Err(if out.status.code() == Some(44) {
+                AuthStatus::Missing
+            } else {
+                AuthStatus::Unreadable
+            });
         }
         String::from_utf8(out.stdout).map_err(|_| AuthStatus::Unreadable)
     }
@@ -405,6 +429,10 @@ fn observations_from_usage(
                         plan_type: if plan.is_empty() { None } else { Some(plan.to_string()) },
                         limit_reached: pct >= 99.995,
                         has_credits,
+                        // The usage endpoint only serves resets_at for real
+                        // windows; a 0% weekly period is genuine zero use and
+                        // must exist for the overall mean.
+                        anchor_stable: true,
                         ts_ms,
                     });
                 }
@@ -516,6 +544,14 @@ pub fn run_claude_poller(
             continue;
         }
 
+        // Hot-reload gate: window_polling can be flipped off at runtime.
+        if !hub.polling_enabled() {
+            if refresh {
+                hub.publish(|st| st.done_seq = st.want_seq);
+            }
+            continue;
+        }
+
         // ---- Poll ----
         last_poll_ms = now;
         let result = match read_claude_credentials(&claude_root) {
@@ -552,6 +588,12 @@ pub fn run_claude_poller(
             Ok(usage) => {
                 consecutive_failures = 0;
                 backoff_until_ms = 0;
+                if !last_auth_ok {
+                    // Auth just recovered — possibly a different account.
+                    // Invalidate the cached profile so the account scope and
+                    // plan re-resolve immediately instead of after 24h.
+                    profile = None;
+                }
                 last_auth_ok = true;
                 let plan = profile.as_ref().map(|p| p.plan.as_str()).unwrap_or("");
                 let observations = observations_from_usage(&usage, plan, now);
@@ -567,11 +609,17 @@ pub fn run_claude_poller(
                         let _ = db_tx.send(DbOp::WriteWindow(Box::new(w)));
                     }
                 }
+                let extra_enabled = usage
+                    .extra_usage
+                    .as_ref()
+                    .and_then(|e| e.is_enabled)
+                    .unwrap_or(false);
                 hub.publish(|st| {
                     st.auth_status = AuthStatus::Ok;
                     st.last_success_ms = now;
                     st.last_poll_ms = now;
                     st.plan = plan.to_string();
+                    st.extra_usage_enabled = extra_enabled;
                     st.done_seq = st.want_seq;
                 });
             }
@@ -585,6 +633,11 @@ pub fn run_claude_poller(
                 hub.publish(|st| {
                     if status != AuthStatus::Ok {
                         st.auth_status = status;
+                    } else {
+                        // Credentials read fine; only the fetch failed
+                        // transiently. Publish Ok so a fresh daemon's default
+                        // Missing state never masquerades as "logged out".
+                        st.auth_status = AuthStatus::Ok;
                     }
                     st.last_poll_ms = now;
                     st.done_seq = st.want_seq;

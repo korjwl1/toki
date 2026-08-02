@@ -315,11 +315,12 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
             if rt.provider.name() == "codex" {
                 if let Some(root) = rt.provider.root_dir() {
                     let db = rt.db.clone();
+                    let db_tx = rt.db_tx.clone();
                     let sessions_glob = format!("{}/sessions/**/*.jsonl", root);
                     let account = windows::codex_account_scope(&root);
                     if let Err(e) = std::thread::Builder::new()
                         .name("toki-windows-backfill".to_string())
-                        .spawn(move || windows::run_windows_backfill(db, sessions_glob, account))
+                        .spawn(move || windows::run_windows_backfill(db, db_tx, sessions_glob, account))
                     {
                         eprintln!("[toki] windows backfill thread spawn failed: {}", e);
                     }
@@ -462,6 +463,7 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
     // Start settings file watcher for hot-reload (auto-respawns on panic)
     let (settings_stop_tx, settings_stop_rx) = crossbeam_channel::bounded::<()>(1);
     let settings_toggles = sync_toggles.clone();
+    let settings_hub = windows_hub.clone();
     let settings_watcher_handle = std::thread::Builder::new()
         .name("toki-settings-watcher".to_string())
         .spawn(move || {
@@ -471,7 +473,7 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
                 }
 
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_settings_watcher(settings_stop_rx.clone(), settings_toggles.clone());
+                    run_settings_watcher(settings_stop_rx.clone(), settings_toggles.clone(), settings_hub.clone());
                 }));
 
                 match result {
@@ -519,6 +521,7 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
 fn run_settings_watcher(
     stop_rx: crossbeam_channel::Receiver<()>,
     sync_toggles: Vec<(String, sync::SyncToggle)>,
+    windows_hub: Option<Arc<claude_poll::PollerHub>>,
 ) {
     let sentinel_path = config::settings_sentinel_path();
 
@@ -587,14 +590,25 @@ fn run_settings_watcher(
         last_mtime = current_mtime;
 
         eprintln!("[toki:settings-watcher] settings change detected, reloading...");
-        handle_settings_change(&sync_toggles);
+        handle_settings_change(&sync_toggles, windows_hub.as_ref());
     }
 }
 
 /// Handle a settings change by re-reading the settings DB and dispatching updates.
 fn handle_settings_change(
     sync_toggles: &[(String, sync::SyncToggle)],
+    windows_hub: Option<&Arc<claude_poll::PollerHub>>,
 ) {
+    // Hot-reload: active window polling can be toggled without a restart.
+    if let Some(hub) = windows_hub {
+        let enabled = config::get_setting("window_polling")
+            .map(|v| v != "false" && v != "0")
+            .unwrap_or(true);
+        if hub.polling_enabled() != enabled {
+            eprintln!("[toki:settings-watcher] window_polling → {}", enabled);
+            hub.set_polling_enabled(enabled);
+        }
+    }
     let sync_enabled = config::get_setting("sync_enabled")
         .map(|v| v == "true")
         .unwrap_or(false);

@@ -80,7 +80,11 @@ pub const REACHED_ON_CREDITS: u8 = 2;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WindowSnapshotV1 {
     /// Highest observed utilization, percent × 100 (e.g. 4250 = 42.5%).
+    /// The statistics value — monotone by construction.
     pub peak_pct_x100: u16,
+    /// Latest raw utilization, percent × 100. The live-display value: unlike
+    /// the peak it can decrease (server-side limit resets, credit refills).
+    pub last_pct_x100: u16,
     /// Timestamp of the newest observation merged into this row.
     pub observed_ts_ms: i64,
     /// Latest raw resets_at seen (the anchor in the key never moves; this does).
@@ -140,6 +144,7 @@ impl WindowSnapshotV1 {
             self.observed_ts_ms = other.observed_ts_ms;
             self.raw_resets_at_ms = other.raw_resets_at_ms;
             self.last_sample_gap_ms = other.last_sample_gap_ms;
+            self.last_pct_x100 = other.last_pct_x100;
             self.plan = other.plan.clone();
         }
         self.first_seen_ms = self.first_seen_ms.min(other.first_seen_ms);
@@ -196,6 +201,7 @@ pub struct WindowRow {
     pub raw_resets_at_ms: i64,
     pub window_minutes: u32,
     pub peak_pct: f64,
+    pub last_pct: f64,
     pub observed_ts_ms: i64,
     pub first_seen_ms: i64,
     pub finalized: bool,
@@ -204,6 +210,7 @@ pub struct WindowRow {
     pub time_to_100_ms: i64,
     pub active_ms: u64,
     pub last_sample_gap_ms: i64,
+    pub sampled_active_fraction: u16,
     pub n_samples: u32,
     pub plan: String,
 }
@@ -222,6 +229,7 @@ impl WindowRow {
             raw_resets_at_ms: snap.raw_resets_at_ms,
             window_minutes: snap.window_minutes,
             peak_pct: (snap.peak_pct_x100 as f64) / 100.0,
+            last_pct: (snap.last_pct_x100 as f64) / 100.0,
             observed_ts_ms: snap.observed_ts_ms,
             first_seen_ms: snap.first_seen_ms,
             finalized: snap.finalized,
@@ -230,6 +238,7 @@ impl WindowRow {
             time_to_100_ms: snap.time_to_100_ms,
             active_ms: snap.active_ms,
             last_sample_gap_ms: snap.last_sample_gap_ms,
+            sampled_active_fraction: snap.sampled_active_fraction,
             n_samples: snap.n_samples,
             plan: snap.plan.clone(),
         }
@@ -246,6 +255,7 @@ pub fn wire_from_stored(key: &[u8], snap: &WindowSnapshotV1) -> toki_sync_protoc
         raw_resets_at_ms: snap.raw_resets_at_ms,
         window_minutes: snap.window_minutes,
         peak_pct_x100: snap.peak_pct_x100,
+        last_pct_x100: snap.last_pct_x100,
         observed_ts_ms: snap.observed_ts_ms,
         first_seen_ms: snap.first_seen_ms,
         finalized: snap.finalized,
@@ -278,6 +288,7 @@ struct OpenWindow {
     first_seen_ms: i64,
     window_minutes: u32,
     peak_pct: f64,
+    last_pct: f64,
     maxed_out: bool,
     limit_reached_kind: u8,
     time_to_100_ms: i64,
@@ -293,6 +304,7 @@ impl OpenWindow {
     fn to_snapshot(&self, finalized: bool) -> WindowSnapshotV1 {
         WindowSnapshotV1 {
             peak_pct_x100: (self.peak_pct.clamp(0.0, 655.0) * 100.0).round() as u16,
+            last_pct_x100: (self.last_pct.clamp(0.0, 655.0) * 100.0).round() as u16,
             observed_ts_ms: self.last_sample_ts_ms,
             raw_resets_at_ms: self.raw_resets_at_ms,
             first_seen_ms: self.first_seen_ms,
@@ -376,12 +388,16 @@ impl WindowTracker {
         let kind = WindowKind::from_minutes(obs.window_minutes);
         let limit_hash = hash_str(&obs.limit_id);
 
-        // Match against an open window: same kind + limit, resets_at within
-        // epsilon of the latest raw value.
+        // Match against an open window: same kind + limit + account, resets_at
+        // within epsilon of the latest raw value AND bounded to the immutable
+        // anchor (audit: matching raw alone could let repeated <=epsilon steps
+        // walk arbitrarily far from the anchor; the anchor bound caps drift).
         let idx = self.open.iter().position(|w| {
             w.kind == kind
                 && w.limit_id_hash == limit_hash
+                && w.account_hash == self.account_hash
                 && (w.raw_resets_at_ms - obs.resets_at_ms).abs() <= ANCHOR_EPSILON_MS
+                && (w.anchor_min_ms - obs.resets_at_ms).abs() <= ANCHOR_EPSILON_MS + 60_000
         });
 
         match idx {
@@ -395,6 +411,7 @@ impl WindowTracker {
                 if obs.ts_ms > w.last_sample_ts_ms {
                     w.last_sample_ts_ms = obs.ts_ms;
                     w.raw_resets_at_ms = obs.resets_at_ms;
+                    w.last_pct = obs.used_percent;
                     if let Some(p) = &obs.plan_type {
                         if w.plan != *p {
                             w.plan = p.clone();
@@ -427,9 +444,13 @@ impl WindowTracker {
                 }
             }
             None => {
-                // Unused limits slide resets_at continuously; a window is only
-                // born from a >0% observation (anchor stabilizes with usage).
-                if obs.used_percent <= 0.0 {
+                // Passively-extracted unused limits slide resets_at
+                // continuously (Phase 0: ~130s steps), so a window is only
+                // born from a >0% observation — unless the source vouches for
+                // anchor stability (Claude's active poller: a served
+                // resets_at is a real window even at 0%, and genuine zero-use
+                // weekly periods must exist for the overall mean).
+                if obs.used_percent <= 0.0 && !obs.anchor_stable {
                     return None;
                 }
                 // A resets_at already in the past is a stale replay: it may
@@ -448,6 +469,7 @@ impl WindowTracker {
                     first_seen_ms: obs.ts_ms,
                     window_minutes: obs.window_minutes,
                     peak_pct: obs.used_percent,
+                    last_pct: obs.used_percent,
                     maxed_out: obs.used_percent >= 99.995,
                     limit_reached_kind: if obs.limit_reached {
                         if obs.has_credits { REACHED_ON_CREDITS } else { REACHED_HARD_STOP }
@@ -536,7 +558,12 @@ pub fn codex_account_scope(codex_root: &str) -> String {
 /// (field-wise merge), so overlapping rescans are safe. Runs on its own thread,
 /// throttled, after cold start — deliberately outside the checkpointed
 /// cold-start path, which never revisits already-consumed files.
-pub fn run_windows_backfill(db: Arc<Database>, sessions_glob: String, account: String) {
+pub fn run_windows_backfill(
+    db: Arc<Database>,
+    db_tx: crossbeam_channel::Sender<crate::writer::DbOp>,
+    sessions_glob: String,
+    account: String,
+) {
     const FIRST_RUN_DAYS: i64 = 60;
     const CATCHUP_DAYS: i64 = 8;
     const MARKER_KEY: &str = "windows_scan_ms";
@@ -604,12 +631,24 @@ pub fn run_windows_backfill(db: Arc<Database>, sessions_glob: String, account: S
     writes.extend(tracker.finalize_expired(now_ms));
     writes.extend(tracker.flush_all());
 
+    // All window writes flow through the writer thread: upsert_window_merge
+    // is read-merge-write, and a direct write here could race a concurrent
+    // live-collection write for the same window (audit finding).
     let n = writes.len();
     for w in writes {
-        if let Err(e) = db.upsert_window_merge(&w.key, &w.snapshot) {
-            eprintln!("[toki] windows backfill write error: {}", e);
+        if db_tx.send(crate::writer::DbOp::WriteWindow(Box::new(w))).is_err() {
+            eprintln!("[toki] windows backfill: writer channel closed");
             return; // leave marker unset so the next start retries
         }
+    }
+    // Barrier: the writer processes its channel FIFO, so an acked flush op
+    // proves every window write above has been applied before the marker.
+    let (ack_tx, ack_rx) = crossbeam_channel::bounded::<()>(1);
+    if db_tx.send(crate::writer::DbOp::FlushBulkEvents(ack_tx)).is_err()
+        || ack_rx.recv_timeout(std::time::Duration::from_secs(60)).is_err()
+    {
+        eprintln!("[toki] windows backfill: flush barrier failed; marker not set");
+        return;
     }
     let _ = db.set_setting(MARKER_KEY, &now_ms.to_string());
     if n > 0 {
@@ -633,6 +672,7 @@ mod tests {
             plan_type: Some("prolite".to_string()),
             limit_reached: false,
             has_credits: false,
+            anchor_stable: false,
             ts_ms,
         }
     }
@@ -643,6 +683,7 @@ mod tests {
     fn window_snapshot_field_order_stable() {
         let snap = WindowSnapshotV1 {
             peak_pct_x100: 4250,
+            last_pct_x100: 4250,
             observed_ts_ms: 1_786_000_000_000,
             raw_resets_at_ms: 1_786_000_060_000,
             first_seen_ms: 1_785_999_000_000,
@@ -664,7 +705,7 @@ mod tests {
         let dec = WindowSnapshotV1::decode(&enc).unwrap();
         assert_eq!(dec, snap);
         // Layout fingerprint: version(1) + fixed fields + 3 length-prefixed strings.
-        let fixed = 2 + 8 + 8 + 8 + 4 + 1 + 1 + 1 + 8 + 8 + 8 + 2 + 4;
+        let fixed = 2 + 2 + 8 + 8 + 8 + 4 + 1 + 1 + 1 + 8 + 8 + 8 + 2 + 4;
         let strings = (8 + 5) + (8 + 7) + (8 + 4);
         assert_eq!(enc.len(), 1 + fixed + strings);
     }
@@ -750,6 +791,59 @@ mod tests {
     }
 
     #[test]
+    fn anchor_walk_is_bounded() {
+        // Repeated <=epsilon steps must not drift a window arbitrarily far
+        // from its immutable anchor (audit finding: raw-relative matching
+        // alone allows an unbounded walk).
+        let mut t = WindowTracker::new();
+        let base = 1_786_000_000_000i64;
+        let _ = t.observe(&obs("codex", 300, 10.0, base, base - 3_600_000));
+        // Walk in +100s steps: each within epsilon of the previous raw, but
+        // step 3 exceeds the anchor bound and must open a NEW window.
+        let _ = t.observe(&obs("codex", 300, 11.0, base + 100_000, base - 3_500_000));
+        let _ = t.observe(&obs("codex", 300, 12.0, base + 200_000, base - 3_400_000));
+        let _ = t.observe(&obs("codex", 300, 13.0, base + 300_000, base - 3_300_000));
+        assert!(t.open.len() >= 2, "walk past the anchor bound must split");
+        assert_eq!(t.open[0].anchor_min_ms, floor_to_minute(base));
+    }
+
+    #[test]
+    fn account_change_never_merges_into_old_row() {
+        let mut t = WindowTracker::new();
+        t.set_account("acct-a");
+        let reset = 1_786_000_000_000i64;
+        let _ = t.observe(&obs("codex", 300, 10.0, reset, reset - 3_600_000));
+        t.set_account("acct-b");
+        let _ = t.observe(&obs("codex", 300, 3.0, reset, reset - 3_000_000));
+        assert_eq!(t.open.len(), 2);
+        assert_ne!(t.open[0].account_hash, t.open[1].account_hash);
+    }
+
+    #[test]
+    fn zero_percent_opens_window_when_anchor_stable() {
+        // Claude's active poller vouches for the anchor: a genuine zero-use
+        // weekly window must exist (weekly overall mean would otherwise bias
+        // toward active weeks).
+        let mut t = WindowTracker::new();
+        let mut o = obs("seven_day", 10_080, 0.0, 1_786_000_000_000, 1_785_500_000_000);
+        o.anchor_stable = true;
+        assert!(t.observe(&o).is_some());
+        assert_eq!(t.open.len(), 1);
+        assert_eq!(t.open[0].peak_pct, 0.0);
+    }
+
+    #[test]
+    fn last_pct_tracks_latest_not_peak() {
+        let mut t = WindowTracker::new();
+        let reset = 1_774_793_876_000i64;
+        let _ = t.observe(&obs("codex", 10080, 26.0, reset, 1_774_200_000_000));
+        let _ = t.observe(&obs("codex", 10080, 0.0, reset, 1_774_226_000_000));
+        let w = &t.open[0];
+        assert_eq!(w.peak_pct, 26.0); // statistics keep the max
+        assert_eq!(w.last_pct, 0.0); // live display follows the raw value
+    }
+
+    #[test]
     fn stale_past_resets_never_open_windows() {
         let mut t = WindowTracker::new();
         // Observation timestamped long after its own reset time (log replay).
@@ -775,6 +869,7 @@ mod tests {
     fn merge_is_field_wise_not_row_lww() {
         let mut a = WindowSnapshotV1 {
             peak_pct_x100: 9000,
+            last_pct_x100: 9000,
             observed_ts_ms: 100,
             raw_resets_at_ms: 1_000,
             first_seen_ms: 50,
@@ -793,6 +888,7 @@ mod tests {
         };
         let b = WindowSnapshotV1 {
             peak_pct_x100: 4000, // older device saw lower peak
+            last_pct_x100: 400,  // raw dropped to 4% post server-reset
             observed_ts_ms: 200, // but observed later (post server-reset)
             raw_resets_at_ms: 1_060,
             first_seen_ms: 80,
