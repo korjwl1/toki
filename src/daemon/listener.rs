@@ -67,6 +67,18 @@ pub fn run_listener(
         }
     };
 
+    // Owner-only: the socket's mode is otherwise umask-dependent (a 002
+    // umask leaves it group-connectable). Everything it serves — usage data,
+    // auth state, forced provider-API refreshes — is for this user's own
+    // tools; other local users have no business connecting.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(0o600)) {
+            eprintln!("[toki:daemon] socket chmod failed: {}", e);
+        }
+    }
+
     // Non-blocking accept with 100ms sleep between attempts.
     // SO_RCVTIMEO does NOT affect accept() on macOS, so we use non-blocking mode.
     listener.set_nonblocking(true).ok();
@@ -133,6 +145,31 @@ pub fn run_listener(
     eprintln!("[toki:daemon] Listener stopped");
 }
 
+/// Read one '\n'-terminated line with a hard byte cap. `read_line` alone
+/// grows its String until the peer sends a newline — a hostile or broken
+/// local client could feed an endless unterminated stream and balloon the
+/// daemon's memory. Returns None on EOF, error, or cap overflow.
+fn read_line_limited(
+    reader: &mut BufReader<&UnixStream>,
+    max_bytes: u64,
+) -> Option<String> {
+    use std::io::Read;
+    let mut line = String::new();
+    let mut limited = reader.take(max_bytes);
+    match limited.read_line(&mut line) {
+        Ok(0) => None,
+        Ok(_) => {
+            // A cap-sized read without a trailing newline means truncation.
+            if !line.ends_with('\n') && line.len() as u64 >= max_bytes {
+                None
+            } else {
+                Some(line)
+            }
+        }
+        Err(_) => None,
+    }
+}
+
 /// Read the first line (command) and dispatch to the appropriate handler.
 fn handle_connection(
     stream: UnixStream,
@@ -144,10 +181,9 @@ fn handle_connection(
     stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
 
     let mut reader = BufReader::new(&stream);
-    let mut command_line = String::new();
-    if reader.read_line(&mut command_line).unwrap_or(0) == 0 {
+    let Some(command_line) = read_line_limited(&mut reader, 4 * 1024) else {
         return;
-    }
+    };
     let command = command_line.trim();
 
     match command {
@@ -163,18 +199,16 @@ fn handle_connection(
             // report runs under the single connection-worker cap — no separate
             // thread and no racy per-report counter.
             stream.set_read_timeout(Some(std::time::Duration::from_secs(60))).ok();
-            let mut payload_line = String::new();
-            if reader.read_line(&mut payload_line).unwrap_or(0) == 0 {
+            let Some(payload_line) = read_line_limited(&mut reader, 1024 * 1024) else {
                 return;
-            }
+            };
             handle_report_client(stream, &payload_line, dbs);
         }
         "WINDOWS" => {
             // Optional JSON request line: {"max_age_ms": 0} forces a bounded
             // revalidation; absent/large max_age serves the cached state.
             stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
-            let mut payload_line = String::new();
-            let _ = reader.read_line(&mut payload_line);
+            let payload_line = read_line_limited(&mut reader, 4 * 1024).unwrap_or_default();
             handle_windows_client(stream, &payload_line, dbs, windows_hub);
         }
         _ => {

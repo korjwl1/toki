@@ -1572,6 +1572,18 @@ fn dispatch_result_to_sink(
             // Typed pass-through — the grouped catch-all below would look for
             // usage_per_models, find none, and silently print nothing.
             if let Ok(rows) = serde_json::from_value::<Vec<toki::windows::WindowRow>>(item["data"].clone()) {
+                if rows.is_empty() {
+                    return;
+                }
+                // Same provider banner the sessions/projects listings print:
+                // rows from claude_code and codex are otherwise only
+                // distinguishable by limit_id.
+                if let Some(provider) = schema {
+                    let name = provider.provider_name();
+                    if !name.is_empty() {
+                        eprintln!("[toki] {}", name);
+                    }
+                }
                 sink.emit_windows(&rows);
             }
         }
