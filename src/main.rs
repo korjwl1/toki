@@ -564,11 +564,29 @@ const HOT_RELOAD_SETTINGS: &[&str] = &[
 fn handle_settings_set(key: &str, value: &str) {
     // Boolean settings: reject values we would otherwise silently coerce.
     // `window_polling off` used to mean "keep polling".
-    const BOOL_SETTINGS: &[&str] = &["window_tracking", "window_polling", "no_cost", "daemon_autostart"];
-    if BOOL_SETTINGS.contains(&key) && toki::config::parse_bool_setting(value).is_none() {
-        eprintln!("[toki] '{}' expects a boolean (true/false, on/off, yes/no, 1/0), got '{}'", key, value);
-        std::process::exit(1);
-    }
+    const BOOL_SETTINGS: &[&str] = &[
+        "window_tracking", "window_polling", "no_cost", "daemon_autostart",
+        "sync_enabled", "sync_tls", "sync_tls_insecure",
+    ];
+    // Normalize on WRITE rather than teaching every reader the full vocabulary:
+    // several readers (the TUI, sync toggles) compare against "true" verbatim,
+    // so `settings set sync_enabled on` would have been stored as-is and read
+    // as false. Canonical storage makes every reader agree.
+    let canonical;
+    let value = if BOOL_SETTINGS.contains(&key) {
+        match toki::config::parse_bool_setting(value) {
+            Some(b) => {
+                canonical = if b { "true" } else { "false" };
+                canonical
+            }
+            None => {
+                eprintln!("[toki] '{}' expects a boolean (true/false, on/off, yes/no, 1/0), got '{}'", key, value);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        value
+    };
     if !VALID_SETTINGS.contains(&key) {
         eprintln!("[toki] Unknown setting: {}", key);
         eprintln!("[toki] Valid keys: {}", VALID_SETTINGS.join(", "));

@@ -730,15 +730,16 @@ pub fn run_claude_poller(
                 // second request per attempt).
                 let token_hash = crate::windows::hash_str(&creds.access_token);
                 if !last_auth_ok || token_hash != last_token_hash {
+                    // Claude Code rotates its access token on its own schedule,
+                    // so a changed token usually means the SAME account. Only
+                    // re-resolve the profile; do not quarantine to "unknown"
+                    // here — a failing profile endpoint would then split every
+                    // observation into a second row for 10 minutes, and the
+                    // published account would disagree with what is written.
+                    // If the resolved scope really differs, the tracker's open
+                    // windows are re-keyed below.
                     profile = None;
                     profile_attempt_ms = 0; // token change bypasses the retry backoff
-                    // Until the NEW token's profile resolves, attribution must
-                    // not continue into the previous account's rows: quarantine
-                    // under "unknown" (consistent with backfill's policy —
-                    // unknown segments are excluded from advice).
-                    if token_hash != last_token_hash && last_token_hash != 0 {
-                        tracker.set_account("unknown");
-                    }
                 }
                 last_token_hash = token_hash;
                 match fetch_usage(&creds.access_token) {
@@ -749,6 +750,12 @@ pub fn run_claude_poller(
                         {
                             profile_attempt_ms = now;
                             if let Some(p) = fetch_profile(&creds.access_token) {
+                                // A genuinely different account: re-key the
+                                // windows opened under the old scope so they
+                                // are not merged into the new account's rows.
+                                if tracker.account() != p.account_scope {
+                                    tracker.reattribute_open(&p.account_scope);
+                                }
                                 tracker.set_account(&p.account_scope);
                                 let scope = p.account_scope.clone();
                                 profile = Some(p);
@@ -827,6 +834,11 @@ pub fn run_claude_poller(
                     backoff_until_ms = now + b;
                 }
                 hub.publish(|st| {
+                    if status == AuthStatus::Missing {
+                        // Logged out: stop naming the previous account, or the
+                        // monitor keeps filtering rows against a dead scope.
+                        st.account.clear();
+                    }
                     if status != AuthStatus::Ok {
                         st.auth_status = status;
                     } else {

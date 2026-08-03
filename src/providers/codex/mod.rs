@@ -6,10 +6,22 @@ pub(crate) use parser::parse_rate_limits_line;
 /// Resolve the Codex account scope from `<codex_root>/auth.json`, as a
 /// privacy-safe hash string. Returns "unknown" when unreadable.
 pub fn account_scope(codex_root: &str) -> String {
+    try_account_scope(codex_root).unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Like `account_scope`, but returns None when the file could not be READ or
+/// PARSED (a half-written auth.json during a token refresh) as opposed to
+/// legitimately absent. Callers that cache should keep their previous value
+/// on None — adopting "unknown" forks the tracker onto a second key.
+pub fn try_account_scope(codex_root: &str) -> Option<String> {
     let path = std::path::Path::new(codex_root).join("auth.json");
     let raw = match std::fs::read_to_string(&path) {
         Ok(s) => s,
-        Err(_) => return "unknown".to_string(),
+        // Absent = logged out, which IS "unknown"; anything else is transient.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Some("unknown".to_string())
+        }
+        Err(_) => return None,
     };
     #[derive(serde::Deserialize)]
     struct Auth {
@@ -20,11 +32,11 @@ pub fn account_scope(codex_root: &str) -> String {
         account_id: Option<String>,
     }
     match serde_json::from_str::<Auth>(&raw) {
-        Ok(a) => match a.tokens.and_then(|t| t.account_id) {
+        Ok(a) => Some(match a.tokens.and_then(|t| t.account_id) {
             Some(id) if !id.is_empty() => format!("{:016x}", crate::windows::hash_str(&id)),
             _ => "unknown".to_string(),
-        },
-        Err(_) => "unknown".to_string(),
+        }),
+        Err(_) => None,
     }
 }
 

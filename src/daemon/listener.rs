@@ -67,11 +67,22 @@ pub fn run_listener(
     // window would lose its x bit. Instead make the PARENT directory
     // owner-only — an unreachable path is unreachable regardless of the
     // socket's own mode.
+    // ONLY when the socket lives in toki's own config dir: daemon_sock is a
+    // user-settable path, and chmod-ing an arbitrary parent would silently
+    // lock down $HOME (or attempt /tmp) — never mutate directories we do not
+    // own. The 0600 socket mode plus the peer-uid check below carry the
+    // security property; this is defense in depth.
     #[cfg(unix)]
     if let Some(parent) = sock_path.parent() {
         use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)) {
-            eprintln!("[toki:daemon] could not restrict {}: {}", parent.display(), e);
+        let own_dir = crate::config::settings_file_path()
+            .parent()
+            .map(|p| p == parent)
+            .unwrap_or(false);
+        if own_dir {
+            if let Err(e) = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)) {
+                eprintln!("[toki:daemon] could not restrict {}: {}", parent.display(), e);
+            }
         }
     }
     let bind_result = UnixListener::bind(sock_path);
@@ -246,12 +257,22 @@ fn handle_connection(
             // so the 16-worker cap does NOT bound it. Cap subscribers
             // explicitly or N connections become 2N threads + N fds.
             stream.set_read_timeout(None).ok();
+            let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+            // Keep a handle for the reject path so the client gets the same
+            // busy JSON the connection cap sends, not a bare EOF.
+            let reject_handle = stream.try_clone().ok();
             // add_client admits atomically (CAS) and returns false at the cap —
             // a count-then-add check could admit past it under concurrent
             // accepts.
-            let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
-            if !broadcast.add_client(stream.try_clone().unwrap_or_else(|_| stream)) {
+            if !broadcast.add_client(stream) {
                 eprintln!("[toki:daemon] Too many trace clients, rejecting");
+                if let Some(h) = reject_handle {
+                    let busy = serde_json::json!({
+                        "ok": false,
+                        "error": "too many trace clients"
+                    });
+                    let _ = writeln!(&h, "{}", serde_json::to_string(&busy).unwrap_or_default());
+                }
                 return;
             }
             eprintln!("[toki:daemon] Trace client connected ({} total)", broadcast.client_count());
@@ -274,7 +295,10 @@ fn handle_connection(
         "WINDOWS" => {
             // Optional JSON request line: {"max_age_ms": 0} forces a bounded
             // revalidation; absent/large max_age serves the cached state.
-            stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+            // The payload line is OPTIONAL, so this read is expected to time
+            // out for clients that omit it — keep it short or every such
+            // request would pin a connection worker for 5s.
+            stream.set_read_timeout(Some(std::time::Duration::from_millis(300))).ok();
             stream.set_write_timeout(Some(std::time::Duration::from_secs(10))).ok();
             let payload_line = read_line_limited(&mut reader, 4 * 1024).unwrap_or_default();
             handle_windows_client(stream, &payload_line, dbs, windows_hub);
@@ -340,9 +364,12 @@ fn handle_windows_client(
     let mut providers = serde_json::Map::new();
     for (name, db) in dbs {
         let mut rows: Vec<crate::windows::WindowRow> = Vec::new();
-        let _ = db.for_each_window_in(now_ms - ROW_HORIZON_MS, i64::MAX, |key, snap| {
-            rows.push(crate::windows::WindowRow::from_stored(key, &snap));
-        });
+        let read_err = db
+            .for_each_window_in(now_ms - ROW_HORIZON_MS, i64::MAX, |key, snap| {
+                rows.push(crate::windows::WindowRow::from_stored(key, &snap));
+            })
+            .err()
+            .map(|e| e.to_string());
         rows.sort_by_key(|r| r.window_end_ms);
 
         let auth = match name.as_str() {
@@ -360,7 +387,10 @@ fn handle_windows_client(
                 // active horizon, defer to the (30s-cached) keychain read.
                 let published_fresh = claude_state.last_poll_ms > 0
                     && now_ms - claude_state.last_poll_ms < 30 * 60_000;
-                if hub.polling_enabled() && published_fresh {
+                // poller_running too: if the thread died, its last
+                // classification must not be served as authoritative for the
+                // next 30 minutes.
+                if hub.polling_enabled() && hub.poller_running() && published_fresh {
                     claude_state.auth_status.label().to_string()
                 } else {
                     hub.claude_auth_cached().label().to_string()
@@ -378,10 +408,17 @@ fn handle_windows_client(
             "codex" => Some(hub.codex_account_cached()),
             // Published by the poller after profile resolution — without it
             // the monitor cannot tell a superseded login's rows from the
-            // current one's for Claude either.
+            // current one's for Claude either. A daemon restarted on an idle
+            // machine never polls (activity gate), so fall back to the newest
+            // stored row's account (already in hand — no extra I/O).
             "claude_code" if !claude_state.account.is_empty() => {
                 Some(claude_state.account.clone())
             }
+            "claude_code" => rows
+                .iter()
+                .max_by_key(|r| r.observed_ts_ms)
+                .map(|r| r.account.clone())
+                .filter(|a| !a.is_empty()),
             _ => None,
         };
         let mut entry = serde_json::json!({
@@ -389,6 +426,11 @@ fn handle_windows_client(
             "auth_status": auth,
             "current_account": current_account,
         });
+        if let Some(err) = read_err {
+            // Distinguish "storage failed" from "no windows yet": the client
+            // otherwise silently treats a broken DB as an empty one.
+            entry["error"] = serde_json::json!(err);
+        }
         if name == "claude_code" {
             entry["extra_usage_enabled"] = serde_json::json!(claude_state.extra_usage_enabled);
             entry["last_success_ms"] = serde_json::json!(claude_state.last_success_ms);

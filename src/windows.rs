@@ -155,12 +155,17 @@ impl WindowSnapshotV1 {
         let Some((&version, body)) = bytes.split_first() else {
             return WindowDecode::Corrupt;
         };
-        if version > WINDOW_VALUE_VERSION {
-            return WindowDecode::FutureVersion;
-        }
-        match bincode::deserialize(body) {
-            Ok(s) => WindowDecode::Valid(s),
-            Err(_) => WindowDecode::Corrupt,
+        // Exhaustive on purpose: bincode is not self-describing, so bumping
+        // WINDOW_VALUE_VERSION without adding a migration arm here would make
+        // every stored V1 row decode as garbage (or "Corrupt", which REPLACES
+        // it). The match must stop compiling instead.
+        match version {
+            1 => match bincode::deserialize(body) {
+                Ok(s) => WindowDecode::Valid(s),
+                Err(_) => WindowDecode::Corrupt,
+            },
+            v if v > WINDOW_VALUE_VERSION => WindowDecode::FutureVersion,
+            _ => WindowDecode::Corrupt,
         }
     }
 
@@ -182,7 +187,15 @@ impl WindowSnapshotV1 {
             self.window_minutes = other.window_minutes;
             self.plan = other.plan.clone();
         }
-        self.first_seen_ms = self.first_seen_ms.min(other.first_seen_ms);
+        // Guarded like the server mirror (toki_sync events::merge_wire_windows):
+        // an unset first_seen must not win the min.
+        if other.first_seen_ms > 0 {
+            self.first_seen_ms = if self.first_seen_ms > 0 {
+                self.first_seen_ms.min(other.first_seen_ms)
+            } else {
+                other.first_seen_ms
+            };
+        }
         self.finalized |= other.finalized;
         self.maxed_out |= other.maxed_out;
         self.limit_reached_kind = self.limit_reached_kind.max(other.limit_reached_kind);
@@ -191,6 +204,13 @@ impl WindowSnapshotV1 {
             (a, b) => a.min(b),
         };
         self.active_ms = self.active_ms.max(other.active_ms);
+        // Re-assert to_snapshot's invariant: window_minutes follows the newer
+        // observation while active_ms takes the max, so a merge that shortens
+        // the window could otherwise leave the row violating it.
+        let cap = (self.window_minutes as u64).saturating_mul(60_000);
+        if self.active_ms > cap {
+            self.active_ms = cap;
+        }
         self.sampled_active_fraction = self.sampled_active_fraction.max(other.sampled_active_fraction);
         self.n_samples = self.n_samples.max(other.n_samples);
     }
@@ -653,8 +673,14 @@ impl CachedAccountScope {
         // cached "unknown" (an `is_none()` re-check re-read the file on
         // every call — exactly the cost this cache exists to avoid).
         if mtime != self.mtime {
-            self.mtime = mtime;
-            self.scope = codex_account_scope(&self.root);
+            // Only adopt a successfully parsed scope: a read landing mid-write
+            // (Codex rewrites auth.json on token refresh) would otherwise flip
+            // the tracker to "unknown", forking every open window onto a
+            // second key until the next mtime change.
+            if let Some(scope) = crate::providers::codex::try_account_scope(&self.root) {
+                self.mtime = mtime;
+                self.scope = scope;
+            }
         }
         &self.scope
     }
@@ -699,6 +725,12 @@ pub fn run_windows_backfill(
     // First run replays months of history that cannot be attributed to the
     // current login with confidence; catch-up scans cover recent days only.
     let first_run = last_scan_ms == 0;
+    // The first run keys months of history as "unknown" (it cannot be tied to
+    // the current login), but the NEXT run re-reads the same files from byte 0
+    // under the real account — so any window in the region both runs touch
+    // would exist twice under two keys. Switch to the real account at the
+    // catch-up boundary during the first run so the overlap merges instead.
+    let handover_ms = now_ms - CATCHUP_DAYS * 86_400_000;
     let scan_account = if first_run { "unknown".to_string() } else { account.clone() };
 
     let mut tracker = WindowTracker::new();
@@ -742,11 +774,27 @@ pub fn run_windows_backfill(
             let Some(obs) = crate::providers::codex::parse_rate_limits_line(line) else {
                 return;
             };
-            observations.extend([obs.primary, obs.secondary].into_iter().flatten());
+            // Per-observation cutoff: a long session file admitted by its
+            // mtime can carry observations far older than the lookback, and
+            // re-keying those on a later run is what forks a window into two
+            // rows. The first run's cutoff IS the full horizon, so it loses
+            // nothing.
+            observations.extend(
+                [obs.primary, obs.secondary]
+                    .into_iter()
+                    .flatten()
+                    .filter(|o| o.ts_ms >= cutoff_ms),
+            );
         });
-        if scan.is_err() {
-            io_errors += 1;
-            continue;
+        match scan {
+            Ok(_) => {}
+            // A file that vanished between the mtime filter and the open is
+            // nothing to read, not a failure.
+            Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                io_errors += 1;
+                continue;
+            }
         }
         files_scanned += 1;
         // Deliberate throttle: this is background work, never a startup burst.
@@ -756,19 +804,25 @@ pub fn run_windows_backfill(
 
     let mut writes: Vec<WindowWrite> = Vec::new();
     let mut idx = 0usize;
+    let mut handed_over = !first_run;
     while idx < observations.len() {
         let line_ts = observations[idx].ts_ms;
+        // Crossing into the region the next catch-up will re-cover: adopt the
+        // real account (and re-key anything still open) so both runs produce
+        // the same storage keys.
+        if !handed_over && line_ts >= handover_ms {
+            handed_over = true;
+            tracker.reattribute_open(&account);
+        }
         // Replay time only moves forward: close what this instant expires...
         writes.extend(tracker.finalize_expired(line_ts));
         // ...open every slot observed at this instant...
-        let start = idx;
         while idx < observations.len() && observations[idx].ts_ms == line_ts {
             let _ = tracker.observe(&observations[idx]);
             idx += 1;
         }
         // ...then credit the instant's activity ONCE (rate_limits rides
         // token_count lines, so one instant is one token-activity event).
-        let _ = start;
         tracker.observe_activity(line_ts);
     }
     writes.extend(tracker.finalize_expired(now_ms));
@@ -800,11 +854,16 @@ pub fn run_windows_backfill(
         eprintln!("[toki] windows backfill: flush barrier failed; marker not set");
         return;
     }
-    // Partial I/O failure leaves the marker untouched so the next start
-    // rescans (idempotent merge makes the overlap free).
+    // A TOTAL failure leaves the marker untouched so the next start retries.
+    // A partial one must NOT: a single permanently unreadable file would
+    // otherwise pin the daemon in first-run mode forever — re-scanning 60 days
+    // on every start and re-attributing all history to "unknown".
     if io_errors > 0 {
-        eprintln!("[toki] windows backfill: {io_errors} files unreadable; marker not advanced");
-        return;
+        eprintln!("[toki] windows backfill: {io_errors} files unreadable");
+        if files_scanned == 0 {
+            eprintln!("[toki] windows backfill: nothing readable; marker not advanced");
+            return;
+        }
     }
     let _ = db.set_setting(MARKER_KEY, &now_ms.to_string());
     if n > 0 {

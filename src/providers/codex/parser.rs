@@ -367,7 +367,13 @@ pub(crate) fn parse_rate_limits_line(line: &str) -> Option<crate::common::types:
     }
     let ts_ms = crate::common::time::parse_ts_to_ms(header.timestamp.unwrap_or(""))?;
     let parsed: CodexEventMsgLine = serde_json::from_str(line).ok()?;
-    let raw = parsed.payload?.rate_limits?;
+    let payload = parsed.payload?;
+    // Same gate as the live path: only token_count carries rate_limits today,
+    // and without this the two would silently disagree if that ever changed.
+    if payload.payload_type != Some("token_count") {
+        return None;
+    }
+    let raw = payload.rate_limits?;
     parse_rate_limits_json(raw.get(), ts_ms)
 }
 

@@ -135,7 +135,9 @@ impl Config {
             }
         }
         if let Some(v) = settings.get("no_cost").and_then(|v| v.as_str()) {
-            self.no_cost = v == "true";
+            // Shared parser: `settings set` advertises on/off/yes/no, so a
+            // loader that only accepted "true" made those silently no-ops.
+            if let Some(b) = parse_bool_setting(v) { self.no_cost = b; }
         }
         if let Some(v) = settings.get("output_format").and_then(|v| v.as_str()) {
             if v == "table" || v == "json" {

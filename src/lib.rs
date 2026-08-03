@@ -168,7 +168,10 @@ impl Drop for Handle {
 pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
     let retention = RetentionPolicy {
         event_retention_days: config.retention_days,
-        window_retention_days: if config.window_tracking { config.window_retention_days } else { 0 },
+        // Applied regardless of window_tracking: turning collection off must
+        // not strand existing rows forever while the retention pass still
+        // scans and finalizes them every day.
+        window_retention_days: config.window_retention_days,
     };
 
     // Migrate legacy toki.fjall → claude_code.fjall if needed
