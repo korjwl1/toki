@@ -245,11 +245,15 @@ fn handle_windows_client(
 
         let auth = match name.as_str() {
             "claude_code" => {
-                if hub.polling_enabled() {
+                // The poller's classification is authoritative only once it
+                // has actually attempted a poll. A daemon (re)started on an
+                // idle machine never polls (activity gate) and its default
+                // state is Missing — serving that told the monitor the user
+                // was logged out, forever. Fall back to the 30s-cached
+                // keychain classification until the first attempt.
+                if hub.polling_enabled() && claude_state.last_poll_ms > 0 {
                     claude_state.auth_status.label().to_string()
                 } else {
-                    // 30s-cached: this runs at widget-poll rate and would
-                    // otherwise spawn a `security` subprocess per request.
                     hub.claude_auth_cached().label().to_string()
                 }
             }
