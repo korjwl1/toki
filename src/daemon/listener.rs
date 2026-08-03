@@ -59,7 +59,18 @@ pub fn run_listener(
         let _ = std::fs::remove_file(sock_path);
     }
 
-    let listener = match UnixListener::bind(sock_path) {
+    // Owner-only from the instant it exists: bind() applies the process
+    // umask, so a post-bind chmod leaves a window in which another local user
+    // can connect (and a connection made inside that window survives the
+    // chmod). Tighten the umask across bind, then verify.
+    #[cfg(unix)]
+    let prev_umask = unsafe { libc::umask(0o177) };
+    let bind_result = UnixListener::bind(sock_path);
+    #[cfg(unix)]
+    unsafe {
+        libc::umask(prev_umask);
+    }
+    let listener = match bind_result {
         Ok(l) => l,
         Err(e) => {
             eprintln!("[toki:daemon] Failed to bind {}: {}", sock_path.display(), e);
@@ -67,15 +78,17 @@ pub fn run_listener(
         }
     };
 
-    // Owner-only: the socket's mode is otherwise umask-dependent (a 002
-    // umask leaves it group-connectable). Everything it serves — usage data,
-    // auth state, forced provider-API refreshes — is for this user's own
-    // tools; other local users have no business connecting.
+    // Belt and braces, and FATAL on failure: everything this socket serves —
+    // usage data, auth state, forced provider-API refreshes — belongs to this
+    // user's own tools. Serving it on a world/group-connectable socket is
+    // worse than not serving it.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         if let Err(e) = std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(0o600)) {
-            eprintln!("[toki:daemon] socket chmod failed: {}", e);
+            eprintln!("[toki:daemon] socket chmod failed ({}), refusing to listen", e);
+            let _ = std::fs::remove_file(sock_path);
+            return;
         }
     }
 
@@ -95,6 +108,17 @@ pub fn run_listener(
         match listener.accept() {
             Ok((stream, _addr)) => {
                 stream.set_nonblocking(false).ok();
+                // Defense in depth: reject any peer that is not this daemon's
+                // own uid, whatever the socket mode ended up being (a
+                // connection established during a mode gap, or an
+                // administrator loosening it later).
+                #[cfg(unix)]
+                {
+                    if !peer_is_owner(&stream) {
+                        eprintln!("[toki:daemon] rejecting connection from another uid");
+                        continue;
+                    }
+                }
                 // Acquire a worker permit BEFORE spawning: at capacity we reject
                 // inline (no thread) so a flood of idle clients can never exhaust
                 // threads. The permit is moved into the worker and dropped when it
@@ -145,6 +169,30 @@ pub fn run_listener(
     eprintln!("[toki:daemon] Listener stopped");
 }
 
+/// True when the connected peer runs as this process's uid. `getpeereid` is
+/// the documented BSD/macOS API for local peer credentials; on other unixes
+/// the SO_PEERCRED equivalents differ, so we fail open there rather than
+/// break the socket (mode 0600 remains the primary control).
+#[cfg(unix)]
+fn peer_is_owner(stream: &UnixStream) -> bool {
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
+    {
+        use std::os::unix::io::AsRawFd;
+        let mut euid: libc::uid_t = 0;
+        let mut egid: libc::gid_t = 0;
+        let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut euid, &mut egid) };
+        if rc != 0 {
+            return true; // cannot determine — mode 0600 already gates this
+        }
+        euid == unsafe { libc::geteuid() }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd")))]
+    {
+        let _ = stream;
+        true
+    }
+}
+
 /// Read one '\n'-terminated line with a hard byte cap. `read_line` alone
 /// grows its String until the peer sends a newline — a hostile or broken
 /// local client could feed an endless unterminated stream and balloon the
@@ -188,6 +236,20 @@ fn handle_connection(
 
     match command {
         "TRACE" => {
+            // TRACE hands the stream to the broadcaster and releases its
+            // worker permit immediately (two long-lived threads per client),
+            // so the 16-worker cap does NOT bound it. Cap subscribers
+            // explicitly or N connections become 2N threads + N fds.
+            const MAX_TRACE_CLIENTS: usize = 16;
+            if broadcast.client_count() >= MAX_TRACE_CLIENTS {
+                eprintln!("[toki:daemon] Too many trace clients, rejecting");
+                let busy = serde_json::json!({
+                    "ok": false,
+                    "error": "too many trace clients"
+                });
+                let _ = writeln!(&stream, "{}", serde_json::to_string(&busy).unwrap_or_default());
+                return;
+            }
             stream.set_read_timeout(None).ok();
             let count = broadcast.client_count() + 1;
             eprintln!("[toki:daemon] Trace client connected ({} total)", count);
@@ -295,9 +357,19 @@ fn handle_windows_client(
             _ => "unknown".to_string(),
         };
 
+        // Current account scope so a client can ignore rows still open under
+        // a previous login (they linger until their own reset).
+        let current_account = match name.as_str() {
+            "codex" => hub
+                .codex_root
+                .as_deref()
+                .map(crate::providers::codex::account_scope),
+            _ => None,
+        };
         let mut entry = serde_json::json!({
             "windows": serde_json::to_value(&rows).unwrap_or(serde_json::Value::Array(vec![])),
             "auth_status": auth,
+            "current_account": current_account,
         });
         if name == "claude_code" {
             entry["extra_usage_enabled"] = serde_json::json!(claude_state.extra_usage_enabled);

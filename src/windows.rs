@@ -403,7 +403,11 @@ impl WindowTracker {
             0
         };
         if credit > 0 {
-            for w in &mut self.open {
+            // ONLY the current account's windows: after a switch the previous
+            // account's still-open rows must not absorb the new account's
+            // activity (max-merge would make that permanent at finalize).
+            let current = self.account_hash;
+            for w in self.open.iter_mut().filter(|w| w.account_hash == current) {
                 w.active_ms = w.active_ms.saturating_add(credit);
             }
         }
@@ -552,6 +556,11 @@ impl WindowTracker {
                 Some(write)
             }
         }
+    }
+
+    /// Account scope currently applied to new windows.
+    pub fn account(&self) -> &str {
+        &self.account
     }
 
     /// Raw reset instants of currently open windows (poller confirm scheduling).
