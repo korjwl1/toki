@@ -87,6 +87,8 @@ pub struct PublishedState {
     pub last_success_ms: i64,
     pub last_poll_ms: i64,
     pub plan: String,
+    /// Account scope currently being collected under ("" until resolved).
+    pub account: String,
     /// Claude extra-usage (pay-per-overflow) enabled on the account.
     pub extra_usage_enabled: bool,
     /// Refresh bookkeeping: a WINDOWS request with max_age=0 bumps want_seq;
@@ -102,6 +104,7 @@ impl Default for PublishedState {
             last_success_ms: 0,
             last_poll_ms: 0,
             plan: String::new(),
+            account: String::new(),
             extra_usage_enabled: false,
             want_seq: 0,
             done_seq: 0,
@@ -747,8 +750,10 @@ pub fn run_claude_poller(
                             profile_attempt_ms = now;
                             if let Some(p) = fetch_profile(&creds.access_token) {
                                 tracker.set_account(&p.account_scope);
+                                let scope = p.account_scope.clone();
                                 profile = Some(p);
                                 profile_fetched_ms = now;
+                                hub.publish(|st| st.account = scope);
                             }
                         }
                         Ok(usage)

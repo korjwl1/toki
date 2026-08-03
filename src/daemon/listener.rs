@@ -376,6 +376,12 @@ fn handle_windows_client(
             // Cached: this runs at widget-poll rate and account_scope() is a
             // full read+parse of auth.json (parity with the two auth caches).
             "codex" => Some(hub.codex_account_cached()),
+            // Published by the poller after profile resolution — without it
+            // the monitor cannot tell a superseded login's rows from the
+            // current one's for Claude either.
+            "claude_code" if !claude_state.account.is_empty() => {
+                Some(claude_state.account.clone())
+            }
             _ => None,
         };
         let mut entry = serde_json::json!({
