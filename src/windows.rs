@@ -602,6 +602,22 @@ impl WindowTracker {
         writes
     }
 
+    /// Re-attribute every still-open window to `account_scope`.
+    ///
+    /// Backfill's first run replays months of history under "unknown"
+    /// (old observations cannot be tied to the current login), but the
+    /// windows still OPEN at the end of that replay are the current login's
+    /// — and the live tracker keys them under the real account. Without this
+    /// they would be written a second time under a different key.
+    pub fn reattribute_open(&mut self, account_scope: &str) {
+        let hash = hash_str(account_scope);
+        for w in &mut self.open {
+            w.account = account_scope.to_string();
+            w.account_hash = hash;
+        }
+        self.set_account(account_scope);
+    }
+
     /// Flush all open windows without finalizing (daemon shutdown).
     pub fn flush_all(&mut self) -> Vec<WindowWrite> {
         self.open
@@ -683,7 +699,7 @@ pub fn run_windows_backfill(
     // First run replays months of history that cannot be attributed to the
     // current login with confidence; catch-up scans cover recent days only.
     let first_run = last_scan_ms == 0;
-    let scan_account = if first_run { "unknown".to_string() } else { account };
+    let scan_account = if first_run { "unknown".to_string() } else { account.clone() };
 
     let mut tracker = WindowTracker::new();
     tracker.set_account(&scan_account);
@@ -756,13 +772,14 @@ pub fn run_windows_backfill(
         tracker.observe_activity(line_ts);
     }
     writes.extend(tracker.finalize_expired(now_ms));
-    // On the first run the scan is attributed to "unknown", so any window
-    // still OPEN right now would be written a second time under a different
-    // account key — the live tracker already owns those. Emit only closed
-    // windows; catch-up runs (real account) flush normally.
-    if !first_run {
-        writes.extend(tracker.flush_all());
+    // Windows still open at the end of the replay belong to the CURRENT
+    // login, whatever the historical rows were attributed to — re-key them so
+    // they merge with the live tracker's rows instead of duplicating under
+    // "unknown".
+    if first_run {
+        tracker.reattribute_open(&account);
     }
+    writes.extend(tracker.flush_all());
 
     // All window writes flow through the writer thread: upsert_window_merge
     // is read-merge-write, and a direct write here could race a concurrent
