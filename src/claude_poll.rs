@@ -72,6 +72,11 @@ impl AuthStatus {
 struct Signal {
     token_flow: bool,
     refresh: bool,
+    /// Generic "re-evaluate now" nudge (settings change). A bare notify is
+    /// indistinguishable from a spurious wakeup: wait_timeout_while re-checks
+    /// its predicate and sleeps out the REMAINING duration, so a state flag
+    /// is required to actually shorten an hour-long idle sleep.
+    wake: bool,
     stop: bool,
 }
 
@@ -129,6 +134,8 @@ pub struct PollerHub {
     /// Same 30s cache for Codex: auth.json was re-read and DOM-parsed on
     /// every WINDOWS request.
     codex_auth_cache: Mutex<(i64, AuthStatus)>,
+    /// 30s cache for the Codex account scope (same file, same rate).
+    codex_account_cache: Mutex<(i64, String)>,
 }
 
 impl PollerHub {
@@ -143,7 +150,27 @@ impl PollerHub {
             poller_running: std::sync::atomic::AtomicBool::new(false),
             fallback_auth: Mutex::new((0, AuthStatus::Missing)),
             codex_auth_cache: Mutex::new((0, AuthStatus::Missing)),
+            codex_account_cache: Mutex::new((0, String::new())),
         }
+    }
+
+    /// Codex account scope with a 30s cache (WINDOWS-handler rate).
+    pub fn codex_account_cached(&self) -> String {
+        const TTL_MS: i64 = 30_000;
+        let now = now_ms();
+        {
+            let cached = self.codex_account_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if now - cached.0 < TTL_MS && !cached.1.is_empty() {
+                return cached.1.clone();
+            }
+        }
+        let scope = self
+            .codex_root
+            .as_deref()
+            .map(crate::providers::codex::account_scope)
+            .unwrap_or_else(|| "unknown".to_string());
+        *self.codex_account_cache.lock().unwrap_or_else(|e| e.into_inner()) = (now, scope.clone());
+        scope
     }
 
     /// Codex auth classification with a 30s cache (WINDOWS-handler rate).
@@ -205,7 +232,9 @@ impl PollerHub {
     /// (window_tracking) pipeline is engine-embedded and stays restart-bound.
     pub fn set_polling_enabled(&self, enabled: bool) {
         self.polling_enabled.store(enabled, Ordering::Relaxed);
-        let (_, cvar) = &self.signal;
+        let (lock, cvar) = &self.signal;
+        let mut s = lock.lock().unwrap_or_else(|e| e.into_inner());
+        s.wake = true;
         cvar.notify_all();
     }
 
@@ -248,10 +277,11 @@ impl PollerHub {
         };
         {
             let (lock, cvar) = &self.signal;
-            if let Ok(mut s) = lock.lock() {
-                s.refresh = true;
-                cvar.notify_all();
-            }
+            // into_inner like every other hub method: dropping this signal
+            // would burn the caller's full wait and report refreshing forever.
+            let mut s = lock.lock().unwrap_or_else(|e| e.into_inner());
+            s.refresh = true;
+            cvar.notify_all();
         }
         let (lock, cvar) = &self.state;
         let guard = match lock.lock() {
@@ -532,7 +562,16 @@ pub fn run_claude_poller(
     db_tx: crossbeam_channel::Sender<DbOp>,
     claude_root: String,
 ) {
+    // RAII: a panic anywhere below must not leave poller_running=true, or
+    // every forced refresh burns its full 2s wait against a dead thread.
+    struct RunningGuard(Arc<PollerHub>);
+    impl Drop for RunningGuard {
+        fn drop(&mut self) {
+            self.0.set_poller_running(false);
+        }
+    }
     hub.set_poller_running(true);
+    let _running_guard = RunningGuard(hub.clone());
     let mut tracker = WindowTracker::new();
     let mut last_poll_ms: i64 = 0;
     let mut consecutive_failures: u32 = 0;
@@ -596,7 +635,9 @@ pub fn run_claude_poller(
                 Err(e) => e.into_inner(),
             };
             let (mut s, _t) = cvar
-                .wait_timeout_while(guard, wait, |s| !s.token_flow && !s.refresh && !s.stop)
+                .wait_timeout_while(guard, wait, |s| {
+                    !s.token_flow && !s.refresh && !s.wake && !s.stop
+                })
                 .unwrap_or_else(|e| {
                     let g = e.into_inner();
                     (g.0, g.1)
@@ -604,6 +645,7 @@ pub fn run_claude_poller(
             let out = (s.token_flow, s.refresh, s.stop);
             s.token_flow = false;
             s.refresh = false;
+            s.wake = false;
             out
         };
 
@@ -735,8 +777,13 @@ pub fn run_claude_poller(
                 last_auth_ok = true;
                 let plan = profile.as_ref().map(|p| p.plan.as_str()).unwrap_or("");
                 let observations = observations_from_usage(&usage, plan, now);
+                // Densify on the SESSION window only: a weekly bucket sits
+                // above 90% for days on a heavy plan, and 30s polling buys
+                // 0.03% of extra time_to_100 precision on a 7-day window
+                // while quadrupling calls to a rate-limit-sensitive endpoint.
                 peak_hint = observations
                     .iter()
+                    .filter(|o| o.window_minutes <= 24 * 60)
                     .map(|o| o.used_percent)
                     .fold(0.0, f64::max);
                 for obs in &observations {

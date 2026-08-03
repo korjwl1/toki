@@ -175,6 +175,11 @@ impl WindowSnapshotV1 {
             self.raw_resets_at_ms = other.raw_resets_at_ms;
             self.last_sample_gap_ms = other.last_sample_gap_ms;
             self.last_pct_x100 = other.last_pct_x100;
+            // Travels with raw_resets_at_ms: a provider changing its window
+            // length would otherwise leave the first writer's duration
+            // against a later writer's reset (it feeds time_to_100 and the
+            // active_ms clamp).
+            self.window_minutes = other.window_minutes;
             self.plan = other.plan.clone();
         }
         self.first_seen_ms = self.first_seen_ms.min(other.first_seen_ms);
@@ -507,12 +512,27 @@ impl WindowTracker {
                 // anchor stability (Claude's active poller: a served
                 // resets_at is a real window even at 0%, and genuine zero-use
                 // weekly periods must exist for the overall mean).
-                if obs.used_percent <= 0.0 && !obs.anchor_stable {
+                // The exception exists so genuine zero-use WEEKLY periods
+                // enter the overall mean. A synthetic 0% session window is not
+                // that: it would add an untouched row to the 5h duty-cycle and
+                // active-mean statistics, and it is the shape most at risk if
+                // a provider ever slides an unused window's resets_at.
+                if obs.used_percent <= 0.0
+                    && !(obs.anchor_stable && kind == WindowKind::Weekly)
+                {
                     return None;
                 }
-                // A resets_at already in the past is a stale replay: it may
-                // only finalize an existing row, never open a new one.
-                if obs.resets_at_ms + ANCHOR_EPSILON_MS < obs.ts_ms {
+                // A resets_at already past is a stale replay: it may only
+                // finalize an existing row, never open a new one.
+                //
+                // The tolerance must stay BELOW `FINALIZE_GRACE_MS − max
+                // observed jitter (93s)`, or a late sample carrying a
+                // positively-jittered reset slips between the close cutoff and
+                // the reopen cutoff and mints a ghost row at a second anchor
+                // that nothing ever merges away. 60s satisfies that
+                // (93 + 60 < 180) while still tolerating clock skew.
+                const REOPEN_TOLERANCE_MS: i64 = 60_000;
+                if obs.resets_at_ms + REOPEN_TOLERANCE_MS < obs.ts_ms {
                     return None;
                 }
                 let w = OpenWindow {
@@ -662,7 +682,8 @@ pub fn run_windows_backfill(
     let cutoff_ms = now_ms - lookback_ms;
     // First run replays months of history that cannot be attributed to the
     // current login with confidence; catch-up scans cover recent days only.
-    let scan_account = if last_scan_ms == 0 { "unknown".to_string() } else { account };
+    let first_run = last_scan_ms == 0;
+    let scan_account = if first_run { "unknown".to_string() } else { account };
 
     let mut tracker = WindowTracker::new();
     tracker.set_account(&scan_account);
@@ -684,7 +705,15 @@ pub fn run_windows_backfill(
         .collect();
     paths.sort(); // filename order == chronological order for rollout files
 
-    let mut writes: Vec<WindowWrite> = Vec::new();
+    // Collect observations from every file FIRST, then replay in global
+    // timestamp order. Rollout sessions overlap in wall-clock time (a long
+    // session spans files that sort after it), so a per-file replay drives
+    // the tracker's clock BACKWARDS at each file boundary: activity gaps go
+    // negative (credit 0 — measured ~25% of historical active time lost) and
+    // finalize_expired closes windows that a later-read, earlier-timestamped
+    // file then re-opens under a second anchor. Only the observations are
+    // buffered (a few thousand), never the file text.
+    let mut observations: Vec<crate::common::types::WindowObservation> = Vec::new();
     for path in paths {
         let path_str = path.to_string_lossy();
         // Zero-alloc line reader (mmap + memchr) — the same one the watch hot
@@ -697,29 +726,7 @@ pub fn run_windows_backfill(
             let Some(obs) = crate::providers::codex::parse_rate_limits_line(line) else {
                 return;
             };
-            // Replay time advances with the observations: windows whose
-            // reset has passed must close AS THE SCAN PROGRESSES (leaving the
-            // whole range open at once made the earliest window absorb every
-            // hour of activity, permanently, via the max-merge).
-            let line_ts = obs
-                .primary
-                .as_ref()
-                .or(obs.secondary.as_ref())
-                .map(|o| o.ts_ms)
-                .unwrap_or(0);
-            writes.extend(tracker.finalize_expired(line_ts));
-            // Open BOTH slots of the line before crediting its activity once:
-            // per-slot interleaving gave the first slot the line's credit and
-            // the second slot nothing.
-            for o in [obs.primary.as_ref(), obs.secondary.as_ref()].into_iter().flatten() {
-                // Intermediate observe() writes are discarded (the tracker
-                // still updates its open windows); finalized + final
-                // snapshots are the only ones sent.
-                let _ = tracker.observe(o);
-            }
-            // rate_limits rides token_count lines: the line IS one
-            // token-activity instant.
-            tracker.observe_activity(line_ts);
+            observations.extend([obs.primary, obs.secondary].into_iter().flatten());
         });
         if scan.is_err() {
             io_errors += 1;
@@ -729,8 +736,33 @@ pub fn run_windows_backfill(
         // Deliberate throttle: this is background work, never a startup burst.
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
+    observations.sort_by_key(|o| o.ts_ms);
+
+    let mut writes: Vec<WindowWrite> = Vec::new();
+    let mut idx = 0usize;
+    while idx < observations.len() {
+        let line_ts = observations[idx].ts_ms;
+        // Replay time only moves forward: close what this instant expires...
+        writes.extend(tracker.finalize_expired(line_ts));
+        // ...open every slot observed at this instant...
+        let start = idx;
+        while idx < observations.len() && observations[idx].ts_ms == line_ts {
+            let _ = tracker.observe(&observations[idx]);
+            idx += 1;
+        }
+        // ...then credit the instant's activity ONCE (rate_limits rides
+        // token_count lines, so one instant is one token-activity event).
+        let _ = start;
+        tracker.observe_activity(line_ts);
+    }
     writes.extend(tracker.finalize_expired(now_ms));
-    writes.extend(tracker.flush_all());
+    // On the first run the scan is attributed to "unknown", so any window
+    // still OPEN right now would be written a second time under a different
+    // account key — the live tracker already owns those. Emit only closed
+    // windows; catch-up runs (real account) flush normally.
+    if !first_run {
+        writes.extend(tracker.flush_all());
+    }
 
     // All window writes flow through the writer thread: upsert_window_merge
     // is read-merge-write, and a direct write here could race a concurrent
@@ -982,13 +1014,40 @@ mod tests {
     }
 
     #[test]
+    fn zero_percent_session_never_opens_even_when_anchor_stable() {
+        // The exception is for genuine zero-use WEEKLY periods; a synthetic
+        // 0% session row would pollute the 5h duty-cycle statistics.
+        let mut t = WindowTracker::new();
+        let mut o = obs("five_hour", 300, 0.0, 1_786_000_000_000, 1_785_999_000_000);
+        o.anchor_stable = true;
+        assert!(t.observe(&o).is_none());
+        assert!(t.open.is_empty());
+    }
+
+    #[test]
+    fn late_jittered_sample_cannot_mint_a_ghost_row() {
+        // A sample arriving after finalize, with a positively-jittered reset,
+        // used to slip between the epsilon (120s) and the grace (180s) and
+        // open a second anchor for a window that was already closed.
+        let mut t = WindowTracker::new();
+        let reset = 1_786_000_000_000i64;
+        let _ = t.observe(&obs("codex", 300, 40.0, reset, reset - 3_600_000));
+        let closed = t.finalize_expired(reset + FINALIZE_GRACE_MS + 1);
+        assert_eq!(closed.len(), 1);
+        // ts is past reset+grace; a +90s jittered reset must NOT reopen.
+        let late = obs("codex", 300, 41.0, reset + 90_000, reset + FINALIZE_GRACE_MS + 30_000);
+        assert!(t.observe(&late).is_none());
+        assert!(t.open.is_empty());
+    }
+
+    #[test]
     fn zero_percent_opens_window_when_anchor_stable() {
         // Claude's active poller vouches for the anchor: a genuine zero-use
         // weekly window must exist (weekly overall mean would otherwise bias
         // toward active weeks).
         let mut t = WindowTracker::new();
         let mut o = obs("seven_day", 10_080, 0.0, 1_786_000_000_000, 1_785_500_000_000);
-        o.anchor_stable = true;
+        o.anchor_stable = true; // weekly: the documented exception
         assert!(t.observe(&o).is_some());
         assert_eq!(t.open.len(), 1);
         assert_eq!(t.open[0].peak_pct, 0.0);

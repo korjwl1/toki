@@ -604,7 +604,7 @@ fn handle_settings_change(
     // Hot-reload: active window polling can be toggled without a restart.
     if let Some(hub) = windows_hub {
         let enabled = config::get_setting("window_polling")
-            .map(|v| v != "false" && v != "0")
+            .and_then(|v| config::parse_bool_setting(&v))
             .unwrap_or(true);
         if hub.polling_enabled() != enabled {
             eprintln!("[toki:settings-watcher] window_polling → {}", enabled);

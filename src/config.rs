@@ -116,10 +116,10 @@ impl Config {
             if let Ok(n) = v.parse::<u32>() { self.retention_days = n; }
         }
         if let Some(v) = settings.get("window_tracking").and_then(|v| v.as_str()) {
-            self.window_tracking = v != "false" && v != "0";
+            if let Some(b) = parse_bool_setting(v) { self.window_tracking = b; }
         }
         if let Some(v) = settings.get("window_polling").and_then(|v| v.as_str()) {
-            self.window_polling = v != "false" && v != "0";
+            if let Some(b) = parse_bool_setting(v) { self.window_polling = b; }
         }
         if let Some(v) = settings.get("window_retention_days").and_then(|v| v.as_str()) {
             if let Ok(n) = v.parse::<u32>() { self.window_retention_days = n; }
@@ -186,6 +186,18 @@ pub fn device_id() -> String {
 // ── File-based settings ──
 
 /// Default settings file path.
+/// Parse a boolean setting. Deliberately strict: `window_polling` exists so a
+/// user can stop the daemon from calling a provider API, and the old
+/// `v != "false"` form silently treated `off`/`no`/`False` as ENABLED.
+/// Unrecognized values keep the default (and `settings set` rejects them).
+pub fn parse_bool_setting(v: &str) -> Option<bool> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
 pub fn settings_file_path() -> PathBuf {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
     home.join(".config").join("toki").join("settings.json")

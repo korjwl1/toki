@@ -59,17 +59,22 @@ pub fn run_listener(
         let _ = std::fs::remove_file(sock_path);
     }
 
-    // Owner-only from the instant it exists: bind() applies the process
-    // umask, so a post-bind chmod leaves a window in which another local user
-    // can connect (and a connection made inside that window survives the
-    // chmod). Tighten the umask across bind, then verify.
+    // Owner-only from the instant it exists. bind() applies the process
+    // umask, so a post-bind chmod alone leaves a window in which another local
+    // user can connect (and such a connection survives the chmod). Closing it
+    // by flipping the process-global umask would be worse: this daemon is
+    // multi-threaded by now, and any DIRECTORY another thread creates in that
+    // window would lose its x bit. Instead make the PARENT directory
+    // owner-only — an unreachable path is unreachable regardless of the
+    // socket's own mode.
     #[cfg(unix)]
-    let prev_umask = unsafe { libc::umask(0o177) };
-    let bind_result = UnixListener::bind(sock_path);
-    #[cfg(unix)]
-    unsafe {
-        libc::umask(prev_umask);
+    if let Some(parent) = sock_path.parent() {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)) {
+            eprintln!("[toki:daemon] could not restrict {}: {}", parent.display(), e);
+        }
     }
+    let bind_result = UnixListener::bind(sock_path);
     let listener = match bind_result {
         Ok(l) => l,
         Err(e) => {
@@ -240,20 +245,16 @@ fn handle_connection(
             // worker permit immediately (two long-lived threads per client),
             // so the 16-worker cap does NOT bound it. Cap subscribers
             // explicitly or N connections become 2N threads + N fds.
-            const MAX_TRACE_CLIENTS: usize = 16;
-            if broadcast.client_count() >= MAX_TRACE_CLIENTS {
+            stream.set_read_timeout(None).ok();
+            // add_client admits atomically (CAS) and returns false at the cap —
+            // a count-then-add check could admit past it under concurrent
+            // accepts.
+            let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
+            if !broadcast.add_client(stream.try_clone().unwrap_or_else(|_| stream)) {
                 eprintln!("[toki:daemon] Too many trace clients, rejecting");
-                let busy = serde_json::json!({
-                    "ok": false,
-                    "error": "too many trace clients"
-                });
-                let _ = writeln!(&stream, "{}", serde_json::to_string(&busy).unwrap_or_default());
                 return;
             }
-            stream.set_read_timeout(None).ok();
-            let count = broadcast.client_count() + 1;
-            eprintln!("[toki:daemon] Trace client connected ({} total)", count);
-            broadcast.add_client(stream);
+            eprintln!("[toki:daemon] Trace client connected ({} total)", broadcast.client_count());
         }
         "REPORT" => {
             // Read the next line as JSON payload, then serve inline. This worker
@@ -261,6 +262,10 @@ fn handle_connection(
             // report runs under the single connection-worker cap — no separate
             // thread and no racy per-report counter.
             stream.set_read_timeout(Some(std::time::Duration::from_secs(60))).ok();
+            // Bound the RESPONSE too: a peer that stops reading would
+            // otherwise pin this connection worker forever (responses exceed
+            // the socket buffer).
+            stream.set_write_timeout(Some(std::time::Duration::from_secs(30))).ok();
             let Some(payload_line) = read_line_limited(&mut reader, 1024 * 1024) else {
                 return;
             };
@@ -270,6 +275,7 @@ fn handle_connection(
             // Optional JSON request line: {"max_age_ms": 0} forces a bounded
             // revalidation; absent/large max_age serves the cached state.
             stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+            stream.set_write_timeout(Some(std::time::Duration::from_secs(10))).ok();
             let payload_line = read_line_limited(&mut reader, 4 * 1024).unwrap_or_default();
             handle_windows_client(stream, &payload_line, dbs, windows_hub);
         }
@@ -347,7 +353,14 @@ fn handle_windows_client(
                 // state is Missing — serving that told the monitor the user
                 // was logged out, forever. Fall back to the 30s-cached
                 // keychain classification until the first attempt.
-                if hub.polling_enabled() && claude_state.last_poll_ms > 0 {
+                // Authoritative only while FRESH. On an idle machine the
+                // activity gate means no further polls, so a logout after the
+                // last successful poll would keep publishing "ok" forever —
+                // the mirror of the pre-first-poll "missing" bug. Past the
+                // active horizon, defer to the (30s-cached) keychain read.
+                let published_fresh = claude_state.last_poll_ms > 0
+                    && now_ms - claude_state.last_poll_ms < 30 * 60_000;
+                if hub.polling_enabled() && published_fresh {
                     claude_state.auth_status.label().to_string()
                 } else {
                     hub.claude_auth_cached().label().to_string()
@@ -360,10 +373,9 @@ fn handle_windows_client(
         // Current account scope so a client can ignore rows still open under
         // a previous login (they linger until their own reset).
         let current_account = match name.as_str() {
-            "codex" => hub
-                .codex_root
-                .as_deref()
-                .map(crate::providers::codex::account_scope),
+            // Cached: this runs at widget-poll rate and account_scope() is a
+            // full read+parse of auth.json (parity with the two auth caches).
+            "codex" => Some(hub.codex_account_cached()),
             _ => None,
         };
         let mut entry = serde_json::json!({

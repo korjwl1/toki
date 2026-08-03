@@ -42,6 +42,22 @@ impl Default for BroadcastSink {
     }
 }
 
+/// Peek for EOF without consuming data: a disconnected peer returns 0.
+/// Used to reap trace clients on an idle daemon (no writes = no write errors).
+fn peer_disconnected(stream: &UnixStream) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let mut byte = 0u8;
+    let n = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            &mut byte as *mut u8 as *mut libc::c_void,
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    n == 0
+}
+
 impl BroadcastSink {
     pub fn new() -> Self {
         BroadcastSink {
@@ -55,17 +71,34 @@ impl BroadcastSink {
         }
     }
 
+    /// Maximum concurrent trace subscribers. TRACE releases its listener
+    /// worker permit immediately (the stream lives on in these two threads),
+    /// so this is the only bound on trace resource use.
+    pub const MAX_CLIENTS: usize = 16;
+
     /// Subscribe a new trace client. Spawns two threads:
     ///   - Receiver: waits on condvar, pushes to local queue
     ///   - Writer: pops from local queue, writes to UDS
-    pub fn add_client(&self, stream: UnixStream) {
+    ///
+    /// Returns false when the subscriber cap is already reached (the caller
+    /// should reject the connection). The check is a CAS, not check-then-act:
+    /// several listener workers can race here.
+    pub fn add_client(&self, stream: UnixStream) -> bool {
         let state = Arc::clone(&self.state);
         let condvar = Arc::clone(&self.condvar);
         let count = Arc::clone(&self.client_count);
 
         let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
 
-        count.fetch_add(1, Ordering::Relaxed);
+        // Atomic admit: fetch_add + check would transiently exceed the cap.
+        if count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
+                if c >= Self::MAX_CLIENTS { None } else { Some(c + 1) }
+            })
+            .is_err()
+        {
+            return false;
+        }
 
         // Local queue: receiver pushes, writer pops
         let queue = Arc::new(Mutex::new(VecDeque::<String>::new()));
@@ -127,7 +160,7 @@ impl BroadcastSink {
             eprintln!("[toki:daemon] Failed to spawn receiver thread: {}", e);
             count.fetch_sub(1, Ordering::Relaxed);
             let _ = writeln!(&stream, "{{\"error\":\"server thread spawn failed\"}}");
-            return;
+            return true;
         }
 
         // Thread B: writer — queue pop → batch write_all
@@ -149,8 +182,21 @@ impl BroadcastSink {
                     loop {
                         {
                             let mut q = queue.lock().unwrap_or_else(|e| e.into_inner());
+                            // Bounded wait: a disconnect is only noticed when a
+                            // write fails, and on an idle daemon no write ever
+                            // happens — dead clients would hold their slot (and
+                            // two threads) until traffic resumed, eventually
+                            // denying the subscriber cap to live clients.
                             while q.is_empty() && alive.load(Ordering::Relaxed) {
-                                q = queue_condvar.wait(q).unwrap_or_else(|e| e.into_inner());
+                                let (guard, timeout) = queue_condvar
+                                    .wait_timeout(q, std::time::Duration::from_secs(5))
+                                    .unwrap_or_else(|e| e.into_inner());
+                                q = guard;
+                                if timeout.timed_out() && q.is_empty() && peer_disconnected(&stream) {
+                                    alive.store(false, Ordering::Relaxed);
+                                    broadcast_condvar.notify_all();
+                                    break;
+                                }
                             }
                             if !alive.load(Ordering::Relaxed) && q.is_empty() {
                                 break;
@@ -175,11 +221,13 @@ impl BroadcastSink {
         if let Err(e) = write_result {
             eprintln!("[toki:daemon] Failed to spawn writer thread: {}", e);
             alive.store(false, Ordering::Relaxed);
+            let _ = &e;
             // Wake the receiver immediately so it observes alive=false and exits,
             // instead of lingering until the 5s condvar timeout. The receiver
             // parks on the shared broadcast condvar, so notify that.
             self.condvar.notify_all();
         }
+        true
     }
 
     pub fn client_count(&self) -> usize {

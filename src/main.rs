@@ -562,6 +562,13 @@ const HOT_RELOAD_SETTINGS: &[&str] = &[
 ];
 
 fn handle_settings_set(key: &str, value: &str) {
+    // Boolean settings: reject values we would otherwise silently coerce.
+    // `window_polling off` used to mean "keep polling".
+    const BOOL_SETTINGS: &[&str] = &["window_tracking", "window_polling", "no_cost", "daemon_autostart"];
+    if BOOL_SETTINGS.contains(&key) && toki::config::parse_bool_setting(value).is_none() {
+        eprintln!("[toki] '{}' expects a boolean (true/false, on/off, yes/no, 1/0), got '{}'", key, value);
+        std::process::exit(1);
+    }
     if !VALID_SETTINGS.contains(&key) {
         eprintln!("[toki] Unknown setting: {}", key);
         eprintln!("[toki] Valid keys: {}", VALID_SETTINGS.join(", "));
