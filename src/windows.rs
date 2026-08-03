@@ -6,9 +6,12 @@
 //! floored to the minute (the "anchor"). Later observations jitter by up to
 //! ~93s around the true reset time, so they are merged into an open window by
 //! ±120s proximity against the latest raw resets_at — but the anchor (and thus
-//! the storage key) is never rewritten once created. Unused (0%) limits slide
-//! their resets_at continuously (resets_at ≈ now + window), so 0% observations
-//! never create a window.
+//! the storage key) is never rewritten once created. Passively-extracted
+//! unused (0%) limits slide their resets_at continuously (resets_at ≈ now +
+//! window), so 0% observations never open a window UNLESS the source vouches
+//! for anchor stability (`WindowObservation::anchor_stable` — Claude's active
+//! poller, where a served resets_at is a real window and genuine zero-use
+//! weekly periods must exist for the overall mean).
 //!
 //! Utilization is monotone non-decreasing within a window (observed decreases
 //! are 1%p flickers or a server-side limit reset), so `peak = max(samples)` is
@@ -414,6 +417,16 @@ impl WindowTracker {
     /// change / MIN_WRITE_INTERVAL elapsed).
     pub fn observe(&mut self, obs: &WindowObservation) -> Option<WindowWrite> {
         if obs.resets_at_ms <= 0 || obs.ts_ms <= 0 || !obs.used_percent.is_finite() {
+            return None;
+        }
+        // Local sanity (the server validates uploads, but nothing guarded the
+        // local parser): a corrupt line with an absurd duration or a reset
+        // farther away than the window's own length would open an entry that
+        // never finalizes and mint a garbage storage key.
+        if obs.window_minutes == 0 || obs.window_minutes > 60 * 24 * 31 {
+            return None;
+        }
+        if obs.resets_at_ms - obs.ts_ms > (obs.window_minutes as i64) * 60_000 + 86_400_000 {
             return None;
         }
         let kind = WindowKind::from_minutes(obs.window_minutes);
@@ -896,7 +909,7 @@ mod tests {
     fn write_policy_caps_frequency() {
         let mut t = WindowTracker::new();
         let reset = 1_786_000_000_000;
-        let t0 = 1_785_400_000_000i64;
+        let t0 = reset - 4 * 3_600_000; // inside the 5h window
         assert!(t.observe(&obs("codex", 300, 10.0, reset, t0)).is_some()); // new window
         // Sub-integer wiggle within the interval: suppressed.
         assert!(t.observe(&obs("codex", 300, 10.4, reset, t0 + 10_000)).is_none());
@@ -981,6 +994,18 @@ mod tests {
         let w = &t.open[0];
         assert_eq!(w.peak_pct, 26.0); // statistics keep the max
         assert_eq!(w.last_pct, 0.0); // live display follows the raw value
+    }
+
+    #[test]
+    fn implausible_observations_are_rejected() {
+        let mut t = WindowTracker::new();
+        // Reset farther in the future than the window's own length: corrupt.
+        let far = obs("codex", 300, 10.0, 1_786_000_000_000 + 3 * 86_400_000, 1_786_000_000_000);
+        assert!(t.observe(&far).is_none());
+        // Zero / absurd durations.
+        assert!(t.observe(&obs("codex", 0, 10.0, 1_786_000_000_000, 1_785_999_000_000)).is_none());
+        assert!(t.observe(&obs("codex", 60 * 24 * 366, 10.0, 1_786_000_000_000, 1_785_999_000_000)).is_none());
+        assert!(t.open.is_empty());
     }
 
     #[test]
