@@ -196,6 +196,11 @@ impl DbWriter {
             DbOp::WriteWindow(write) => {
                 if let Err(e) = self.db.upsert_window_merge(&write.key, &write.snapshot) {
                     eprintln!("[toki:writer] window write error: {}", e);
+                    // Counted, not just logged: the backfill's flush barrier
+                    // can only observe that its ops were PROCESSED, so without
+                    // this a failed write would advance the 60-day marker and
+                    // that window could never be reconstructed.
+                    self.db.note_window_write_error();
                 }
                 true
             }

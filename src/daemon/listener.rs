@@ -202,7 +202,41 @@ fn peer_is_owner(stream: &UnixStream) -> bool {
         }
         euid == unsafe { libc::geteuid() }
     }
-    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd")))]
+    // Linux (and anything else with SO_PEERCRED). Previously this arm returned
+    // an unconditional `true`, so on Linux the UID check did not exist: with a
+    // custom `daemon_sock` under a world-writable parent, a connection that
+    // slipped in between bind() and chmod(0600) stayed valid afterwards and
+    // could issue REPORT / WINDOWS / forced-refresh commands.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                &mut cred as *mut libc::ucred as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        // Fail CLOSED: unlike the BSD arm (whose default socket lives inside a
+        // 0700 directory), the case this guard exists for is a socket whose
+        // parent directory is public, where mode alone is not a gate.
+        if rc != 0 || len as usize != std::mem::size_of::<libc::ucred>() {
+            return false;
+        }
+        cred.uid == unsafe { libc::geteuid() }
+    }
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "linux"
+    )))]
     {
         let _ = stream;
         true

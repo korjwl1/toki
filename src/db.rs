@@ -15,9 +15,20 @@ pub struct Database {
     dict: Keyspace,
     /// Rate-limit window snapshots: one row per window instance.
     /// Key: [kind u8][limit_id_hash u64][account_hash u64][anchor_min_ms i64] (all BE).
-    /// Value: versioned WindowSnapshotV1 (see windows.rs). Additive keyspace —
-    /// deliberately NOT part of SCHEMA_VERSION (see CLAUDE.md).
+    /// Value: versioned WindowSnapshotV1 (see windows.rs). Additive keyspace:
+    /// adding it does not bump SCHEMA_VERSION (see CLAUDE.md). That is NOT the
+    /// same as being protected from a version reset — the reset removes the
+    /// whole database directory, windows included. Events survive that (a cold
+    /// scan rebuilds them from the provider's own log files); window peaks do
+    /// NOT, because the provider exposes only the CURRENT window state. A
+    /// future SCHEMA_VERSION bump therefore destroys Claude window history for
+    /// good, and should move this keyspace to its own database first.
     windows: Keyspace,
+    /// Count of window writes that FAILED to persist. The writer thread cannot
+    /// return an error to the sender (writes are fire-and-forget through a
+    /// channel), so the backfill needs some way to tell "the writer processed
+    /// my ops" from "the writer stored them" before it advances its marker.
+    window_write_errors: std::sync::atomic::AtomicU64,
     /// Maps bare msg_id → event key [ts_ms(8bytes) + event_key] for dedup.
     /// When a new event arrives with the same msg_id, the previous event is
     /// deleted from events keyspace and its tokens are no longer counted.
@@ -86,7 +97,10 @@ impl Database {
         // Write current schema version
         meta.insert("schema_version", SCHEMA_VERSION.to_string().as_bytes())?;
 
-        Ok(Database { db, checkpoints, meta, events, idx_sessions, idx_projects, dict, idx_msg, windows })
+        Ok(Database {
+            db, checkpoints, meta, events, idx_sessions, idx_projects, dict, idx_msg, windows,
+            window_write_errors: std::sync::atomic::AtomicU64::new(0),
+        })
     }
 
     pub fn inner(&self) -> &FjallDatabase {
@@ -232,6 +246,17 @@ impl Database {
     /// Field-wise merge upsert for a window snapshot. Never whole-row LWW:
     /// an existing row's peak/maxed/first_seen survive a snapshot taken later
     /// but knowing less (daemon restart, other-device replay via sync).
+    /// Failed window writes so far. Monotonic; compare two reads to learn
+    /// whether anything was lost in between.
+    pub fn window_write_errors(&self) -> u64 {
+        self.window_write_errors.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn note_window_write_error(&self) {
+        self.window_write_errors
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn upsert_window_merge(
         &self,
         key: &[u8],

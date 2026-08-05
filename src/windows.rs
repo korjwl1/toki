@@ -246,6 +246,16 @@ pub fn window_key_anchor_ms(key: &[u8]) -> Option<i64> {
     Some(i64::from_be_bytes(key[17..25].try_into().ok()?))
 }
 
+/// Mirrors the sync server's per-item bounds (`window_item_stable_ok`): a row
+/// that violates them is dropped there permanently, so it must never be minted
+/// here.
+pub const MAX_LIMIT_ID_LEN: usize = 64;
+pub const MAX_PLAN_LEN: usize = 64;
+/// Ceiling on simultaneously tracked window identities per provider. Claude
+/// exposes 3, Codex 2; this is ~20x headroom and exists only to keep a corrupt
+/// input from growing the linear-scanned `open` vector without bound.
+pub const MAX_OPEN_WINDOWS: usize = 64;
+
 pub fn floor_to_minute(ts_ms: i64) -> i64 {
     ts_ms - ts_ms.rem_euclid(60_000)
 }
@@ -478,6 +488,21 @@ impl WindowTracker {
             return None;
         }
         if obs.resets_at_ms - obs.ts_ms > (obs.window_minutes as i64) * 60_000 + 86_400_000 {
+            return None;
+        }
+        // Same bounds the sync server applies to uploads. Without them a long
+        // limit_id or plan from a corrupt//future-schema line is stored locally
+        // and then PERMANENTLY rejected by the server as a stable-invalid item
+        // — visible in local stats, silently absent from every other device.
+        if obs.limit_id.len() > MAX_LIMIT_ID_LEN || obs.plan_type.as_ref().map(|p| p.len()).unwrap_or(0) > MAX_PLAN_LEN {
+            return None;
+        }
+        // A distinct (kind, limit_id) identity opens its own entry, and the
+        // match below is a linear scan over `open`. Real providers expose a
+        // handful; a file full of unique limit ids would turn this into an
+        // O(n^2) scan over an unbounded Vec. Refuse to open more rather than
+        // let one bad file stall the daemon.
+        if self.open.len() >= MAX_OPEN_WINDOWS {
             return None;
         }
         let kind = WindowKind::from_minutes(obs.window_minutes);
@@ -915,6 +940,7 @@ pub fn run_windows_backfill(
     // All window writes flow through the writer thread: upsert_window_merge
     // is read-merge-write, and a direct write here could race a concurrent
     // live-collection write for the same window (audit finding).
+    let errors_before = db.window_write_errors();
     let n = writes.len();
     for w in writes {
         if db_tx.send(crate::writer::DbOp::WriteWindow(Box::new(w))).is_err() {
@@ -923,12 +949,21 @@ pub fn run_windows_backfill(
         }
     }
     // Barrier: the writer processes its channel FIFO, so an acked flush op
-    // proves every window write above has been applied before the marker.
+    // proves every window write above was PROCESSED before the marker moves.
+    // Processed is not stored — writes are fire-and-forget — so the error
+    // counter is checked below.
     let (ack_tx, ack_rx) = crossbeam_channel::bounded::<()>(1);
     if db_tx.send(crate::writer::DbOp::FlushBulkEvents(ack_tx)).is_err()
         || ack_rx.recv_timeout(std::time::Duration::from_secs(60)).is_err()
     {
         eprintln!("[toki] windows backfill: flush barrier failed; marker not set");
+        return;
+    }
+    // A write that failed to persist (ENOSPC, corruption) must not let the
+    // marker advance: the next start would scan only the 8-day catch-up, so
+    // that window is gone for good. Retry the whole run instead.
+    if db.window_write_errors() != errors_before {
+        eprintln!("[toki] windows backfill: some writes failed; marker not set");
         return;
     }
     // A TOTAL failure leaves the marker untouched so the next start retries.

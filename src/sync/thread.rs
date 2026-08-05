@@ -141,6 +141,29 @@ fn insecure_agent() -> Option<ureq::Agent> {
     Some(ureq::AgentBuilder::new().tls_connector(std::sync::Arc::new(tls)).build())
 }
 
+/// Pass 2 of the windows upload: materialize the wire items for the rows the
+/// fingerprint pass selected. `cutoff` is `None` below the per-sync cap and
+/// otherwise the `(anchor, key_hash)` low-water mark of the selected set —
+/// applied with the identical comparison, so the two passes cannot diverge.
+fn collect_window_items(
+    db: &crate::db::Database,
+    now_ms: i64,
+    cutoff: Option<(i64, u64)>,
+    capacity: usize,
+) -> Vec<toki_sync_protocol::WireWindow> {
+    let mut items = Vec::with_capacity(capacity);
+    let _ = db.for_each_window_in(now_ms - WINDOWS_SYNC_HORIZON_MS, i64::MAX, |key, snap| {
+        if let Some((ca, ck)) = cutoff {
+            let a = crate::windows::window_key_anchor_ms(key).unwrap_or(i64::MIN);
+            if (a, crate::windows::hash_bytes(key)) < (ca, ck) {
+                return;
+            }
+        }
+        items.push(crate::windows::wire_from_stored(key, &snap));
+    });
+    items
+}
+
 /// Per-row fingerprint contribution. Extracted so the fingerprint pass and the
 /// over-cap selection pass cannot drift: if they disagree, the client latches a
 /// fingerprint for a set it never sent.
@@ -640,16 +663,34 @@ fn run_sync_inner(
                     last_windows_sync = Instant::now();
                 } else if count > 0 {
                     // Pass 2 (rare): the set changed — build the wire items.
-                    let mut items = Vec::with_capacity(count);
-                    let _ = db.for_each_window_in(now_ms - WINDOWS_SYNC_HORIZON_MS, i64::MAX, |key, snap| {
-                        if let Some((ca, ck)) = cutoff {
-                            let a = crate::windows::window_key_anchor_ms(key).unwrap_or(i64::MIN);
-                            if (a, crate::windows::hash_bytes(key)) < (ca, ck) {
-                                return;
+                    // Extracted so `items` is a plain binding: if the send below
+                    // is ever lost in an edit, the compiler flags it as unused
+                    // rather than silently building a payload and dropping it
+                    // (which is exactly how window sync went dead once).
+                    let items = collect_window_items(&db, now_ms, cutoff, count);
+                    if let Some(ref mut c) = client {
+                        let n = items.len();
+                        match c.sync_windows(&config.provider, items) {
+                            Ok(()) => {
+                                last_windows_sync = Instant::now();
+                                last_windows_fingerprint = fingerprint;
+                                eprintln!("[toki:sync] synced {n} window snapshots");
+                            }
+                            Err(e) => {
+                                // A SyncErr keeps the connection; an IO error
+                                // means the link is gone (reconnect path).
+                                eprintln!("[toki:sync] windows sync error: {e}");
+                                // Surface in `toki settings sync status` —
+                                // eprintln alone left rejections invisible.
+                                sw.set("sync_last_error", &format!("windows: {e}"));
+                                if e.kind() != std::io::ErrorKind::Other {
+                                    client = None;
+                                    continue;
+                                }
+                                last_windows_sync = Instant::now();
                             }
                         }
-                        items.push(crate::windows::wire_from_stored(key, &snap));
-                    });
+                    }
                 } else {
                     last_windows_sync = Instant::now();
                 }
