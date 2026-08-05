@@ -56,20 +56,36 @@ fn windows_reach_a_real_server_over_tcp() {
                 .as_millis() as i64
         });
 
+    // TOKI_E2E_COUNT lets the driver push a full over-cap set through real
+    // framing: the client caps at MAX_WINDOWS_PER_SYNC (2000) and the server
+    // rejects any payload over 1 MiB, so the two limits must be compatible.
+    let count: u64 = std::env::var("TOKI_E2E_COUNT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
+    // Worst-case field sizes: every string at the server's 64-byte maximum.
+    let fat = std::env::var("TOKI_E2E_FAT").is_ok();
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(&dir.path().join("e2e.fjall")).unwrap();
-    for i in 0..3u64 {
-        let anchor = now_ms - (i as i64) * 3_600_000;
-        db.upsert_window_merge(
-            &window_key(WindowKind::Session, i, 99, anchor),
-            &snap(
-                std::env::var("TOKI_E2E_PEAK").ok().and_then(|v| v.parse().ok()).unwrap_or(4200)
-                    + i as u16,
-                anchor,
-                &format!("e2e_limit_{i}"),
-            ),
-        )
-        .unwrap();
+    for i in 0..count {
+        let anchor = now_ms - (i as i64) * 600_000;
+        let limit = if fat {
+            // 64 bytes exactly, and distinct per row.
+            format!("{:0>64}", format!("e2e_limit_{i}"))
+        } else {
+            format!("e2e_limit_{i}")
+        };
+        let mut sn = snap(
+            std::env::var("TOKI_E2E_PEAK").ok().and_then(|v| v.parse().ok()).unwrap_or(4200)
+                + (i % 100) as u16,
+            anchor,
+            &limit,
+        );
+        if fat {
+            sn.account = "a".repeat(64);
+            sn.plan = "p".repeat(64);
+        }
+        db.upsert_window_merge(&window_key(WindowKind::Session, i, 99, anchor), &sn).unwrap();
     }
 
     let mut client = toki::sync::client::SyncClient::connect(&addr, false, false)

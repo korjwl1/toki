@@ -137,3 +137,21 @@ ERRS=$(docker logs toki-e2e 2>&1 | grep -ciE "\berror\b|panic" || true)
 
 echo
 if [ "$FAIL" = "0" ]; then echo "════ ALL E2E CHECKS PASSED ════"; else echo "════ E2E FAILURES PRESENT ════"; fi
+
+# ── ClickHouse backend ────────────────────────────────────────────────────────
+# The fjall path above does not exercise the ClickHouse code at all, and the
+# `updated_at` migration is data-destroying if wrong. To run it:
+#
+#   docker run -d --name toki-ch -p 18123:8123 clickhouse/clickhouse-server:latest
+#   # create the PRE-updated_at table (21 cols, ReplacingMergeTree(observed_ts_ms)),
+#   # insert legacy rows, then start toki-sync with backend = "clickhouse".
+#
+# Verified 2026-08-05 against clickhouse-server:latest:
+#   - migration ran once, preserved all rows, engine became
+#     ReplacingMergeTree(updated_at), updated_at derived from observed_ts_ms
+#   - restarts did NOT re-run it (idempotent)
+#   - with the live table renamed away (crash between the two RENAMEs),
+#     recover_interrupted_migration adopted toki_windows_old with zero loss
+#   - uploads merged field-wise: resend kept the row count and took the max peak
+#   - 2500 windows with every string at the 64-byte maximum: the client capped
+#     at 2000 and the payload stayed under the server's 1 MiB limit
