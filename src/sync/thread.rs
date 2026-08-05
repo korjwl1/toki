@@ -142,6 +142,22 @@ fn insecure_agent() -> Option<ureq::Agent> {
 }
 
 
+/// Test-only entry point for the end-to-end integration test, which drives a
+/// real `SyncClient` against a containerized server. Returns whether the batch
+/// was sent AND acknowledged.
+pub fn windows_sync_step_for_test(
+    db: &crate::db::Database,
+    provider: &str,
+    now_ms: i64,
+    last_fingerprint: (usize, u64),
+    client: &mut crate::sync::client::SyncClient,
+) -> bool {
+    matches!(
+        windows_sync_step(db, provider, now_ms, last_fingerprint, client).outcome,
+        WindowsSyncOutcome::Sent { .. }
+    )
+}
+
 /// Anything that can deliver a windows batch. Exists so `windows_sync_step`
 /// can be exercised without a TCP connection — the regression this indirection
 /// is here to prevent was a build-the-payload-and-drop-it edit that no test
