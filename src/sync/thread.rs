@@ -299,6 +299,7 @@ fn run_sync_inner(
     // Transient capability-probe failures retry with a backoff, not per-wake.
     let mut next_cap_probe = Instant::now();
     let mut cap_probe_failure_logged = false;
+    let mut last_over_cap_logged: usize = 0;
     // Fingerprint of the last uploaded window set — identical sets skip the
     // resend entirely (serialization + network) while staying cursorless.
     // Folds every merge-visible field: a finalize-only change keeps count,
@@ -617,10 +618,17 @@ fn run_sync_inner(
                     if let Some(&(a, k, _)) = ids.last() {
                         cutoff = Some((a, k));
                     }
-                    eprintln!(
-                        "[toki:sync] {dropped} oldest windows exceed the per-sync cap; \
-                         sending the newest {MAX_WINDOWS_PER_SYNC}"
-                    );
+                    // This block runs on every 5-minute tick, including the
+                    // ones whose fingerprint matches and upload nothing, so an
+                    // unconditional log here would repeat forever. Report only
+                    // when the number actually moves.
+                    if last_over_cap_logged != dropped {
+                        last_over_cap_logged = dropped;
+                        eprintln!(
+                            "[toki:sync] {dropped} oldest windows exceed the per-sync cap; \
+                             sending the newest {MAX_WINDOWS_PER_SYNC}"
+                        );
+                    }
                     (ids.len(), acc2)
                 } else {
                     (count, acc)

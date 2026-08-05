@@ -601,10 +601,14 @@ pub fn run_claude_poller(
     loop {
         let now = now_ms();
 
+        // One allocation, two deadlines: both the confirm sample and the
+        // finalize wake are derived from the same open-window reset instants.
+        let open_resets = tracker.open_reset_times();
+
         // Next hard deadline: the earliest pending pre-reset confirm sample.
-        let next_confirm = tracker
-            .open_reset_times()
-            .into_iter()
+        let next_confirm = open_resets
+            .iter()
+            .copied()
             .filter(|r| !confirmed.contains(&crate::windows::floor_to_minute(*r)))
             .map(|r| r - CONFIRM_BEFORE_RESET_MS)
             .min();
@@ -637,9 +641,8 @@ pub fn run_claude_poller(
         // row stays finalized=false until the next poll — up to an hour on an
         // idle machine — so statistics exclude it and the monitor can still
         // read it as live. Costs one wake per reset and no provider call.
-        if let Some(finalize_at) = tracker
-            .open_reset_times()
-            .into_iter()
+        if let Some(finalize_at) = open_resets
+            .iter()
             .map(|r| r + crate::windows::FINALIZE_GRACE_MS + 1_000)
             .filter(|t| *t > now)
             .min()
