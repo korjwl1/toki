@@ -111,11 +111,16 @@ impl DbWriter {
                 for key in &stats.dict_removed {
                     self.dict_cache.remove(key);
                 }
-                if stats.events_deleted > 0 || stats.index_deleted > 0 || !stats.dict_removed.is_empty() {
+                if stats.events_deleted > 0
+                    || stats.index_deleted > 0
+                    || stats.windows_deleted > 0
+                    || !stats.dict_removed.is_empty()
+                {
                     eprintln!(
-                        "[toki:writer] {}: {} events, {} index, {} dict entries removed ({}ms)",
+                        "[toki:writer] {}: {} events, {} index, {} windows, {} dict entries removed ({}ms)",
                         label, stats.events_deleted, stats.index_deleted,
-                        stats.dict_removed.len(), stats.elapsed.as_millis()
+                        stats.windows_deleted, stats.dict_removed.len(),
+                        stats.elapsed.as_millis()
                     );
                 }
             }

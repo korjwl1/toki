@@ -32,14 +32,20 @@ pub fn run_retention(db: &Database, policy: &RetentionPolicy) -> Result<Retentio
     // Close out rows orphaned open by a restart. Deliberately OUTSIDE the
     // retention toggle below: disabling retention must not leave restart
     // orphans finalized=false forever.
+    // Non-panicking: these now run on EVERY pass in the default config (window
+    // retention defaults to 730d while event retention defaults to off), and a
+    // clock behind the epoch would otherwise kill the writer thread — after
+    // which every DB write fails silently.
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
     {
-        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
         if let Err(e) = db.finalize_stale_windows(now_ms) {
             eprintln!("[toki] stale-window finalize error (continuing): {}", e);
         }
     }
     let windows_deleted = if policy.window_retention_days > 0 {
-        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
         let cutoff = now_ms - (policy.window_retention_days as i64) * 86_400_000;
         // A windows sweep failure must never suppress the pre-existing event
         // retention below (audit: `?` here would early-return the whole pass).
@@ -65,7 +71,6 @@ pub fn run_retention(db: &Database, policy: &RetentionPolicy) -> Result<Retentio
         });
     }
 
-    let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
     let cutoff = now_ms - (policy.event_retention_days as i64) * 86_400_000;
 
     let events_deleted = db.delete_events_before(cutoff)?;

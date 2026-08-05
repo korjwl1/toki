@@ -590,6 +590,11 @@ pub fn run_claude_poller(
     // Detects an atomic valid-token→valid-token swap (logout+login between
     // polls never trips an auth failure, but the account may have changed).
     let mut last_token_hash: u64 = 0;
+    // The token the server last rejected (401/403). Re-probing with the SAME
+    // token can only produce another 401, so the HTTP call is skipped until a
+    // different token appears — which is exactly what a re-login produces, so
+    // recovery stays immediate.
+    let mut rejected_token_hash: u64 = 0;
     // Reset instants (minute-floored) whose pre-reset confirm sample was taken.
     let mut confirmed: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
@@ -627,6 +632,19 @@ pub fn run_claude_poller(
                     .max(backoff_until_ms);
                 deadline = deadline.min(confirm_deadline.max(now));
             }
+        }
+        // Wake shortly after a window's reset to finalize it. Without this the
+        // row stays finalized=false until the next poll — up to an hour on an
+        // idle machine — so statistics exclude it and the monitor can still
+        // read it as live. Costs one wake per reset and no provider call.
+        if let Some(finalize_at) = tracker
+            .open_reset_times()
+            .into_iter()
+            .map(|r| r + crate::windows::FINALIZE_GRACE_MS + 1_000)
+            .filter(|t| *t > now)
+            .min()
+        {
+            deadline = deadline.min(finalize_at);
         }
         let wait = Duration::from_millis((deadline - now).clamp(50, 3_600_000) as u64);
 
@@ -742,6 +760,15 @@ pub fn run_claude_poller(
                     profile_attempt_ms = 0; // token change bypasses the retry backoff
                 }
                 last_token_hash = token_hash;
+                if rejected_token_hash != 0 && token_hash == rejected_token_hash {
+                    // Known-bad token: no API call. Keep the published state
+                    // (already Expired) and wait for a new one.
+                    hub.publish(|st| {
+                        st.last_poll_ms = now;
+                        st.done_seq = st.want_seq;
+                    });
+                    continue;
+                }
                 match fetch_usage(&creds.access_token) {
                     Ok(usage) => {
                         // Account/plan resolution piggybacks on a proven token.
@@ -750,11 +777,20 @@ pub fn run_claude_poller(
                         {
                             profile_attempt_ms = now;
                             if let Some(p) = fetch_profile(&creds.access_token) {
-                                // A genuinely different account: re-key the
-                                // windows opened under the old scope so they
-                                // are not merged into the new account's rows.
-                                if tracker.account() != p.account_scope {
+                                if tracker.account() == "unknown" {
+                                    // Opened before the account was known:
+                                    // adopt the resolved scope (same windows).
                                     tracker.reattribute_open(&p.account_scope);
+                                } else if tracker.account() != p.account_scope {
+                                    // A genuinely DIFFERENT account: the old
+                                    // account's windows will never be observed
+                                    // again, so close them under their own
+                                    // keys. Re-keying them here would have
+                                    // blended A's peak into B's row and let
+                                    // B's activity credit A's window.
+                                    for w in tracker.close_all() {
+                                        let _ = db_tx.send(DbOp::WriteWindow(Box::new(w)));
+                                    }
                                 }
                                 tracker.set_account(&p.account_scope);
                                 let scope = p.account_scope.clone();
@@ -765,7 +801,10 @@ pub fn run_claude_poller(
                         }
                         Ok(usage)
                     }
-                    Err(PollError::AuthRejected) => Err((AuthStatus::Expired, None)),
+                    Err(PollError::AuthRejected) => {
+                        rejected_token_hash = token_hash;
+                        Err((AuthStatus::Expired, None))
+                    }
                     Err(PollError::RateLimited) => {
                         Err((AuthStatus::Ok, Some(RATE_LIMITED_BACKOFF_MS)))
                     }
@@ -786,6 +825,7 @@ pub fn run_claude_poller(
             Ok(usage) => {
                 consecutive_failures = 0;
                 backoff_until_ms = 0;
+                rejected_token_hash = 0;
                 last_auth_ok = true;
                 let plan = profile.as_ref().map(|p| p.plan.as_str()).unwrap_or("");
                 let observations = observations_from_usage(&usage, plan, now);

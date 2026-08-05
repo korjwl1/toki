@@ -70,6 +70,11 @@ pub struct Handle {
     windows_hub: Option<Arc<claude_poll::PollerHub>>,
     /// Claude poller thread join handle.
     poller_handle: Option<JoinHandle<()>>,
+    /// Windows-backfill stop channels + join handles. Joined before the DB
+    /// writers: the backfill sends window writes through a writer channel and
+    /// holds a `Database` handle for the length of a 60-day scan.
+    backfill_stops: Vec<crossbeam_channel::Sender<()>>,
+    backfill_threads: Vec<Option<JoinHandle<()>>>,
 }
 
 struct ProviderRuntimeHandle {
@@ -122,6 +127,16 @@ impl Handle {
         }
         // Join sync threads before shutting down DB writers — they hold DB read handles
         for handle_opt in &mut self.sync_threads {
+            if let Some(handle) = handle_opt.take() {
+                let _ = handle.join();
+            }
+        }
+
+        // Stop the windows backfill before the writers, for the same reason.
+        for tx in &self.backfill_stops {
+            let _ = tx.send(());
+        }
+        for handle_opt in &mut self.backfill_threads {
             if let Some(handle) = handle_opt.take() {
                 let _ = handle.join();
             }
@@ -313,6 +328,8 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
     // start (which never revisits consumed files): first run reaches back 60
     // days, later runs re-cover the last 8 days to absorb daemon-down gaps.
     // Idempotent via field-wise merge, throttled, and off the startup path.
+    let mut backfill_stops: Vec<crossbeam_channel::Sender<()>> = Vec::new();
+    let mut backfill_threads: Vec<Option<JoinHandle<()>>> = Vec::new();
     if config.window_tracking {
         for rt in &runtimes {
             if rt.provider.name() == "codex" {
@@ -320,12 +337,17 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
                     let db = rt.db.clone();
                     let db_tx = rt.db_tx.clone();
                     let sessions_glob = format!("{}/sessions/**/*.jsonl", root);
-                    let account = windows::codex_account_scope(&root);
-                    if let Err(e) = std::thread::Builder::new()
+                    let (stop_tx, stop_rx) = crossbeam_channel::bounded(1);
+                    match std::thread::Builder::new()
                         .name("toki-windows-backfill".to_string())
-                        .spawn(move || windows::run_windows_backfill(db, db_tx, sessions_glob, account))
-                    {
-                        eprintln!("[toki] windows backfill thread spawn failed: {}", e);
+                        .spawn(move || {
+                            windows::run_windows_backfill(db, db_tx, sessions_glob, root, stop_rx)
+                        }) {
+                        Ok(h) => {
+                            backfill_stops.push(stop_tx);
+                            backfill_threads.push(Some(h));
+                        }
+                        Err(e) => eprintln!("[toki] windows backfill thread spawn failed: {}", e),
                     }
                 }
             }
@@ -517,6 +539,8 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
         settings_watcher_stop: Some(settings_stop_tx),
         windows_hub,
         poller_handle,
+        backfill_stops,
+        backfill_threads,
     })
 }
 

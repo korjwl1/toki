@@ -125,6 +125,16 @@ pub struct WindowSnapshotV1 {
 
 pub const WINDOW_VALUE_VERSION: u8 = 1;
 
+/// Compile-time tripwire. `decode_versioned`'s match cannot enforce this on
+/// its own — a `_` arm makes it exhaustive for any const, so bumping the
+/// version without adding a decode arm would silently classify every stored
+/// row as Corrupt (which REPLACES it). Bumping this const must break the
+/// build until the new arm exists, and then this assert is updated.
+const _: () = assert!(
+    WINDOW_VALUE_VERSION == 1,
+    "WINDOW_VALUE_VERSION changed: add a decode arm in decode_versioned, then update this assert"
+);
+
 /// Outcome of decoding a stored window value (see decode_versioned).
 pub enum WindowDecode {
     Valid(WindowSnapshotV1),
@@ -238,6 +248,10 @@ pub fn window_key_anchor_ms(key: &[u8]) -> Option<i64> {
 
 pub fn floor_to_minute(ts_ms: i64) -> i64 {
     ts_ms - ts_ms.rem_euclid(60_000)
+}
+
+pub fn hash_bytes(b: &[u8]) -> u64 {
+    xxh3_64(b)
 }
 
 pub fn hash_str(s: &str) -> u64 {
@@ -638,6 +652,24 @@ impl WindowTracker {
         self.set_account(account_scope);
     }
 
+    /// Close every open window under ITS OWN key and forget them.
+    ///
+    /// Used when the observed account changes for real: the previous
+    /// account's windows will never be observed again, so they are finalized
+    /// as-is. Re-keying them to the new account instead (what
+    /// `reattribute_open` does) would blend one account's peak into the
+    /// other's row — `reattribute_open` is only for windows opened before the
+    /// account was KNOWN (backfill's "unknown" handover).
+    pub fn close_all(&mut self) -> Vec<WindowWrite> {
+        let writes: Vec<WindowWrite> = self
+            .open
+            .iter()
+            .map(|w| WindowWrite { key: w.key(), snapshot: w.to_snapshot(true) })
+            .collect();
+        self.open.clear();
+        writes
+    }
+
     /// Flush all open windows without finalizing (daemon shutdown).
     pub fn flush_all(&mut self) -> Vec<WindowWrite> {
         self.open
@@ -695,7 +727,8 @@ pub fn run_windows_backfill(
     db: Arc<Database>,
     db_tx: crossbeam_channel::Sender<crate::writer::DbOp>,
     sessions_glob: String,
-    account: String,
+    codex_root: String,
+    stop_rx: crossbeam_channel::Receiver<()>,
 ) {
     const FIRST_RUN_DAYS: i64 = 60;
     const CATCHUP_DAYS: i64 = 8;
@@ -711,6 +744,20 @@ pub fn run_windows_backfill(
         .flatten()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
+
+    // Resolve the account HERE, with the non-swallowing variant: a read
+    // landing mid-rewrite (Codex rewrites auth.json on token refresh) would
+    // otherwise key the whole first run as "unknown", and the next run would
+    // re-key the same windows under the real account — the duplicate the
+    // handover exists to prevent. Not resolvable now ⇒ do nothing, leave the
+    // marker unset, retry on the next start.
+    let account = match crate::providers::codex::try_account_scope(&codex_root) {
+        Some(a) if a != "unknown" => a,
+        _ => {
+            eprintln!("[toki] windows backfill: account not resolvable yet; deferring");
+            return;
+        }
+    };
     // Catch-up covers max(8d, time since the last completed scan + 1d overlap),
     // capped at the first-run depth — a daemon down for >8 days must not
     // permanently lose the gap.
@@ -731,26 +778,44 @@ pub fn run_windows_backfill(
     // would exist twice under two keys. Switch to the real account at the
     // catch-up boundary during the first run so the overlap merges instead.
     let handover_ms = now_ms - CATCHUP_DAYS * 86_400_000;
+    let mut io_errors = 0u32;
     let scan_account = if first_run { "unknown".to_string() } else { account.clone() };
 
     let mut tracker = WindowTracker::new();
     tracker.set_account(&scan_account);
     let mut files_scanned = 0u32;
-    let mut io_errors = 0u32;
 
-    let mut paths: Vec<std::path::PathBuf> = glob::glob(&sessions_glob)
-        .into_iter()
-        .flatten()
-        .filter_map(|p| p.ok())
-        .filter(|p| {
-            std::fs::metadata(p)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| (d.as_millis() as i64) >= cutoff_ms)
-                .unwrap_or(false)
-        })
-        .collect();
+    // Plain loop, not an iterator chain: two closures both need `&mut
+    // io_errors`, which the borrow checker rejects.
+    let mut candidates = 0usize;
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    for entry in glob::glob(&sessions_glob).into_iter().flatten() {
+        let p = match entry {
+            Ok(p) => p,
+            // A directory-level glob error (permissions, unmounted volume) is
+            // a real failure: counted, not silently dropped.
+            Err(_) => {
+                io_errors += 1;
+                continue;
+            }
+        };
+        candidates += 1;
+        match std::fs::metadata(&p).and_then(|m| m.modified()) {
+            Ok(t) => {
+                let fresh = t
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|d| (d.as_millis() as i64) >= cutoff_ms)
+                    .unwrap_or(false);
+                if fresh {
+                    paths.push(p);
+                }
+            }
+            // Rotated away between glob and stat: not an error.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => io_errors += 1,
+        }
+    }
     paths.sort(); // filename order == chronological order for rollout files
 
     // Collect observations from every file FIRST, then replay in global
@@ -798,7 +863,11 @@ pub fn run_windows_backfill(
         }
         files_scanned += 1;
         // Deliberate throttle: this is background work, never a startup burst.
-        std::thread::sleep(std::time::Duration::from_millis(5));
+        // Doubles as the stop check — shutdown must not wait out a 60-day scan.
+        if stop_rx.recv_timeout(std::time::Duration::from_millis(5)).is_ok() {
+            eprintln!("[toki] windows backfill: stopping (shutdown)");
+            return;
+        }
     }
     observations.sort_by_key(|o| o.ts_ms);
 
@@ -859,11 +928,17 @@ pub fn run_windows_backfill(
     // otherwise pin the daemon in first-run mode forever — re-scanning 60 days
     // on every start and re-attributing all history to "unknown".
     if io_errors > 0 {
-        eprintln!("[toki] windows backfill: {io_errors} files unreadable");
+        eprintln!("[toki] windows backfill: {io_errors} paths unreadable");
         if files_scanned == 0 {
             eprintln!("[toki] windows backfill: nothing readable; marker not advanced");
             return;
         }
+    }
+    // Candidates existed but none could be scanned: consuming the first-run
+    // marker here would drop the 60-day horizon to 8 days permanently.
+    if first_run && candidates > 0 && files_scanned == 0 {
+        eprintln!("[toki] windows backfill: no file scanned; marker not advanced");
+        return;
     }
     let _ = db.set_setting(MARKER_KEY, &now_ms.to_string());
     if n > 0 {

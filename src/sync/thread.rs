@@ -98,13 +98,28 @@ enum WindowsCapability {
 }
 
 /// How long an authoritative "unsupported" verdict holds before re-probing.
+/// Must match the server's per-batch keep limit (`toki_sync`'s
+/// `MAX_WINDOWS_PER_BATCH`). Rows beyond it are dropped server-side WITHOUT
+/// being reported as dropped, so the client selects the survivors itself.
+const MAX_WINDOWS_PER_SYNC: usize = 2_000;
+
 const CAP_UNSUPPORTED_TTL: Duration = Duration::from_secs(6 * 3600);
 
 /// Probe the server's capabilities endpoint. Ok(Some(bool)) is authoritative;
 /// Ok(None)/Err are transient (retry later, never latch).
-fn probe_windows_capability(http_url: &str) -> Option<bool> {
+fn probe_windows_capability(http_url: &str, tls_insecure: bool) -> Option<bool> {
     let url = format!("{}/api/v1/capabilities", http_url.trim_end_matches('/'));
-    match ureq::get(&url).timeout(Duration::from_secs(5)).call() {
+    // Must honour `sync_tls_insecure` exactly like the TCP path: on a
+    // self-signed deployment (a mode this client itself recommends) a strict
+    // agent fails the probe forever, so event sync works and window sync
+    // silently never starts.
+    let agent = if tls_insecure {
+        // Connector build failure is transient-ish, not "unsupported".
+        insecure_agent()?
+    } else {
+        ureq::Agent::new()
+    };
+    match agent.get(&url).timeout(Duration::from_secs(5)).call() {
         Ok(resp) => {
             let body: serde_json::Value = resp.into_json().ok()?;
             Some(body.get("sync_windows_v1").and_then(|v| v.as_bool()).unwrap_or(false))
@@ -112,6 +127,45 @@ fn probe_windows_capability(http_url: &str) -> Option<bool> {
         Err(ureq::Error::Status(404, _)) => Some(false),
         Err(_) => None,
     }
+}
+
+/// Agent that skips certificate verification, for self-signed deployments
+/// (`sync_tls_insecure`). Mirrors what `toki settings sync enable --insecure`
+/// builds for the TCP path.
+fn insecure_agent() -> Option<ureq::Agent> {
+    let tls = native_tls::TlsConnector::builder()
+        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_hostnames(true)
+        .build()
+        .ok()?;
+    Some(ureq::AgentBuilder::new().tls_connector(std::sync::Arc::new(tls)).build())
+}
+
+/// Per-row fingerprint contribution. Extracted so the fingerprint pass and the
+/// over-cap selection pass cannot drift: if they disagree, the client latches a
+/// fingerprint for a set it never sent.
+fn window_row_fold(key: &[u8], snap: &crate::windows::WindowSnapshotV1) -> u64 {
+    let mut acc: u64 = 0;
+    let mut fold = |v: u64| acc = acc.wrapping_mul(31).wrapping_add(v);
+    for &b in key {
+        fold(b as u64);
+    }
+    fold(snap.peak_pct_x100 as u64);
+    fold(snap.last_pct_x100 as u64);
+    fold(snap.observed_ts_ms as u64);
+    fold(snap.raw_resets_at_ms as u64);
+    fold(snap.first_seen_ms as u64);
+    fold(snap.window_minutes as u64);
+    fold(snap.finalized as u64);
+    fold(snap.maxed_out as u64);
+    fold(snap.limit_reached_kind as u64);
+    fold(snap.active_ms);
+    fold(snap.time_to_100_ms as u64);
+    fold(snap.last_sample_gap_ms as u64);
+    fold(snap.sampled_active_fraction as u64);
+    fold(snap.n_samples as u64);
+    fold(crate::windows::hash_str(&snap.plan));
+    acc
 }
 
 /// Flush notification handle: a Condvar + dirty flag shared with DbWriter.
@@ -244,6 +298,7 @@ fn run_sync_inner(
     let mut last_windows_sync = Instant::now() - WINDOWS_SYNC_INTERVAL;
     // Transient capability-probe failures retry with a backoff, not per-wake.
     let mut next_cap_probe = Instant::now();
+    let mut cap_probe_failure_logged = false;
     // Fingerprint of the last uploaded window set — identical sets skip the
     // resend entirely (serialization + network) while staying cursorless.
     // Folds every merge-visible field: a finalize-only change keeps count,
@@ -478,7 +533,9 @@ fn run_sync_inner(
         // Windows sync: full recent set, throttled; field-wise server merge
         // makes the resend idempotent, so no cursor exists (a cursor on
         // window_end would permanently miss peak updates under a fixed key).
-        if last_windows_sync.elapsed() >= WINDOWS_SYNC_INTERVAL {
+        // `client.is_some()`: the ping-failure path above nulls the client and
+        // falls through here, where both passes would run and be thrown away.
+        if client.is_some() && last_windows_sync.elapsed() >= WINDOWS_SYNC_INTERVAL {
             if windows_cap == WindowsCapability::Unsupported
                 && Instant::now() >= next_cap_probe
             {
@@ -487,7 +544,7 @@ fn run_sync_inner(
             if windows_cap == WindowsCapability::Unknown && Instant::now() >= next_cap_probe {
                 if let Some(creds) = crate::sync::credentials::load() {
                     if !creds.http_url.is_empty() {
-                        match probe_windows_capability(&creds.http_url) {
+                        match probe_windows_capability(&creds.http_url, config.tls_insecure) {
                             Some(true) => {
                                 windows_cap = WindowsCapability::Supported;
                                 eprintln!("[toki:sync] server supports windows sync");
@@ -499,7 +556,16 @@ fn run_sync_inner(
                             }
                             None => {
                                 // Transient (network/TLS/5xx): back off instead
-                                // of re-probing on every flush wake.
+                                // of re-probing on every flush wake. Logged once
+                                // — a silent None left "window sync never
+                                // started" with no diagnostic anywhere.
+                                if !cap_probe_failure_logged {
+                                    cap_probe_failure_logged = true;
+                                    eprintln!(
+                                        "[toki:sync] windows capability probe failed (retrying); \
+                                         window sync is paused until it succeeds"
+                                    );
+                                }
                                 next_cap_probe = Instant::now() + Duration::from_secs(60);
                             }
                         }
@@ -518,26 +584,48 @@ fn run_sync_inner(
                 let mut acc: u64 = 0;
                 let _ = db.for_each_window_in(now_ms - WINDOWS_SYNC_HORIZON_MS, i64::MAX, |key, snap| {
                     count += 1;
-                    let mut fold = |v: u64| acc = acc.wrapping_mul(31).wrapping_add(v);
-                    for &b in key {
-                        fold(b as u64);
-                    }
-                    fold(snap.peak_pct_x100 as u64);
-                    fold(snap.last_pct_x100 as u64);
-                    fold(snap.observed_ts_ms as u64);
-                    fold(snap.raw_resets_at_ms as u64);
-                    fold(snap.first_seen_ms as u64);
-                    fold(snap.window_minutes as u64);
-                    fold(snap.finalized as u64);
-                    fold(snap.maxed_out as u64);
-                    fold(snap.limit_reached_kind as u64);
-                    fold(snap.active_ms);
-                    fold(snap.time_to_100_ms as u64);
-                    fold(snap.last_sample_gap_ms as u64);
-                    fold(snap.sampled_active_fraction as u64);
-                    fold(snap.n_samples as u64);
-                    fold(crate::windows::hash_str(&snap.plan));
+                    acc = acc.wrapping_mul(31).wrapping_add(window_row_fold(key, &snap));
                 });
+
+                // Over the server's cap the server keeps only the newest
+                // MAX_WINDOWS_PER_SYNC and drops the rest WITHOUT reporting
+                // them as dropped — so if we sent the whole set we would latch
+                // a fingerprint for rows that were never stored, losing them
+                // permanently and silently. Decide here which rows are ours to
+                // send, and fingerprint exactly those.
+                //
+                // Selection = the newest rows by (anchor, key), which pass 2
+                // reproduces with the identical comparison. Costs one extra
+                // scan, but only in the over-cap case, which uploads anyway.
+                let mut cutoff: Option<(i64, u64)> = None;
+                let (count, acc) = if count > MAX_WINDOWS_PER_SYNC {
+                    let mut ids: Vec<(i64, u64, u64)> = Vec::with_capacity(count);
+                    let _ = db.for_each_window_in(now_ms - WINDOWS_SYNC_HORIZON_MS, i64::MAX, |key, snap| {
+                        ids.push((
+                            crate::windows::window_key_anchor_ms(key).unwrap_or(i64::MIN),
+                            crate::windows::hash_bytes(key),
+                            window_row_fold(key, &snap),
+                        ));
+                    });
+                    ids.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+                    let dropped = ids.len().saturating_sub(MAX_WINDOWS_PER_SYNC);
+                    ids.truncate(MAX_WINDOWS_PER_SYNC);
+                    let mut acc2: u64 = 0;
+                    for &(_, _, fold) in &ids {
+                        acc2 = acc2.wrapping_mul(31).wrapping_add(fold);
+                    }
+                    if let Some(&(a, k, _)) = ids.last() {
+                        cutoff = Some((a, k));
+                    }
+                    eprintln!(
+                        "[toki:sync] {dropped} oldest windows exceed the per-sync cap; \
+                         sending the newest {MAX_WINDOWS_PER_SYNC}"
+                    );
+                    (ids.len(), acc2)
+                } else {
+                    (count, acc)
+                };
+
                 // Unchanged set: nothing to say — skip the upload, keep the throttle.
                 let fingerprint = (count, acc);
                 if fingerprint == last_windows_fingerprint {
@@ -546,31 +634,14 @@ fn run_sync_inner(
                     // Pass 2 (rare): the set changed — build the wire items.
                     let mut items = Vec::with_capacity(count);
                     let _ = db.for_each_window_in(now_ms - WINDOWS_SYNC_HORIZON_MS, i64::MAX, |key, snap| {
-                        items.push(crate::windows::wire_from_stored(key, &snap));
-                    });
-                    if let Some(ref mut c) = client {
-                        let n = items.len();
-                        match c.sync_windows(&config.provider, items) {
-                            Ok(()) => {
-                                last_windows_sync = Instant::now();
-                                last_windows_fingerprint = fingerprint;
-                                eprintln!("[toki:sync] synced {n} window snapshots");
-                            }
-                            Err(e) => {
-                                // A SyncErr keeps the connection; an IO error
-                                // means the link is gone (reconnect path).
-                                eprintln!("[toki:sync] windows sync error: {e}");
-                                // Surface in `toki settings sync status` —
-                                // eprintln alone left rejections invisible.
-                                sw.set("sync_last_error", &format!("windows: {e}"));
-                                if e.kind() != std::io::ErrorKind::Other {
-                                    client = None;
-                                    continue;
-                                }
-                                last_windows_sync = Instant::now();
+                        if let Some((ca, ck)) = cutoff {
+                            let a = crate::windows::window_key_anchor_ms(key).unwrap_or(i64::MIN);
+                            if (a, crate::windows::hash_bytes(key)) < (ca, ck) {
+                                return;
                             }
                         }
-                    }
+                        items.push(crate::windows::wire_from_stored(key, &snap));
+                    });
                 } else {
                     last_windows_sync = Instant::now();
                 }
