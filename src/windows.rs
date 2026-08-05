@@ -996,6 +996,84 @@ pub fn run_windows_backfill(
 mod tests {
     use super::*;
 
+    /// A window write that failed to PERSIST must not let the backfill marker
+    /// advance: the next start scans only the 8-day catch-up, so those windows
+    /// would be unrecoverable. The flush barrier alone cannot see this — window
+    /// writes are fire-and-forget through a channel, so an ack proves the ops
+    /// were processed, not stored.
+    #[test]
+    fn write_error_counter_gates_the_backfill_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::Database::open(&dir.path().join("t.fjall")).unwrap();
+
+        let before = db.window_write_errors();
+        assert_eq!(before, 0);
+
+        // What the writer thread does when upsert_window_merge fails.
+        db.note_window_write_error();
+
+        // The guard the backfill applies before setting its marker.
+        assert_ne!(db.window_write_errors(), before);
+        assert_eq!(db.window_write_errors(), 1, "counter is monotonic, not a flag");
+        db.note_window_write_error();
+        assert_eq!(db.window_write_errors(), 2);
+    }
+
+    /// Local bounds must match what the sync server accepts. A row minted past
+    /// them is stored and displayed locally, then rejected server-side as
+    /// permanently invalid — visible on one device, silently absent on the rest.
+    #[test]
+    fn observation_beyond_server_bounds_is_refused_locally() {
+        let mut t = WindowTracker::new();
+        t.set_account("acct");
+        let now = 1_800_000_000_000i64;
+
+        let mut obs = WindowObservation {
+            limit_id: "x".repeat(MAX_LIMIT_ID_LEN + 1),
+            window_minutes: 300,
+            used_percent: 40.0,
+            resets_at_ms: now + 3_600_000,
+            plan_type: Some("max_5x".into()),
+            limit_reached: false,
+            has_credits: false,
+            anchor_stable: true,
+            ts_ms: now,
+        };
+        assert!(t.observe(&obs).is_none(), "over-long limit_id must not open a window");
+
+        obs.limit_id = "ok".into();
+        obs.plan_type = Some("p".repeat(MAX_PLAN_LEN + 1));
+        assert!(t.observe(&obs).is_none(), "over-long plan must not open a window");
+
+        obs.plan_type = Some("max_5x".into());
+        t.observe(&obs);
+        assert_eq!(t.open_reset_times().len(), 1, "a valid observation still opens one");
+    }
+
+    /// `open` is linear-scanned per observation, so an input with unbounded
+    /// distinct identities would make it O(n^2) over a growing vector.
+    #[test]
+    fn open_window_count_is_bounded() {
+        let mut t = WindowTracker::new();
+        t.set_account("acct");
+        let now = 1_800_000_000_000i64;
+        for i in 0..(MAX_OPEN_WINDOWS + 50) {
+            t.observe(&WindowObservation {
+                limit_id: format!("l{i}"),
+                window_minutes: 300,
+                used_percent: 40.0,
+                // Distinct anchors so nothing merges into an existing entry.
+                resets_at_ms: now + 3_600_000 + (i as i64) * 600_000,
+                plan_type: Some("max_5x".into()),
+                limit_reached: false,
+                has_credits: false,
+                anchor_stable: true,
+                ts_ms: now,
+            });
+        }
+        assert_eq!(t.open_reset_times().len(), MAX_OPEN_WINDOWS);
+    }
+
     fn obs(limit: &str, minutes: u32, pct: f64, resets_at_ms: i64, ts_ms: i64) -> WindowObservation {
         WindowObservation {
             limit_id: limit.to_string(),

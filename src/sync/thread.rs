@@ -141,6 +141,125 @@ fn insecure_agent() -> Option<ureq::Agent> {
     Some(ureq::AgentBuilder::new().tls_connector(std::sync::Arc::new(tls)).build())
 }
 
+
+/// Anything that can deliver a windows batch. Exists so `windows_sync_step`
+/// can be exercised without a TCP connection — the regression this indirection
+/// is here to prevent was a build-the-payload-and-drop-it edit that no test
+/// could observe.
+pub(crate) trait WindowSender {
+    fn send_windows(
+        &mut self,
+        provider: &str,
+        items: Vec<toki_sync_protocol::WireWindow>,
+    ) -> std::io::Result<()>;
+}
+
+impl WindowSender for crate::sync::client::SyncClient {
+    fn send_windows(
+        &mut self,
+        provider: &str,
+        items: Vec<toki_sync_protocol::WireWindow>,
+    ) -> std::io::Result<()> {
+        self.sync_windows(provider, items)
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum WindowsSyncOutcome {
+    /// Nothing to send: empty set, or unchanged since the last ACCEPTED upload.
+    Skipped,
+    Sent { count: usize, fingerprint: (usize, u64) },
+    /// Server said no (SyncErr). Connection stays usable, fingerprint must not
+    /// latch, so the same set is retried.
+    Rejected(String),
+    /// Transport failure — caller drops the connection and reconnects.
+    Disconnected(String),
+}
+
+pub(crate) struct WindowsSyncStep {
+    pub outcome: WindowsSyncOutcome,
+    /// Rows the per-sync cap excluded, for the caller's (throttled) log.
+    pub over_cap_dropped: usize,
+}
+
+impl WindowsSyncStep {
+    fn skipped() -> Self {
+        WindowsSyncStep { outcome: WindowsSyncOutcome::Skipped, over_cap_dropped: 0 }
+    }
+}
+
+/// One windows upload attempt: fingerprint the eligible set, decide whether it
+/// changed, and if so build and send exactly the rows the server will keep.
+pub(crate) fn windows_sync_step(
+    db: &crate::db::Database,
+    provider: &str,
+    now_ms: i64,
+    last_fingerprint: (usize, u64),
+    sender: &mut dyn WindowSender,
+) -> WindowsSyncStep {
+    // Pass 1: fingerprint only (no WireWindow/String allocation) — the common
+    // steady-state outcome is "unchanged, skip", and it shouldn't pay the full
+    // item build every 5 minutes.
+    let mut count = 0usize;
+    let mut acc: u64 = 0;
+    let _ = db.for_each_window_in(now_ms - WINDOWS_SYNC_HORIZON_MS, i64::MAX, |key, snap| {
+        count += 1;
+        acc = acc.wrapping_mul(31).wrapping_add(window_row_fold(key, &snap));
+    });
+
+    // Over the server's cap the server keeps only the newest
+    // MAX_WINDOWS_PER_SYNC and drops the rest WITHOUT reporting them as
+    // dropped — so sending the whole set would latch a fingerprint for rows
+    // that were never stored, losing them permanently and silently. Decide
+    // here which rows are ours to send, and fingerprint exactly those.
+    //
+    // Selection = the newest rows by (anchor, key hash), which pass 2
+    // reproduces with the identical comparison. Costs one extra scan, but only
+    // in the over-cap case, which uploads anyway.
+    let mut cutoff: Option<(i64, u64)> = None;
+    let mut over_cap_dropped = 0usize;
+    let (count, acc) = if count > MAX_WINDOWS_PER_SYNC {
+        let mut ids: Vec<(i64, u64, u64)> = Vec::with_capacity(count);
+        let _ = db.for_each_window_in(now_ms - WINDOWS_SYNC_HORIZON_MS, i64::MAX, |key, snap| {
+            ids.push((
+                crate::windows::window_key_anchor_ms(key).unwrap_or(i64::MIN),
+                crate::windows::hash_bytes(key),
+                window_row_fold(key, &snap),
+            ));
+        });
+        ids.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
+        over_cap_dropped = ids.len().saturating_sub(MAX_WINDOWS_PER_SYNC);
+        ids.truncate(MAX_WINDOWS_PER_SYNC);
+        let mut acc2: u64 = 0;
+        for &(_, _, fold) in &ids {
+            acc2 = acc2.wrapping_mul(31).wrapping_add(fold);
+        }
+        if let Some(&(a, k, _)) = ids.last() {
+            cutoff = Some((a, k));
+        }
+        (ids.len(), acc2)
+    } else {
+        (count, acc)
+    };
+
+    let fingerprint = (count, acc);
+    if fingerprint == last_fingerprint || count == 0 {
+        return WindowsSyncStep { outcome: WindowsSyncOutcome::Skipped, over_cap_dropped };
+    }
+    let items = collect_window_items(db, now_ms, cutoff, count);
+    let n = items.len();
+    let outcome = match sender.send_windows(provider, items) {
+        Ok(()) => WindowsSyncOutcome::Sent { count: n, fingerprint },
+        // ErrorKind::Other is how the client reports a server-side SyncErr;
+        // anything else means the link itself is gone.
+        Err(e) if e.kind() == std::io::ErrorKind::Other => {
+            WindowsSyncOutcome::Rejected(e.to_string())
+        }
+        Err(e) => WindowsSyncOutcome::Disconnected(e.to_string()),
+    };
+    WindowsSyncStep { outcome, over_cap_dropped }
+}
+
 /// Pass 2 of the windows upload: materialize the wire items for the rows the
 /// fingerprint pass selected. `cutoff` is `None` below the per-sync cap and
 /// otherwise the `(anchor, key_hash)` low-water mark of the selected set —
@@ -601,98 +720,49 @@ fn run_sync_inner(
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as i64)
                     .unwrap_or(0);
-                // Pass 1: fingerprint only (no WireWindow/String allocation) —
-                // the common steady-state outcome is "unchanged, skip", and it
-                // shouldn't pay the full item build every 5 minutes.
-                let mut count = 0usize;
-                let mut acc: u64 = 0;
-                let _ = db.for_each_window_in(now_ms - WINDOWS_SYNC_HORIZON_MS, i64::MAX, |key, snap| {
-                    count += 1;
-                    acc = acc.wrapping_mul(31).wrapping_add(window_row_fold(key, &snap));
-                });
-
-                // Over the server's cap the server keeps only the newest
-                // MAX_WINDOWS_PER_SYNC and drops the rest WITHOUT reporting
-                // them as dropped — so if we sent the whole set we would latch
-                // a fingerprint for rows that were never stored, losing them
-                // permanently and silently. Decide here which rows are ours to
-                // send, and fingerprint exactly those.
-                //
-                // Selection = the newest rows by (anchor, key), which pass 2
-                // reproduces with the identical comparison. Costs one extra
-                // scan, but only in the over-cap case, which uploads anyway.
-                let mut cutoff: Option<(i64, u64)> = None;
-                let (count, acc) = if count > MAX_WINDOWS_PER_SYNC {
-                    let mut ids: Vec<(i64, u64, u64)> = Vec::with_capacity(count);
-                    let _ = db.for_each_window_in(now_ms - WINDOWS_SYNC_HORIZON_MS, i64::MAX, |key, snap| {
-                        ids.push((
-                            crate::windows::window_key_anchor_ms(key).unwrap_or(i64::MIN),
-                            crate::windows::hash_bytes(key),
-                            window_row_fold(key, &snap),
-                        ));
-                    });
-                    ids.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
-                    let dropped = ids.len().saturating_sub(MAX_WINDOWS_PER_SYNC);
-                    ids.truncate(MAX_WINDOWS_PER_SYNC);
-                    let mut acc2: u64 = 0;
-                    for &(_, _, fold) in &ids {
-                        acc2 = acc2.wrapping_mul(31).wrapping_add(fold);
+                // The decision itself lives in `windows_sync_step` so it can be
+                // tested without a socket; this arm only applies the outcome.
+                let step = match client {
+                    Some(ref mut c) => {
+                        windows_sync_step(&db, &config.provider, now_ms, last_windows_fingerprint, c)
                     }
-                    if let Some(&(a, k, _)) = ids.last() {
-                        cutoff = Some((a, k));
-                    }
-                    // This block runs on every 5-minute tick, including the
-                    // ones whose fingerprint matches and upload nothing, so an
-                    // unconditional log here would repeat forever. Report only
-                    // when the number actually moves.
-                    if last_over_cap_logged != dropped {
-                        last_over_cap_logged = dropped;
+                    None => WindowsSyncStep::skipped(),
+                };
+                if step.over_cap_dropped != last_over_cap_logged {
+                    last_over_cap_logged = step.over_cap_dropped;
+                    if step.over_cap_dropped > 0 {
                         eprintln!(
-                            "[toki:sync] {dropped} oldest windows exceed the per-sync cap; \
-                             sending the newest {MAX_WINDOWS_PER_SYNC}"
+                            "[toki:sync] {} oldest windows exceed the per-sync cap; \
+                             sending the newest {MAX_WINDOWS_PER_SYNC}",
+                            step.over_cap_dropped
                         );
                     }
-                    (ids.len(), acc2)
-                } else {
-                    (count, acc)
-                };
-
-                // Unchanged set: nothing to say — skip the upload, keep the throttle.
-                let fingerprint = (count, acc);
-                if fingerprint == last_windows_fingerprint {
-                    last_windows_sync = Instant::now();
-                } else if count > 0 {
-                    // Pass 2 (rare): the set changed — build the wire items.
-                    // Extracted so `items` is a plain binding: if the send below
-                    // is ever lost in an edit, the compiler flags it as unused
-                    // rather than silently building a payload and dropping it
-                    // (which is exactly how window sync went dead once).
-                    let items = collect_window_items(&db, now_ms, cutoff, count);
-                    if let Some(ref mut c) = client {
-                        let n = items.len();
-                        match c.sync_windows(&config.provider, items) {
-                            Ok(()) => {
-                                last_windows_sync = Instant::now();
-                                last_windows_fingerprint = fingerprint;
-                                eprintln!("[toki:sync] synced {n} window snapshots");
-                            }
-                            Err(e) => {
-                                // A SyncErr keeps the connection; an IO error
-                                // means the link is gone (reconnect path).
-                                eprintln!("[toki:sync] windows sync error: {e}");
-                                // Surface in `toki settings sync status` —
-                                // eprintln alone left rejections invisible.
-                                sw.set("sync_last_error", &format!("windows: {e}"));
-                                if e.kind() != std::io::ErrorKind::Other {
-                                    client = None;
-                                    continue;
-                                }
-                                last_windows_sync = Instant::now();
-                            }
-                        }
+                }
+                match step.outcome {
+                    WindowsSyncOutcome::Skipped => {
+                        last_windows_sync = Instant::now();
                     }
-                } else {
-                    last_windows_sync = Instant::now();
+                    WindowsSyncOutcome::Sent { count, fingerprint } => {
+                        last_windows_sync = Instant::now();
+                        last_windows_fingerprint = fingerprint;
+                        eprintln!("[toki:sync] synced {count} window snapshots");
+                    }
+                    // A SyncErr keeps the connection; the fingerprint does NOT
+                    // latch, so the set is retried next cycle.
+                    WindowsSyncOutcome::Rejected(e) => {
+                        eprintln!("[toki:sync] windows sync error: {e}");
+                        // Surface in `toki settings sync status` — eprintln
+                        // alone left rejections invisible.
+                        sw.set("sync_last_error", &format!("windows: {e}"));
+                        last_windows_sync = Instant::now();
+                    }
+                    // Transport is gone: reconnect path.
+                    WindowsSyncOutcome::Disconnected(e) => {
+                        eprintln!("[toki:sync] windows sync error: {e}");
+                        sw.set("sync_last_error", &format!("windows: {e}"));
+                        client = None;
+                        continue;
+                    }
                 }
             }
         }
@@ -963,4 +1033,237 @@ fn try_refresh_token(config: &mut SyncConfig) -> bool {
 fn truncate(s: &str, n: usize) -> &str {
     let end = s.char_indices().nth(n).map_or(s.len(), |(i, _)| i);
     &s[..end]
+}
+
+#[cfg(test)]
+mod windows_sync_tests {
+    use super::*;
+    use crate::windows::{window_key, WindowKind, WindowSnapshotV1, REACHED_NONE};
+
+    /// Records what was handed to it, so a step that builds a payload and never
+    /// delivers it is observable. Window sync once shipped in exactly that
+    /// state — the payload was built and dropped — and no test could see it.
+    struct RecordingSender {
+        sent: Vec<(String, usize)>,
+        result: fn() -> std::io::Result<()>,
+    }
+
+    impl RecordingSender {
+        fn ok() -> Self {
+            RecordingSender { sent: Vec::new(), result: || Ok(()) }
+        }
+        fn rejecting() -> Self {
+            RecordingSender {
+                sent: Vec::new(),
+                result: || Err(std::io::Error::other("2 of 5 window items rejected")),
+            }
+        }
+        fn broken_pipe() -> Self {
+            RecordingSender {
+                sent: Vec::new(),
+                result: || Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+            }
+        }
+    }
+
+    impl WindowSender for RecordingSender {
+        fn send_windows(
+            &mut self,
+            provider: &str,
+            items: Vec<toki_sync_protocol::WireWindow>,
+        ) -> std::io::Result<()> {
+            self.sent.push((provider.to_string(), items.len()));
+            (self.result)()
+        }
+    }
+
+    fn temp_db() -> (crate::db::Database, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::Database::open(&dir.path().join("t.fjall")).unwrap();
+        (db, dir)
+    }
+
+    fn put(db: &crate::db::Database, now_ms: i64, i: u64, peak: u16) {
+        // 10-minute spacing keeps even a full over-cap set (2000+ rows) inside
+        // the 60-day sync horizon; at hourly spacing the horizon would exclude
+        // most of them and the cap would never engage.
+        let anchor = now_ms - (i as i64) * 600_000;
+        let key = window_key(WindowKind::Session, i, 7, anchor);
+        let snap = WindowSnapshotV1 {
+            peak_pct_x100: peak,
+            last_pct_x100: peak,
+            observed_ts_ms: anchor - 1000,
+            raw_resets_at_ms: anchor,
+            first_seen_ms: anchor - 300_000,
+            window_minutes: 300,
+            finalized: true,
+            maxed_out: false,
+            limit_reached_kind: REACHED_NONE,
+            time_to_100_ms: -1,
+            active_ms: 1000,
+            last_sample_gap_ms: 1000,
+            sampled_active_fraction: 1000,
+            n_samples: 3,
+            limit_id: format!("l{i}"),
+            plan: "max_5x".into(),
+            account: "acct".into(),
+        };
+        db.upsert_window_merge(&key, &snap).unwrap();
+    }
+
+    #[test]
+    fn changed_set_is_actually_delivered() {
+        let (db, _d) = temp_db();
+        let now = 1_800_000_000_000i64;
+        for i in 0..3 {
+            put(&db, now, i, 5000);
+        }
+        let mut sender = RecordingSender::ok();
+        let step = windows_sync_step(&db, "codex", now, (0, 0), &mut sender);
+
+        assert_eq!(sender.sent, vec![("codex".to_string(), 3)], "payload must reach the sender");
+        match step.outcome {
+            WindowsSyncOutcome::Sent { count, .. } => assert_eq!(count, 3),
+            other => panic!("expected Sent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unchanged_set_skips_without_sending() {
+        let (db, _d) = temp_db();
+        let now = 1_800_000_000_000i64;
+        put(&db, now, 0, 5000);
+
+        let mut first = RecordingSender::ok();
+        let fp = match windows_sync_step(&db, "codex", now, (0, 0), &mut first).outcome {
+            WindowsSyncOutcome::Sent { fingerprint, .. } => fingerprint,
+            other => panic!("expected Sent, got {other:?}"),
+        };
+
+        let mut second = RecordingSender::ok();
+        let step = windows_sync_step(&db, "codex", now, fp, &mut second);
+        assert_eq!(step.outcome, WindowsSyncOutcome::Skipped);
+        assert!(second.sent.is_empty(), "an unchanged set must not re-upload");
+    }
+
+    #[test]
+    fn a_changed_peak_re_uploads() {
+        let (db, _d) = temp_db();
+        let now = 1_800_000_000_000i64;
+        put(&db, now, 0, 5000);
+        let mut first = RecordingSender::ok();
+        let fp = match windows_sync_step(&db, "codex", now, (0, 0), &mut first).outcome {
+            WindowsSyncOutcome::Sent { fingerprint, .. } => fingerprint,
+            other => panic!("expected Sent, got {other:?}"),
+        };
+        // Same key, higher peak — the fingerprint must notice.
+        put(&db, now, 0, 9000);
+        let mut second = RecordingSender::ok();
+        match windows_sync_step(&db, "codex", now, fp, &mut second).outcome {
+            WindowsSyncOutcome::Sent { count, .. } => assert_eq!(count, 1),
+            other => panic!("expected Sent after a peak change, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejection_does_not_latch_the_fingerprint() {
+        let (db, _d) = temp_db();
+        let now = 1_800_000_000_000i64;
+        put(&db, now, 0, 5000);
+        let mut sender = RecordingSender::rejecting();
+        let step = windows_sync_step(&db, "codex", now, (0, 0), &mut sender);
+        // Rejected carries no fingerprint, so the caller cannot latch one and
+        // the same set is retried next cycle.
+        assert!(matches!(step.outcome, WindowsSyncOutcome::Rejected(_)));
+    }
+
+    #[test]
+    fn transport_failure_is_distinguished_from_rejection() {
+        let (db, _d) = temp_db();
+        let now = 1_800_000_000_000i64;
+        put(&db, now, 0, 5000);
+        let mut sender = RecordingSender::broken_pipe();
+        let step = windows_sync_step(&db, "codex", now, (0, 0), &mut sender);
+        assert!(
+            matches!(step.outcome, WindowsSyncOutcome::Disconnected(_)),
+            "an IO error must trigger reconnect, not a quiet retry"
+        );
+    }
+
+    #[test]
+    fn empty_set_sends_nothing() {
+        let (db, _d) = temp_db();
+        let mut sender = RecordingSender::ok();
+        let step = windows_sync_step(&db, "codex", 1_800_000_000_000, (0, 0), &mut sender);
+        assert_eq!(step.outcome, WindowsSyncOutcome::Skipped);
+        assert!(sender.sent.is_empty());
+    }
+
+    #[test]
+    fn over_cap_sends_exactly_the_cap_and_fingerprints_that_same_set() {
+        let (db, _d) = temp_db();
+        let now = 1_800_000_000_000i64;
+        let total = MAX_WINDOWS_PER_SYNC + 25;
+        for i in 0..total as u64 {
+            put(&db, now, i, 5000);
+        }
+        let mut sender = RecordingSender::ok();
+        let step = windows_sync_step(&db, "codex", now, (0, 0), &mut sender);
+
+        assert_eq!(step.over_cap_dropped, 25);
+        assert_eq!(sender.sent[0].1, MAX_WINDOWS_PER_SYNC, "must send exactly the cap");
+        let fp = match step.outcome {
+            WindowsSyncOutcome::Sent { count, fingerprint } => {
+                assert_eq!(count, MAX_WINDOWS_PER_SYNC);
+                fingerprint
+            }
+            other => panic!("expected Sent, got {other:?}"),
+        };
+        // The fingerprint must describe the SENT set, not the whole set: if it
+        // described rows the server never stored, latching it would drop them
+        // permanently and silently.
+        assert_eq!(fp.0, MAX_WINDOWS_PER_SYNC);
+
+        // And it must be stable — a second pass over the unchanged DB skips.
+        let mut again = RecordingSender::ok();
+        assert_eq!(
+            windows_sync_step(&db, "codex", now, fp, &mut again).outcome,
+            WindowsSyncOutcome::Skipped
+        );
+    }
+
+    #[test]
+    fn over_cap_selection_keeps_the_newest_windows() {
+        let (db, _d) = temp_db();
+        let now = 1_800_000_000_000i64;
+        for i in 0..(MAX_WINDOWS_PER_SYNC + 5) as u64 {
+            put(&db, now, i, 5000);
+        }
+        // Pass 2 reproduces pass 1's selection, so the delivered rows are the
+        // newest by anchor: index 0 is newest, index N-1 oldest.
+        let items = {
+            let mut captured: Vec<toki_sync_protocol::WireWindow> = Vec::new();
+            struct Capture<'a>(&'a mut Vec<toki_sync_protocol::WireWindow>);
+            impl WindowSender for Capture<'_> {
+                fn send_windows(
+                    &mut self,
+                    _p: &str,
+                    items: Vec<toki_sync_protocol::WireWindow>,
+                ) -> std::io::Result<()> {
+                    *self.0 = items;
+                    Ok(())
+                }
+            }
+            let mut c = Capture(&mut captured);
+            windows_sync_step(&db, "codex", now, (0, 0), &mut c);
+            captured
+        };
+        assert_eq!(items.len(), MAX_WINDOWS_PER_SYNC);
+        let oldest_sent = items.iter().map(|w| w.window_end_ms).min().unwrap();
+        let dropped_anchor = now - ((MAX_WINDOWS_PER_SYNC + 4) as i64) * 600_000;
+        assert!(
+            oldest_sent > dropped_anchor,
+            "the excluded rows must be the OLDEST, not an arbitrary subset"
+        );
+    }
 }
