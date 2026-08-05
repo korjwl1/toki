@@ -366,7 +366,7 @@ fn handle_windows_client(
         let mut rows: Vec<crate::windows::WindowRow> = Vec::new();
         let read_err = db
             .for_each_window_in(now_ms - ROW_HORIZON_MS, i64::MAX, |key, snap| {
-                rows.push(crate::windows::WindowRow::from_stored(key, &snap));
+                rows.push(crate::windows::WindowRow::from_stored(key, &snap, now_ms));
             })
             .err()
             .map(|e| e.to_string());

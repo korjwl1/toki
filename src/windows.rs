@@ -285,7 +285,7 @@ pub struct WindowRow {
 }
 
 impl WindowRow {
-    pub fn from_stored(key: &[u8], snap: &WindowSnapshotV1) -> WindowRow {
+    pub fn from_stored(key: &[u8], snap: &WindowSnapshotV1, now_ms: i64) -> WindowRow {
         WindowRow {
             kind: key
                 .first()
@@ -301,7 +301,15 @@ impl WindowRow {
             last_pct: (snap.last_pct_x100 as f64) / 100.0,
             observed_ts_ms: snap.observed_ts_ms,
             first_seen_ms: snap.first_seen_ms,
-            finalized: snap.finalized,
+            // Derived, not merely copied: a window whose reset has passed IS
+            // final regardless of whether anything got around to writing the
+            // flag (daemon stopped over the reset, or the retention sweep has
+            // not run yet). The sync SERVER already derives it this way; a
+            // stored-flag-only local path meant the same window counted toward
+            // statistics when read from the server and was silently dropped
+            // when read from the local CLI.
+            finalized: snap.finalized
+                || snap.raw_resets_at_ms + FINALIZE_GRACE_MS < now_ms,
             maxed_out: snap.maxed_out,
             limit_reached_kind: snap.limit_reached_kind,
             time_to_100_ms: snap.time_to_100_ms,
@@ -1324,7 +1332,7 @@ mod tests {
             plan: "prolite".into(),
             account: "acct".into(),
         };
-        let row = WindowRow::from_stored(&key, &snap);
+        let row = WindowRow::from_stored(&key, &snap, snap.observed_ts_ms);
         let wire = wire_from_stored(&key, &snap);
         assert_eq!(row.kind, "weekly");
         assert_eq!(wire.window_kind, 1);

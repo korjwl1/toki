@@ -214,8 +214,15 @@ pub fn execute_parsed_query(
             // One row per window instance; whole-keyspace scan is a few
             // hundred rows. Range filters apply to the window anchor.
             let mut rows: Vec<crate::windows::WindowRow> = Vec::new();
+            // Wall clock, deliberately NOT the caller's --end: a date string
+            // rounds up to 23:59:59, which would report a window that is still
+            // filling as final. Same rule the sync server applies.
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
             db.for_each_window_in(since_ms, until_ms, |key, snap| {
-                rows.push(crate::windows::WindowRow::from_stored(key, &snap));
+                rows.push(crate::windows::WindowRow::from_stored(key, &snap, now_ms));
             })
             .map_err(|e| e.to_string())?;
             rows.sort_by_key(|r| r.window_end_ms);
