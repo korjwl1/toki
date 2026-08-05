@@ -155,3 +155,23 @@ if [ "$FAIL" = "0" ]; then echo "════ ALL E2E CHECKS PASSED ════
 #   - uploads merged field-wise: resend kept the row count and took the max peak
 #   - 2500 windows with every string at the 64-byte maximum: the client capped
 #     at 2000 and the payload stayed under the server's 1 MiB limit
+
+# ── Backward compatibility with a server that predates window sync ────────────
+# Build an image from toki_sync's pre-feature commit and point the client at it.
+#
+# Verified 2026-08-05 against toki_sync main (85177eb):
+#   - GET /api/v1/capabilities returns 404, which probe_windows_capability maps
+#     to Some(false) -> WindowsCapability::Unsupported, so the client never
+#     sends the frame
+#   - forcing the send anyway (calling windows_sync_step directly) confirms why
+#     that gate exists: the old server logs
+#     "dropping TCP connection: unknown msg_type: 36" (0x24) and closes the
+#     socket WITHOUT a SyncErr. Since event sync shares that connection, an
+#     ungated send would tear down event sync on every window cycle.
+#
+# ── Provider data reality (same date, this machine) ───────────────────────────
+# Codex stopped issuing the 5-hour window for plan_type=prolite between
+# 2026-07-02 and 2026-07-14 ("secondary": null); the payload shape did not
+# change. Free-tier history never had it either. A monitor showing only the
+# weekly window for Codex is therefore correct, not a bug — replaying June
+# rollout files (which do carry both) produces both session and weekly rows.
