@@ -173,3 +173,58 @@ fn event_sync_and_window_sync_share_one_connection() {
         .expect("event batch after windows");
     println!("EVENTS_AFTER_WINDOWS_ACK={acked}");
 }
+
+
+/// Multi-device merge — the reason the server exists for this feature, and the
+/// one path never exercised: every earlier check was a single device
+/// resending. Two devices on ONE account upload the SAME window with
+/// different values; the stored row must be the field-wise merge, not
+/// last-writer-wins.
+#[test]
+fn two_devices_merge_field_wise_on_one_window() {
+    let Some((addr, jwt)) = env2() else {
+        eprintln!("skipping: TOKI_E2E_ADDR / TOKI_E2E_JWT not set");
+        return;
+    };
+    let anchor: i64 = std::env::var("TOKI_E2E_ANCHOR")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .expect("TOKI_E2E_ANCHOR must pin the window identity for both devices");
+
+    // Device A: the HIGHER peak, observed EARLIER, still open.
+    let mut a = snap(7700, anchor, "shared_limit");
+    a.observed_ts_ms = anchor - 120_000;
+    a.finalized = false;
+    a.maxed_out = false;
+    a.active_ms = 30_000;
+
+    // Device B: a LOWER peak but observed LATER, and it saw the finalize.
+    // Last-writer-wins would drop A's peak; the merge must keep it.
+    let mut b = snap(2200, anchor, "shared_limit");
+    b.observed_ts_ms = anchor - 30_000;
+    b.finalized = true;
+    b.maxed_out = true;
+    b.time_to_100_ms = 4_200_000;
+    b.active_ms = 90_000;
+
+    for (device, key, sn) in [
+        ("dev-a", "aaaa0000-0000-4000-8000-00000000aaaa", a),
+        ("dev-b", "bbbb0000-0000-4000-8000-00000000bbbb", b),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::open(&dir.path().join(format!("{device}.fjall"))).unwrap();
+        db.upsert_window_merge(&window_key(WindowKind::Session, 777, 42, anchor), &sn)
+            .unwrap();
+        let mut client = toki::sync::client::SyncClient::connect(&addr, false, false)
+            .expect("connect");
+        client.auth(&jwt, device, key, "codex").expect("auth");
+        let sent = toki::sync::thread::windows_sync_step_for_test(
+            &db,
+            "codex",
+            anchor,
+            (0, 0),
+            &mut client,
+        );
+        println!("DEVICE_{}_SENT={}", device, sent);
+    }
+}

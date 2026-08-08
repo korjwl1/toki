@@ -82,7 +82,7 @@ export TOKI_E2E_JWT="$ACCESS"
 # Fixed anchor so every run uploads the SAME logical windows.
 export TOKI_E2E_ANCHOR=$(( $(date +%s) * 1000 ))
 cd "$REPO"
-if cargo test --test window_sync_e2e -- --nocapture 2>&1 | tee "$R/e2e.log" | grep -q "test result: ok"; then
+if cargo test --test window_sync_e2e windows_reach -- --nocapture 2>&1 | tee "$R/e2e.log" | grep -q "test result: ok"; then
   grep -q "skipping" "$R/e2e.log" && bad "test skipped (env not seen)" || ok "client delivered the batch and the server acked"
 else
   bad "client->server sync failed"; tail -20 "$R/e2e.log"
@@ -96,7 +96,7 @@ N=$(echo "$WIN" | python3 -c "
 import json,sys
 try: d=json.load(sys.stdin)
 except Exception: print(-1); raise SystemExit
-print(sum(len(v) for v in (d.get('windows') or {}).values()))
+print(sum(1 for v in (d.get('windows') or {}).values() for w in v if w['limit_id'].startswith('e2e_limit_')))
 ")
 [ "$N" = "3" ] && ok "server returns all 3 uploaded windows" || bad "server returned $N windows, expected 3"
 
@@ -106,19 +106,20 @@ sleep 62
 # Second upload contributes a HIGHER peak for the same windows, so the
 # field-wise merge is observable rather than a no-op.
 export TOKI_E2E_PEAK=8800
-OUT6=$(cargo test --test window_sync_e2e -- --nocapture 2>&1 | grep -o "OUTCOME=[A-Za-z]*" | head -1)
+OUT6=$(cargo test --test window_sync_e2e windows_reach -- --nocapture 2>&1 | grep -o "OUTCOME=[A-Za-z]*" | head -1)
 [ "$OUT6" = "OUTCOME=Sent" ] && ok "resend accepted after the throttle window" || bad "resend not accepted: $OUT6"
 N2=$(curl -s "http://127.0.0.1:19091/api/v1/toki/query?query=windows&start=$(( $(date +%s) - 86400 ))&end=$(( $(date +%s) + 86400 ))" \
       -H "authorization: Bearer $ACCESS" | python3 -c "
 import json,sys
-d=json.load(sys.stdin); print(sum(len(v) for v in (d.get('windows') or {}).values()))
+d=json.load(sys.stdin)
+print(sum(1 for v in (d.get('windows') or {}).values() for w in v if w['limit_id'].startswith('e2e_limit_')))
 ")
 [ "$N2" = "3" ] && ok "still 3 rows — no duplicates" || bad "resend duplicated rows: $N2"
 PEAK=$(curl -s "http://127.0.0.1:19091/api/v1/toki/query?query=windows&start=$(( $(date +%s) - 86400 ))&end=$(( $(date +%s) + 86400 ))" \
       -H "authorization: Bearer $ACCESS" | python3 -c "
 import json,sys
 d=json.load(sys.stdin)
-rows=[w for v in (d.get('windows') or {}).values() for w in v]
+rows=[w for v in (d.get('windows') or {}).values() for w in v if w['limit_id'].startswith('e2e_limit_')]
 print(max(w['peak_pct'] for w in rows) if rows else -1)
 ")
 python3 -c "import sys; sys.exit(0 if abs(float('$PEAK') - 88.02) < 0.05 else 1)" \
@@ -128,7 +129,7 @@ python3 -c "import sys; sys.exit(0 if abs(float('$PEAK') - 88.02) < 0.05 else 1)
 say "7. per-user throttle survives a reconnect"
 # Each cargo test run is a FRESH TCP connection: under the old per-connection
 # throttle this would be accepted, which is the bug the per-user limiter fixes.
-OUT7=$(cargo test --test window_sync_e2e -- --nocapture 2>&1 | grep -o "OUTCOME=[A-Za-z]*" | head -1)
+OUT7=$(cargo test --test window_sync_e2e windows_reach -- --nocapture 2>&1 | grep -o "OUTCOME=[A-Za-z]*" | head -1)
 [ "$OUT7" = "OUTCOME=NotSent" ] && ok "immediate resend on a new connection was throttled" || bad "throttle bypassed by reconnect: $OUT7"
 
 say "8. event sync and window sync share one connection"
@@ -143,7 +144,29 @@ echo "$MIX" | grep -q "EVENTS_AFTER_WINDOWS_ACK=" \
   && ok "events still accepted after a window frame ($(echo "$MIX" | grep -o 'EVENTS_AFTER_WINDOWS_ACK=[-0-9]*'))" \
   || bad "event sync broke after a window frame"
 
-say "9. server logs clean"
+say "9. multi-device field-wise merge"
+# The reason this feature has a server at all. Two devices on ONE account
+# upload the SAME window with different values; the stored row must be the
+# field-wise merge, not last-writer-wins.
+export TOKI_E2E_ANCHOR=$(( $(date +%s) * 1000 ))
+MD=$(cargo test --test window_sync_e2e two_devices -- --nocapture 2>&1)
+echo "$MD" | grep -q "DEVICE_dev-b_SENT=true" \
+  && ok "a second device on the same account was accepted" \
+  || bad "second device refused — a limiter is blocking the merge path"
+MERGED=$(curl -s "http://127.0.0.1:19091/api/v1/toki/query?query=windows&start=$(( $(date +%s) - 86400 ))&end=$(( $(date +%s) + 86400 ))" \
+  -H "authorization: Bearer $ACCESS" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+rows=[w for v in (d.get('windows') or {}).values() for w in v if w['limit_id']=='shared_limit']
+if len(rows)!=1: print('BADROWS', len(rows)); raise SystemExit
+w=rows[0]
+ok = (w['peak_pct']==77.0 and w['finalized'] and w['maxed_out']
+      and w['time_to_100_ms']==4200000 and w['active_ms']==90000)
+print('MERGED_OK' if ok else 'MERGED_WRONG %s' % w)
+")
+[ "$MERGED" = "MERGED_OK" ] && ok "one row, max peak kept, flags OR-ed, later observation won" || bad "merge wrong: $MERGED"
+
+say "10. server logs clean"
 ERRS=$(docker logs toki-e2e 2>&1 | grep -ciE "\berror\b|panic" || true)
 [ "$ERRS" = "0" ] && ok "no errors/panics in server log" || { bad "$ERRS error lines in server log"; docker logs toki-e2e 2>&1 | grep -iE "\berror\b|panic" | tail -5; }
 
