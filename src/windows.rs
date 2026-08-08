@@ -497,14 +497,6 @@ impl WindowTracker {
         if obs.limit_id.len() > MAX_LIMIT_ID_LEN || obs.plan_type.as_ref().map(|p| p.len()).unwrap_or(0) > MAX_PLAN_LEN {
             return None;
         }
-        // A distinct (kind, limit_id) identity opens its own entry, and the
-        // match below is a linear scan over `open`. Real providers expose a
-        // handful; a file full of unique limit ids would turn this into an
-        // O(n^2) scan over an unbounded Vec. Refuse to open more rather than
-        // let one bad file stall the daemon.
-        if self.open.len() >= MAX_OPEN_WINDOWS {
-            return None;
-        }
         let kind = WindowKind::from_minutes(obs.window_minutes);
         let limit_hash = hash_str(&obs.limit_id);
 
@@ -519,6 +511,16 @@ impl WindowTracker {
                 && (w.raw_resets_at_ms - obs.resets_at_ms).abs() <= ANCHOR_EPSILON_MS
                 && (w.anchor_min_ms - obs.resets_at_ms).abs() <= ANCHOR_EPSILON_MS + 60_000
         });
+
+        // The cap belongs HERE, after the match: placed before it, a tracker
+        // sitting at the ceiling would also refuse to UPDATE the windows it
+        // already holds, silently freezing every peak. Only OPENING a new
+        // identity is refused — a linear scan over `open` is O(n) per
+        // observation, so an input with unbounded distinct limit ids would
+        // otherwise make it O(n^2) over an unbounded Vec.
+        if idx.is_none() && self.open.len() >= MAX_OPEN_WINDOWS {
+            return None;
+        }
 
         match idx {
             Some(i) => {
@@ -1050,6 +1052,43 @@ mod tests {
         assert_eq!(t.open_reset_times().len(), 1, "a valid observation still opens one");
     }
 
+
+    /// The cap must refuse only NEW identities. Applied before the match, a
+    /// tracker sitting at the ceiling would also stop updating the windows it
+    /// already holds, silently freezing every peak it had.
+    #[test]
+    fn cap_does_not_block_updates_to_windows_already_open() {
+        let mut t = WindowTracker::new();
+        t.set_account("acct");
+        let now = 1_800_000_000_000i64;
+        let mk = |i: usize, pct: f64| WindowObservation {
+            limit_id: format!("l{i}"),
+            window_minutes: 300,
+            used_percent: pct,
+            resets_at_ms: now + 3_600_000 + (i as i64) * 600_000,
+            plan_type: Some("max_5x".into()),
+            limit_reached: false,
+            has_credits: false,
+            anchor_stable: true,
+            ts_ms: now,
+        };
+        for i in 0..MAX_OPEN_WINDOWS {
+            t.observe(&mk(i, 10.0));
+        }
+        assert_eq!(t.open_reset_times().len(), MAX_OPEN_WINDOWS, "at the ceiling");
+
+        // A NEW identity is refused...
+        assert!(t.observe(&mk(MAX_OPEN_WINDOWS + 1, 10.0)).is_none());
+        assert_eq!(t.open_reset_times().len(), MAX_OPEN_WINDOWS);
+
+        // ...but an existing one still takes the higher peak.
+        t.observe(&mk(0, 90.0));
+        let peaks: Vec<f64> = t.flush_all().iter().map(|w| w.snapshot.peak_pct_x100 as f64 / 100.0).collect();
+        assert!(
+            peaks.iter().any(|p| (*p - 90.0).abs() < 0.01),
+            "an already-open window must keep updating at the cap, got {peaks:?}"
+        );
+    }
     /// `open` is linear-scanned per observation, so an input with unbounded
     /// distinct identities would make it O(n^2) over a growing vector.
     #[test]

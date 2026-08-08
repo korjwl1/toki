@@ -213,6 +213,36 @@ pub(crate) fn windows_sync_step(
     last_fingerprint: (usize, u64),
     sender: &mut dyn WindowSender,
 ) -> WindowsSyncStep {
+    windows_sync_step_gated(db, provider, now_ms, last_fingerprint, None, sender).0
+}
+
+/// As above, but skips the scan entirely when the DB's write counter proves
+/// nothing has been stored since the last attempt. The steady state is
+/// "unchanged, skip", and reaching that conclusion should not cost a full
+/// keyspace scan with a bincode decode and three String allocations per row
+/// every five minutes. Returns the counter to carry into the next call.
+pub(crate) fn windows_sync_step_gated(
+    db: &crate::db::Database,
+    provider: &str,
+    now_ms: i64,
+    last_fingerprint: (usize, u64),
+    last_writes: Option<u64>,
+    sender: &mut dyn WindowSender,
+) -> (WindowsSyncStep, u64) {
+    let writes = db.window_writes();
+    if last_writes == Some(writes) {
+        return (WindowsSyncStep::skipped(), writes);
+    }
+    (windows_sync_step_inner(db, provider, now_ms, last_fingerprint, sender), writes)
+}
+
+fn windows_sync_step_inner(
+    db: &crate::db::Database,
+    provider: &str,
+    now_ms: i64,
+    last_fingerprint: (usize, u64),
+    sender: &mut dyn WindowSender,
+) -> WindowsSyncStep {
     // Pass 1: fingerprint only (no WireWindow/String allocation) — the common
     // steady-state outcome is "unchanged, skip", and it shouldn't pay the full
     // item build every 5 minutes.
@@ -458,6 +488,7 @@ fn run_sync_inner(
     let mut next_cap_probe = Instant::now();
     let mut cap_probe_failure_logged = false;
     let mut last_over_cap_logged: usize = 0;
+    let mut last_windows_writes: Option<u64> = None;
     // Fingerprint of the last uploaded window set — identical sets skip the
     // resend entirely (serialization + network) while staying cursorless.
     // Folds every merge-visible field: a finalize-only change keeps count,
@@ -740,7 +771,21 @@ fn run_sync_inner(
                 // tested without a socket; this arm only applies the outcome.
                 let step = match client {
                     Some(ref mut c) => {
-                        windows_sync_step(&db, &config.provider, now_ms, last_windows_fingerprint, c)
+                        let (s, w) = windows_sync_step_gated(
+                            &db,
+                            &config.provider,
+                            now_ms,
+                            last_windows_fingerprint,
+                            last_windows_writes,
+                            c,
+                        );
+                        // Only latch the counter on an ACCEPTED upload: a
+                        // rejection or a dropped link must leave the set
+                        // looking dirty so the next cycle retries it.
+                        if matches!(s.outcome, WindowsSyncOutcome::Sent { .. } | WindowsSyncOutcome::Skipped) {
+                            last_windows_writes = Some(w);
+                        }
+                        s
                     }
                     None => WindowsSyncStep::skipped(),
                 };
@@ -1059,13 +1104,13 @@ mod windows_sync_tests {
     /// Records what was handed to it, so a step that builds a payload and never
     /// delivers it is observable. Window sync once shipped in exactly that
     /// state — the payload was built and dropped — and no test could see it.
-    struct RecordingSender {
-        sent: Vec<(String, usize)>,
+    pub(crate) struct RecordingSender {
+        pub(crate) sent: Vec<(String, usize)>,
         result: fn() -> std::io::Result<()>,
     }
 
     impl RecordingSender {
-        fn ok() -> Self {
+        pub(crate) fn ok() -> Self {
             RecordingSender { sent: Vec::new(), result: || Ok(()) }
         }
         fn rejecting() -> Self {
@@ -1093,13 +1138,13 @@ mod windows_sync_tests {
         }
     }
 
-    fn temp_db() -> (crate::db::Database, tempfile::TempDir) {
+    pub(crate) fn temp_db() -> (crate::db::Database, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let db = crate::db::Database::open(&dir.path().join("t.fjall")).unwrap();
         (db, dir)
     }
 
-    fn put(db: &crate::db::Database, now_ms: i64, i: u64, peak: u16) {
+    pub(crate) fn put(db: &crate::db::Database, now_ms: i64, i: u64, peak: u16) {
         // 10-minute spacing keeps even a full over-cap set (2000+ rows) inside
         // the 60-day sync horizon; at hourly spacing the horizon would exclude
         // most of them and the cap would never engage.
@@ -1281,5 +1326,31 @@ mod windows_sync_tests {
             oldest_sent > dropped_anchor,
             "the excluded rows must be the OLDEST, not an arbitrary subset"
         );
+    }
+
+    #[test]
+    fn unchanged_store_skips_the_scan_entirely() {
+        let (db, _d) = temp_db();
+        let now = 1_800_000_000_000i64;
+        put(&db, now, 0, 5000);
+
+        let mut s1 = RecordingSender::ok();
+        let (step1, w1) = windows_sync_step_gated(&db, "codex", now, (0, 0), None, &mut s1);
+        assert!(matches!(step1.outcome, WindowsSyncOutcome::Sent { .. }));
+
+        // Same counter -> skipped without touching the keyspace.
+        let mut s2 = RecordingSender::ok();
+        let (step2, w2) = windows_sync_step_gated(&db, "codex", now, (0, 0), Some(w1), &mut s2);
+        assert_eq!(step2.outcome, WindowsSyncOutcome::Skipped);
+        assert_eq!(w2, w1);
+        assert!(s2.sent.is_empty());
+
+        // A new write moves the counter, so the next cycle scans and uploads.
+        put(&db, now, 1, 6000);
+        let mut s3 = RecordingSender::ok();
+        let (step3, w3) = windows_sync_step_gated(&db, "codex", now, (0, 0), Some(w1), &mut s3);
+        assert!(w3 > w1, "a write must move the counter");
+        assert!(matches!(step3.outcome, WindowsSyncOutcome::Sent { .. }));
+        assert_eq!(s3.sent[0].1, 2);
     }
 }

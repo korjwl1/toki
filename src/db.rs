@@ -24,6 +24,11 @@ pub struct Database {
     /// future SCHEMA_VERSION bump therefore destroys Claude window history for
     /// good, and should move this keyspace to its own database first.
     windows: Keyspace,
+    /// Monotonic counter of window rows actually WRITTEN. The sync thread's
+    /// fingerprint pass is a full keyspace scan that decodes every value, and
+    /// in the steady state it exists only to conclude "unchanged" — this lets
+    /// that conclusion be reached in O(1) instead.
+    window_writes: std::sync::atomic::AtomicU64,
     /// Count of window writes that FAILED to persist. The writer thread cannot
     /// return an error to the sender (writes are fire-and-forget through a
     /// channel), so the backfill needs some way to tell "the writer processed
@@ -99,6 +104,7 @@ impl Database {
 
         Ok(Database {
             db, checkpoints, meta, events, idx_sessions, idx_projects, dict, idx_msg, windows,
+            window_writes: std::sync::atomic::AtomicU64::new(0),
             window_write_errors: std::sync::atomic::AtomicU64::new(0),
         })
     }
@@ -246,6 +252,12 @@ impl Database {
     /// Field-wise merge upsert for a window snapshot. Never whole-row LWW:
     /// an existing row's peak/maxed/first_seen survive a snapshot taken later
     /// but knowing less (daemon restart, other-device replay via sync).
+    /// Window rows written so far. Monotonic; if it has not moved since the
+    /// last upload, the stored set cannot have changed.
+    pub fn window_writes(&self) -> u64 {
+        self.window_writes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Failed window writes so far. Monotonic; compare two reads to learn
     /// whether anything was lost in between.
     pub fn window_write_errors(&self) -> u64 {
@@ -281,6 +293,8 @@ impl Database {
             None => snap.clone(),
         };
         self.windows.insert(key, merged.encode())?;
+        self.window_writes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
