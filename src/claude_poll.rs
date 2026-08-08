@@ -438,13 +438,39 @@ struct ExtraUsageRaw {
     is_enabled: Option<bool>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct UsageResponseRaw {
     five_hour: Option<UsageBucketRaw>,
     seven_day: Option<UsageBucketRaw>,
     seven_day_sonnet: Option<UsageBucketRaw>,
     seven_day_opus: Option<UsageBucketRaw>,
     extra_usage: Option<ExtraUsageRaw>,
+    /// The endpoint's current shape. The legacy top-level buckets above only
+    /// carry `session` and the unscoped weekly; model-scoped weekly limits
+    /// moved here (`seven_day_sonnet` now returns null even while a scoped
+    /// weekly limit is live), so reading only the old keys silently loses a
+    /// whole limit the user is actually consuming.
+    #[serde(default)]
+    limits: Vec<LimitEntryRaw>,
+}
+
+#[derive(serde::Deserialize, Debug, Default)]
+struct LimitEntryRaw {
+    /// "session" | "weekly_all" | "weekly_scoped" | (future kinds)
+    kind: Option<String>,
+    percent: Option<f64>,
+    resets_at: Option<String>,
+    scope: Option<LimitScopeRaw>,
+}
+
+#[derive(serde::Deserialize, Debug, Default)]
+struct LimitScopeRaw {
+    model: Option<LimitScopeModelRaw>,
+}
+
+#[derive(serde::Deserialize, Debug, Default)]
+struct LimitScopeModelRaw {
+    display_name: Option<String>,
 }
 
 enum PollError {
@@ -555,6 +581,49 @@ fn observations_from_usage(
     push(&usage.seven_day, "seven_day", 10_080);
     push(&usage.seven_day_sonnet, "seven_day_sonnet", 10_080);
     push(&usage.seven_day_opus, "seven_day_opus", 10_080);
+    drop(push);
+
+    // Model-scoped weekly limits live ONLY in `limits[]`; the legacy
+    // `seven_day_sonnet`/`seven_day_opus` keys return null even while such a
+    // limit is being consumed. Kinds already covered by the legacy keys are
+    // skipped so one limit never becomes two rows.
+    for l in &usage.limits {
+        let kind = l.kind.as_deref().unwrap_or("");
+        if kind != "weekly_scoped" {
+            // session / weekly_all duplicate five_hour / seven_day.
+            continue;
+        }
+        let model = l
+            .scope
+            .as_ref()
+            .and_then(|s| s.model.as_ref())
+            .and_then(|m| m.display_name.as_deref())
+            .unwrap_or("");
+        if model.is_empty() {
+            continue;
+        }
+        let (Some(pct), Some(reset_str)) = (l.percent, l.resets_at.as_deref()) else {
+            continue;
+        };
+        let Some(resets_at_ms) = parse_iso_ms(reset_str) else {
+            continue;
+        };
+        // Stable, lowercase, and bounded: this becomes a storage key and is
+        // length-checked against the sync server's limit.
+        let mut limit_id = format!("weekly_{}", model.to_lowercase());
+        limit_id.truncate(crate::windows::MAX_LIMIT_ID_LEN);
+        out.push(WindowObservation {
+            limit_id,
+            window_minutes: 10_080,
+            used_percent: pct,
+            resets_at_ms,
+            plan_type: if plan.is_empty() { None } else { Some(plan.to_string()) },
+            limit_reached: pct >= 99.995,
+            has_credits,
+            anchor_stable: true,
+            ts_ms,
+        });
+    }
     out
 }
 
@@ -919,6 +988,52 @@ mod tests {
         assert!(matches!(parse_credentials("not json"), Err(AuthStatus::Unreadable)));
     }
 
+
+    /// The endpoint moved model-scoped weekly limits out of the top-level keys
+    /// and into `limits[]`; `seven_day_sonnet` now returns null while a scoped
+    /// weekly limit is actively being consumed. Reading only the legacy keys
+    /// silently loses a limit the user is spending against.
+    #[test]
+    fn scoped_weekly_limit_is_captured_from_the_limits_array() {
+        let raw: UsageResponseRaw = serde_json::from_str(
+            r#"{
+              "five_hour": {"utilization": 16.0, "resets_at": "2026-08-08T09:10:00+00:00"},
+              "seven_day": {"utilization": 28.0, "resets_at": "2026-08-11T12:00:00+00:00"},
+              "seven_day_sonnet": null,
+              "limits": [
+                {"kind":"session","group":"session","percent":16,"resets_at":"2026-08-08T09:10:00+00:00"},
+                {"kind":"weekly_all","group":"weekly","percent":28,"resets_at":"2026-08-11T12:00:00+00:00"},
+                {"kind":"weekly_scoped","group":"weekly","percent":13,
+                 "resets_at":"2026-08-11T12:00:00+00:00",
+                 "scope":{"model":{"id":null,"display_name":"Fable"},"surface":null}}
+              ]
+            }"#,
+        )
+        .unwrap();
+        let obs = observations_from_usage(&raw, "max_5x", 1_800_000_000_000);
+        let ids: Vec<&str> = obs.iter().map(|o| o.limit_id.as_str()).collect();
+        assert!(ids.contains(&"five_hour"), "{ids:?}");
+        assert!(ids.contains(&"seven_day"), "{ids:?}");
+        assert!(ids.contains(&"weekly_fable"), "scoped limit missing: {ids:?}");
+        // session / weekly_all must not double up with the legacy keys.
+        assert_eq!(ids.len(), 3, "one limit became two rows: {ids:?}");
+        let fable = obs.iter().find(|o| o.limit_id == "weekly_fable").unwrap();
+        assert_eq!(fable.window_minutes, 10_080);
+        assert!((fable.used_percent - 13.0).abs() < 0.01);
+    }
+
+    /// An older server that only sends the legacy keys must keep working.
+    #[test]
+    fn missing_limits_array_falls_back_to_legacy_keys() {
+        let raw: UsageResponseRaw = serde_json::from_str(
+            r#"{"five_hour": {"utilization": 5.0, "resets_at": "2026-08-08T09:10:00+00:00"}}"#,
+        )
+        .unwrap();
+        let obs = observations_from_usage(&raw, "", 1_800_000_000_000);
+        assert_eq!(obs.len(), 1);
+        assert_eq!(obs[0].limit_id, "five_hour");
+    }
+
     #[test]
     fn observations_map_buckets_to_limits() {
         let usage = UsageResponseRaw {
@@ -936,6 +1051,7 @@ mod tests {
                 resets_at: Some("2026-08-04T12:00:00Z".into()),
             }),
             extra_usage: Some(ExtraUsageRaw { is_enabled: Some(true) }),
+            limits: Vec::new(),
         };
         let obs = observations_from_usage(&usage, "default_claude_max_5x", 1_000);
         assert_eq!(obs.len(), 2);
