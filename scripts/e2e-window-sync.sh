@@ -168,6 +168,27 @@ if [ "$FAIL" = "0" ]; then echo "════ ALL E2E CHECKS PASSED ════
 #   - 2500 windows with every string at the 64-byte maximum: the client capped
 #     at 2000 and the payload stayed under the server's 1 MiB limit
 
+# ── Full live path: real daemon with sync ENABLED ─────────────────────────────
+# The checks above drive SyncClient directly against the server. This one runs
+# the real thing end to end and is worth repeating by hand before a release:
+#
+#   1. start the server container (as in step 1)
+#   2. toki settings sync enable --server 127.0.0.1 --sync-port <p> \
+#        --http-port <p> --no-tls --device-name e2e-live
+#      then approve the printed code via POST /device/approve with an admin
+#      token, so no browser click is needed
+#   3. start the daemon with window_tracking = true and wait out one
+#      WINDOWS_SYNC_INTERVAL (300s)
+#   4. GET /api/v1/toki/query?query=windows and count the rows
+#   5. toki settings sync disable  — the enable step writes real credentials
+#      into the login keychain (service "toki-sync"), so this cleanup is not
+#      optional
+#
+# Verified 2026-08-05: the daemon uploaded 21 rows on its own (3 Claude —
+# five_hour, seven_day, weekly_fable — and 18 Codex), event sync and window
+# sync ran together on one connection, and the capability probe logged
+# "server supports windows sync".
+
 # ── Monitor's server-read path ────────────────────────────────────────────────
 # Plan Fit reads merged multi-device rows from the server, not just from the
 # local daemon. Verified 2026-08-05 by decoding a REAL server response
