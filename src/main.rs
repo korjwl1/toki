@@ -38,11 +38,41 @@ struct ReportOptions {
 }
 
 #[derive(Subcommand)]
+enum WindowsCommands {
+    /// Live state: how much of each limit is used and when it resets
+    Status {
+        /// Force the daemon to revalidate before answering (bounded wait)
+        #[arg(long)]
+        fresh: bool,
+        /// Emit raw JSON instead of a table
+        #[arg(long)]
+        json: bool,
+    },
+    /// Recorded window history (one row per window instance)
+    List {
+        /// Range start (epoch seconds, YYYYMMDD, or YYYYMMDDhhmmss)
+        #[arg(long)]
+        start: Option<String>,
+        /// Range end (same formats)
+        #[arg(long)]
+        end: Option<String>,
+        /// Emit raw JSON instead of a table
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum Commands {
     /// Daemon management: start/stop/status
     Daemon {
         #[command(subcommand)]
         command: DaemonCommands,
+    },
+    /// Rate-limit windows: live gauges and recorded history
+    Windows {
+        #[command(subcommand)]
+        command: Option<WindowsCommands>,
     },
     /// Connect to running daemon and stream real-time events (JSONL output)
     Trace {
@@ -437,6 +467,10 @@ fn main() {
                 sink
             };
             handle_trace(&config, &sink_specs, no_cost);
+        }
+        Commands::Windows { command } => {
+            let config = build_config(None, false, None);
+            handle_windows(&config, command.unwrap_or(WindowsCommands::Status { fresh: false, json: false }));
         }
         Commands::Query { query, remote, timezone, start_of_week: cli_start_of_week, output_format: cli_fmt, start, end, step: _step, no_cost: cli_no_cost } => {
             let cli_tz: Option<Tz> = match timezone.as_deref() {
@@ -974,6 +1008,200 @@ fn handle_daemon(command: DaemonCommands, config: &Config) {
 }
 
 // ── Trace (client) ──────────────────────────────────────
+
+/// `toki windows` — the live gauges and the recorded history.
+///
+/// Deliberately does NOT reimplement the statistics engine (peak percentiles,
+/// maxed-out rates, active-vs-overall means, tier advice). That lives in the
+/// monitor, and a second implementation here is exactly the duplicated
+/// invariant that drifts — `list --json` gives the same rows it computes from.
+fn handle_windows(config: &toki::config::Config, command: WindowsCommands) {
+    match command {
+        WindowsCommands::Status { fresh, json } => windows_status(config, fresh, json),
+        WindowsCommands::List { start, end, json } => windows_list(config, start, end, json),
+    }
+}
+
+fn windows_status(config: &toki::config::Config, fresh: bool, json: bool) {
+    use std::io::{BufRead, Write};
+    let sock = &config.daemon_sock;
+    let stream = match UnixStream::connect(sock) {
+        Ok(s) => s,
+        Err(_) => {
+            eprintln!("[toki] Cannot connect to toki daemon.");
+            eprintln!("[toki] Start the daemon first: toki daemon start");
+            std::process::exit(1);
+        }
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
+    let mut w = &stream;
+    if writeln!(w, "WINDOWS").is_err()
+        || writeln!(w, "{{\"max_age_ms\": {}}}", if fresh { 0 } else { 60_000 }).is_err()
+        || w.flush().is_err()
+    {
+        eprintln!("[toki] Failed to send WINDOWS request");
+        std::process::exit(1);
+    }
+    let mut line = String::new();
+    if std::io::BufReader::new(&stream).read_line(&mut line).is_err() || line.trim().is_empty() {
+        eprintln!("[toki] No response from daemon");
+        std::process::exit(1);
+    }
+    let v: serde_json::Value = match serde_json::from_str(&line) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[toki] Malformed response: {}", e);
+            std::process::exit(1);
+        }
+    };
+    if json {
+        println!("{}", line.trim());
+        return;
+    }
+    if v.get("ok").and_then(|b| b.as_bool()) != Some(true) {
+        let err = v.get("error").and_then(|e| e.as_str()).unwrap_or("unknown error");
+        eprintln!("[toki] {}", err);
+        std::process::exit(1);
+    }
+    let now_ms = v.get("now_ms").and_then(|n| n.as_i64()).unwrap_or(0);
+    let providers = match v.get("providers").and_then(|p| p.as_object()) {
+        Some(p) => p,
+        None => {
+            println!("[toki] no providers");
+            return;
+        }
+    };
+    let mut names: Vec<&String> = providers.keys().collect();
+    names.sort();
+    for name in names {
+        let e = &providers[name];
+        let auth = e.get("auth_status").and_then(|a| a.as_str()).unwrap_or("?");
+        let source = e.get("source").and_then(|a| a.as_str()).unwrap_or("?");
+        let plan = e.get("plan").and_then(|a| a.as_str()).unwrap_or("");
+        print!("[toki] {} — auth {}, {}", display_provider(name), auth, source);
+        if !plan.is_empty() {
+            print!(", plan {}", plan);
+        }
+        println!();
+        if let Some(err) = e.get("error").and_then(|x| x.as_str()) {
+            println!("       storage error: {}", err);
+            continue;
+        }
+        let rows = e.get("windows").and_then(|r| r.as_array()).cloned().unwrap_or_default();
+        // Only windows that have not reset yet: a finished one is history,
+        // which is what `windows list` is for.
+        let mut live: Vec<&serde_json::Value> = rows
+            .iter()
+            .filter(|w| {
+                w.get("finalized").and_then(|f| f.as_bool()) == Some(false)
+                    && w.get("raw_resets_at_ms").and_then(|r| r.as_i64()).unwrap_or(0) > now_ms
+            })
+            .collect();
+        live.sort_by_key(|w| w.get("window_minutes").and_then(|m| m.as_i64()).unwrap_or(0));
+        if live.is_empty() {
+            println!("       no active window (nothing used since the last reset)");
+            continue;
+        }
+        for w in live {
+            let id = w.get("limit_id").and_then(|x| x.as_str()).unwrap_or("");
+            let pct = w
+                .get("last_pct")
+                .or_else(|| w.get("peak_pct"))
+                .and_then(|x| x.as_f64())
+                .unwrap_or(0.0);
+            let mins = w.get("window_minutes").and_then(|x| x.as_i64()).unwrap_or(0);
+            let reset = w.get("raw_resets_at_ms").and_then(|x| x.as_i64()).unwrap_or(0);
+            println!(
+                "       {:<16} {:>5.1}%  {}  resets in {}",
+                if id.is_empty() { "(unnamed)" } else { id },
+                pct,
+                window_label(mins),
+                humanize_ms(reset - now_ms),
+            );
+        }
+    }
+}
+
+fn display_provider(name: &str) -> &str {
+    match name {
+        "claude_code" => "Claude Code",
+        "codex" => "Codex CLI",
+        other => other,
+    }
+}
+
+fn window_label(minutes: i64) -> String {
+    if minutes % 1440 == 0 && minutes >= 1440 {
+        format!("{}d window", minutes / 1440)
+    } else if minutes % 60 == 0 {
+        format!("{}h window", minutes / 60)
+    } else {
+        format!("{}m window", minutes)
+    }
+}
+
+fn humanize_ms(ms: i64) -> String {
+    if ms <= 0 {
+        return "now".to_string();
+    }
+    let mins = ms / 60_000;
+    if mins >= 1440 {
+        format!("{}d {}h", mins / 1440, (mins % 1440) / 60)
+    } else if mins >= 60 {
+        format!("{}h {}m", mins / 60, mins % 60)
+    } else {
+        format!("{}m", mins.max(1))
+    }
+}
+
+fn windows_list(
+    config: &toki::config::Config,
+    start: Option<String>,
+    end: Option<String>,
+    json: bool,
+) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let start = start.unwrap_or_else(|| (now - 28 * 86_400).to_string());
+    // Default end reaches PAST the newest anchor: a window's anchor is its
+    // reset instant, which is in the FUTURE while it is still filling, so an
+    // end of "now" would hide exactly the live ones.
+    let end = end.unwrap_or_else(|| (now + 8 * 86_400).to_string());
+
+    let output_format = if json {
+        toki::sink::OutputFormat::Json
+    } else {
+        toki::sink::OutputFormat::Table
+    };
+    let sink = toki::sink::create_sinks(&["print".to_string()], output_format);
+    let sock_path = config.daemon_sock.clone();
+    let pidfile = toki::daemon::default_pidfile_path();
+    if toki::daemon::daemon_status(&pidfile).is_none() {
+        eprintln!("[toki] Cannot connect to toki daemon.");
+        eprintln!("[toki] Start the daemon first: toki daemon start");
+        std::process::exit(1);
+    }
+    // Reuses the exact path `toki query windows` takes, so the range
+    // semantics have one implementation rather than two.
+    let sow_str = config.start_of_week.to_string().to_lowercase();
+    match send_report_query(&sock_path, "windows", config.tz, Some(&start), Some(&end), &sow_str) {
+        Ok(resp) => {
+            if output_format == toki::sink::OutputFormat::Json {
+                emit_json_report(&resp, config, config.start_of_week, None);
+            } else {
+                for item in resp.data.as_array().unwrap_or(&vec![]) {
+                    dispatch_result_to_sink(item, sink.as_ref(), None);
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("[toki] {}", e);
+            std::process::exit(1);
+        }
+    }
+}
 
 fn handle_trace(config: &Config, sink_specs: &[String], no_cost: bool) {
     use std::io::Write;

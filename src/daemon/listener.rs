@@ -459,6 +459,18 @@ fn handle_windows_client(
             "windows": serde_json::to_value(&rows).unwrap_or(serde_json::Value::Array(vec![])),
             "auth_status": auth,
             "current_account": current_account,
+            // How this provider's windows are obtained. Response-only: it is a
+            // property of the provider, not of a stored row, so it costs no
+            // schema change. Claude has no passive source (window state exists
+            // only behind the API); Codex has no active one (it is extracted
+            // from rollout files the daemon already watches, zero API calls),
+            // and the difference explains why freshness behaves differently
+            // between them.
+            "source": match name.as_str() {
+                "claude_code" => "active-poll",
+                "codex" => "passive-extract",
+                _ => "unknown",
+            },
         });
         if let Some(err) = read_err {
             // Distinguish "storage failed" from "no windows yet": the client

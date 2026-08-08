@@ -47,6 +47,60 @@ fn effective_schema(schema: Option<&dyn ProviderSchema>) -> &dyn ProviderSchema 
 }
 
 impl Sink for PrintSink {
+
+    /// Recorded window rows as a table. The trait's default emits raw JSON,
+    /// which made `--output-format table` print one JSON object per line —
+    /// technically non-empty, but not a table.
+    fn emit_windows(&self, rows: &[crate::windows::WindowRow]) {
+        if rows.is_empty() {
+            return;
+        }
+        let mut table = Table::new();
+        table.load_preset(UTF8_FULL);
+        table.set_content_arrangement(ContentArrangement::Dynamic);
+        table.set_header(vec![
+            Cell::new("Limit").add_attribute(Attribute::Bold),
+            Cell::new("Window").add_attribute(Attribute::Bold),
+            Cell::new("Peak").add_attribute(Attribute::Bold),
+            Cell::new("Reset (UTC)").add_attribute(Attribute::Bold),
+            Cell::new("State").add_attribute(Attribute::Bold),
+            Cell::new("Active").add_attribute(Attribute::Bold),
+            Cell::new("Samples").add_attribute(Attribute::Bold),
+        ]);
+        for r in rows {
+            let window = if r.window_minutes % 1440 == 0 && r.window_minutes >= 1440 {
+                format!("{}d", r.window_minutes / 1440)
+            } else if r.window_minutes % 60 == 0 {
+                format!("{}h", r.window_minutes / 60)
+            } else {
+                format!("{}m", r.window_minutes)
+            };
+            let reset = chrono::DateTime::from_timestamp_millis(r.raw_resets_at_ms)
+                .map(|d| d.format("%Y-%m-%d %H:%M").to_string())
+                .unwrap_or_else(|| "-".to_string());
+            // A maxed window is the one that matters most in a history
+            // listing, so it is called out rather than left to the reader to
+            // infer from a 100% peak.
+            let state = if r.maxed_out {
+                "maxed"
+            } else if r.finalized {
+                "closed"
+            } else {
+                "open"
+            };
+            let active_min = r.active_ms / 60_000;
+            table.add_row(vec![
+                Cell::new(if r.limit_id.is_empty() { "(unnamed)" } else { &r.limit_id }),
+                Cell::new(window),
+                Cell::new(format!("{:.1}%", r.peak_pct)),
+                Cell::new(reset),
+                Cell::new(state),
+                Cell::new(format!("{}m", active_min)),
+                Cell::new(r.n_samples.to_string()),
+            ]);
+        }
+        println!("{}", table);
+    }
     fn emit_summary(&self, summaries: &HashMap<String, ModelUsageSummary>, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
         if summaries.is_empty() {
             if self.format == OutputFormat::Json {
