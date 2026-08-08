@@ -807,17 +807,21 @@ pub fn run_windows_backfill(
     // First run replays months of history that cannot be attributed to the
     // current login with confidence; catch-up scans cover recent days only.
     let first_run = last_scan_ms == 0;
-    // The first run keys months of history as "unknown" (it cannot be tied to
-    // the current login), but the NEXT run re-reads the same files from byte 0
-    // under the real account — so any window in the region both runs touch
-    // would exist twice under two keys. Switch to the real account at the
-    // catch-up boundary during the first run so the overlap merges instead.
-    let handover_ms = now_ms - CATCHUP_DAYS * 86_400_000;
+    // Replayed history is attributed to the CURRENT account. Rollout files
+    // record no account of their own, so this is a judgement call either way:
+    // the overwhelmingly common case is one account per machine, and keying
+    // months of real history as "unknown" split it into a second statistics
+    // segment that the user then had to interpret. A user who genuinely
+    // switched accounts gets the old windows folded into the new account —
+    // the tradeoff taken deliberately in favour of the common case.
+    //
+    // It also removes a hazard: with both the first run and every later
+    // catch-up scanning under the same account, a window covered by both
+    // produces the same storage key and merges, instead of existing twice.
     let mut io_errors = 0u32;
-    let scan_account = if first_run { "unknown".to_string() } else { account.clone() };
 
     let mut tracker = WindowTracker::new();
-    tracker.set_account(&scan_account);
+    tracker.set_account(&account);
     let mut files_scanned = 0u32;
 
     // Plain loop, not an iterator chain: two closures both need `&mut
@@ -908,16 +912,8 @@ pub fn run_windows_backfill(
 
     let mut writes: Vec<WindowWrite> = Vec::new();
     let mut idx = 0usize;
-    let mut handed_over = !first_run;
     while idx < observations.len() {
         let line_ts = observations[idx].ts_ms;
-        // Crossing into the region the next catch-up will re-cover: adopt the
-        // real account (and re-key anything still open) so both runs produce
-        // the same storage keys.
-        if !handed_over && line_ts >= handover_ms {
-            handed_over = true;
-            tracker.reattribute_open(&account);
-        }
         // Replay time only moves forward: close what this instant expires...
         writes.extend(tracker.finalize_expired(line_ts));
         // ...open every slot observed at this instant...
@@ -930,13 +926,6 @@ pub fn run_windows_backfill(
         tracker.observe_activity(line_ts);
     }
     writes.extend(tracker.finalize_expired(now_ms));
-    // Windows still open at the end of the replay belong to the CURRENT
-    // login, whatever the historical rows were attributed to — re-key them so
-    // they merge with the live tracker's rows instead of duplicating under
-    // "unknown".
-    if first_run {
-        tracker.reattribute_open(&account);
-    }
     writes.extend(tracker.flush_all());
 
     // All window writes flow through the writer thread: upsert_window_merge
@@ -1052,6 +1041,37 @@ mod tests {
         assert_eq!(t.open_reset_times().len(), 1, "a valid observation still opens one");
     }
 
+
+
+    /// Backfilled history is attributed to the CURRENT account. Rollout files
+    /// carry no account of their own, and keying months of real history as
+    /// "unknown" split it into a second statistics segment the user then had
+    /// to interpret. One account per machine is the overwhelmingly common
+    /// case, so the common case wins.
+    #[test]
+    fn backfilled_history_is_keyed_to_the_current_account() {
+        let mut t = WindowTracker::new();
+        t.set_account("acct-current");
+        let now = 1_800_000_000_000i64;
+        // A window from well before any catch-up boundary.
+        t.observe(&WindowObservation {
+            limit_id: "codex".into(),
+            window_minutes: 10_080,
+            used_percent: 42.0,
+            resets_at_ms: now - 40 * 86_400_000,
+            plan_type: Some("prolite".into()),
+            limit_reached: false,
+            has_credits: false,
+            anchor_stable: true,
+            ts_ms: now - 44 * 86_400_000,
+        });
+        let writes = t.flush_all();
+        assert_eq!(writes.len(), 1);
+        assert_eq!(
+            writes[0].snapshot.account, "acct-current",
+            "old history must not land under a separate \"unknown\" segment"
+        );
+    }
 
     /// The cap must refuse only NEW identities. Applied before the match, a
     /// tracker sitting at the ceiling would also stop updating the windows it

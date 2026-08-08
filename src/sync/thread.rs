@@ -196,11 +196,22 @@ pub(crate) struct WindowsSyncStep {
     pub outcome: WindowsSyncOutcome,
     /// Rows the per-sync cap excluded, for the caller's (throttled) log.
     pub over_cap_dropped: usize,
+    /// True when there was nothing to send AND re-checking is cheap: either
+    /// the store has not been written since the last attempt (one atomic
+    /// load), or it holds no rows in the horizon at all. The caller must NOT
+    /// burn the 5-minute interval on this — it is exactly the state a
+    /// just-started daemon is in while its backfill is still running, and
+    /// waiting it out delayed the first upload by a full interval.
+    pub nothing_stored_yet: bool,
 }
 
 impl WindowsSyncStep {
     fn skipped() -> Self {
-        WindowsSyncStep { outcome: WindowsSyncOutcome::Skipped, over_cap_dropped: 0 }
+        WindowsSyncStep {
+            outcome: WindowsSyncOutcome::Skipped,
+            over_cap_dropped: 0,
+            nothing_stored_yet: false,
+        }
     }
 }
 
@@ -231,7 +242,9 @@ pub(crate) fn windows_sync_step_gated(
 ) -> (WindowsSyncStep, u64) {
     let writes = db.window_writes();
     if last_writes == Some(writes) {
-        return (WindowsSyncStep::skipped(), writes);
+        let mut step = WindowsSyncStep::skipped();
+        step.nothing_stored_yet = true;
+        return (step, writes);
     }
     (windows_sync_step_inner(db, provider, now_ms, last_fingerprint, sender), writes)
 }
@@ -290,7 +303,14 @@ fn windows_sync_step_inner(
 
     let fingerprint = (count, acc);
     if fingerprint == last_fingerprint || count == 0 {
-        return WindowsSyncStep { outcome: WindowsSyncOutcome::Skipped, over_cap_dropped };
+        return WindowsSyncStep {
+            outcome: WindowsSyncOutcome::Skipped,
+            over_cap_dropped,
+            // An empty horizon is the backfill-still-running case; an
+            // unchanged fingerprint means we genuinely looked at real rows and
+            // they had not moved, which IS worth the full interval.
+            nothing_stored_yet: count == 0,
+        };
     }
     let items = collect_window_items(db, now_ms, cutoff, count);
     let n = items.len();
@@ -303,7 +323,7 @@ fn windows_sync_step_inner(
         }
         Err(e) => WindowsSyncOutcome::Disconnected(e.to_string()),
     };
-    WindowsSyncStep { outcome, over_cap_dropped }
+    WindowsSyncStep { outcome, over_cap_dropped, nothing_stored_yet: false }
 }
 
 /// Pass 2 of the windows upload: materialize the wire items for the rows the
@@ -800,6 +820,13 @@ fn run_sync_inner(
                     }
                 }
                 match step.outcome {
+                    // Nothing stored since the last look: leave the throttle
+                    // alone so the very next wake retries. That is the state a
+                    // fresh daemon sits in while its backfill runs, and burning
+                    // the interval there postponed the first upload by 5
+                    // minutes for no reason. The write-counter gate makes the
+                    // re-check a single atomic load.
+                    WindowsSyncOutcome::Skipped if step.nothing_stored_yet => {}
                     WindowsSyncOutcome::Skipped => {
                         last_windows_sync = Instant::now();
                     }
@@ -1326,6 +1353,40 @@ mod windows_sync_tests {
             oldest_sent > dropped_anchor,
             "the excluded rows must be the OLDEST, not an arbitrary subset"
         );
+    }
+
+
+    /// A just-started daemon runs its first window sync BEFORE the backfill has
+    /// written anything. Burning the 5-minute interval on that empty look
+    /// postponed the first upload by a full interval; the write-counter gate
+    /// makes re-checking a single atomic load, so the throttle must be left
+    /// alone until there is actually something to look at.
+    #[test]
+    fn empty_store_does_not_burn_the_interval() {
+        let (db, _d) = temp_db();
+        let now = 1_800_000_000_000i64;
+        let mut s0 = RecordingSender::ok();
+
+        // Nothing stored, nothing ever uploaded: this is the "look once" case,
+        // so it is NOT flagged as gated.
+        let (first, w0) = windows_sync_step_gated(&db, "codex", now, (0, 0), None, &mut s0);
+        assert_eq!(first.outcome, WindowsSyncOutcome::Skipped);
+        assert!(
+            first.nothing_stored_yet,
+            "an empty horizon is the backfill-still-running case, not a real look"
+        );
+
+        // Still nothing stored: the gate short-circuits and the caller is told
+        // not to spend its interval.
+        let (second, _) = windows_sync_step_gated(&db, "codex", now, (0, 0), Some(w0), &mut s0);
+        assert_eq!(second.outcome, WindowsSyncOutcome::Skipped);
+        assert!(second.nothing_stored_yet, "an untouched store must not burn the interval");
+
+        // Backfill lands -> the very next attempt uploads.
+        put(&db, now, 0, 5000);
+        let (third, _) = windows_sync_step_gated(&db, "codex", now, (0, 0), Some(w0), &mut s0);
+        assert!(!third.nothing_stored_yet);
+        assert!(matches!(third.outcome, WindowsSyncOutcome::Sent { .. }));
     }
 
     #[test]
