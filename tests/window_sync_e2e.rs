@@ -100,3 +100,76 @@ fn windows_reach_a_real_server_over_tcp() {
     let sent = toki::sync::thread::windows_sync_step_for_test(&db, "codex", now_ms, (0, 0), &mut client);
     println!("OUTCOME={}", if sent { "Sent" } else { "NotSent" });
 }
+
+/// Window sync and event sync share ONE TCP connection by design, and nothing
+/// verified they coexist — a framing or state bug in the new path would break
+/// event sync, a feature that already shipped. Sends both on the same
+/// connection, in both orders.
+#[test]
+fn event_sync_and_window_sync_share_one_connection() {
+    let Some((addr, jwt)) = env2() else {
+        eprintln!("skipping: TOKI_E2E_ADDR / TOKI_E2E_JWT not set");
+        return;
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = Database::open(&dir.path().join("mixed.fjall")).unwrap();
+    let anchor = now_ms - 7_200_000;
+    db.upsert_window_merge(
+        &window_key(WindowKind::Session, 4242, 99, anchor),
+        &snap(3300, anchor, "mixed_limit"),
+    )
+    .unwrap();
+
+    let mut dict = std::collections::HashMap::new();
+    dict.insert(1u32, "claude-opus-5".to_string());
+    dict.insert(2u32, "sess-mixed".to_string());
+    dict.insert(3u32, "file-mixed".to_string());
+    dict.insert(4u32, "proj-mixed".to_string());
+    let item = toki_sync_protocol::SyncItem {
+        ts_ms: now_ms,
+        message_id: format!("mixed-{now_ms}"),
+        event: toki_sync_protocol::StoredEvent {
+            model_id: 1,
+            session_id: 2,
+            source_file_id: 3,
+            project_name_id: 4,
+            // Order matches `cols` below (the wire's token_columns).
+            tokens: vec![11, 22, 0, 0],
+        },
+        usage_total: 33,
+        is_correction: false,
+    };
+    let cols = vec![
+        "input_tokens".to_string(),
+        "output_tokens".to_string(),
+        "cache_creation_input_tokens".to_string(),
+        "cache_read_input_tokens".to_string(),
+    ];
+
+    let mut client = toki::sync::client::SyncClient::connect(&addr, false, false)
+        .expect("TCP connect");
+    client
+        .auth(&jwt, "e2e-mixed", "e2e00000-0000-4000-8000-00000000e2e1", "codex")
+        .expect("auth handshake");
+
+    // events -> windows
+    client
+        .sync_batch(vec![item.clone()], &dict, "codex", cols.clone())
+        .expect("event batch before windows");
+    let sent = toki::sync::thread::windows_sync_step_for_test(&db, "codex", now_ms, (0, 0), &mut client);
+    println!("OUTCOME_AFTER_EVENTS={}", if sent { "Sent" } else { "NotSent" });
+
+    // ...and events again AFTER windows, on the same connection: a window
+    // frame must not leave the stream in a state event sync cannot use.
+    let mut item2 = item;
+    item2.message_id = format!("mixed2-{now_ms}");
+    let acked = client
+        .sync_batch(vec![item2], &dict, "codex", cols)
+        .expect("event batch after windows");
+    println!("EVENTS_AFTER_WINDOWS_ACK={acked}");
+}

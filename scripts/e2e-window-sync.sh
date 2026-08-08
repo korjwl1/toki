@@ -131,7 +131,19 @@ say "7. per-user throttle survives a reconnect"
 OUT7=$(cargo test --test window_sync_e2e -- --nocapture 2>&1 | grep -o "OUTCOME=[A-Za-z]*" | head -1)
 [ "$OUT7" = "OUTCOME=NotSent" ] && ok "immediate resend on a new connection was throttled" || bad "throttle bypassed by reconnect: $OUT7"
 
-say "8. server logs clean"
+say "8. event sync and window sync share one connection"
+# Window frames travel on the SAME TCP connection as event sync. A framing or
+# state bug in the new path would break a feature that already shipped.
+sleep 62
+MIX=$(cargo test --test window_sync_e2e event_sync_and_window_sync -- --nocapture 2>&1)
+echo "$MIX" | grep -q "OUTCOME_AFTER_EVENTS=Sent" \
+  && ok "windows accepted on a connection that just carried events" \
+  || bad "window sync broke after an event batch: $(echo "$MIX" | grep -o 'OUTCOME_AFTER_EVENTS=[A-Za-z]*')"
+echo "$MIX" | grep -q "EVENTS_AFTER_WINDOWS_ACK=" \
+  && ok "events still accepted after a window frame ($(echo "$MIX" | grep -o 'EVENTS_AFTER_WINDOWS_ACK=[-0-9]*'))" \
+  || bad "event sync broke after a window frame"
+
+say "9. server logs clean"
 ERRS=$(docker logs toki-e2e 2>&1 | grep -ciE "\berror\b|panic" || true)
 [ "$ERRS" = "0" ] && ok "no errors/panics in server log" || { bad "$ERRS error lines in server log"; docker logs toki-e2e 2>&1 | grep -iE "\berror\b|panic" | tail -5; }
 
@@ -155,6 +167,13 @@ if [ "$FAIL" = "0" ]; then echo "════ ALL E2E CHECKS PASSED ════
 #   - uploads merged field-wise: resend kept the row count and took the max peak
 #   - 2500 windows with every string at the 64-byte maximum: the client capped
 #     at 2000 and the payload stayed under the server's 1 MiB limit
+
+# ── Monitor's server-read path ────────────────────────────────────────────────
+# Plan Fit reads merged multi-device rows from the server, not just from the
+# local daemon. Verified 2026-08-05 by decoding a REAL server response
+# (/api/v1/toki/query?query=windows) against ServerQueryClient's WindowRow
+# CodingKeys: envelope {schema, windows}, all 19 row fields present, nothing
+# undecoded, nothing required missing.
 
 # ── Backward compatibility with a server that predates window sync ────────────
 # Build an image from toki_sync's pre-feature commit and point the client at it.
