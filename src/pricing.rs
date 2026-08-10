@@ -482,24 +482,25 @@ mod tests {
 
     #[test]
     fn test_fast_suffix_multiplier_fallback() {
-        // Base model priced, "-fast" row missing → apply 6x multiplier.
+        // Base model priced, "-fast" row missing → apply the 2x multiplier.
         let mut prices = HashMap::new();
-        prices.insert("claude-opus-4-7".to_string(), ModelPricing {
+        prices.insert("claude-opus-5".to_string(), ModelPricing {
             input_cost_per_token: 0.000005,
             output_cost_per_token: 0.000025,
             cache_creation_input_token_cost: Some(0.00000625),
             cache_read_input_token_cost: Some(0.0000005),
         });
         let table = PricingTable::new(prices);
-        let p = table.get("claude-opus-4-7-fast").unwrap();
-        assert!((p.input_cost_per_token - 0.000005 * 6.0).abs() < 1e-12);
-        assert!((p.output_cost_per_token - 0.000025 * 6.0).abs() < 1e-12);
+        let p = table.get("claude-opus-5-fast").unwrap();
+        // $10/$50 against a $5/$25 base.
+        assert!((p.input_cost_per_token - 0.000010).abs() < 1e-12);
+        assert!((p.output_cost_per_token - 0.000050).abs() < 1e-12);
         assert!(
-            (p.cache_creation_input_token_cost.unwrap() - 0.00000625 * 6.0).abs()
+            (p.cache_creation_input_token_cost.unwrap() - 0.00000625 * 2.0).abs()
                 < 1e-12
         );
         assert!(
-            (p.cache_read_input_token_cost.unwrap() - 0.0000005 * 6.0).abs()
+            (p.cache_read_input_token_cost.unwrap() - 0.0000005 * 2.0).abs()
                 < 1e-12
         );
     }
@@ -522,14 +523,14 @@ mod tests {
     #[test]
     fn test_fast_fallback_is_owned() {
         let mut prices = HashMap::new();
-        prices.insert("claude-opus-4-7".to_string(), ModelPricing {
+        prices.insert("claude-opus-5".to_string(), ModelPricing {
             input_cost_per_token: 0.000005,
             output_cost_per_token: 0.000025,
             cache_creation_input_token_cost: None,
             cache_read_input_token_cost: None,
         });
         let table = PricingTable::new(prices);
-        let cow = table.get("claude-opus-4-7-fast").unwrap();
+        let cow = table.get("claude-opus-5-fast").unwrap();
         assert!(matches!(cow, std::borrow::Cow::Owned(_)));
     }
 
@@ -537,7 +538,11 @@ mod tests {
     fn test_empty_provider_table_safe() {
         // Codex's FAST_MULTIPLIER is an empty placeholder; the resolver
         // must still find Claude entries from the other provider's table.
-        assert_eq!(fast_multiplier("claude-opus-4-7"), Some(6.0));
+        assert_eq!(fast_multiplier("claude-opus-5"), Some(2.0));
+        // 4.7 rejects fast requests and 4.6 runs at standard rates, so
+        // neither may carry a multiplier.
+        assert_eq!(fast_multiplier("claude-opus-4-7"), None);
+        assert_eq!(fast_multiplier("claude-opus-4-6"), None);
         // And an unknown base must yield None without panicking on the
         // empty Codex slice.
         assert_eq!(fast_multiplier("gpt-5.5"), None);

@@ -6,9 +6,16 @@ pub use parser::ClaudeCodeParser;
 /// Applied by `pricing::PricingTable::get` when a `<base>-fast` lookup
 /// misses the LiteLLM table (direct `-fast` rows always win).
 /// Source: Anthropic Claude Code fast-mode pricing ($30/$150 vs $5/$25 = 6x).
+/// Fast mode is billed at $10/$50 against a $5/$25 base — a flat 2x, and the
+/// cache tiers inherit it because they are fixed multiples of base input.
+///
+/// It is offered on Opus 5 and Opus 4.8 only: 4.7 rejects a fast request
+/// outright and 4.6 runs at standard speed and standard rates, so neither
+/// takes a multiplier. The previous 6x on 4.6/4.7 came from the $30/$150 era
+/// and survived the price change.
 pub const FAST_MULTIPLIER: &[(&str, f64)] = &[
-    ("claude-opus-4-6", 6.0),
-    ("claude-opus-4-7", 6.0),
+    ("claude-opus-5", 2.0),
+    ("claude-opus-4-8", 2.0),
 ];
 
 use crate::common::types::{LogParser, LogParserWithTs, SessionGroup};
