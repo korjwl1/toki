@@ -9,3 +9,6 @@ data/
 *.db
 *.db-shm
 *.db-wal
+
+# Coverage instrumentation drops these in the repo root on `cargo test`.
+*.profraw
