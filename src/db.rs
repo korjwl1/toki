@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use fjall::{Database as FjallDatabase, Keyspace, KeyspaceCreateOptions};
 
@@ -15,15 +15,20 @@ pub struct Database {
     dict: Keyspace,
     /// Rate-limit window snapshots: one row per window instance.
     /// Key: [kind u8][limit_id_hash u64][account_hash u64][anchor_min_ms i64] (all BE).
-    /// Value: versioned WindowSnapshotV1 (see windows.rs). Additive keyspace:
-    /// adding it does not bump SCHEMA_VERSION (see CLAUDE.md). That is NOT the
-    /// same as being protected from a version reset — the reset removes the
-    /// whole database directory, windows included. Events survive that (a cold
-    /// scan rebuilds them from the provider's own log files); window peaks do
-    /// NOT, because the provider exposes only the CURRENT window state. A
-    /// future SCHEMA_VERSION bump therefore destroys Claude window history for
-    /// good, and should move this keyspace to its own database first.
+    /// Value: versioned WindowSnapshotV1 (see windows.rs).
+    ///
+    /// Lives in its OWN database (`<provider>.windows.fjall`), not in the event
+    /// database, because the two have opposite recovery properties. Events are
+    /// derived: a schema bump wipes them and a cold scan rebuilds them from the
+    /// provider's own log files. Window peaks are observed: the provider
+    /// exposes only the CURRENT window state, so anything deleted is gone for
+    /// good. Keeping them in the event database meant one `SCHEMA_VERSION`
+    /// bump — for a reason having nothing to do with windows — would silently
+    /// destroy the whole history, and nobody would notice because the events
+    /// came back.
     windows: Keyspace,
+    /// Owns the window keyspace's database. Dropping it closes the keyspace.
+    _windows_db: FjallDatabase,
     /// Monotonic counter of window rows actually WRITTEN. The sync thread's
     /// fingerprint pass is a full keyspace scan that decodes every value, and
     /// in the steady state it exists only to conclude "unchanged" — this lets
@@ -52,6 +57,31 @@ pub struct Database {
 ///       rescan that re-aggregates the full (previously dropped) Codex history.
 pub const SCHEMA_VERSION: u32 = 4;
 
+/// Layout version for the window database.
+///
+/// Deliberately NOT wired to a wipe. The event database resets on mismatch
+/// because it can rebuild; this one cannot, so a mismatch here must be handled
+/// by code that knows what changed, never by deletion.
+///
+/// It is also unlikely to move. A window's identity is
+/// `[kind][limit_id_hash][account_hash][anchor]`, so a provider renaming a
+/// limit or adding one produces a different hash and therefore NEW rows — the
+/// old ones stay as history, which is the correct reading of "that limit is
+/// gone and this one appeared". That is a data event, not a schema change.
+pub const WINDOWS_SCHEMA_VERSION: u32 = 1;
+
+/// Where a provider's window database lives, given its event database path.
+/// `claude_code.fjall` → `claude_code.windows.fjall`, so the two sit side by
+/// side and neither reset can reach the other.
+pub fn windows_db_path(event_db_path: &Path) -> PathBuf {
+    let name = event_db_path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "toki".to_string());
+    let parent = event_db_path.parent().map(Path::to_path_buf).unwrap_or_default();
+    parent.join(format!("{name}.windows.fjall"))
+}
+
 /// meta-keyspace key for the persisted "dict GC owed" retention marker. An
 /// internal bookkeeping key, not a user setting, so it lives outside get/set_setting.
 const PENDING_DICT_GC_KEY: &str = "pending_dict_gc";
@@ -62,10 +92,32 @@ impl Database {
             std::fs::create_dir_all(parent).ok();
         }
 
+        let windows_path = windows_db_path(path);
+
+        // Rows written by an earlier build, when windows still lived inside the
+        // event database. Read BEFORE the version check, because that check may
+        // delete the directory they are sitting in.
+        let mut orphaned_windows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+
         // Check schema version; wipe and recreate if mismatched
         if path.exists() {
             if let Ok(db) = FjallDatabase::builder(path).open() {
                 let opts = || KeyspaceCreateOptions::default();
+
+                if !windows_path.exists() {
+                    if let Ok(old_windows) = db.keyspace("windows", opts) {
+                        for guard in old_windows.iter() {
+                            if let Ok(kv) = guard.into_inner() {
+                                orphaned_windows.push((kv.0.to_vec(), kv.1.to_vec()));
+                            }
+                        }
+                        if !orphaned_windows.is_empty() {
+                            eprintln!("[toki] moving {} window rows out of the event database",
+                                orphaned_windows.len());
+                        }
+                    }
+                }
+
                 if let Ok(meta) = db.keyspace("meta", opts) {
                     let stored_version = meta.get("schema_version")
                         .ok()
@@ -97,13 +149,47 @@ impl Database {
         let idx_projects = db.keyspace("idx_projects", opts)?;
         let dict = db.keyspace("dict", opts)?;
         let idx_msg = db.keyspace("idx_msg", opts)?;
-        let windows = db.keyspace("windows", opts)?;
+
+        // Separate database — see the `windows` field. A mismatch here is NOT
+        // a reason to delete: this data cannot be rebuilt from anything.
+        if let Some(parent) = windows_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+        let windows_db = FjallDatabase::builder(&windows_path).open()?;
+        let windows = windows_db.keyspace("windows", opts)?;
+        let windows_meta = windows_db.keyspace("meta", opts)?;
+        let stored_windows_version = windows_meta
+            .get("windows_schema_version")
+            .ok()
+            .flatten()
+            .and_then(|b| String::from_utf8_lossy(&b).parse::<u32>().ok())
+            .unwrap_or(0);
+        if stored_windows_version != 0 && stored_windows_version != WINDOWS_SCHEMA_VERSION {
+            eprintln!(
+                "[toki] window database layout is v{} but this build expects v{}; \
+                 leaving it untouched — window history cannot be rebuilt.",
+                stored_windows_version, WINDOWS_SCHEMA_VERSION
+            );
+        }
+        windows_meta.insert(
+            "windows_schema_version",
+            WINDOWS_SCHEMA_VERSION.to_string().as_bytes(),
+        )?;
+
+        // Carry across anything an earlier build left in the event database.
+        // Only ever runs once: after this the standalone path exists.
+        for (key, value) in orphaned_windows {
+            if windows.get(&key)?.is_none() {
+                windows.insert(key, value)?;
+            }
+        }
 
         // Write current schema version
         meta.insert("schema_version", SCHEMA_VERSION.to_string().as_bytes())?;
 
         Ok(Database {
             db, checkpoints, meta, events, idx_sessions, idx_projects, dict, idx_msg, windows,
+            _windows_db: windows_db,
             window_writes: std::sync::atomic::AtomicU64::new(0),
             window_write_errors: std::sync::atomic::AtomicU64::new(0),
         })
@@ -1025,4 +1111,147 @@ mod tests {
         let remaining = db.query_events_range(0, 10000).unwrap();
         assert_eq!(remaining.len(), 2);
     }
+    // -- Window database separation --
+
+    fn sample_snapshot(peak: u16) -> crate::windows::WindowSnapshotV1 {
+        crate::windows::WindowSnapshotV1 {
+            peak_pct_x100: peak,
+            last_pct_x100: peak,
+            observed_ts_ms: 1_800_000_000_000,
+            raw_resets_at_ms: 1_800_000_100_000,
+            first_seen_ms: 1_799_999_000_000,
+            window_minutes: 300,
+            finalized: true,
+            maxed_out: false,
+            limit_reached_kind: crate::windows::REACHED_NONE,
+            time_to_100_ms: -1,
+            active_ms: 60_000,
+            last_sample_gap_ms: 1_000,
+            n_samples: 4,
+            sampled_active_fraction: 1_000,
+            limit_id: "five_hour".to_string(),
+            plan: "max".to_string(),
+            account: "acct".to_string(),
+        }
+    }
+
+    fn a_window_key() -> Vec<u8> {
+        crate::windows::window_key(
+            crate::windows::WindowKind::Session,
+            crate::windows::hash_str("five_hour"),
+            crate::windows::hash_str("acct"),
+            1_800_000_000_000,
+        )
+        .to_vec()
+    }
+
+    #[test]
+    fn windows_live_outside_the_event_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude_code.fjall");
+        let db = Database::open(&path).unwrap();
+        db.upsert_window_merge(&a_window_key(), &sample_snapshot(4_200)).unwrap();
+        drop(db);
+
+        assert!(windows_db_path(&path).exists(), "windows get their own database");
+        assert!(windows_db_path(&path).file_name().unwrap()
+            .to_string_lossy().contains("windows"));
+    }
+
+    /// The whole point of the split. A schema bump wipes events — which come
+    /// back from the provider's log files — and must not touch window peaks,
+    /// which nothing can rebuild.
+    #[test]
+    fn window_history_survives_an_event_schema_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude_code.fjall");
+
+        let db = Database::open(&path).unwrap();
+        db.upsert_window_merge(&a_window_key(), &sample_snapshot(4_200)).unwrap();
+        drop(db);
+
+        // Simulate the next release bumping SCHEMA_VERSION.
+        {
+            let raw = FjallDatabase::builder(&path).open().unwrap();
+            let meta = raw.keyspace("meta", || KeyspaceCreateOptions::default()).unwrap();
+            meta.insert("schema_version", b"999").unwrap();
+        }
+
+        let db = Database::open(&path).unwrap();
+        let mut found = Vec::new();
+        db.for_each_window(|_k, snap| found.push(snap)).unwrap();
+        assert_eq!(found.len(), 1, "the reset deleted window history");
+        assert_eq!(found[0].peak_pct_x100, 4_200);
+    }
+
+    /// Rows written before the split have to come across, once.
+    #[test]
+    fn rows_left_in_the_event_database_are_moved_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude_code.fjall");
+
+        // An old build: window rows inside the event database, no sibling.
+        {
+            let raw = FjallDatabase::builder(&path).open().unwrap();
+            let opts = || KeyspaceCreateOptions::default();
+            let meta = raw.keyspace("meta", opts).unwrap();
+            meta.insert("schema_version", SCHEMA_VERSION.to_string().as_bytes()).unwrap();
+            let windows = raw.keyspace("windows", opts).unwrap();
+            windows.insert(a_window_key(), sample_snapshot(7_700).encode()).unwrap();
+        }
+        assert!(!windows_db_path(&path).exists());
+
+        let db = Database::open(&path).unwrap();
+        let mut found = Vec::new();
+        db.for_each_window(|_k, snap| found.push(snap)).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].peak_pct_x100, 7_700);
+    }
+
+    /// A newer layout marker must be reported, never acted on by deleting.
+    #[test]
+    fn an_unknown_window_layout_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude_code.fjall");
+        let db = Database::open(&path).unwrap();
+        db.upsert_window_merge(&a_window_key(), &sample_snapshot(1_100)).unwrap();
+        drop(db);
+
+        {
+            let raw = FjallDatabase::builder(windows_db_path(&path)).open().unwrap();
+            let meta = raw.keyspace("meta", || KeyspaceCreateOptions::default()).unwrap();
+            meta.insert("windows_schema_version", b"999").unwrap();
+        }
+
+        let db = Database::open(&path).unwrap();
+        let mut found = Vec::new();
+        db.for_each_window(|_k, snap| found.push(snap)).unwrap();
+        assert_eq!(found.len(), 1, "an unreadable marker must not cost the data");
+    }
+
+    /// A renamed or newly appearing limit is a data event, not a schema one:
+    /// the id is part of the key, so it lands as a new row and the old one
+    /// stays as history.
+    #[test]
+    fn a_new_limit_id_becomes_new_rows_not_a_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("claude_code.fjall");
+        let db = Database::open(&path).unwrap();
+
+        let old = crate::windows::window_key(
+            crate::windows::WindowKind::Weekly,
+            crate::windows::hash_str("seven_day_sonnet"),
+            crate::windows::hash_str("acct"), 1_800_000_000_000);
+        let new = crate::windows::window_key(
+            crate::windows::WindowKind::Weekly,
+            crate::windows::hash_str("seven_day_fable"),
+            crate::windows::hash_str("acct"), 1_800_000_000_000);
+        db.upsert_window_merge(&old, &sample_snapshot(3_000)).unwrap();
+        db.upsert_window_merge(&new, &sample_snapshot(1_000)).unwrap();
+
+        let mut count = 0;
+        db.for_each_window(|_k, _s| count += 1).unwrap();
+        assert_eq!(count, 2, "the rename kept its history and started a new series");
+    }
+
 }
