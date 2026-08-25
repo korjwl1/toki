@@ -470,7 +470,63 @@ struct LimitScopeRaw {
 
 #[derive(serde::Deserialize, Debug, Default)]
 struct LimitScopeModelRaw {
+    /// A stable machine identifier when the endpoint sends one. It is null
+    /// today, which is why `display_name` is still read — but a display name
+    /// is a UI string that localizes and gets rebranded, and this value ends
+    /// up hashed into a storage key.
+    id: Option<String>,
     display_name: Option<String>,
+}
+
+/// Builds the `limit_id` for a model-scoped weekly limit.
+///
+/// This value is hashed into the window storage key, so it has to stay put for
+/// as long as the limit does: if it drifts, one window's history silently
+/// splits in two. `id` wins over `display_name` for that reason. When the
+/// endpoint starts sending `id` the identifier does change once, and that is
+/// deliberate — a new identifier opens a new window and the old rows remain as
+/// history rather than being rewritten.
+///
+/// The output is normalised so the key never carries whatever punctuation or
+/// casing the endpoint happens to use ("Fable 5" and "fable-5" must not be two
+/// windows), and is truncated on a character boundary — `String::truncate`
+/// panics on a byte index that splits a multi-byte character, which a
+/// localised display name can produce.
+fn scoped_limit_id(model: &LimitScopeModelRaw) -> Option<String> {
+    let raw = [model.id.as_deref(), model.display_name.as_deref()]
+        .into_iter()
+        .flatten()
+        .find(|s| !s.trim().is_empty())?;
+
+    let mut id = String::from("weekly_");
+    let mut pending_sep = false;
+    for ch in raw.chars() {
+        if ch.is_alphanumeric() {
+            if pending_sep {
+                id.push('_');
+                pending_sep = false;
+            }
+            id.extend(ch.to_lowercase());
+        } else if id.len() > "weekly_".len() {
+            // Collapse any run of separators, and never emit a trailing one.
+            pending_sep = true;
+        }
+    }
+
+    if id.len() > crate::windows::MAX_LIMIT_ID_LEN {
+        let cut = id
+            .char_indices()
+            .map(|(i, _)| i)
+            .take_while(|&i| i <= crate::windows::MAX_LIMIT_ID_LEN)
+            .last()
+            .unwrap_or(0);
+        id.truncate(cut);
+        while id.ends_with('_') {
+            id.pop();
+        }
+    }
+
+    (id.len() > "weekly_".len()).then_some(id)
 }
 
 enum PollError {
@@ -593,25 +649,20 @@ fn observations_from_usage(
             // session / weekly_all duplicate five_hour / seven_day.
             continue;
         }
-        let model = l
+        let Some(limit_id) = l
             .scope
             .as_ref()
             .and_then(|s| s.model.as_ref())
-            .and_then(|m| m.display_name.as_deref())
-            .unwrap_or("");
-        if model.is_empty() {
+            .and_then(scoped_limit_id)
+        else {
             continue;
-        }
+        };
         let (Some(pct), Some(reset_str)) = (l.percent, l.resets_at.as_deref()) else {
             continue;
         };
         let Some(resets_at_ms) = parse_iso_ms(reset_str) else {
             continue;
         };
-        // Stable, lowercase, and bounded: this becomes a storage key and is
-        // length-checked against the sync server's limit.
-        let mut limit_id = format!("weekly_{}", model.to_lowercase());
-        limit_id.truncate(crate::windows::MAX_LIMIT_ID_LEN);
         out.push(WindowObservation {
             limit_id,
             window_minutes: 10_080,
@@ -1020,6 +1071,84 @@ mod tests {
         let fable = obs.iter().find(|o| o.limit_id == "weekly_fable").unwrap();
         assert_eq!(fable.window_minutes, 10_080);
         assert!((fable.used_percent - 13.0).abs() < 0.01);
+    }
+
+    /// `display_name` is a UI string. It is what the endpoint sends today
+    /// because `id` is null, but the moment a stable slug appears it must win:
+    /// this value is hashed into the window storage key, and a key that tracks
+    /// a display name gets re-cut every time marketing renames a model.
+    #[test]
+    fn a_stable_model_id_is_preferred_over_the_display_name() {
+        let m = LimitScopeModelRaw {
+            id: Some("claude-fable-5".into()),
+            display_name: Some("Fable".into()),
+        };
+        assert_eq!(scoped_limit_id(&m).as_deref(), Some("weekly_claude_fable_5"));
+    }
+
+    #[test]
+    fn the_display_name_is_used_only_when_no_id_is_sent() {
+        let m = LimitScopeModelRaw { id: None, display_name: Some("Fable".into()) };
+        assert_eq!(scoped_limit_id(&m).as_deref(), Some("weekly_fable"));
+        // An empty or blank id must not beat a usable display name.
+        let blank = LimitScopeModelRaw {
+            id: Some("   ".into()),
+            display_name: Some("Fable".into()),
+        };
+        assert_eq!(scoped_limit_id(&blank).as_deref(), Some("weekly_fable"));
+    }
+
+    /// Punctuation and casing are the endpoint's presentation choice. If they
+    /// reached the key, "Fable 5" and "fable-5" would be two windows for one
+    /// limit.
+    #[test]
+    fn punctuation_and_casing_do_not_fork_a_window() {
+        let of = |s: &str| {
+            scoped_limit_id(&LimitScopeModelRaw { id: Some(s.into()), display_name: None })
+                .unwrap()
+        };
+        assert_eq!(of("Fable 5"), "weekly_fable_5");
+        assert_eq!(of("fable-5"), "weekly_fable_5");
+        assert_eq!(of("  Fable   5  "), "weekly_fable_5");
+        assert_eq!(of("Fable/5"), "weekly_fable_5");
+        // No trailing or doubled separator ever reaches the key.
+        assert!(!of("Fable 5 ").ends_with('_'));
+        assert!(!of("Fable  5").contains("__"));
+    }
+
+    /// The previous code did `String::truncate(MAX_LIMIT_ID_LEN)` on a value
+    /// derived from a display name. `truncate` takes a BYTE index and panics
+    /// when it splits a multi-byte character, so one localised model name would
+    /// have taken down the poller thread.
+    #[test]
+    fn an_over_long_multibyte_name_truncates_instead_of_panicking() {
+        let long = "\u{d55c}".repeat(100); // 3 bytes each, far past the limit
+        let id = scoped_limit_id(&LimitScopeModelRaw {
+            id: Some(long),
+            display_name: None,
+        })
+        .expect("a long name still yields an id");
+        assert!(id.len() <= crate::windows::MAX_LIMIT_ID_LEN, "len {}", id.len());
+        assert!(id.is_char_boundary(id.len()), "truncated mid-character");
+        // Long ASCII truncates too, and never to a trailing separator.
+        let ascii = scoped_limit_id(&LimitScopeModelRaw {
+            id: Some("a-".repeat(60)),
+            display_name: None,
+        })
+        .unwrap();
+        assert!(ascii.len() <= crate::windows::MAX_LIMIT_ID_LEN);
+        assert!(!ascii.ends_with('_'));
+    }
+
+    /// A name with nothing alphanumeric in it yields no identifier at all
+    /// rather than a bare `weekly_` that every such limit would collide on.
+    #[test]
+    fn a_nameless_scope_opens_no_window() {
+        for raw in ["", "   ", "---", "///"] {
+            let m = LimitScopeModelRaw { id: Some(raw.into()), display_name: None };
+            assert!(scoped_limit_id(&m).is_none(), "{raw:?} must not yield an id");
+        }
+        assert!(scoped_limit_id(&LimitScopeModelRaw::default()).is_none());
     }
 
     /// An older server that only sends the legacy keys must keep working.
