@@ -91,6 +91,10 @@ pub struct PublishedState {
     pub account: String,
     /// Claude extra-usage (pay-per-overflow) enabled on the account.
     pub extra_usage_enabled: bool,
+    /// Provider-reported account shape (subscription vs seat-based, tier
+    /// flags). Response-only, like `plan`: it describes the account, not any
+    /// stored window, so carrying it costs no schema change.
+    pub account_shape: AccountShape,
     /// Refresh bookkeeping: a WINDOWS request with max_age=0 bumps want_seq;
     /// the poller bumps done_seq after the next completed poll attempt.
     want_seq: u64,
@@ -106,6 +110,7 @@ impl Default for PublishedState {
             plan: String::new(),
             account: String::new(),
             extra_usage_enabled: false,
+            account_shape: AccountShape::default(),
             want_seq: 0,
             done_seq: 0,
         }
@@ -452,6 +457,9 @@ struct UsageResponseRaw {
     /// whole limit the user is actually consuming.
     #[serde(default)]
     limits: Vec<LimitEntryRaw>,
+    /// Present on organizations with a member dashboard — a team/enterprise
+    /// signal that arrives on the usage response rather than the profile.
+    member_dashboard_available: Option<bool>,
 }
 
 #[derive(serde::Deserialize, Debug, Default)]
@@ -557,9 +565,50 @@ fn fetch_usage(token: &str) -> Result<UsageResponseRaw, PollError> {
 struct ProfileInfo {
     account_scope: String,
     plan: String,
+    /// Account-shape fields the endpoint already sends. They are passed through
+    /// verbatim rather than classified here: the provider owns this vocabulary
+    /// and adds to it, so a daemon-side enum would silently drop values it was
+    /// not compiled against. A consumer that cannot recognise a value must be
+    /// able to see that it did not recognise it.
+    account: AccountShape,
+}
+
+/// Provider-reported account shape. Every field is optional because the
+/// endpoint is free to omit any of them, and an absent field is a distinct
+/// state from a known-false one.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AccountShape {
+    /// e.g. "claude_max". The provider's own account classification.
+    pub organization_type: Option<String>,
+    /// e.g. "stripe_subscription". Positive evidence of a subscription; its
+    /// absence is NOT evidence of an API account.
+    pub billing_type: Option<String>,
+    /// Non-null on seat-based (team/enterprise) organizations.
+    pub seat_tier: Option<String>,
+    /// e.g. "active".
+    pub subscription_status: Option<String>,
+    pub has_claude_max: Option<bool>,
+    pub has_claude_pro: Option<bool>,
+    /// Set from the usage endpoint, not the profile: a team/org signal.
+    pub member_dashboard_available: Option<bool>,
 }
 
 fn fetch_profile(token: &str) -> Option<ProfileInfo> {
+    let resp = ureq::get(PROFILE_URL)
+        .set("Authorization", &format!("Bearer {}", token))
+        .set("anthropic-beta", OAUTH_BETA)
+        .set("User-Agent", USER_AGENT)
+        .timeout(Duration::from_secs(10))
+        .call()
+        .ok()?;
+    parse_profile(&resp.into_string().ok()?)
+}
+
+/// Split from the fetch so the shape extraction is testable without a network
+/// call — the fields below are exactly the ones a silent parse change would
+/// drop, and there was no way to assert on them while this lived inside the
+/// request.
+fn parse_profile(body: &str) -> Option<ProfileInfo> {
     #[derive(Deserialize)]
     struct ProfileRaw {
         account: Option<AccountRaw>,
@@ -568,30 +617,45 @@ fn fetch_profile(token: &str) -> Option<ProfileInfo> {
     #[derive(Deserialize)]
     struct AccountRaw {
         uuid: Option<String>,
+        has_claude_max: Option<bool>,
+        has_claude_pro: Option<bool>,
     }
     #[derive(Deserialize)]
     struct OrgRaw {
         rate_limit_tier: Option<String>,
+        organization_type: Option<String>,
+        billing_type: Option<String>,
+        seat_tier: Option<String>,
+        subscription_status: Option<String>,
     }
-    let resp = ureq::get(PROFILE_URL)
-        .set("Authorization", &format!("Bearer {}", token))
-        .set("anthropic-beta", OAUTH_BETA)
-        .set("User-Agent", USER_AGENT)
-        .timeout(Duration::from_secs(10))
-        .call()
-        .ok()?;
-    let p: ProfileRaw = resp.into_json().ok()?;
-    let account_scope = p
-        .account
-        .and_then(|a| a.uuid)
+    let p: ProfileRaw = serde_json::from_str(body).ok()?;
+    let acct = p.account.unwrap_or(AccountRaw {
+        uuid: None,
+        has_claude_max: None,
+        has_claude_pro: None,
+    });
+    let account_scope = acct
+        .uuid
         .filter(|u| !u.is_empty())
         .map(|u| format!("{:016x}", crate::windows::hash_str(&u)))
         .unwrap_or_else(|| "default".to_string());
-    let plan = p
-        .organization
-        .and_then(|o| o.rate_limit_tier)
+    let org = p.organization;
+    let plan = org
+        .as_ref()
+        .and_then(|o| o.rate_limit_tier.clone())
         .unwrap_or_default();
-    Some(ProfileInfo { account_scope, plan })
+    // Blank strings are the endpoint saying nothing, not saying "".
+    let nonempty = |v: Option<String>| v.filter(|s| !s.trim().is_empty());
+    let account = AccountShape {
+        organization_type: nonempty(org.as_ref().and_then(|o| o.organization_type.clone())),
+        billing_type: nonempty(org.as_ref().and_then(|o| o.billing_type.clone())),
+        seat_tier: nonempty(org.as_ref().and_then(|o| o.seat_tier.clone())),
+        subscription_status: nonempty(org.as_ref().and_then(|o| o.subscription_status.clone())),
+        has_claude_max: acct.has_claude_max,
+        has_claude_pro: acct.has_claude_pro,
+        member_dashboard_available: None,
+    };
+    Some(ProfileInfo { account_scope, plan, account })
 }
 
 fn parse_iso_ms(s: &str) -> Option<i64> {
@@ -980,12 +1044,23 @@ pub fn run_claude_poller(
                     .as_ref()
                     .and_then(|e| e.is_enabled)
                     .unwrap_or(false);
+                // The profile is refreshed at most daily, so the shape it
+                // carries has to survive the polls in between. Only the
+                // member-dashboard flag comes from this response.
+                let mut shape = profile
+                    .as_ref()
+                    .map(|p| p.account.clone())
+                    .unwrap_or_default();
+                if usage.member_dashboard_available.is_some() {
+                    shape.member_dashboard_available = usage.member_dashboard_available;
+                }
                 hub.publish(|st| {
                     st.auth_status = AuthStatus::Ok;
                     st.last_success_ms = now;
                     st.last_poll_ms = now;
                     st.plan = plan.to_string();
                     st.extra_usage_enabled = extra_enabled;
+                    st.account_shape = shape;
                     st.done_seq = st.want_seq;
                 });
             }
@@ -1151,6 +1226,107 @@ mod tests {
         assert!(scoped_limit_id(&LimitScopeModelRaw::default()).is_none());
     }
 
+    /// The account fields were being parsed away: the endpoint sends the
+    /// account's shape on every profile call and the daemon kept only the
+    /// rate-limit tier. Without these, a consumer can only infer "this is a
+    /// subscription" from the ABSENCE of something, which is exactly the
+    /// inference that misfires on a logged-out or polling-disabled account.
+    ///
+    /// The fixture is the live 2026-08-26 response with identifiers removed.
+    #[test]
+    fn the_profile_carries_the_accounts_shape() {
+        #[derive(Deserialize)]
+        struct P {
+            account: Option<serde_json::Value>,
+            organization: Option<serde_json::Value>,
+        }
+        let raw = r#"{
+          "account": {"uuid":"u","full_name":"n","email":"e",
+                      "has_claude_max": true, "has_claude_pro": false,
+                      "created_at":"2025-04-28T04:17:40Z"},
+          "organization": {"uuid":"o","name":"n",
+                           "organization_type":"claude_max",
+                           "billing_type":"stripe_subscription",
+                           "rate_limit_tier":"default_claude_max_5x",
+                           "seat_tier":null,
+                           "subscription_status":"active"},
+          "application": {"slug":"claude-code"}
+        }"#;
+        // Deserializing must not fail on the fields we do not model.
+        let p: P = serde_json::from_str(raw).expect("profile shape parses");
+        assert!(p.account.is_some() && p.organization.is_some());
+
+        let shape = parse_profile(raw).expect("profile parses").account;
+        assert_eq!(shape.organization_type.as_deref(), Some("claude_max"));
+        assert_eq!(shape.billing_type.as_deref(), Some("stripe_subscription"));
+        assert_eq!(shape.subscription_status.as_deref(), Some("active"));
+        assert_eq!(shape.has_claude_max, Some(true));
+        assert_eq!(shape.has_claude_pro, Some(false));
+        // A seat tier of null is "not a seat-based org", and must stay None
+        // rather than becoming an empty string that reads as a real value.
+        assert_eq!(shape.seat_tier, None);
+    }
+
+    /// An absent field and a false field are different states. Defaulting the
+    /// absent ones to false would let a consumer conclude "not a subscription"
+    /// from a response that simply did not mention it.
+    #[test]
+    fn absent_account_fields_stay_absent() {
+        let shape = parse_profile(r#"{"organization":{"rate_limit_tier":"x"}}"#)
+            .expect("profile parses")
+            .account;
+        assert_eq!(shape.organization_type, None);
+        assert_eq!(shape.billing_type, None);
+        assert_eq!(shape.has_claude_max, None, "absent must not become false");
+        assert_eq!(shape.has_claude_pro, None);
+    }
+
+    /// A blank string is the endpoint declining to answer, not an answer.
+    #[test]
+    fn blank_account_strings_are_treated_as_absent() {
+        let shape = parse_profile(
+            r#"{"organization":{"organization_type":"","billing_type":"   ","seat_tier":"team"}}"#,
+        )
+        .expect("profile parses")
+        .account;
+        assert_eq!(shape.organization_type, None);
+        assert_eq!(shape.billing_type, None);
+        assert_eq!(shape.seat_tier.as_deref(), Some("team"));
+    }
+
+    /// The usage response carries one account-shape signal of its own.
+    #[test]
+    fn the_usage_response_carries_the_member_dashboard_flag() {
+        let raw: UsageResponseRaw = serde_json::from_str(
+            r#"{"five_hour":null,"member_dashboard_available":false}"#,
+        )
+        .unwrap();
+        assert_eq!(raw.member_dashboard_available, Some(false));
+        let absent: UsageResponseRaw = serde_json::from_str("{}").unwrap();
+        assert_eq!(absent.member_dashboard_available, None);
+    }
+
+    /// The endpoint's top-level bucket list is open-ended and grows with
+    /// codenames (the live response carried `nimbus_quill`, `tangelo`,
+    /// `iguana_necktie` and others alongside the four we name). Unknown keys
+    /// must not break the parse, and a bucket with no reset time must not
+    /// become a window.
+    #[test]
+    fn unknown_codename_buckets_do_not_break_the_parse() {
+        let raw: UsageResponseRaw = serde_json::from_str(
+            r#"{
+              "five_hour": {"utilization": 20.0, "resets_at": "2026-08-25T22:20:00+00:00"},
+              "nimbus_quill": {"utilization": 0.0, "resets_at": null},
+              "tangelo": null, "iguana_necktie": null, "amber_ladder": null,
+              "limits": []
+            }"#,
+        )
+        .expect("unknown buckets must not fail the parse");
+        let obs = observations_from_usage(&raw, "max_5x", 1_800_000_000_000);
+        let ids: Vec<&str> = obs.iter().map(|o| o.limit_id.as_str()).collect();
+        assert_eq!(ids, vec!["five_hour"], "a bucket with no reset is not a window: {ids:?}");
+    }
+
     /// An older server that only sends the legacy keys must keep working.
     #[test]
     fn missing_limits_array_falls_back_to_legacy_keys() {
@@ -1181,6 +1357,7 @@ mod tests {
             }),
             extra_usage: Some(ExtraUsageRaw { is_enabled: Some(true) }),
             limits: Vec::new(),
+            member_dashboard_available: None,
         };
         let obs = observations_from_usage(&usage, "default_claude_max_5x", 1_000);
         assert_eq!(obs.len(), 2);

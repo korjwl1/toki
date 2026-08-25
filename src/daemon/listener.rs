@@ -483,6 +483,35 @@ fn handle_windows_client(
             entry["last_poll_ms"] = serde_json::json!(claude_state.last_poll_ms);
             entry["plan"] = serde_json::json!(claude_state.plan);
             entry["polling_enabled"] = serde_json::json!(hub.polling_enabled());
+            // Account shape, response-only for the same reason as `source`
+            // above: it describes the account rather than any stored row.
+            // Values are the provider's own vocabulary, passed through
+            // unclassified — a field the provider did not send is omitted
+            // rather than defaulted, because "absent" and "false" mean
+            // different things here (no billing_type is not evidence of an
+            // API account; it is evidence of nothing).
+            let sh = &claude_state.account_shape;
+            let mut account = serde_json::Map::new();
+            let mut put_str = |k: &str, v: &Option<String>| {
+                if let Some(v) = v {
+                    account.insert(k.to_string(), serde_json::json!(v));
+                }
+            };
+            put_str("organization_type", &sh.organization_type);
+            put_str("billing_type", &sh.billing_type);
+            put_str("seat_tier", &sh.seat_tier);
+            put_str("subscription_status", &sh.subscription_status);
+            let mut put_bool = |k: &str, v: Option<bool>| {
+                if let Some(v) = v {
+                    account.insert(k.to_string(), serde_json::json!(v));
+                }
+            };
+            put_bool("has_claude_max", sh.has_claude_max);
+            put_bool("has_claude_pro", sh.has_claude_pro);
+            put_bool("member_dashboard_available", sh.member_dashboard_available);
+            if !account.is_empty() {
+                entry["account_shape"] = serde_json::Value::Object(account);
+            }
         }
         providers.insert(name.clone(), entry);
     }
