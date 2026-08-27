@@ -424,6 +424,10 @@ impl OpenWindow {
 pub struct WindowTracker {
     open: Vec<OpenWindow>,
     last_activity_ts_ms: i64,
+    /// High-water mark for `finalize_expired`. Log-derived timestamps arrive
+    /// out of order across interleaved provider files; a backward step must
+    /// not un-expire a window, and must not be mistaken for a fresh clock.
+    finalize_clock_ms: i64,
     /// Account scope applied to new windows ("unknown" until resolved).
     account: String,
     account_hash: u64,
@@ -434,6 +438,7 @@ impl WindowTracker {
         WindowTracker {
             open: Vec::new(),
             last_activity_ts_ms: 0,
+            finalize_clock_ms: 0,
             account: "unknown".to_string(),
             account_hash: hash_str("unknown"),
         }
@@ -658,7 +663,20 @@ impl WindowTracker {
     }
 
     /// Close out windows whose reset time has passed. Returns their final writes.
+    ///
+    /// `now_ms` may be derived from a provider log line rather than the wall
+    /// clock, so it is held to a monotonic high-water mark. Finalization is
+    /// irreversible — `merge_from` ORs `finalized`, and `time_to_100_ms` and
+    /// `active_ms` do not self-heal the way `peak_pct_x100` does — so a single
+    /// line carrying a future or skewed timestamp would otherwise close every
+    /// open window with a partial peak and no way to reopen it.
     pub fn finalize_expired(&mut self, now_ms: i64) -> Vec<WindowWrite> {
+        let now_ms = if now_ms > self.finalize_clock_ms {
+            self.finalize_clock_ms = now_ms;
+            now_ms
+        } else {
+            self.finalize_clock_ms
+        };
         let mut writes = Vec::new();
         self.open.retain(|w| {
             if now_ms > w.raw_resets_at_ms + FINALIZE_GRACE_MS {
@@ -1313,6 +1331,38 @@ mod tests {
         assert!(writes[0].snapshot.finalized);
         assert_eq!(writes[0].snapshot.peak_pct_x100, 4200);
         assert!(t.open.is_empty());
+    }
+
+    #[test]
+    fn a_backward_timestamp_step_cannot_unexpire_a_window() {
+        // Window observations are now driven by timestamps parsed out of
+        // provider logs, which arrive out of order across interleaved files.
+        // A backward step must not reopen the finalization gate, and must not
+        // be read as the clock having moved back.
+        let mut t = WindowTracker::new();
+        let reset = 1_786_000_000_000i64;
+        let _ = t.observe(&obs("codex", 300, 42.0, reset, reset - 3_600_000));
+
+        // A stale line from well before the reset closes nothing.
+        assert!(t.finalize_expired(reset - 10_000_000).is_empty());
+        assert_eq!(t.open.len(), 1);
+
+        // The clock passes the reset: the window closes.
+        let writes = t.finalize_expired(reset + FINALIZE_GRACE_MS + 1);
+        assert_eq!(writes.len(), 1);
+        assert!(writes[0].snapshot.finalized);
+
+        // A later stale line must not resurrect the high-water mark. A fresh
+        // window opened after the jump stays open.
+        let _ = t.observe(&obs(
+            "codex",
+            300,
+            10.0,
+            reset + 100_000_000,
+            reset + 1_000,
+        ));
+        assert!(t.finalize_expired(reset - 10_000_000).is_empty());
+        assert_eq!(t.open.len(), 1, "a backward step must not close the new window");
     }
 
     #[test]

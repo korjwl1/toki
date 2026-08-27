@@ -7,6 +7,15 @@ use crossbeam_channel::{Receiver, Sender};
 use crate::checkpoint::{find_resume_offset, process_lines_streaming};
 use crate::common::types::{FileCheckpoint, LogParser, LogParserWithTs, ModelUsageSummary, TokenFields};
 use crate::providers::Provider;
+
+/// Wall-clock milliseconds. Used to bound log-derived timestamps before they
+/// can drive irreversible work such as window finalization.
+fn wall_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(i64::MAX)
+}
 use chrono::{NaiveDateTime, Weekday};
 use chrono_tz::Tz;
 use crate::sink::Sink;
@@ -674,7 +683,13 @@ impl TrackerEngine {
                         ProviderTimelineItem::Windows(observations) => {
                             if let Some(tracker) = self.window_trackers.get_mut(provider.name()) {
                                 for obs in observations {
-                                    for write in tracker.finalize_expired(obs.ts_ms) {
+                                    // Finalization is irreversible, so never let
+                                    // a log-derived timestamp run ahead of the
+                                    // wall clock: one skewed line would close
+                                    // every open window with a partial peak.
+                                    for write in
+                                        tracker.finalize_expired(obs.ts_ms.min(wall_now_ms()))
+                                    {
                                         if let Err(e) = db_tx.send(DbOp::WriteWindow(Box::new(write))) {
                                             debug_log!("writer channel closed: {}", e);
                                         }
@@ -714,7 +729,7 @@ impl TrackerEngine {
                                 },
                             }));
                             if let Some(tracker) = self.window_trackers.get_mut(provider.name()) {
-                                for write in tracker.finalize_expired(ts_ms) {
+                                for write in tracker.finalize_expired(ts_ms.min(wall_now_ms())) {
                                     if let Err(e) = db_tx.send(DbOp::WriteWindow(Box::new(write))) {
                                         debug_log!("writer channel closed: {}", e);
                                     }
