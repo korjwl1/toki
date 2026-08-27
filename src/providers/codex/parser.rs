@@ -87,6 +87,29 @@ fn watch_identity(source_file: &str) -> String {
     super::extract_uuid_from_filename(stem).unwrap_or_else(|| stem.to_string())
 }
 
+/// The model named by the last `turn_context` line in a rollout file.
+///
+/// Used to recover state a restarted daemon never saw. Rollout files hold a
+/// handful of `turn_context` lines among thousands of events, so this is a
+/// substring test per line and a parse for almost none of them.
+fn last_turn_context_model(path: &str) -> Option<String> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).ok()?;
+    let mut found: Option<String> = None;
+    for line in std::io::BufReader::new(file).lines() {
+        let Ok(line) = line else { break };
+        if !line.contains("\"turn_context\"") {
+            continue;
+        }
+        if let Ok(parsed) = serde_json::from_str::<CodexTurnContextLine>(&line) {
+            if let Some(model) = parsed.payload.as_ref().and_then(|p| p.model) {
+                found = Some(model.to_string());
+            }
+        }
+    }
+    found
+}
+
 /// Stateful per-file parser for Codex CLI cold start.
 /// Tracks model name across turn_context -> token_count events.
 pub struct CodexFileParser {
@@ -501,13 +524,31 @@ impl CodexParser {
         false
     }
 
+    /// The model this file's events belong to.
+    ///
+    /// Watch mode only ever sees lines appended after the daemon started, and
+    /// `turn_context` is written once per turn -- so a daemon that starts in
+    /// the middle of a session has an empty map and would stamp "unknown" on
+    /// live events until the next turn began. The map is a cache, not the
+    /// source of truth: on a miss, read the answer out of the file.
+    ///
+    /// A miss happens once per file per daemon lifetime. A file with genuinely
+    /// no `turn_context` caches "unknown" so it is not re-read per event.
     fn get_model(&self, source_file: &str) -> String {
-        self.file_models
+        if let Some(model) = self
+            .file_models
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(source_file)
             .cloned()
-            .unwrap_or_else(|| "unknown".to_string())
+        {
+            return model;
+        }
+        // Read outside the lock: this touches the disk.
+        let recovered = last_turn_context_model(source_file)
+            .unwrap_or_else(|| "unknown".to_string());
+        self.set_model(source_file, &recovered);
+        recovered
     }
 
     fn set_model(&self, source_file: &str, model: &str) {
@@ -799,6 +840,35 @@ impl LogParserWithTs for CodexParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_restarted_watch_recovers_the_model_from_the_file() {
+        // Watch mode only sees lines appended after the daemon started, and
+        // turn_context is written once per turn. A daemon that starts mid
+        // session has an empty cache and would stamp "unknown" on live events
+        // until the next turn began -- the same hole as the cold-start resume,
+        // in the other half of the pipeline.
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, r#"{{"timestamp":"2026-08-27T04:15:39.000Z","type":"turn_context","payload":{{"model":"gpt-5.6-sol"}}}}"#).unwrap();
+        writeln!(f, r#"{{"timestamp":"2026-08-27T04:15:49.000Z","type":"turn_context","payload":{{"model":"gpt-5.6-terra"}}}}"#).unwrap();
+        drop(f);
+        let path = path.to_str().unwrap();
+
+        // The most recent turn_context wins, not the first.
+        assert_eq!(last_turn_context_model(path).as_deref(), Some("gpt-5.6-terra"));
+
+        // A parser that never saw those lines still answers correctly.
+        let parser = CodexParser::new();
+        assert_eq!(parser.get_model(path), "gpt-5.6-terra");
+
+        // A file with no turn_context stays unknown rather than guessing.
+        let empty = dir.path().join("empty.jsonl");
+        std::fs::write(&empty, "{}\n").unwrap();
+        assert_eq!(parser.get_model(empty.to_str().unwrap()), "unknown");
+    }
 
     #[test]
     fn a_resumed_parser_keeps_the_session_model() {

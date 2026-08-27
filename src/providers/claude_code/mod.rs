@@ -75,7 +75,10 @@ impl Provider for ClaudeCodeProvider {
         self.parser.discover_sessions(&self.root)
     }
 
-    fn create_file_parser(&self) -> Box<dyn FileParser> {
+    /// Claude Code's parse is line-local -- every usage record names its own
+    /// model -- so there is no prefix state to recover and both arguments are
+    /// ignored.
+    fn create_file_parser(&self, _path: &str, _offset: u64) -> Box<dyn FileParser> {
         Box::new(ClaudeCodeFileParser)
     }
 

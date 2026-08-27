@@ -39,9 +39,14 @@ pub trait Provider: Send + Sync {
     /// Discover session groups for cold start.
     fn discover_sessions(&self) -> Vec<SessionGroup>;
 
-    /// Create a per-file stateful parser for cold start.
-    /// Each file gets its own instance (supports stateful parsing like Codex model tracking).
-    fn create_file_parser(&self) -> Box<dyn FileParser>;
+    /// Create a per-file stateful parser positioned at `offset`.
+    ///
+    /// The offset is part of the contract, not a convenience: a stateful
+    /// parser resuming mid-file has missed whatever the earlier bytes
+    /// established (Codex tracks the model that way), and a parser built
+    /// without knowing where it starts cannot recover it. Providers whose
+    /// parse carries no state may ignore both arguments.
+    fn create_file_parser(&self, path: &str, offset: u64) -> Box<dyn FileParser>;
 
     /// Scan a single file for cold start, calling `emit` for each parsed event.
     /// Returns checkpoint data (bytes_consumed, last_line_len, last_line_hash) if lines were processed.
@@ -50,7 +55,7 @@ pub trait Provider: Send + Sync {
     fn scan_file_cold_start(&self, path: &str, offset: u64, emit: &mut dyn FnMut(ColdStartParsed))
         -> std::io::Result<Option<(u64, u64, u64)>>
     {
-        let mut parser = self.create_file_parser();
+        let mut parser = self.create_file_parser(path, offset);
         crate::checkpoint::process_lines_streaming(path, offset, |line| {
             if let Some(parsed) = parser.parse_line(line) {
                 emit(parsed);

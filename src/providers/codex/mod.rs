@@ -151,8 +151,8 @@ impl Provider for CodexProvider {
         sessions
     }
 
-    fn create_file_parser(&self) -> Box<dyn FileParser> {
-        Box::new(parser::CodexFileParser::new())
+    fn create_file_parser(&self, path: &str, offset: u64) -> Box<dyn FileParser> {
+        Box::new(parser::CodexFileParser::primed(path, offset))
     }
 
     fn parser(&self) -> &dyn LogParser {
@@ -210,7 +210,7 @@ impl Provider for CodexProvider {
     fn scan_file_cold_start(&self, path: &str, offset: u64, emit: &mut dyn FnMut(super::ColdStartParsed))
         -> std::io::Result<Option<(u64, u64, u64)>>
     {
-        let mut parser = crate::providers::codex::parser::CodexFileParser::new();
+        let mut parser = crate::providers::codex::parser::CodexFileParser::primed(path, offset);
         crate::checkpoint::process_lines_streaming(path, offset, |line| {
             if let Some(parsed) = <crate::providers::codex::parser::CodexFileParser as crate::providers::FileParser>::parse_line(&mut parser, line) {
                 emit(parsed);
