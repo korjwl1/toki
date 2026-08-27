@@ -62,6 +62,22 @@ fn normalise_last_poll(last_poll_ms: i64, now: i64) -> i64 {
     if last_poll_ms > now { 0 } else { last_poll_ms }
 }
 
+/// Whether a value cached at `cached_at` is still inside `ttl_ms`.
+///
+/// The naive `now - cached_at < ttl` is wrong in one direction that matters: a
+/// backward clock step makes that difference NEGATIVE, which is less than any
+/// TTL, so the entry stops expiring until the wall clock climbs back past
+/// `cached_at + ttl`. A thirty-second auth cache would then hold whatever it
+/// last saw for the length of the skew — the daemon would keep reporting
+/// `auth ok` after the user signed out, because the cache it reads can no
+/// longer go stale.
+///
+/// A timestamp from the future is treated as expired, which costs one refresh.
+fn cache_is_fresh(cached_at: i64, ttl_ms: i64, now: i64) -> bool {
+    let age = now - cached_at;
+    age >= 0 && age < ttl_ms
+}
+
 /// Auth state as classified by the daemon, mirroring the monitor's
 /// ClaudeAuthResult so the UI's login-detection flows keep working unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,7 +199,7 @@ impl PollerHub {
         let now = now_ms();
         {
             let cached = self.codex_account_cache.lock().unwrap_or_else(|e| e.into_inner());
-            if now - cached.0 < TTL_MS && !cached.1.is_empty() {
+            if cache_is_fresh(cached.0, TTL_MS, now) && !cached.1.is_empty() {
                 return cached.1.clone();
             }
         }
@@ -202,7 +218,7 @@ impl PollerHub {
         let now = now_ms();
         {
             let cached = self.codex_auth_cache.lock().unwrap_or_else(|e| e.into_inner());
-            if now - cached.0 < TTL_MS {
+            if cache_is_fresh(cached.0, TTL_MS, now) {
                 return cached.1;
             }
         }
@@ -231,7 +247,7 @@ impl PollerHub {
         let now = now_ms();
         {
             let cached = self.fallback_auth.lock().unwrap_or_else(|e| e.into_inner());
-            if now - cached.0 < TTL_MS {
+            if cache_is_fresh(cached.0, TTL_MS, now) {
                 return cached.1;
             }
         }
@@ -1372,6 +1388,31 @@ mod tests {
         // an open door.
         let after_poll = normalise_last_poll(now, now);
         assert!(now - after_poll < POLL_FLOOR_MS, "an immediate second poll is still refused");
+    }
+
+    /// A cache that cannot go stale is worse than no cache.
+    ///
+    /// `now - cached_at < ttl` reads TRUE for a negative age, so a backward
+    /// clock step freezes every TTL here until the wall clock climbs back past
+    /// the entry's own timestamp. These caches hold auth status, so a frozen
+    /// one keeps reporting `auth ok` after the user has signed out — for the
+    /// length of the skew, not for the thirty seconds the TTL promises.
+    #[test]
+    fn a_backward_clock_step_does_not_freeze_a_cache() {
+        let now = 1_800_000_000_000_i64;
+        let ttl = 30_000_i64;
+
+        assert!(cache_is_fresh(now - 1_000, ttl, now), "a one-second-old entry is fresh");
+        assert!(!cache_is_fresh(now - ttl, ttl, now), "exactly at the TTL is expired");
+        assert!(!cache_is_fresh(now - ttl - 1, ttl, now), "past the TTL is expired");
+        assert!(cache_is_fresh(now, ttl, now), "written this instant");
+
+        // The bug: an hour-long backward step leaves every entry stamped in the
+        // future, and `now - cached_at` is -3_600_000, which is < any ttl.
+        assert!(
+            !cache_is_fresh(now + 3_600_000, ttl, now),
+            "an entry from the future must expire, not become permanently fresh"
+        );
     }
 
     /// An older server that only sends the legacy keys must keep working.
