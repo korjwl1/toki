@@ -1429,6 +1429,62 @@ mod tests {
         assert_eq!(w.active_ms, ISOLATED_EVENT_PAD_MS + 60_000 + 60_000 + ISOLATED_EVENT_PAD_MS);
     }
 
+    /// The `>=` in `merge_from`'s LWW branch, pinned.
+    ///
+    /// Two devices can report the same window at the same recorded instant —
+    /// the timestamp is the provider's, not the device's clock, so a tie is not
+    /// exotic. With `>` the FIRST arrival would win and the last-state fields
+    /// would depend on which device the server happened to process first, so
+    /// the same two observations could settle differently on the server than
+    /// on a client replaying them in the other order. With `>=` the later
+    /// arrival wins on both, which is what makes the two implementations agree.
+    ///
+    /// The order-independent fields (peak, flags, first_seen) are unaffected
+    /// either way; this is only about the ones that travel together in that
+    /// branch.
+    #[test]
+    fn an_equal_timestamp_lets_the_later_arrival_win() {
+        let base = WindowSnapshotV1 {
+            peak_pct_x100: 5000,
+            last_pct_x100: 5000,
+            observed_ts_ms: 1_000,
+            raw_resets_at_ms: 9_000,
+            first_seen_ms: 500,
+            window_minutes: 300,
+            finalized: false,
+            maxed_out: false,
+            limit_reached_kind: REACHED_NONE,
+            time_to_100_ms: -1,
+            active_ms: 100,
+            last_sample_gap_ms: 10,
+            sampled_active_fraction: 1000,
+            n_samples: 3,
+            limit_id: "codex".into(),
+            plan: "first".into(),
+            account: "x".into(),
+        };
+        let mut later = base.clone();
+        later.last_pct_x100 = 6100;
+        later.plan = "second".into();
+        later.raw_resets_at_ms = 9_500;
+
+        // Same instant, arriving second.
+        let mut a = base.clone();
+        a.merge_from(&later);
+        assert_eq!(a.last_pct_x100, 6100, "the later arrival's state must land");
+        assert_eq!(a.plan, "second");
+        assert_eq!(a.raw_resets_at_ms, 9_500, "these fields travel together");
+
+        // Peak is a max regardless of which side is newer, so a tie cannot
+        // lower it — that is what stops arrival order from losing a peak.
+        let mut b = later.clone();
+        b.last_pct_x100 = 100;
+        let mut c = base.clone();
+        c.peak_pct_x100 = 8800;
+        c.merge_from(&b);
+        assert_eq!(c.peak_pct_x100, 8800, "a tie must not pull the peak down");
+    }
+
     #[test]
     fn merge_is_field_wise_not_row_lww() {
         let mut a = WindowSnapshotV1 {
