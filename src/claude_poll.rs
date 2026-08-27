@@ -47,6 +47,21 @@ const PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 const USER_AGENT: &str = "claude-code/2.1.220 (external, toki)";
 const OAUTH_BETA: &str = "oauth-2025-04-20";
 
+/// Normalises a stored poll timestamp against the current wall clock.
+///
+/// Every poll gate is `now - last_poll_ms >= SOME_FLOOR`. A wall clock can move
+/// backwards — NTP stepping a drifted laptop after sleep is the ordinary case,
+/// not a pathological one — and when it does that difference goes negative,
+/// every gate closes, and polling stops until the clock climbs back to where it
+/// was. That can be hours, and Claude windows are the one thing here that
+/// cannot be rebuilt from a file afterwards, so the gap is permanent.
+///
+/// A `last_poll_ms` in the future is therefore read as "never polled". The cost
+/// is at most one extra poll, which the 30s floor immediately re-establishes.
+fn normalise_last_poll(last_poll_ms: i64, now: i64) -> i64 {
+    if last_poll_ms > now { 0 } else { last_poll_ms }
+}
+
 /// Auth state as classified by the daemon, mirroring the monitor's
 /// ClaudeAuthResult so the UI's login-detection flows keep working unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -881,6 +896,10 @@ pub fn run_claude_poller(
             let _ = db_tx.send(DbOp::WriteWindow(Box::new(w)));
         }
 
+        // See `normalise_last_poll`: a backward clock step must not wedge the
+        // poller until the clock catches up.
+        last_poll_ms = normalise_last_poll(last_poll_ms, now);
+
         // ---- Decide whether to poll now ----
         // Confirm retries share the 30s floor and honor backoff: a failing
         // confirm poll (offline, 429) must not retry at the wake clamp.
@@ -1325,6 +1344,34 @@ mod tests {
         let obs = observations_from_usage(&raw, "max_5x", 1_800_000_000_000);
         let ids: Vec<&str> = obs.iter().map(|o| o.limit_id.as_str()).collect();
         assert_eq!(ids, vec!["five_hour"], "a bucket with no reset is not a window: {ids:?}");
+    }
+
+    /// The poller wedges without this.
+    ///
+    /// Every gate is `now - last_poll_ms >= SOME_FLOOR`. Step the wall clock
+    /// backwards — which NTP does to a drifted laptop coming out of sleep —
+    /// and that difference is negative, so every gate closes and polling stops
+    /// until the clock climbs back to where it was. Claude windows are polled
+    /// only; nothing on disk can rebuild the ones missed in that interval.
+    #[test]
+    fn a_backward_clock_step_does_not_wedge_the_poller() {
+        let now = 1_800_000_000_000_i64;
+
+        // The ordinary case is untouched.
+        assert_eq!(normalise_last_poll(now - 60_000, now), now - 60_000);
+        assert_eq!(normalise_last_poll(0, now), 0);
+        assert_eq!(normalise_last_poll(now, now), now, "equal is not in the future");
+
+        // An hour-long backward step. Without the guard `now - last_poll` is
+        // -3_600_000 and every floor comparison fails.
+        let stale = normalise_last_poll(now + 3_600_000, now);
+        assert_eq!(stale, 0);
+        assert!(now - stale >= POLL_FLOOR_MS, "the 30s floor must be satisfiable again");
+
+        // And the floor still applies from there — the guard buys one poll, not
+        // an open door.
+        let after_poll = normalise_last_poll(now, now);
+        assert!(now - after_poll < POLL_FLOOR_MS, "an immediate second poll is still refused");
     }
 
     /// An older server that only sends the legacy keys must keep working.
