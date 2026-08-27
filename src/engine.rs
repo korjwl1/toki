@@ -67,6 +67,15 @@ struct FileActivity {
     last_checked: Instant,
 }
 
+/// A provider log is a timeline, not two independent batches. Keeping window
+/// observations and usage events in their original line order prevents a
+/// later reset observation from receiving activity that happened before that
+/// window existed.
+enum ProviderTimelineItem {
+    Windows(Vec<crate::common::types::WindowObservation>),
+    Event(crate::common::types::UsageEventWithTs),
+}
+
 pub struct TrackerEngine {
     /// provider_name -> db_tx channel
     channels: HashMap<String, Sender<DbOp>>,
@@ -538,10 +547,7 @@ impl TrackerEngine {
         path: &str,
         parser_ts: &dyn LogParserWithTs,
         provider_name: &str,
-    ) -> Result<
-        (Vec<crate::common::types::UsageEventWithTs>, Vec<crate::common::types::WindowObservation>),
-        Box<dyn std::error::Error>,
-    > {
+    ) -> Result<Vec<ProviderTimelineItem>, Box<dyn std::error::Error>> {
         let now = Instant::now();
 
         let state = match self.activity.get(path) {
@@ -555,7 +561,7 @@ impl TrackerEngine {
                 }
                 let cd = if s == FileState::Active { ACTIVE_COOLDOWN } else { IDLE_COOLDOWN };
                 if now.duration_since(act.last_checked) < cd {
-                    return Ok((Vec::new(), Vec::new()));
+                    return Ok(Vec::new());
                 }
                 s
             }
@@ -576,7 +582,7 @@ impl TrackerEngine {
                             state, last_active: now, last_checked: now,
                         });
                     }
-                    return Ok((Vec::new(), Vec::new()));
+                    return Ok(Vec::new());
                 }
             }
         }
@@ -588,16 +594,22 @@ impl TrackerEngine {
         let find_us = t0.elapsed().as_micros();
 
         let t1 = Instant::now();
-        let mut events = Vec::new();
-        let mut window_obs: Vec<crate::common::types::WindowObservation> = Vec::new();
+        let mut timeline = Vec::new();
+        let mut event_count = 0usize;
         let mut line_count: u64 = 0;
         let result = process_lines_streaming(path, offset, |line| {
             let (event, windows) = parser_ts.parse_line_full(line, path);
-            if let Some(event) = event {
-                events.push(event);
-            }
             if let Some(w) = windows {
-                window_obs.extend([w.primary, w.secondary].into_iter().flatten());
+                let observations: Vec<_> = [w.primary, w.secondary].into_iter().flatten().collect();
+                if !observations.is_empty() {
+                    // Match the backfill path: state observed on a line opens
+                    // before that same line's token activity is credited.
+                    timeline.push(ProviderTimelineItem::Windows(observations));
+                }
+            }
+            if let Some(event) = event {
+                event_count += 1;
+                timeline.push(ProviderTimelineItem::Event(event));
             }
             line_count += 1;
         })?;
@@ -612,7 +624,7 @@ impl TrackerEngine {
                 });
                 act.last_checked = now;
                 act.state = state;
-                Ok((Vec::new(), window_obs))
+                Ok(timeline)
             }
             Some((bytes_read, last_line_len, last_line_hash)) => {
                 self.file_sizes.insert(path_owned.clone(), offset + bytes_read);
@@ -630,9 +642,9 @@ impl TrackerEngine {
                     state: FileState::Active, last_active: now, last_checked: now,
                 });
                 debug_log!("process_file {} -- {} lines, {} bytes, {} events, Active | find_resume: {}us, read: {}us, total: {}us",
-                    path, line_count, bytes_read, events.len(),
+                    path, line_count, bytes_read, event_count,
                     find_us, read_us, t_total.elapsed().as_micros());
-                Ok((events, window_obs))
+                Ok(timeline)
             }
         }
     }
@@ -640,16 +652,12 @@ impl TrackerEngine {
     fn process_and_print_provider(&mut self, path: &str, provider: &dyn Provider, db_tx: &Sender<DbOp>) {
         let event_schema = crate::common::schema::schema_for_provider(provider.name());
         match self.process_file_with_ts_dyn(path, provider.parser_with_ts(), provider.name()) {
-            Ok((events, window_obs)) => {
+            Ok(timeline) => {
                 let session_id = provider.extract_session_id(path).unwrap_or_default();
                 // resolve_project_name lets Codex supply the cwd it discovered from
                 // session_meta; for other providers this is the path-based name.
                 let project_name = provider.resolve_project_name(path);
-                // Window observations apply BEFORE this batch's events so a
-                // window opened by line N receives the activity of lines >= N
-                // (both orderings are batch-granular approximations; this one
-                // never loses a fresh window's first activity burst).
-                if !window_obs.is_empty() {
+                if timeline.iter().any(|item| matches!(item, ProviderTimelineItem::Windows(_))) {
                     // Refresh the account scope right before attribution: the
                     // 60s maintenance tick alone let up to a minute of a new
                     // account's usage merge into the previous account's rows.
@@ -660,49 +668,65 @@ impl TrackerEngine {
                             tracker.set_account(&scope);
                         }
                     }
-                    if let Some(tracker) = self.window_trackers.get_mut(provider.name()) {
-                        for obs in &window_obs {
-                            if let Some(write) = tracker.observe(obs) {
-                                if let Err(e) = db_tx.send(DbOp::WriteWindow(Box::new(write))) {
-                                    debug_log!("writer channel closed: {}", e);
+                }
+                for item in timeline {
+                    match item {
+                        ProviderTimelineItem::Windows(observations) => {
+                            if let Some(tracker) = self.window_trackers.get_mut(provider.name()) {
+                                for obs in observations {
+                                    for write in tracker.finalize_expired(obs.ts_ms) {
+                                        if let Err(e) = db_tx.send(DbOp::WriteWindow(Box::new(write))) {
+                                            debug_log!("writer channel closed: {}", e);
+                                        }
+                                    }
+                                    if let Some(write) = tracker.observe(&obs) {
+                                        if let Err(e) = db_tx.send(DbOp::WriteWindow(Box::new(write))) {
+                                            debug_log!("writer channel closed: {}", e);
+                                        }
+                                    }
                                 }
                             }
                         }
-                    }
-                }
-                for event in events {
-                    let ts_ms = crate::common::time::parse_ts_to_ms(&event.timestamp)
-                        .unwrap_or_else(|| {
-                            std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis() as i64
-                        });
+                        ProviderTimelineItem::Event(event) => {
+                            let ts_ms = crate::common::time::parse_ts_to_ms(&event.timestamp)
+                                .unwrap_or_else(|| {
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis() as i64
+                                });
 
-                    self.sink.emit_event(&event, self.pricing.as_ref(), Some(event_schema));
+                            self.sink.emit_event(&event, self.pricing.as_ref(), Some(event_schema));
 
-                    let (usage, _ts) = event.into_usage_event();
-                    let op = DbOp::WriteEvent(Box::new(WriteEventData {
-                        ts_ms,
-                        message_id: usage.event_key,
-                        model: usage.model,
-                        session_id: session_id.clone(),
-                        source_file: usage.source_file,
-                        project_name: project_name.clone(),
-                        tokens: TokenFields {
-                            input_tokens: usage.input_tokens,
-                            output_tokens: usage.output_tokens,
-                            cache_creation_input_tokens: usage.cache_creation_input_tokens,
-                            cache_read_input_tokens: usage.cache_read_input_tokens,
-                        },
-                    }));
-                    if let Some(tracker) = self.window_trackers.get_mut(provider.name()) {
-                        tracker.observe_activity(ts_ms);
-                    }
+                            let (usage, _ts) = event.into_usage_event();
+                            let op = DbOp::WriteEvent(Box::new(WriteEventData {
+                                ts_ms,
+                                message_id: usage.event_key,
+                                model: usage.model,
+                                session_id: session_id.clone(),
+                                source_file: usage.source_file,
+                                project_name: project_name.clone(),
+                                tokens: TokenFields {
+                                    input_tokens: usage.input_tokens,
+                                    output_tokens: usage.output_tokens,
+                                    cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                                    cache_read_input_tokens: usage.cache_read_input_tokens,
+                                },
+                            }));
+                            if let Some(tracker) = self.window_trackers.get_mut(provider.name()) {
+                                for write in tracker.finalize_expired(ts_ms) {
+                                    if let Err(e) = db_tx.send(DbOp::WriteWindow(Box::new(write))) {
+                                        debug_log!("writer channel closed: {}", e);
+                                    }
+                                }
+                                tracker.observe_activity(ts_ms);
+                            }
 
-                    // Use blocking send to apply backpressure instead of dropping events
-                    if let Err(e) = db_tx.send(op) {
-                        debug_log!("writer channel closed: {}", e);
+                            // Use blocking send to apply backpressure instead of dropping events
+                            if let Err(e) = db_tx.send(op) {
+                                debug_log!("writer channel closed: {}", e);
+                            }
+                        }
                     }
                 }
                 // dirty is already marked inside process_file_with_ts_dyn with the correct provider name
@@ -1161,6 +1185,77 @@ mod tests {
                 timestamp: ts,
             })
         }
+    }
+
+    struct TimelineParser;
+
+    impl LogParserWithTs for TimelineParser {
+        fn parse_line_with_ts(
+            &self,
+            _line: &str,
+            _source_file: &str,
+        ) -> Option<crate::common::types::UsageEventWithTs> {
+            None
+        }
+
+        fn parse_line_full(
+            &self,
+            line: &str,
+            source_file: &str,
+        ) -> (
+            Option<crate::common::types::UsageEventWithTs>,
+            Option<crate::common::types::WindowObservations>,
+        ) {
+            let event = line.contains("event").then(|| crate::common::types::UsageEventWithTs {
+                event_key: line.to_string(),
+                source_file: source_file.to_string(),
+                model: "test".to_string(),
+                input_tokens: 1,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                output_tokens: 1,
+                timestamp: "2026-03-08T12:00:00Z".to_string(),
+            });
+            let windows = line.contains("window").then(|| crate::common::types::WindowObservations {
+                primary: Some(crate::common::types::WindowObservation {
+                    limit_id: "test".to_string(),
+                    window_minutes: 300,
+                    used_percent: 10.0,
+                    resets_at_ms: 1_800_001_000_000,
+                    plan_type: None,
+                    limit_reached: false,
+                    has_credits: false,
+                    anchor_stable: true,
+                    ts_ms: 1_800_000_000_000,
+                }),
+                secondary: None,
+            });
+            (event, windows)
+        }
+    }
+
+    #[test]
+    fn live_provider_records_preserve_line_timeline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("timeline.jsonl");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, "event-first").unwrap();
+        writeln!(file, "window-and-event").unwrap();
+
+        let (db_tx, _db_rx) = crossbeam_channel::unbounded();
+        let mut engine = TrackerEngine::new_single(
+            db_tx,
+            HashMap::new(),
+            Box::new(crate::sink::PrintSink::new(crate::sink::OutputFormat::Table)),
+        );
+        let timeline = engine
+            .process_file_with_ts_dyn(path.to_str().unwrap(), &TimelineParser, "test")
+            .unwrap();
+
+        assert_eq!(timeline.len(), 3);
+        assert!(matches!(timeline[0], ProviderTimelineItem::Event(_)));
+        assert!(matches!(timeline[1], ProviderTimelineItem::Windows(_)));
+        assert!(matches!(timeline[2], ProviderTimelineItem::Event(_)));
     }
 
     /// Create a db_tx + drain thread that consumes all DbOps (handles FlushBulkEvents done signal).

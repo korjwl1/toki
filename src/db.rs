@@ -29,6 +29,10 @@ pub struct Database {
     windows: Keyspace,
     /// Owns the window keyspace's database. Dropping it closes the keyspace.
     _windows_db: FjallDatabase,
+    /// False when the standalone window database was created by a newer
+    /// layout. A downgraded daemon may still read rows it understands, but it
+    /// must not change either the marker or any data it cannot rebuild.
+    windows_writable: bool,
     /// Monotonic counter of window rows actually WRITTEN. The sync thread's
     /// fingerprint pass is a full keyspace scan that decodes every value, and
     /// in the steady state it exists only to conclude "unchanged" — this lets
@@ -164,23 +168,28 @@ impl Database {
             .flatten()
             .and_then(|b| String::from_utf8_lossy(&b).parse::<u32>().ok())
             .unwrap_or(0);
-        if stored_windows_version != 0 && stored_windows_version != WINDOWS_SCHEMA_VERSION {
+        let windows_writable =
+            stored_windows_version == 0 || stored_windows_version == WINDOWS_SCHEMA_VERSION;
+        if !windows_writable {
             eprintln!(
                 "[toki] window database layout is v{} but this build expects v{}; \
                  leaving it untouched — window history cannot be rebuilt.",
                 stored_windows_version, WINDOWS_SCHEMA_VERSION
             );
+        } else if stored_windows_version == 0 {
+            windows_meta.insert(
+                "windows_schema_version",
+                WINDOWS_SCHEMA_VERSION.to_string().as_bytes(),
+            )?;
         }
-        windows_meta.insert(
-            "windows_schema_version",
-            WINDOWS_SCHEMA_VERSION.to_string().as_bytes(),
-        )?;
 
         // Carry across anything an earlier build left in the event database.
         // Only ever runs once: after this the standalone path exists.
-        for (key, value) in orphaned_windows {
-            if windows.get(&key)?.is_none() {
-                windows.insert(key, value)?;
+        if windows_writable {
+            for (key, value) in orphaned_windows {
+                if windows.get(&key)?.is_none() {
+                    windows.insert(key, value)?;
+                }
             }
         }
 
@@ -190,6 +199,7 @@ impl Database {
         Ok(Database {
             db, checkpoints, meta, events, idx_sessions, idx_projects, dict, idx_msg, windows,
             _windows_db: windows_db,
+            windows_writable,
             window_writes: std::sync::atomic::AtomicU64::new(0),
             window_write_errors: std::sync::atomic::AtomicU64::new(0),
         })
@@ -360,6 +370,9 @@ impl Database {
         key: &[u8],
         snap: &crate::windows::WindowSnapshotV1,
     ) -> Result<(), fjall::Error> {
+        if !self.windows_writable {
+            return Ok(());
+        }
         let merged = match self.windows.get(key)? {
             Some(existing) => match crate::windows::WindowSnapshotV1::decode_versioned(&existing) {
                 crate::windows::WindowDecode::Valid(mut prev) => {
@@ -431,6 +444,9 @@ impl Database {
     /// restart between shutdown-flush and finalize): without this they stay
     /// finalized=false forever and the statistics exclude them.
     pub fn finalize_stale_windows(&self, now_ms: i64) -> Result<usize, fjall::Error> {
+        if !self.windows_writable {
+            return Ok(0);
+        }
         const GRACE_MS: i64 = crate::windows::FINALIZE_GRACE_MS;
         let mut fixed = 0usize;
         let mut updates: Vec<(Vec<u8>, crate::windows::WindowSnapshotV1)> = Vec::new();
@@ -452,6 +468,9 @@ impl Database {
 
     /// Delete window rows whose anchor is older than the cutoff (retention).
     pub fn delete_windows_before(&self, cutoff_ms: i64) -> Result<usize, fjall::Error> {
+        if !self.windows_writable {
+            return Ok(0);
+        }
         let mut stale: Vec<Vec<u8>> = Vec::new();
         for guard in self.windows.iter() {
             let kv = guard.into_inner()?;
@@ -1208,7 +1227,10 @@ mod tests {
         assert_eq!(found[0].peak_pct_x100, 7_700);
     }
 
-    /// A newer layout marker must be reported, never acted on by deleting.
+    /// A newer layout marker must make this build fully read-only. Merely
+    /// preserving already-unreadable values is insufficient: otherwise a
+    /// downgraded daemon can still rewrite the marker, finalize/delete known
+    /// rows, or add old-layout rows alongside the future layout.
     #[test]
     fn an_unknown_window_layout_is_left_alone() {
         let dir = tempfile::tempdir().unwrap();
@@ -1224,9 +1246,21 @@ mod tests {
         }
 
         let db = Database::open(&path).unwrap();
+        let mut new_key = a_window_key();
+        new_key[1] ^= 1;
+        db.upsert_window_merge(&a_window_key(), &sample_snapshot(9_900)).unwrap();
+        db.upsert_window_merge(&new_key, &sample_snapshot(2_200)).unwrap();
+        assert_eq!(db.finalize_stale_windows(i64::MAX).unwrap(), 0);
+        assert_eq!(db.delete_windows_before(i64::MAX).unwrap(), 0);
         let mut found = Vec::new();
         db.for_each_window(|_k, snap| found.push(snap)).unwrap();
         assert_eq!(found.len(), 1, "an unreadable marker must not cost the data");
+        assert_eq!(found[0].peak_pct_x100, 1_100, "future-layout rows are read-only");
+        drop(db);
+
+        let raw = FjallDatabase::builder(windows_db_path(&path)).open().unwrap();
+        let meta = raw.keyspace("meta", || KeyspaceCreateOptions::default()).unwrap();
+        assert_eq!(meta.get("windows_schema_version").unwrap().unwrap().as_ref(), b"999");
     }
 
     /// A renamed or newly appearing limit is a data event, not a schema one:
