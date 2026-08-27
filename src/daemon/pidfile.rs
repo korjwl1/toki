@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 /// Default PID file path.
 pub fn default_pidfile_path() -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let home = crate::config::home_dir();
     home.join(".config").join("toki").join("daemon.pid")
 }
 

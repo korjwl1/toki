@@ -1,14 +1,14 @@
 /// Default Claude Code root on macOS: ~/.claude
 #[allow(dead_code)]
 pub fn default_claude_root() -> String {
-    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let home = crate::config::home_dir();
     home.join(".claude").to_string_lossy().to_string()
 }
 
 const PLIST_LABEL: &str = "com.toki.daemon";
 
 fn plist_path() -> std::path::PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    let home = crate::config::home_dir();
     home.join("Library/LaunchAgents").join(format!("{}.plist", PLIST_LABEL))
 }
 

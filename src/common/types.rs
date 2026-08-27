@@ -59,7 +59,9 @@ pub struct FileCheckpoint {
 pub struct ModelUsageSummary {
     pub model: String,
     pub input_tokens: u64,
+    #[serde(alias = "reasoning_output_tokens")]
     pub cache_creation_input_tokens: u64,
+    #[serde(alias = "cached_input_tokens")]
     pub cache_read_input_tokens: u64,
     pub output_tokens: u64,
     #[serde(alias = "events")]

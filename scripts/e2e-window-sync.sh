@@ -82,7 +82,7 @@ export TOKI_E2E_JWT="$ACCESS"
 # Fixed anchor so every run uploads the SAME logical windows.
 export TOKI_E2E_ANCHOR=$(( $(date +%s) * 1000 ))
 cd "$REPO"
-if cargo test --test window_sync_e2e windows_reach -- --nocapture 2>&1 | tee "$R/e2e.log" | grep -q "test result: ok"; then
+if cargo test --test window_sync_e2e windows_reach -- --ignored --nocapture 2>&1 | tee "$R/e2e.log" | grep -q "test result: ok"; then
   grep -q "skipping" "$R/e2e.log" && bad "test skipped (env not seen)" || ok "client delivered the batch and the server acked"
 else
   bad "client->server sync failed"; tail -20 "$R/e2e.log"
@@ -106,7 +106,7 @@ sleep 62
 # Second upload contributes a HIGHER peak for the same windows, so the
 # field-wise merge is observable rather than a no-op.
 export TOKI_E2E_PEAK=8800
-OUT6=$(cargo test --test window_sync_e2e windows_reach -- --nocapture 2>&1 | grep -o "OUTCOME=[A-Za-z]*" | head -1)
+OUT6=$(cargo test --test window_sync_e2e windows_reach -- --ignored --nocapture 2>&1 | grep -o "OUTCOME=[A-Za-z]*" | head -1)
 [ "$OUT6" = "OUTCOME=Sent" ] && ok "resend accepted after the throttle window" || bad "resend not accepted: $OUT6"
 N2=$(curl -s "http://127.0.0.1:19091/api/v1/toki/query?query=windows&start=$(( $(date +%s) - 86400 ))&end=$(( $(date +%s) + 86400 ))" \
       -H "authorization: Bearer $ACCESS" | python3 -c "
@@ -129,14 +129,14 @@ python3 -c "import sys; sys.exit(0 if abs(float('$PEAK') - 88.02) < 0.05 else 1)
 say "7. per-user throttle survives a reconnect"
 # Each cargo test run is a FRESH TCP connection: under the old per-connection
 # throttle this would be accepted, which is the bug the per-user limiter fixes.
-OUT7=$(cargo test --test window_sync_e2e windows_reach -- --nocapture 2>&1 | grep -o "OUTCOME=[A-Za-z]*" | head -1)
+OUT7=$(cargo test --test window_sync_e2e windows_reach -- --ignored --nocapture 2>&1 | grep -o "OUTCOME=[A-Za-z]*" | head -1)
 [ "$OUT7" = "OUTCOME=NotSent" ] && ok "immediate resend on a new connection was throttled" || bad "throttle bypassed by reconnect: $OUT7"
 
 say "8. event sync and window sync share one connection"
 # Window frames travel on the SAME TCP connection as event sync. A framing or
 # state bug in the new path would break a feature that already shipped.
 sleep 62
-MIX=$(cargo test --test window_sync_e2e event_sync_and_window_sync -- --nocapture 2>&1)
+MIX=$(cargo test --test window_sync_e2e event_sync_and_window_sync -- --ignored --nocapture 2>&1)
 echo "$MIX" | grep -q "OUTCOME_AFTER_EVENTS=Sent" \
   && ok "windows accepted on a connection that just carried events" \
   || bad "window sync broke after an event batch: $(echo "$MIX" | grep -o 'OUTCOME_AFTER_EVENTS=[A-Za-z]*')"
@@ -149,7 +149,7 @@ say "9. multi-device field-wise merge"
 # upload the SAME window with different values; the stored row must be the
 # field-wise merge, not last-writer-wins.
 export TOKI_E2E_ANCHOR=$(( $(date +%s) * 1000 ))
-MD=$(cargo test --test window_sync_e2e two_devices -- --nocapture 2>&1)
+MD=$(cargo test --test window_sync_e2e two_devices -- --ignored --nocapture 2>&1)
 echo "$MD" | grep -q "DEVICE_dev-b_SENT=true" \
   && ok "a second device on the same account was accepted" \
   || bad "second device refused — a limiter is blocking the merge path"

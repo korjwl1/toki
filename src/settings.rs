@@ -29,7 +29,7 @@ impl SettingsState {
         let get = |key: &str, default: &str| -> String {
             crate::config::get_setting(key).unwrap_or_else(|| default.to_string())
         };
-        let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        let home = crate::config::home_dir();
 
         SettingsState {
             claude_code_root: get("claude_code_root", &home.join(".claude").to_string_lossy()),
@@ -450,5 +450,4 @@ fn show_providers_popup(siv: &mut Cursive) {
             .button("Cancel", |s| { s.pop_layer(); })
     );
 }
-
 

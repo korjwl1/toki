@@ -10,6 +10,17 @@ use serde::{Deserialize, Serialize};
 const KEYRING_SERVICE: &str = "toki-sync";
 const KEYRING_USER: &str = "credentials";
 
+fn keyring_service_from(value: Option<String>) -> String {
+    value
+        .filter(|service| !service.trim().is_empty())
+        .unwrap_or_else(|| KEYRING_SERVICE.to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn keyring_service() -> String {
+    keyring_service_from(std::env::var("TOKI_SYNC_KEYRING_SERVICE").ok())
+}
+
 /// Sync credentials stored securely.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Credentials {
@@ -36,7 +47,8 @@ pub fn save(creds: &Credentials) -> Result<(), String> {
 
     #[cfg(target_os = "macos")]
     {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)
+        let service = keyring_service();
+        let entry = keyring::Entry::new(&service, KEYRING_USER)
             .map_err(|e| format!("keychain entry: {e}"))?;
         entry.set_password(&json).map_err(|e| format!("keychain write: {e}"))?;
         return Ok(());
@@ -52,7 +64,8 @@ pub fn save(creds: &Credentials) -> Result<(), String> {
 pub fn load() -> Option<Credentials> {
     #[cfg(target_os = "macos")]
     {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).ok()?;
+        let service = keyring_service();
+        let entry = keyring::Entry::new(&service, KEYRING_USER).ok()?;
         let json = entry.get_password().ok()?;
         serde_json::from_str(&json).ok()
     }
@@ -68,7 +81,8 @@ pub fn load() -> Option<Credentials> {
 pub fn delete() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        let entry = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER)
+        let service = keyring_service();
+        let entry = keyring::Entry::new(&service, KEYRING_USER)
             .map_err(|e| format!("keychain entry: {e}"))?;
         match entry.delete_password() {
             Ok(()) => return Ok(()),
@@ -109,7 +123,7 @@ pub fn check_file_permissions() {
 
 #[cfg(not(target_os = "macos"))]
 fn creds_file_path() -> Option<std::path::PathBuf> {
-    Some(dirs::config_dir()?.join("toki").join("sync.json"))
+    Some(crate::config::home_dir().join(".config").join("toki").join("sync.json"))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -153,4 +167,23 @@ fn delete_file() -> Result<(), String> {
         std::fs::remove_file(&path).map_err(|e| format!("delete credentials: {e}"))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{keyring_service_from, KEYRING_SERVICE};
+
+    #[test]
+    fn keyring_service_defaults_for_missing_or_blank_override() {
+        assert_eq!(keyring_service_from(None), KEYRING_SERVICE);
+        assert_eq!(keyring_service_from(Some("   ".into())), KEYRING_SERVICE);
+    }
+
+    #[test]
+    fn keyring_service_accepts_an_explicit_override() {
+        assert_eq!(
+            keyring_service_from(Some("toki-sync-integration".into())),
+            "toki-sync-integration"
+        );
+    }
 }

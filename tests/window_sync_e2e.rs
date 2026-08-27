@@ -6,14 +6,18 @@
 //! the wire framing had no coverage. This closes that gap by driving the real
 //! `SyncClient` against a server in Docker.
 //!
-//! Skipped unless TOKI_E2E_ADDR and TOKI_E2E_JWT are set (see
-//! scripts that bring the container up); `cargo test` stays hermetic.
+//! Explicitly ignored unless invoked by the E2E driver, which supplies
+//! TOKI_E2E_ADDR and TOKI_E2E_JWT. This prevents a missing environment from
+//! being reported as a passing integration test by a normal `cargo test`.
 
 use toki::db::Database;
 use toki::windows::{window_key, WindowKind, WindowSnapshotV1, REACHED_NONE};
 
-fn env2() -> Option<(String, String)> {
-    Some((std::env::var("TOKI_E2E_ADDR").ok()?, std::env::var("TOKI_E2E_JWT").ok()?))
+fn env2() -> (String, String) {
+    (
+        std::env::var("TOKI_E2E_ADDR").expect("TOKI_E2E_ADDR must be set by the E2E driver"),
+        std::env::var("TOKI_E2E_JWT").expect("TOKI_E2E_JWT must be set by the E2E driver"),
+    )
 }
 
 fn snap(peak: u16, anchor: i64, limit: &str) -> WindowSnapshotV1 {
@@ -39,11 +43,9 @@ fn snap(peak: u16, anchor: i64, limit: &str) -> WindowSnapshotV1 {
 }
 
 #[test]
+#[ignore = "requires a live toki-sync server and TOKI_E2E_ADDR/TOKI_E2E_JWT"]
 fn windows_reach_a_real_server_over_tcp() {
-    let Some((addr, jwt)) = env2() else {
-        eprintln!("skipping: TOKI_E2E_ADDR / TOKI_E2E_JWT not set");
-        return;
-    };
+    let (addr, jwt) = env2();
     // Anchors must be IDENTICAL across runs, otherwise a resend uploads
     // different logical windows and "merged in place" cannot be observed.
     let now_ms: i64 = std::env::var("TOKI_E2E_ANCHOR")
@@ -106,11 +108,9 @@ fn windows_reach_a_real_server_over_tcp() {
 /// event sync, a feature that already shipped. Sends both on the same
 /// connection, in both orders.
 #[test]
+#[ignore = "requires a live toki-sync server and TOKI_E2E_ADDR/TOKI_E2E_JWT"]
 fn event_sync_and_window_sync_share_one_connection() {
-    let Some((addr, jwt)) = env2() else {
-        eprintln!("skipping: TOKI_E2E_ADDR / TOKI_E2E_JWT not set");
-        return;
-    };
+    let (addr, jwt) = env2();
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -181,11 +181,9 @@ fn event_sync_and_window_sync_share_one_connection() {
 /// different values; the stored row must be the field-wise merge, not
 /// last-writer-wins.
 #[test]
+#[ignore = "requires a live toki-sync server and TOKI_E2E_ADDR/TOKI_E2E_JWT"]
 fn two_devices_merge_field_wise_on_one_window() {
-    let Some((addr, jwt)) = env2() else {
-        eprintln!("skipping: TOKI_E2E_ADDR / TOKI_E2E_JWT not set");
-        return;
-    };
+    let (addr, jwt) = env2();
     let anchor: i64 = std::env::var("TOKI_E2E_ANCHOR")
         .ok()
         .and_then(|v| v.parse().ok())

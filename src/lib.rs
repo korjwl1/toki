@@ -663,8 +663,7 @@ fn create_provider_instance(name: &str, root_dir: Option<String>) -> Result<Box<
     match name {
         "claude_code" => {
             let root = root_dir.unwrap_or_else(|| {
-                dirs::home_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                config::home_dir()
                     .join(".claude")
                     .to_string_lossy()
                     .to_string()
@@ -673,8 +672,7 @@ fn create_provider_instance(name: &str, root_dir: Option<String>) -> Result<Box<
         }
         "codex" => {
             let root = root_dir.unwrap_or_else(|| {
-                dirs::home_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                config::home_dir()
                     .join(".codex")
                     .to_string_lossy()
                     .to_string()

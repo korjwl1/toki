@@ -4,6 +4,26 @@ use std::path::PathBuf;
 use chrono::Weekday;
 use chrono_tz::Tz;
 
+fn home_dir_from(override_home: Option<std::ffi::OsString>, fallback: PathBuf) -> PathBuf {
+    override_home
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or(fallback)
+}
+
+/// Root for toki-owned configuration, state, provider discovery, and caches.
+/// `TOKI_HOME` is opt-in; normal launches keep using the OS home directory.
+pub fn home_dir() -> PathBuf {
+    home_dir_from(
+        std::env::var_os("TOKI_HOME"),
+        dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")),
+    )
+}
+
+fn home_is_overridden() -> bool {
+    std::env::var_os("TOKI_HOME").is_some_and(|value| !value.is_empty())
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub providers: Vec<String>,
@@ -34,7 +54,7 @@ impl Default for Config {
 
 impl Config {
     pub fn new() -> Self {
-        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+        let home = home_dir();
         let config_dir = home.join(".config").join("toki");
 
         let claude_code_root = home.join(".claude").to_string_lossy().to_string();
@@ -169,7 +189,7 @@ impl Config {
 /// Returns the stable device UUID, creating it on first call.
 /// Stored in `~/.config/toki/device_id` — survives sync enable/disable cycles.
 pub fn device_id() -> String {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let home = home_dir();
     let path = home.join(".config").join("toki").join("device_id");
     if let Ok(id) = std::fs::read_to_string(&path) {
         let id = id.trim().to_string();
@@ -201,7 +221,7 @@ pub fn parse_bool_setting(v: &str) -> Option<bool> {
 }
 
 pub fn settings_file_path() -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let home = home_dir();
     home.join(".config").join("toki").join("settings.json")
 }
 
@@ -334,7 +354,7 @@ pub fn list_settings() -> HashMap<String, String> {
 /// Path to the settings change sentinel file.
 /// The daemon watches this file; touching it triggers a hot-reload of settings.
 pub fn settings_sentinel_path() -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let home = home_dir();
     home.join(".config").join("toki").join(".settings_changed")
 }
 
@@ -358,6 +378,9 @@ fn touch_settings_sentinel() -> std::io::Result<()> {
 /// Lives in /tmp to avoid unnecessary SSD writes — state is ephemeral
 /// and rebuilt by the daemon on startup.
 pub fn sync_state_path() -> PathBuf {
+    if home_is_overridden() {
+        return home_dir().join(".config").join("toki").join("sync_state.json");
+    }
     PathBuf::from("/tmp/toki/sync_state.json")
 }
 
@@ -428,6 +451,20 @@ pub fn parse_weekday(s: &str) -> Option<Weekday> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn toki_home_override_is_explicit_and_blank_is_ignored() {
+        let fallback = PathBuf::from("/fallback-home");
+        assert_eq!(home_dir_from(None, fallback.clone()), fallback);
+        assert_eq!(
+            home_dir_from(Some(std::ffi::OsString::new()), fallback.clone()),
+            fallback
+        );
+        assert_eq!(
+            home_dir_from(Some(std::ffi::OsString::from("/integration-home")), fallback),
+            PathBuf::from("/integration-home")
+        );
+    }
 
     #[test]
     fn test_config_defaults() {

@@ -1632,6 +1632,32 @@ fn remote_query_params<'a>(
     params
 }
 
+/// The sync backend receives the scan range as separate HTTP parameters; the
+/// range selector in `usage[24h]` describes aggregation but is not itself a
+/// storage bound there. Mirror the local daemon's rolling-window behaviour
+/// when callers did not supply explicit bounds.
+fn derived_remote_query_bounds(
+    query: &str,
+    start: Option<&str>,
+    end: Option<&str>,
+    now_secs: i64,
+) -> (Option<String>, Option<String>) {
+    if start.is_some() || end.is_some() {
+        return (start.map(str::to_string), end.map(str::to_string));
+    }
+    let bucket = toki::query_parser::parse(query)
+        .ok()
+        .and_then(|parsed| parsed.bucket)
+        .map(|bucket| bucket.as_secs() as i64);
+    match bucket {
+        Some(seconds) => (
+            Some(now_secs.saturating_sub(seconds).to_string()),
+            Some(now_secs.to_string()),
+        ),
+        None => (None, None),
+    }
+}
+
 /// Send a PromQL query to the remote toki-sync server via HTTP API.
 /// Loads credentials from Keychain/sync.json, handles 401 with token refresh.
 fn send_remote_query(
@@ -1648,7 +1674,18 @@ fn send_remote_query(
     // start/end/start_of_week are separate params (not embedded in query), matching
     // the daemon REPORT protocol.
     let url = format!("{}/api/v1/toki/query", creds.http_url);
-    let params = remote_query_params(query, start, end, start_of_week);
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
+    let (derived_start, derived_end) =
+        derived_remote_query_bounds(query, start, end, now_secs);
+    let params = remote_query_params(
+        query,
+        derived_start.as_deref(),
+        derived_end.as_deref(),
+        start_of_week,
+    );
 
     let do_request = |token: &str| -> Result<ureq::Response, ureq::Error> {
         let mut req = ureq::get(&url)
@@ -1716,6 +1753,17 @@ fn send_remote_query(
         });
     }
 
+    // `/api/v1/toki/query` returns toki-native JSON. Older code treated this
+    // shape as a VictoriaMetrics response and silently converted it to an
+    // empty claude_code summary. Keep the Prometheus converter below only as
+    // backwards compatibility for endpoints that actually return that shape.
+    if let Some(data) = native_toki_response_to_data(&body, query) {
+        return Ok(ReportResponse {
+            data,
+            meta: serde_json::json!({}),
+        });
+    }
+
     // The toki-sync /api/v1/query_range proxies to VictoriaMetrics and returns
     // Prometheus-compatible JSON. Convert it into toki's ReportResponse format
     // so the existing display pipeline (dispatch_result_to_sink) can render it.
@@ -1724,6 +1772,82 @@ fn send_remote_query(
         data,
         meta: serde_json::json!({}),
     })
+}
+
+/// Convert `{ "providers": { provider: [...] } }` into the provider-tagged
+/// item array used by the local rendering pipeline.
+fn native_toki_response_to_data(
+    body: &serde_json::Value,
+    query: &str,
+) -> Option<serde_json::Value> {
+    let providers = body.get("providers")?.as_object()?;
+    let parsed = toki::query_parser::parse(query).ok();
+    let type_name = match parsed.as_ref() {
+        Some(parsed) if parsed.bucket.is_some() => {
+            format!("every {}", parsed.bucket.unwrap())
+        }
+        Some(parsed)
+            if parsed.metric != toki::query_parser::Metric::Events
+                && parsed.group_by.is_empty() =>
+        {
+            "summary".to_string()
+        }
+        _ => "grouped".to_string(),
+    };
+
+    let items: Vec<serde_json::Value> = providers
+        .iter()
+        .map(|(provider, rows)| {
+            let data = if type_name == "summary" {
+                flatten_native_periods(rows)
+            } else {
+                rows.clone()
+            };
+            serde_json::json!({
+                "type": type_name,
+                "schema": provider,
+                "data": data,
+            })
+        })
+        .collect();
+    Some(serde_json::Value::Array(items))
+}
+
+/// An instant server response still wraps models in a synthetic period. Fold
+/// those periods back into the flat summary shape produced by the local daemon.
+fn flatten_native_periods(rows: &serde_json::Value) -> serde_json::Value {
+    let mut summaries: std::collections::HashMap<String, toki::ModelUsageSummary> =
+        std::collections::HashMap::new();
+    for period in rows.as_array().into_iter().flatten() {
+        let models = match serde_json::from_value::<Vec<toki::ModelUsageSummary>>(
+            period["usage_per_models"].clone(),
+        ) {
+            Ok(models) => models,
+            Err(_) => continue,
+        };
+        for model in models {
+            let entry = summaries
+                .entry(model.model.clone())
+                .or_insert_with(|| toki::ModelUsageSummary {
+                    model: model.model.clone(),
+                    ..Default::default()
+                });
+            entry.input_tokens = entry.input_tokens.saturating_add(model.input_tokens);
+            entry.output_tokens = entry.output_tokens.saturating_add(model.output_tokens);
+            entry.cache_creation_input_tokens = entry
+                .cache_creation_input_tokens
+                .saturating_add(model.cache_creation_input_tokens);
+            entry.cache_read_input_tokens = entry
+                .cache_read_input_tokens
+                .saturating_add(model.cache_read_input_tokens);
+            entry.event_count = entry.event_count.saturating_add(model.event_count);
+            if let Some(cost) = model.cost_usd {
+                *entry.cost_usd.get_or_insert(0.0) += cost;
+            }
+        }
+    }
+    serde_json::to_value(summaries.into_values().collect::<Vec<_>>())
+        .unwrap_or_else(|_| serde_json::Value::Array(vec![]))
 }
 
 /// Convert a Prometheus/VictoriaMetrics JSON response into the array format
@@ -2672,6 +2796,52 @@ mod tests {
         assert!(p.contains(&("start", "20240301")));
         assert!(p.contains(&("end", "20240315")));
         assert!(p.contains(&("start_of_week", "mon")));
+    }
+
+    #[test]
+    fn remote_bucket_derives_a_rolling_server_scan_range() {
+        let (start, end) = derived_remote_query_bounds("usage[24h] by (model)", None, None, 2_000_000);
+        assert_eq!(start.as_deref(), Some("1913600"));
+        assert_eq!(end.as_deref(), Some("2000000"));
+
+        let explicit = derived_remote_query_bounds(
+            "usage[24h]",
+            Some("20260801"),
+            Some("20260802"),
+            2_000_000,
+        );
+        assert_eq!(explicit.0.as_deref(), Some("20260801"));
+        assert_eq!(explicit.1.as_deref(), Some("20260802"));
+    }
+
+    #[test]
+    fn native_codex_response_survives_the_remote_boundary() {
+        let body = serde_json::json!({
+            "providers": {
+                "codex": [{
+                    "period": "1970-01-01T00:00:00|gpt-test",
+                    "usage_per_models": [{
+                        "model": "gpt-test",
+                        "input_tokens": 12,
+                        "output_tokens": 3,
+                        "cached_input_tokens": 4,
+                        "reasoning_output_tokens": 2,
+                        "events": 1,
+                        "total_tokens": 15
+                    }]
+                }]
+            }
+        });
+        let data = native_toki_response_to_data(&body, "usage").unwrap();
+        let item = &data.as_array().unwrap()[0];
+        assert_eq!(item["schema"], "codex");
+        assert_eq!(item["type"], "summary");
+        let summaries: Vec<toki::ModelUsageSummary> =
+            serde_json::from_value(item["data"].clone()).unwrap();
+        assert_eq!(summaries[0].input_tokens, 12);
+        assert_eq!(summaries[0].cache_read_input_tokens, 4);
+        assert_eq!(summaries[0].cache_creation_input_tokens, 2);
+        assert_eq!(summaries[0].event_count, 1);
     }
 
     #[test]
