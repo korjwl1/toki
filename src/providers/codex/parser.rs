@@ -104,9 +104,59 @@ impl CodexFileParser {
         }
     }
 
+    /// A parser that already knows what the bytes before `offset` established.
+    ///
+    /// The model name lives only on `turn_context` lines, and a rollout file
+    /// carries a handful of them among thousands of events. A parser created
+    /// fresh at a resume offset therefore starts at "unknown" and stamps every
+    /// event that way until the session happens to change model — so a daemon
+    /// restart mid-file silently relabelled the rest of that session's usage
+    /// as an unpriced `unknown` row.
+    ///
+    /// Replay the prefix for the state the stream carries forward. Only three
+    /// line kinds matter and they are rare, so the scan is a substring test
+    /// per line and a parse for almost none of them.
+    pub fn primed(path: &str, offset: u64) -> Self {
+        let mut parser = Self::new();
+        if offset == 0 {
+            return parser;
+        }
+        let Ok(file) = std::fs::File::open(path) else {
+            return parser;
+        };
+        let mut reader = std::io::BufReader::new(file);
+        let mut consumed: u64 = 0;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match std::io::BufRead::read_line(&mut reader, &mut line) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if consumed >= offset {
+                        break;
+                    }
+                    consumed += n as u64;
+                    if line.contains("\"turn_context\"") || line.contains("\"session_meta\"") {
+                        let _ = <Self as crate::providers::FileParser>::parse_line(
+                            &mut parser,
+                            line.trim_end(),
+                        );
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        parser
+    }
+
     /// Get the project name (cwd) discovered from session_meta.
     pub fn cwd(&self) -> Option<&str> {
         self.cwd.as_deref()
+    }
+
+    #[cfg(test)]
+    pub fn model_for_test(&self) -> &str {
+        &self.last_model
     }
 }
 
@@ -749,6 +799,36 @@ impl LogParserWithTs for CodexParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_resumed_parser_keeps_the_session_model() {
+        // A daemon restart resumes mid-file. The model is set by a rare
+        // turn_context line, so a parser that starts at the offset labels the
+        // rest of the session "unknown" -- an unpriced row that looks like a
+        // real model the user never ran.
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        let ctx = r#"{"timestamp":"2026-08-27T04:15:39.000Z","type":"turn_context","payload":{"model":"gpt-5.6-sol"}}"#;
+        let usage = r#"{"timestamp":"2026-08-27T04:16:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":10,"cached_input_tokens":4,"cache_write_input_tokens":0,"output_tokens":2,"reasoning_output_tokens":1,"total_tokens":12}}}}"#;
+        writeln!(f, "{ctx}").unwrap();
+        let offset = ctx.len() as u64 + 1;
+        writeln!(f, "{usage}").unwrap();
+        drop(f);
+        let path = path.to_str().unwrap();
+
+        // Fresh at the offset: the turn_context is behind us and lost.
+        let bare = CodexFileParser::new();
+        assert_eq!(bare.model_for_test(), "unknown");
+
+        // Primed: the prefix is replayed for exactly this state.
+        let primed = CodexFileParser::primed(path, offset);
+        assert_eq!(primed.model_for_test(), "gpt-5.6-sol");
+
+        // From byte zero there is nothing to replay and nothing changes.
+        assert_eq!(CodexFileParser::primed(path, 0).model_for_test(), "unknown");
+    }
 
     #[test]
     fn test_parse_session_meta() {

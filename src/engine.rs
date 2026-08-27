@@ -267,7 +267,11 @@ impl TrackerEngine {
                     })
                 }
                 "codex" => {
-                    let mut parser = crate::providers::codex::parser::CodexFileParser::new();
+                    // Resume carries state: the model is set by a rare
+                    // turn_context line, so a parser started at the offset
+                    // would label the rest of the session "unknown".
+                    let mut parser =
+                        crate::providers::codex::parser::CodexFileParser::primed(path, offset);
                     process_lines_streaming(path, offset, |line| {
                         if let Some(parsed) = <crate::providers::codex::parser::CodexFileParser
                             as crate::providers::FileParser>::parse_line(&mut parser, line) {
