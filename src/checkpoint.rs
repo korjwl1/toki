@@ -55,10 +55,12 @@ pub fn find_resume_offset(path: &str, cp: &FileCheckpoint) -> std::io::Result<Op
             if trailing.last() == Some(&b'\r') {
                 trailing = &trailing[..trailing.len() - 1];
             }
-            if !trailing.is_empty() && trailing.len() as u64 == cp.last_line_len
-                && hash_line(trailing) == cp.last_line_hash {
-                    return Ok(Some(file_size));
-                }
+            if !trailing.is_empty()
+                && trailing.len() as u64 == cp.last_line_len
+                && hash_line(trailing) == cp.last_line_hash
+            {
+                return Ok(Some(file_size));
+            }
         }
     }
 
@@ -103,18 +105,21 @@ pub fn find_resume_offset(path: &str, cp: &FileCheckpoint) -> std::io::Result<Op
                     full_line.pop();
                 }
 
-                if !full_line.is_empty() && full_line.len() as u64 == cp.last_line_len
-                    && hash_line(&full_line) == cp.last_line_hash {
-                        return Ok(Some(fragment_resume));
-                    }
+                if !full_line.is_empty()
+                    && full_line.len() as u64 == cp.last_line_len
+                    && hash_line(&full_line) == cp.last_line_hash
+                {
+                    return Ok(Some(fragment_resume));
+                }
             } else {
                 // Complete line entirely within this chunk.
                 if !content_in_buf.is_empty()
                     && content_in_buf.len() as u64 == cp.last_line_len
-                    && hash_line(content_in_buf) == cp.last_line_hash {
-                        // \n terminating this line is at buf_slice[line_end] (file pos read_start + line_end).
-                        return Ok(Some(read_start + line_end as u64 + 1));
-                    }
+                    && hash_line(content_in_buf) == cp.last_line_hash
+                {
+                    // \n terminating this line is at buf_slice[line_end] (file pos read_start + line_end).
+                    return Ok(Some(read_start + line_end as u64 + 1));
+                }
             }
 
             line_end = i;
@@ -143,10 +148,12 @@ pub fn find_resume_offset(path: &str, cp: &FileCheckpoint) -> std::io::Result<Op
     if fragment.last() == Some(&b'\r') {
         fragment.pop();
     }
-    if !fragment.is_empty() && fragment.len() as u64 == cp.last_line_len
-        && hash_line(&fragment) == cp.last_line_hash {
-            return Ok(Some(fragment_resume));
-        }
+    if !fragment.is_empty()
+        && fragment.len() as u64 == cp.last_line_len
+        && hash_line(&fragment) == cp.last_line_hash
+    {
+        return Ok(Some(fragment_resume));
+    }
 
     // Line not found — compacted away entirely.
     Ok(None)
@@ -311,7 +318,8 @@ mod tests {
         let mut lines = Vec::new();
         let result = process_lines_streaming(path, offset, |line| {
             lines.push(line.to_string());
-        }).unwrap();
+        })
+        .unwrap();
         (lines, result)
     }
 
@@ -472,7 +480,10 @@ mod tests {
         let mut content = String::new();
         let target_line = "TARGET_LINE_HERE_12345";
         for i in 0..200 {
-            content.push_str(&format!("padding line number {} with some extra data to make it longer\n", i));
+            content.push_str(&format!(
+                "padding line number {} with some extra data to make it longer\n",
+                i
+            ));
         }
         content.push_str(target_line);
         content.push('\n');
@@ -612,7 +623,10 @@ mod tests {
 
         let cp = make_checkpoint("line2", path_str);
 
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         f.write_all(b"line3\nline4\n").unwrap();
 
         let offset = find_resume_offset(path_str, &cp).unwrap().unwrap();

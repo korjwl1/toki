@@ -133,16 +133,27 @@ impl Config {
         }
 
         if let Some(v) = settings.get("retention_days").and_then(|v| v.as_str()) {
-            if let Ok(n) = v.parse::<u32>() { self.retention_days = n; }
+            if let Ok(n) = v.parse::<u32>() {
+                self.retention_days = n;
+            }
         }
         if let Some(v) = settings.get("window_tracking").and_then(|v| v.as_str()) {
-            if let Some(b) = parse_bool_setting(v) { self.window_tracking = b; }
+            if let Some(b) = parse_bool_setting(v) {
+                self.window_tracking = b;
+            }
         }
         if let Some(v) = settings.get("window_polling").and_then(|v| v.as_str()) {
-            if let Some(b) = parse_bool_setting(v) { self.window_polling = b; }
+            if let Some(b) = parse_bool_setting(v) {
+                self.window_polling = b;
+            }
         }
-        if let Some(v) = settings.get("window_retention_days").and_then(|v| v.as_str()) {
-            if let Ok(n) = v.parse::<u32>() { self.window_retention_days = n; }
+        if let Some(v) = settings
+            .get("window_retention_days")
+            .and_then(|v| v.as_str())
+        {
+            if let Ok(n) = v.parse::<u32>() {
+                self.window_retention_days = n;
+            }
         }
         if let Some(v) = settings.get("daemon_sock").and_then(|v| v.as_str()) {
             self.daemon_sock = PathBuf::from(v);
@@ -166,7 +177,9 @@ impl Config {
         if let Some(v) = settings.get("no_cost").and_then(|v| v.as_str()) {
             // Shared parser: `settings set` advertises on/off/yes/no, so a
             // loader that only accepted "true" made those silently no-ops.
-            if let Some(b) = parse_bool_setting(v) { self.no_cost = b; }
+            if let Some(b) = parse_bool_setting(v) {
+                self.no_cost = b;
+            }
         }
         if let Some(v) = settings.get("output_format").and_then(|v| v.as_str()) {
             if v == "table" || v == "json" {
@@ -251,10 +264,16 @@ pub fn set_setting(key: &str, value: &str) -> Result<(), String> {
     // File lock to prevent concurrent read-modify-write races
     let lock_path = path.with_extension("lock");
     let lock_file = std::fs::OpenOptions::new()
-        .create(true).truncate(false).read(true).write(true)
-        .open(&lock_path).map_err(|e| e.to_string())?;
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| e.to_string())?;
     use fs2::FileExt;
-    lock_file.lock_exclusive().map_err(|e| format!("settings lock: {}", e))?;
+    lock_file
+        .lock_exclusive()
+        .map_err(|e| format!("settings lock: {}", e))?;
 
     let mut settings: HashMap<String, serde_json::Value> = if path.exists() {
         std::fs::read_to_string(&path)
@@ -265,7 +284,10 @@ pub fn set_setting(key: &str, value: &str) -> Result<(), String> {
         HashMap::new()
     };
 
-    settings.insert(key.to_string(), serde_json::Value::String(value.to_string()));
+    settings.insert(
+        key.to_string(),
+        serde_json::Value::String(value.to_string()),
+    );
 
     let tmp = path.with_extension("tmp");
     let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
@@ -289,10 +311,16 @@ pub fn set_setting_array(key: &str, values: &[String]) -> Result<(), String> {
 
     let lock_path = path.with_extension("lock");
     let lock_file = std::fs::OpenOptions::new()
-        .create(true).truncate(false).read(true).write(true)
-        .open(&lock_path).map_err(|e| e.to_string())?;
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| e.to_string())?;
     use fs2::FileExt;
-    lock_file.lock_exclusive().map_err(|e| format!("settings lock: {}", e))?;
+    lock_file
+        .lock_exclusive()
+        .map_err(|e| format!("settings lock: {}", e))?;
 
     let mut settings: HashMap<String, serde_json::Value> = if path.exists() {
         std::fs::read_to_string(&path)
@@ -325,7 +353,10 @@ pub fn set_setting_array(key: &str, values: &[String]) -> Result<(), String> {
 /// Get a single setting from the settings file.
 pub fn get_setting(key: &str) -> Option<String> {
     let settings = load_settings_file()?;
-    settings.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+    settings
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 /// Get providers list from settings file.
@@ -348,14 +379,16 @@ pub fn get_providers() -> Vec<String> {
 /// List all settings as (key, value) pairs.
 pub fn list_settings() -> HashMap<String, String> {
     let settings = load_settings_file().unwrap_or_default();
-    settings.into_iter()
+    settings
+        .into_iter()
         .filter_map(|(k, v)| {
-            v.as_str().map(|s| (k.clone(), s.to_string()))
-                .or_else(|| if v.is_array() || v.is_object() {
+            v.as_str().map(|s| (k.clone(), s.to_string())).or_else(|| {
+                if v.is_array() || v.is_object() {
                     Some((k, v.to_string()))
                 } else {
                     None
-                })
+                }
+            })
         })
         .collect()
 }
@@ -374,10 +407,16 @@ fn touch_settings_sentinel() -> std::io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     // Write current timestamp to force a modify event even if file already exists
-    std::fs::write(&path, format!("{}", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()))?;
+    std::fs::write(
+        &path,
+        format!(
+            "{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ),
+    )?;
     Ok(())
 }
 
@@ -388,7 +427,10 @@ fn touch_settings_sentinel() -> std::io::Result<()> {
 /// and rebuilt by the daemon on startup.
 pub fn sync_state_path() -> PathBuf {
     if home_is_overridden() {
-        return home_dir().join(".config").join("toki").join("sync_state.json");
+        return home_dir()
+            .join(".config")
+            .join("toki")
+            .join("sync_state.json");
     }
     PathBuf::from("/tmp/toki/sync_state.json")
 }
@@ -408,10 +450,16 @@ pub fn set_sync_state(key: &str, value: &str) -> Result<(), String> {
 
     let lock_path = path.with_extension("lock");
     let lock_file = std::fs::OpenOptions::new()
-        .create(true).truncate(false).read(true).write(true)
-        .open(&lock_path).map_err(|e| e.to_string())?;
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|e| e.to_string())?;
     use fs2::FileExt;
-    lock_file.lock_exclusive().map_err(|e| format!("sync_state lock: {}", e))?;
+    lock_file
+        .lock_exclusive()
+        .map_err(|e| format!("sync_state lock: {}", e))?;
 
     let mut state: HashMap<String, serde_json::Value> = if path.exists() {
         std::fs::read_to_string(&path)
@@ -422,7 +470,10 @@ pub fn set_sync_state(key: &str, value: &str) -> Result<(), String> {
         HashMap::new()
     };
 
-    state.insert(key.to_string(), serde_json::Value::String(value.to_string()));
+    state.insert(
+        key.to_string(),
+        serde_json::Value::String(value.to_string()),
+    );
 
     let tmp = path.with_extension("tmp");
     let json = serde_json::to_string_pretty(&state).map_err(|e| e.to_string())?;
@@ -436,7 +487,10 @@ pub fn set_sync_state(key: &str, value: &str) -> Result<(), String> {
 /// Read a key from sync_state.json.
 pub fn get_sync_state(key: &str) -> Option<String> {
     let state = load_sync_state()?;
-    state.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+    state
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 /// Clear all sync state (called on sync disable).
@@ -450,10 +504,14 @@ pub fn clear_sync_state() -> Result<(), String> {
 
 pub fn parse_weekday(s: &str) -> Option<Weekday> {
     match s {
-        "mon" => Some(Weekday::Mon), "tue" => Some(Weekday::Tue),
-        "wed" => Some(Weekday::Wed), "thu" => Some(Weekday::Thu),
-        "fri" => Some(Weekday::Fri), "sat" => Some(Weekday::Sat),
-        "sun" => Some(Weekday::Sun), _ => None,
+        "mon" => Some(Weekday::Mon),
+        "tue" => Some(Weekday::Tue),
+        "wed" => Some(Weekday::Wed),
+        "thu" => Some(Weekday::Thu),
+        "fri" => Some(Weekday::Fri),
+        "sat" => Some(Weekday::Sat),
+        "sun" => Some(Weekday::Sun),
+        _ => None,
     }
 }
 
@@ -470,7 +528,10 @@ mod tests {
             fallback
         );
         assert_eq!(
-            home_dir_from(Some(std::ffi::OsString::from("/integration-home")), fallback),
+            home_dir_from(
+                Some(std::ffi::OsString::from("/integration-home")),
+                fallback
+            ),
             PathBuf::from("/integration-home")
         );
     }
@@ -528,8 +589,14 @@ mod tests {
 
         // Write
         let mut settings = HashMap::new();
-        settings.insert("claude_code_root".to_string(), serde_json::Value::String("/test".to_string()));
-        settings.insert("no_cost".to_string(), serde_json::Value::String("true".to_string()));
+        settings.insert(
+            "claude_code_root".to_string(),
+            serde_json::Value::String("/test".to_string()),
+        );
+        settings.insert(
+            "no_cost".to_string(),
+            serde_json::Value::String("true".to_string()),
+        );
         let json = serde_json::to_string_pretty(&settings).unwrap();
         std::fs::write(&path, &json).unwrap();
 

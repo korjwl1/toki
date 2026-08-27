@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use super::{json, Sink};
 use crate::common::schema::ProviderSchema;
 use crate::common::types::{ModelUsageSummary, UsageEventWithTs};
 use crate::pricing::PricingTable;
-use super::{Sink, json};
 
 /// Connect + read timeout for HTTP sink.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -36,7 +36,9 @@ impl HttpSink {
             }
         };
 
-        if let Err(e) = self.agent.post(&self.url)
+        if let Err(e) = self
+            .agent
+            .post(&self.url)
             .set("Content-Type", "application/json")
             .send_string(&body)
         {
@@ -46,15 +48,31 @@ impl HttpSink {
 }
 
 impl Sink for HttpSink {
-    fn emit_summary(&self, summaries: &HashMap<String, ModelUsageSummary>, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
+    fn emit_summary(
+        &self,
+        summaries: &HashMap<String, ModelUsageSummary>,
+        pricing: Option<&PricingTable>,
+        schema: Option<&dyn ProviderSchema>,
+    ) {
         self.send(&json::summaries_to_json(summaries, pricing, schema));
     }
 
-    fn emit_grouped(&self, grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>, type_name: &str, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
+    fn emit_grouped(
+        &self,
+        grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>,
+        type_name: &str,
+        pricing: Option<&PricingTable>,
+        schema: Option<&dyn ProviderSchema>,
+    ) {
         self.send(&json::grouped_to_json(grouped, type_name, pricing, schema));
     }
 
-    fn emit_event(&self, event: &UsageEventWithTs, pricing: Option<&PricingTable>, _schema: Option<&dyn ProviderSchema>) {
+    fn emit_event(
+        &self,
+        event: &UsageEventWithTs,
+        pricing: Option<&PricingTable>,
+        _schema: Option<&dyn ProviderSchema>,
+    ) {
         self.send(&json::event_to_json(event, pricing, _schema));
     }
 
@@ -62,12 +80,19 @@ impl Sink for HttpSink {
         self.send(&serde_json::json!({ "type": type_name, "items": items }));
     }
 
-    fn emit_events_batch(&self, events: &[crate::common::types::RawEvent], pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
+    fn emit_events_batch(
+        &self,
+        events: &[crate::common::types::RawEvent],
+        pricing: Option<&PricingTable>,
+        schema: Option<&dyn ProviderSchema>,
+    ) {
         self.send(&json::events_batch_to_json(events, pricing, schema));
     }
 
     fn emit_raw(&self, line: &str) {
-        if let Err(e) = self.agent.post(&self.url)
+        if let Err(e) = self
+            .agent
+            .post(&self.url)
             .set("Content-Type", "application/json")
             .send_string(line)
         {

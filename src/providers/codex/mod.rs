@@ -1,7 +1,7 @@
 pub mod parser;
 
-pub use parser::CodexParser;
 pub(crate) use parser::parse_rate_limits_line;
+pub use parser::CodexParser;
 
 /// Resolve the Codex account scope from `<codex_root>/auth.json`, as a
 /// privacy-safe hash string. Returns "unknown" when unreadable.
@@ -18,9 +18,7 @@ pub fn try_account_scope(codex_root: &str) -> Option<String> {
     let raw = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         // Absent = logged out, which IS "unknown"; anything else is transient.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Some("unknown".to_string())
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some("unknown".to_string()),
         Err(_) => return None,
     };
     #[derive(serde::Deserialize)]
@@ -138,8 +136,7 @@ impl Provider for CodexProvider {
             };
 
             // Extract UUID from filename: rollout-YYYY-MM-DDTHH-MM-SS-<UUID>.jsonl
-            let session_id = extract_uuid_from_filename(stem)
-                .unwrap_or_else(|| stem.to_string());
+            let session_id = extract_uuid_from_filename(stem).unwrap_or_else(|| stem.to_string());
 
             sessions.push(SessionGroup {
                 session_id,
@@ -194,7 +191,7 @@ impl Provider for CodexProvider {
         // of fd close, so the native watcher already handles this correctly.
         #[cfg(target_os = "macos")]
         {
-            return Some(self.watch_dirs());
+            Some(self.watch_dirs())
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -207,9 +204,12 @@ impl Provider for CodexProvider {
     }
 
     /// Override: use concrete CodexFileParser directly for inlining (no dyn dispatch).
-    fn scan_file_cold_start(&self, path: &str, offset: u64, emit: &mut dyn FnMut(super::ColdStartParsed))
-        -> std::io::Result<Option<(u64, u64, u64)>>
-    {
+    fn scan_file_cold_start(
+        &self,
+        path: &str,
+        offset: u64,
+        emit: &mut dyn FnMut(super::ColdStartParsed),
+    ) -> std::io::Result<Option<(u64, u64, u64)>> {
         let mut parser = crate::providers::codex::parser::CodexFileParser::primed(path, offset);
         crate::checkpoint::process_lines_streaming(path, offset, |line| {
             if let Some(parsed) = <crate::providers::codex::parser::CodexFileParser as crate::providers::FileParser>::parse_line(&mut parser, line) {
@@ -232,7 +232,9 @@ fn extract_uuid_from_filename(stem: &str) -> Option<String> {
             && parts[2].len() == 4
             && parts[3].len() == 4
             && parts[4].len() == 12
-            && parts.iter().all(|p| p.bytes().all(|b| b.is_ascii_hexdigit()))
+            && parts
+                .iter()
+                .all(|p| p.bytes().all(|b| b.is_ascii_hexdigit()))
         {
             return Some(candidate.to_string());
         }
@@ -248,7 +250,10 @@ mod tests {
     fn test_extract_uuid_from_filename() {
         let stem = "rollout-2026-03-12T00-35-10-019cdd89-9fd9-7f11-b555-459c0ec30834";
         let uuid = extract_uuid_from_filename(stem);
-        assert_eq!(uuid, Some("019cdd89-9fd9-7f11-b555-459c0ec30834".to_string()));
+        assert_eq!(
+            uuid,
+            Some("019cdd89-9fd9-7f11-b555-459c0ec30834".to_string())
+        );
     }
 
     #[test]

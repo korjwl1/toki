@@ -3,14 +3,14 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use toki_sync_protocol::SCHEMA_VERSION;
 use super::protocol::{
-    AuthErrPayload, AuthOkPayload, AuthPayload, GetLastTsPayload, LastTsPayload,
-    MsgType, PROTOCOL_VERSION, SyncAckPayload, SyncBatchPayload, SyncErrPayload,
-    SyncItem, read_frame, write_empty_frame, write_frame,
+    read_frame, write_empty_frame, write_frame, AuthErrPayload, AuthOkPayload, AuthPayload,
+    GetLastTsPayload, LastTsPayload, MsgType, SyncAckPayload, SyncBatchPayload, SyncErrPayload,
+    SyncItem, PROTOCOL_VERSION,
 };
+use toki_sync_protocol::SCHEMA_VERSION;
 
-const READ_TIMEOUT: Duration = Duration::from_secs(180);  // Allow margin for slow VM writes; PING every 60s
+const READ_TIMEOUT: Duration = Duration::from_secs(180); // Allow margin for slow VM writes; PING every 60s
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub const BATCH_SIZE: usize = 1000;
 
@@ -118,14 +118,15 @@ impl SyncClient {
                     .danger_accept_invalid_certs(true)
                     .danger_accept_invalid_hostnames(true)
                     .build()
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("TLS init: {e}")))?
+                    .map_err(|e| io::Error::other(format!("TLS init: {e}")))?
             } else {
                 native_tls::TlsConnector::new()
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("TLS init: {e}")))?
+                    .map_err(|e| io::Error::other(format!("TLS init: {e}")))?
             };
             let hostname = addr.split(':').next().unwrap_or(addr);
-            let tls_stream = connector.connect(hostname, stream)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("TLS handshake: {e}")))?;
+            let tls_stream = connector
+                .connect(hostname, stream)
+                .map_err(|e| io::Error::other(format!("TLS handshake: {e}")))?;
             SyncStream::Tls(tls_stream)
         } else {
             SyncStream::Plain(stream)
@@ -155,8 +156,7 @@ impl SyncClient {
             protocol_version: PROTOCOL_VERSION,
         };
         let bytes = bincode::serialize(&payload).map_err(|e| AuthError::Protocol(e.to_string()))?;
-        write_frame(&mut self.writer, MsgType::Auth, &bytes)
-            .map_err(AuthError::Io)?;
+        write_frame(&mut self.writer, MsgType::Auth, &bytes).map_err(AuthError::Io)?;
 
         let (msg_type, payload) = read_frame(&mut self.reader).map_err(AuthError::Io)?;
         match msg_type {
@@ -168,15 +168,22 @@ impl SyncClient {
             MsgType::AuthErr => {
                 let err: AuthErrPayload = bincode::deserialize(&payload)
                     .map_err(|e| AuthError::Protocol(e.to_string()))?;
-                Err(AuthError::Rejected { reason: err.reason, reset_required: err.reset_required })
+                Err(AuthError::Rejected {
+                    reason: err.reason,
+                    reset_required: err.reset_required,
+                })
             }
-            other => Err(AuthError::Protocol(format!("unexpected response to AUTH: {other:?}"))),
+            other => Err(AuthError::Protocol(format!(
+                "unexpected response to AUTH: {other:?}"
+            ))),
         }
     }
 
     /// Send GET_LAST_TS and receive LAST_TS.
     pub fn get_last_ts(&mut self, provider: &str) -> io::Result<i64> {
-        let payload = GetLastTsPayload { provider: provider.to_string() };
+        let payload = GetLastTsPayload {
+            provider: provider.to_string(),
+        };
         let bytes = bincode::serialize(&payload)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         write_frame(&mut self.writer, MsgType::GetLastTs, &bytes)?;
@@ -202,14 +209,17 @@ impl SyncClient {
         token_columns: Vec<String>,
     ) -> Result<i64, SyncError> {
         // Only include dict entries referenced by this batch
-        let used_ids: std::collections::HashSet<u32> = items.iter().flat_map(|item| {
-            [
-                item.event.model_id,
-                item.event.session_id,
-                item.event.source_file_id,
-                item.event.project_name_id,
-            ]
-        }).collect();
+        let used_ids: std::collections::HashSet<u32> = items
+            .iter()
+            .flat_map(|item| {
+                [
+                    item.event.model_id,
+                    item.event.session_id,
+                    item.event.source_file_id,
+                    item.event.project_name_id,
+                ]
+            })
+            .collect();
         let batch_dict: HashMap<u32, String> = dict
             .iter()
             .filter(|(id, _)| used_ids.contains(id))
@@ -222,8 +232,7 @@ impl SyncClient {
             provider: provider.to_string(),
             token_columns,
         };
-        let bytes = bincode::serialize(&payload)
-            .map_err(|e| SyncError::Protocol(e.to_string()))?;
+        let bytes = bincode::serialize(&payload).map_err(|e| SyncError::Protocol(e.to_string()))?;
 
         // Compress with zstd for batches >= 100 items
         if payload.items.len() >= 100 {
@@ -232,8 +241,7 @@ impl SyncClient {
             write_frame(&mut self.writer, MsgType::SyncBatchZstd, &compressed)
                 .map_err(SyncError::Io)?;
         } else {
-            write_frame(&mut self.writer, MsgType::SyncBatch, &bytes)
-                .map_err(SyncError::Io)?;
+            write_frame(&mut self.writer, MsgType::SyncBatch, &bytes).map_err(SyncError::Io)?;
         }
 
         let (msg_type, resp_payload) = read_frame(&mut self.reader).map_err(SyncError::Io)?;
@@ -248,7 +256,9 @@ impl SyncClient {
                     .map_err(|e| SyncError::Protocol(e.to_string()))?;
                 Err(SyncError::ServerError(err.reason))
             }
-            other => Err(SyncError::Protocol(format!("expected SYNC_ACK, got {other:?}"))),
+            other => Err(SyncError::Protocol(format!(
+                "expected SYNC_ACK, got {other:?}"
+            ))),
         }
     }
 
@@ -269,16 +279,19 @@ impl SyncClient {
         // ErrorKind::Other, deliberately: the caller reconnects on any other
         // kind, and a purely local serialization bug must not cycle the TCP
         // connection that event sync is using.
-        let bytes = bincode::serialize(&payload)
-            .map_err(|e| io::Error::other(e))?;
+        let bytes = bincode::serialize(&payload).map_err(io::Error::other)?;
         write_frame(&mut self.writer, MsgType::SyncWindows, &bytes)?;
         let (msg_type, resp) = read_frame(&mut self.reader)?;
         match msg_type {
             MsgType::SyncAck => Ok(()),
             MsgType::SyncErr => {
-                let err: SyncErrPayload = bincode::deserialize(&resp)
-                    .unwrap_or(SyncErrPayload { reason: "unknown".into() });
-                Err(io::Error::other(format!("server rejected windows: {}", err.reason)))
+                let err: SyncErrPayload = bincode::deserialize(&resp).unwrap_or(SyncErrPayload {
+                    reason: "unknown".into(),
+                });
+                Err(io::Error::other(format!(
+                    "server rejected windows: {}",
+                    err.reason
+                )))
             }
             other => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -306,7 +319,9 @@ impl Drop for SyncClient {
         // Both StreamHalf instances share the same pointer; extract from reader.
         let ptr = self.reader.get_ref().0;
         if !ptr.is_null() {
-            unsafe { drop(Box::from_raw(ptr)); }
+            unsafe {
+                drop(Box::from_raw(ptr));
+            }
         }
     }
 }
@@ -317,7 +332,10 @@ impl Drop for SyncClient {
 pub enum AuthError {
     Io(io::Error),
     Protocol(String),
-    Rejected { reason: String, reset_required: bool },
+    Rejected {
+        reason: String,
+        reset_required: bool,
+    },
 }
 
 impl std::fmt::Display for AuthError {

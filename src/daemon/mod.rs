@@ -4,7 +4,7 @@ mod pidfile;
 
 pub use broadcast::BroadcastSink;
 pub use listener::run_listener;
-pub use pidfile::{write_pidfile, read_pidfile, remove_pidfile, default_pidfile_path};
+pub use pidfile::{default_pidfile_path, read_pidfile, remove_pidfile, write_pidfile};
 
 use std::path::PathBuf;
 
@@ -52,7 +52,9 @@ pub fn stop_daemon(pidfile: &std::path::Path, sock: &std::path::Path) -> Result<
                 return Ok(false);
             }
             // Send SIGTERM for graceful shutdown
-            unsafe { libc::kill(pid as i32, libc::SIGTERM); }
+            unsafe {
+                libc::kill(pid as i32, libc::SIGTERM);
+            }
 
             // Wait for process to actually exit (up to 10s graceful, then SIGKILL)
             let mut exited = false;
@@ -65,7 +67,9 @@ pub fn stop_daemon(pidfile: &std::path::Path, sock: &std::path::Path) -> Result<
                 // After 10s, escalate to SIGKILL
                 if i == 99 {
                     eprintln!("[toki] Graceful shutdown timed out, forcing...");
-                    unsafe { libc::kill(pid as i32, libc::SIGKILL); }
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGKILL);
+                    }
                     std::thread::sleep(std::time::Duration::from_millis(500));
                     exited = unsafe { libc::kill(pid as i32, 0) != 0 };
                 }
@@ -88,7 +92,11 @@ pub fn daemon_status(pidfile: &std::path::Path) -> Option<u32> {
     let pid = read_pidfile(pidfile)?;
     let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
     // Also confirm the live PID is actually toki, not a reused PID.
-    if alive && pid_looks_like_toki(pid) { Some(pid) } else { None }
+    if alive && pid_looks_like_toki(pid) {
+        Some(pid)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

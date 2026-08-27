@@ -3,10 +3,10 @@ use std::io::Write;
 use std::os::unix::net::UnixStream;
 use std::sync::Mutex;
 
+use super::{json, Sink};
 use crate::common::schema::ProviderSchema;
 use crate::common::types::{ModelUsageSummary, UsageEventWithTs};
 use crate::pricing::PricingTable;
-use super::{Sink, json};
 
 /// Unix Domain Socket sink: sends NDJSON (newline-delimited JSON).
 pub struct UdsSink {
@@ -22,7 +22,10 @@ impl UdsSink {
         } else {
             eprintln!("[toki] UDS: will connect to {} on first event", path);
         }
-        UdsSink { path, conn: Mutex::new(conn) }
+        UdsSink {
+            path,
+            conn: Mutex::new(conn),
+        }
     }
 
     fn send(&self, value: &serde_json::Value) {
@@ -58,15 +61,31 @@ impl UdsSink {
 }
 
 impl Sink for UdsSink {
-    fn emit_summary(&self, summaries: &HashMap<String, ModelUsageSummary>, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
+    fn emit_summary(
+        &self,
+        summaries: &HashMap<String, ModelUsageSummary>,
+        pricing: Option<&PricingTable>,
+        schema: Option<&dyn ProviderSchema>,
+    ) {
         self.send(&json::summaries_to_json(summaries, pricing, schema));
     }
 
-    fn emit_grouped(&self, grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>, type_name: &str, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
+    fn emit_grouped(
+        &self,
+        grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>,
+        type_name: &str,
+        pricing: Option<&PricingTable>,
+        schema: Option<&dyn ProviderSchema>,
+    ) {
         self.send(&json::grouped_to_json(grouped, type_name, pricing, schema));
     }
 
-    fn emit_event(&self, event: &UsageEventWithTs, pricing: Option<&PricingTable>, _schema: Option<&dyn ProviderSchema>) {
+    fn emit_event(
+        &self,
+        event: &UsageEventWithTs,
+        pricing: Option<&PricingTable>,
+        _schema: Option<&dyn ProviderSchema>,
+    ) {
         self.send(&json::event_to_json(event, pricing, _schema));
     }
 
@@ -74,7 +93,12 @@ impl Sink for UdsSink {
         self.send(&serde_json::json!({ "type": type_name, "items": items }));
     }
 
-    fn emit_events_batch(&self, events: &[crate::common::types::RawEvent], pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
+    fn emit_events_batch(
+        &self,
+        events: &[crate::common::types::RawEvent],
+        pricing: Option<&PricingTable>,
+        schema: Option<&dyn ProviderSchema>,
+    ) {
         self.send(&json::events_batch_to_json(events, pricing, schema));
     }
 

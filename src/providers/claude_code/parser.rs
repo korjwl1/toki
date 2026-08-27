@@ -1,4 +1,6 @@
-use crate::common::types::{LogParser, LogParserWithTs, SessionGroup, UsageEvent, UsageEventWithTs};
+use crate::common::types::{
+    LogParser, LogParserWithTs, SessionGroup, UsageEvent, UsageEventWithTs,
+};
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -94,7 +96,11 @@ impl ClaudeCodeParser {
         })
     }
 
-    pub fn parse_line_with_ts_inner(&self, line: &str, source_file: &str) -> Option<UsageEventWithTs> {
+    pub fn parse_line_with_ts_inner(
+        &self,
+        line: &str,
+        source_file: &str,
+    ) -> Option<UsageEventWithTs> {
         let parsed = self.parse_line_common(line)?;
 
         let event_key = format!("{}:{}", parsed.message_id, parsed.timestamp);
@@ -153,9 +159,7 @@ impl LogParser for ClaudeCodeParser {
     }
 
     fn file_patterns(&self, root_dir: &str) -> Vec<String> {
-        vec![
-            format!("{}/projects/**/*.jsonl", root_dir),
-        ]
+        vec![format!("{}/projects/**/*.jsonl", root_dir)]
     }
 
     fn discover_sessions(&self, root_dir: &str) -> Vec<SessionGroup> {
@@ -237,7 +241,9 @@ mod tests {
     fn test_parse_assistant_line_with_ts() {
         let line = r#"{"type":"assistant","message":{"id":"msg_123","model":"claude-opus-4-6","usage":{"input_tokens":3,"cache_creation_input_tokens":5139,"cache_read_input_tokens":9631,"output_tokens":14}},"timestamp":"2026-03-08T12:00:00Z"}"#;
         let parser = ClaudeCodeParser;
-        let event = parser.parse_line_with_ts_inner(line, "/test/file.jsonl").unwrap();
+        let event = parser
+            .parse_line_with_ts_inner(line, "/test/file.jsonl")
+            .unwrap();
 
         assert_eq!(event.model, "claude-opus-4-6");
         assert_eq!(event.input_tokens, 3);
@@ -266,7 +272,9 @@ mod tests {
         let parser = ClaudeCodeParser;
         let line = r#"{"type":"assistant","message":{"id":"msg_syn","model":"<synthetic>","usage":{"input_tokens":0,"output_tokens":0}},"timestamp":"2026-03-08T12:00:00Z"}"#;
         assert!(parser.parse_line(line, "/test.jsonl").is_none());
-        assert!(parser.parse_line_with_ts_inner(line, "/test.jsonl").is_none());
+        assert!(parser
+            .parse_line_with_ts_inner(line, "/test.jsonl")
+            .is_none());
     }
 
     #[test]
@@ -316,7 +324,9 @@ mod tests {
         assert!(ClaudeCodeParser::is_uuid_filename(
             "4de9291e-061e-414a-85cb-de615826aded"
         ));
-        assert!(!ClaudeCodeParser::is_uuid_filename("agent-aed1da92cc2e4e9e7"));
+        assert!(!ClaudeCodeParser::is_uuid_filename(
+            "agent-aed1da92cc2e4e9e7"
+        ));
         assert!(!ClaudeCodeParser::is_uuid_filename("not-a-uuid"));
         assert!(!ClaudeCodeParser::is_uuid_filename(""));
     }

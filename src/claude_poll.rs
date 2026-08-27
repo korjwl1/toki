@@ -59,7 +59,11 @@ const OAUTH_BETA: &str = "oauth-2025-04-20";
 /// A `last_poll_ms` in the future is therefore read as "never polled". The cost
 /// is at most one extra poll, which the 30s floor immediately re-establishes.
 fn normalise_last_poll(last_poll_ms: i64, now: i64) -> i64 {
-    if last_poll_ms > now { 0 } else { last_poll_ms }
+    if last_poll_ms > now {
+        0
+    } else {
+        last_poll_ms
+    }
 }
 
 /// Whether a value cached at `cached_at` is still inside `ttl_ms`.
@@ -178,7 +182,11 @@ pub struct PollerHub {
 }
 
 impl PollerHub {
-    pub fn new(claude_root: Option<String>, codex_root: Option<String>, polling_enabled: bool) -> Self {
+    pub fn new(
+        claude_root: Option<String>,
+        codex_root: Option<String>,
+        polling_enabled: bool,
+    ) -> Self {
         PollerHub {
             signal: (Mutex::new(Signal::default()), Condvar::new()),
             state: (Mutex::new(PublishedState::default()), Condvar::new()),
@@ -198,7 +206,10 @@ impl PollerHub {
         const TTL_MS: i64 = 30_000;
         let now = now_ms();
         {
-            let cached = self.codex_account_cache.lock().unwrap_or_else(|e| e.into_inner());
+            let cached = self
+                .codex_account_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if cache_is_fresh(cached.0, TTL_MS, now) && !cached.1.is_empty() {
                 return cached.1.clone();
             }
@@ -208,7 +219,10 @@ impl PollerHub {
             .as_deref()
             .map(crate::providers::codex::account_scope)
             .unwrap_or_else(|| "unknown".to_string());
-        *self.codex_account_cache.lock().unwrap_or_else(|e| e.into_inner()) = (now, scope.clone());
+        *self
+            .codex_account_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = (now, scope.clone());
         scope
     }
 
@@ -217,7 +231,10 @@ impl PollerHub {
         const TTL_MS: i64 = 30_000;
         let now = now_ms();
         {
-            let cached = self.codex_auth_cache.lock().unwrap_or_else(|e| e.into_inner());
+            let cached = self
+                .codex_auth_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             if cache_is_fresh(cached.0, TTL_MS, now) {
                 return cached.1;
             }
@@ -227,7 +244,10 @@ impl PollerHub {
             .as_deref()
             .map(codex_auth_status)
             .unwrap_or(AuthStatus::Missing);
-        *self.codex_auth_cache.lock().unwrap_or_else(|e| e.into_inner()) = (now, status);
+        *self
+            .codex_auth_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = (now, status);
         status
     }
 
@@ -296,7 +316,11 @@ impl PollerHub {
     }
 
     pub fn state_snapshot(&self) -> PublishedState {
-        self.state.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.state
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Request a fresh poll and wait (bounded) for the poller to complete one
@@ -381,7 +405,12 @@ fn read_credentials_raw(claude_root: &str) -> Result<String, AuthStatus> {
         // `security` indefinitely, which would wedge the poller AND
         // Handle::shutdown's join. 10s then kill → transient Unreadable.
         let mut child = std::process::Command::new("security")
-            .args(["find-generic-password", "-s", "Claude Code-credentials", "-w"])
+            .args([
+                "find-generic-password",
+                "-s",
+                "Claude Code-credentials",
+                "-w",
+            ])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -405,7 +434,11 @@ fn read_credentials_raw(claude_root: &str) -> Result<String, AuthStatus> {
             use std::io::Read;
             let _ = out_pipe.read_to_end(&mut stdout);
         }
-        let out = std::process::Output { status, stdout, stderr: Vec::new() };
+        let out = std::process::Output {
+            status,
+            stdout,
+            stderr: Vec::new(),
+        };
         if !out.status.success() {
             // Parity with the monitor's ClaudeAuthReader.classify: exit 44 is
             // errSecItemNotFound (logged out); any other failure — ACL denial,
@@ -453,7 +486,10 @@ fn parse_credentials(raw: &str) -> Result<ClaudeCredentials, AuthStatus> {
     if expires_at_ms > 0 && expires_at_ms < now_ms() {
         return Err(AuthStatus::Expired);
     }
-    Ok(ClaudeCredentials { access_token, expires_at_ms })
+    Ok(ClaudeCredentials {
+        access_token,
+        expires_at_ms,
+    })
 }
 
 /// Codex auth classification (thin delegate — see providers::codex).
@@ -686,7 +722,11 @@ fn parse_profile(body: &str) -> Option<ProfileInfo> {
         has_claude_pro: acct.has_claude_pro,
         member_dashboard_available: None,
     };
-    Some(ProfileInfo { account_scope, plan, account })
+    Some(ProfileInfo {
+        account_scope,
+        plan,
+        account,
+    })
 }
 
 fn parse_iso_ms(s: &str) -> Option<i64> {
@@ -706,33 +746,38 @@ fn observations_from_usage(
         .and_then(|e| e.is_enabled)
         .unwrap_or(false);
     let mut out = Vec::with_capacity(4);
-    let mut push = |bucket: &Option<UsageBucketRaw>, limit_id: &str, window_minutes: u32| {
-        if let Some(b) = bucket {
-            if let (Some(pct), Some(reset_str)) = (b.utilization, b.resets_at.as_deref()) {
-                if let Some(resets_at_ms) = parse_iso_ms(reset_str) {
-                    out.push(WindowObservation {
-                        limit_id: limit_id.to_string(),
-                        window_minutes,
-                        used_percent: pct,
-                        resets_at_ms,
-                        plan_type: if plan.is_empty() { None } else { Some(plan.to_string()) },
-                        limit_reached: pct >= 99.995,
-                        has_credits,
-                        // The usage endpoint only serves resets_at for real
-                        // windows; a 0% weekly period is genuine zero use and
-                        // must exist for the overall mean.
-                        anchor_stable: true,
-                        ts_ms,
-                    });
+    {
+        let mut push = |bucket: &Option<UsageBucketRaw>, limit_id: &str, window_minutes: u32| {
+            if let Some(b) = bucket {
+                if let (Some(pct), Some(reset_str)) = (b.utilization, b.resets_at.as_deref()) {
+                    if let Some(resets_at_ms) = parse_iso_ms(reset_str) {
+                        out.push(WindowObservation {
+                            limit_id: limit_id.to_string(),
+                            window_minutes,
+                            used_percent: pct,
+                            resets_at_ms,
+                            plan_type: if plan.is_empty() {
+                                None
+                            } else {
+                                Some(plan.to_string())
+                            },
+                            limit_reached: pct >= 99.995,
+                            has_credits,
+                            // The usage endpoint only serves resets_at for real
+                            // windows; a 0% weekly period is genuine zero use and
+                            // must exist for the overall mean.
+                            anchor_stable: true,
+                            ts_ms,
+                        });
+                    }
                 }
             }
-        }
-    };
-    push(&usage.five_hour, "five_hour", 300);
-    push(&usage.seven_day, "seven_day", 10_080);
-    push(&usage.seven_day_sonnet, "seven_day_sonnet", 10_080);
-    push(&usage.seven_day_opus, "seven_day_opus", 10_080);
-    drop(push);
+        };
+        push(&usage.five_hour, "five_hour", 300);
+        push(&usage.seven_day, "seven_day", 10_080);
+        push(&usage.seven_day_sonnet, "seven_day_sonnet", 10_080);
+        push(&usage.seven_day_opus, "seven_day_opus", 10_080);
+    }
 
     // Model-scoped weekly limits live ONLY in `limits[]`; the legacy
     // `seven_day_sonnet`/`seven_day_opus` keys return null even while such a
@@ -763,7 +808,11 @@ fn observations_from_usage(
             window_minutes: 10_080,
             used_percent: pct,
             resets_at_ms,
-            plan_type: if plan.is_empty() { None } else { Some(plan.to_string()) },
+            plan_type: if plan.is_empty() {
+                None
+            } else {
+                Some(plan.to_string())
+            },
             limit_reached: pct >= 99.995,
             has_credits,
             anchor_stable: true,
@@ -829,7 +878,11 @@ pub fn run_claude_poller(
             .min();
 
         let active = now - hub.last_token_flow() < ACTIVE_HORIZON_MS;
-        let interval = if peak_hint > 90.0 { POLL_DENSE_MS } else { POLL_STEADY_MS };
+        let interval = if peak_hint > 90.0 {
+            POLL_DENSE_MS
+        } else {
+            POLL_STEADY_MS
+        };
 
         // Compute how long to sleep. Idle, or polling disabled at runtime
         // (set_polling_enabled notifies the condvar to re-evaluate): hourly
@@ -846,9 +899,7 @@ pub fn run_claude_poller(
         };
         if polling_on {
             if let Some(c) = next_confirm {
-                let confirm_deadline = c
-                    .max(last_poll_ms + POLL_FLOOR_MS)
-                    .max(backoff_until_ms);
+                let confirm_deadline = c.max(last_poll_ms + POLL_FLOOR_MS).max(backoff_until_ms);
                 deadline = deadline.min(confirm_deadline.max(now));
             }
         }
@@ -908,7 +959,9 @@ pub fn run_claude_poller(
 
         // Finalize expired windows regardless of polling decisions.
         for w in tracker.finalize_expired(now) {
-            confirmed.remove(&crate::windows::floor_to_minute(w.snapshot.raw_resets_at_ms));
+            confirmed.remove(&crate::windows::floor_to_minute(
+                w.snapshot.raw_resets_at_ms,
+            ));
             let _ = db_tx.send(DbOp::WriteWindow(Box::new(w)));
         }
 
@@ -1035,8 +1088,7 @@ pub fn run_claude_poller(
                             eprintln!("[toki:poll] usage error: {}", e);
                         }
                         consecutive_failures += 1;
-                        let backoff =
-                            (15_000i64 << consecutive_failures.min(3)).min(60_000);
+                        let backoff = (15_000i64 << consecutive_failures.min(3)).min(60_000);
                         Err((AuthStatus::Ok, Some(backoff)))
                     }
                 }
@@ -1138,17 +1190,28 @@ mod tests {
         assert!(parse_credentials(ok).is_ok());
 
         let expired = r#"{"claudeAiOauth":{"accessToken":"tok","expiresAt":1}}"#;
-        assert!(matches!(parse_credentials(expired), Err(AuthStatus::Expired)));
+        assert!(matches!(
+            parse_credentials(expired),
+            Err(AuthStatus::Expired)
+        ));
 
         let missing = r#"{"otherKey":{}}"#;
-        assert!(matches!(parse_credentials(missing), Err(AuthStatus::Missing)));
+        assert!(matches!(
+            parse_credentials(missing),
+            Err(AuthStatus::Missing)
+        ));
 
         let empty_token = r#"{"claudeAiOauth":{"accessToken":""}}"#;
-        assert!(matches!(parse_credentials(empty_token), Err(AuthStatus::Missing)));
+        assert!(matches!(
+            parse_credentials(empty_token),
+            Err(AuthStatus::Missing)
+        ));
 
-        assert!(matches!(parse_credentials("not json"), Err(AuthStatus::Unreadable)));
+        assert!(matches!(
+            parse_credentials("not json"),
+            Err(AuthStatus::Unreadable)
+        ));
     }
-
 
     /// The endpoint moved model-scoped weekly limits out of the top-level keys
     /// and into `limits[]`; `seven_day_sonnet` now returns null while a scoped
@@ -1175,7 +1238,10 @@ mod tests {
         let ids: Vec<&str> = obs.iter().map(|o| o.limit_id.as_str()).collect();
         assert!(ids.contains(&"five_hour"), "{ids:?}");
         assert!(ids.contains(&"seven_day"), "{ids:?}");
-        assert!(ids.contains(&"weekly_fable"), "scoped limit missing: {ids:?}");
+        assert!(
+            ids.contains(&"weekly_fable"),
+            "scoped limit missing: {ids:?}"
+        );
         // session / weekly_all must not double up with the legacy keys.
         assert_eq!(ids.len(), 3, "one limit became two rows: {ids:?}");
         let fable = obs.iter().find(|o| o.limit_id == "weekly_fable").unwrap();
@@ -1193,12 +1259,18 @@ mod tests {
             id: Some("claude-fable-5".into()),
             display_name: Some("Fable".into()),
         };
-        assert_eq!(scoped_limit_id(&m).as_deref(), Some("weekly_claude_fable_5"));
+        assert_eq!(
+            scoped_limit_id(&m).as_deref(),
+            Some("weekly_claude_fable_5")
+        );
     }
 
     #[test]
     fn the_display_name_is_used_only_when_no_id_is_sent() {
-        let m = LimitScopeModelRaw { id: None, display_name: Some("Fable".into()) };
+        let m = LimitScopeModelRaw {
+            id: None,
+            display_name: Some("Fable".into()),
+        };
         assert_eq!(scoped_limit_id(&m).as_deref(), Some("weekly_fable"));
         // An empty or blank id must not beat a usable display name.
         let blank = LimitScopeModelRaw {
@@ -1214,8 +1286,11 @@ mod tests {
     #[test]
     fn punctuation_and_casing_do_not_fork_a_window() {
         let of = |s: &str| {
-            scoped_limit_id(&LimitScopeModelRaw { id: Some(s.into()), display_name: None })
-                .unwrap()
+            scoped_limit_id(&LimitScopeModelRaw {
+                id: Some(s.into()),
+                display_name: None,
+            })
+            .unwrap()
         };
         assert_eq!(of("Fable 5"), "weekly_fable_5");
         assert_eq!(of("fable-5"), "weekly_fable_5");
@@ -1238,7 +1313,11 @@ mod tests {
             display_name: None,
         })
         .expect("a long name still yields an id");
-        assert!(id.len() <= crate::windows::MAX_LIMIT_ID_LEN, "len {}", id.len());
+        assert!(
+            id.len() <= crate::windows::MAX_LIMIT_ID_LEN,
+            "len {}",
+            id.len()
+        );
         assert!(id.is_char_boundary(id.len()), "truncated mid-character");
         // Long ASCII truncates too, and never to a trailing separator.
         let ascii = scoped_limit_id(&LimitScopeModelRaw {
@@ -1255,8 +1334,14 @@ mod tests {
     #[test]
     fn a_nameless_scope_opens_no_window() {
         for raw in ["", "   ", "---", "///"] {
-            let m = LimitScopeModelRaw { id: Some(raw.into()), display_name: None };
-            assert!(scoped_limit_id(&m).is_none(), "{raw:?} must not yield an id");
+            let m = LimitScopeModelRaw {
+                id: Some(raw.into()),
+                display_name: None,
+            };
+            assert!(
+                scoped_limit_id(&m).is_none(),
+                "{raw:?} must not yield an id"
+            );
         }
         assert!(scoped_limit_id(&LimitScopeModelRaw::default()).is_none());
     }
@@ -1332,10 +1417,9 @@ mod tests {
     /// The usage response carries one account-shape signal of its own.
     #[test]
     fn the_usage_response_carries_the_member_dashboard_flag() {
-        let raw: UsageResponseRaw = serde_json::from_str(
-            r#"{"five_hour":null,"member_dashboard_available":false}"#,
-        )
-        .unwrap();
+        let raw: UsageResponseRaw =
+            serde_json::from_str(r#"{"five_hour":null,"member_dashboard_available":false}"#)
+                .unwrap();
         assert_eq!(raw.member_dashboard_available, Some(false));
         let absent: UsageResponseRaw = serde_json::from_str("{}").unwrap();
         assert_eq!(absent.member_dashboard_available, None);
@@ -1359,7 +1443,11 @@ mod tests {
         .expect("unknown buckets must not fail the parse");
         let obs = observations_from_usage(&raw, "max_5x", 1_800_000_000_000);
         let ids: Vec<&str> = obs.iter().map(|o| o.limit_id.as_str()).collect();
-        assert_eq!(ids, vec!["five_hour"], "a bucket with no reset is not a window: {ids:?}");
+        assert_eq!(
+            ids,
+            vec!["five_hour"],
+            "a bucket with no reset is not a window: {ids:?}"
+        );
     }
 
     /// The poller wedges without this.
@@ -1376,18 +1464,28 @@ mod tests {
         // The ordinary case is untouched.
         assert_eq!(normalise_last_poll(now - 60_000, now), now - 60_000);
         assert_eq!(normalise_last_poll(0, now), 0);
-        assert_eq!(normalise_last_poll(now, now), now, "equal is not in the future");
+        assert_eq!(
+            normalise_last_poll(now, now),
+            now,
+            "equal is not in the future"
+        );
 
         // An hour-long backward step. Without the guard `now - last_poll` is
         // -3_600_000 and every floor comparison fails.
         let stale = normalise_last_poll(now + 3_600_000, now);
         assert_eq!(stale, 0);
-        assert!(now - stale >= POLL_FLOOR_MS, "the 30s floor must be satisfiable again");
+        assert!(
+            now - stale >= POLL_FLOOR_MS,
+            "the 30s floor must be satisfiable again"
+        );
 
         // And the floor still applies from there — the guard buys one poll, not
         // an open door.
         let after_poll = normalise_last_poll(now, now);
-        assert!(now - after_poll < POLL_FLOOR_MS, "an immediate second poll is still refused");
+        assert!(
+            now - after_poll < POLL_FLOOR_MS,
+            "an immediate second poll is still refused"
+        );
     }
 
     /// A cache that cannot go stale is worse than no cache.
@@ -1402,9 +1500,18 @@ mod tests {
         let now = 1_800_000_000_000_i64;
         let ttl = 30_000_i64;
 
-        assert!(cache_is_fresh(now - 1_000, ttl, now), "a one-second-old entry is fresh");
-        assert!(!cache_is_fresh(now - ttl, ttl, now), "exactly at the TTL is expired");
-        assert!(!cache_is_fresh(now - ttl - 1, ttl, now), "past the TTL is expired");
+        assert!(
+            cache_is_fresh(now - 1_000, ttl, now),
+            "a one-second-old entry is fresh"
+        );
+        assert!(
+            !cache_is_fresh(now - ttl, ttl, now),
+            "exactly at the TTL is expired"
+        );
+        assert!(
+            !cache_is_fresh(now - ttl - 1, ttl, now),
+            "past the TTL is expired"
+        );
         assert!(cache_is_fresh(now, ttl, now), "written this instant");
 
         // The bug: an hour-long backward step leaves every entry stamped in the
@@ -1443,7 +1550,9 @@ mod tests {
                 utilization: None, // no utilization → skipped
                 resets_at: Some("2026-08-04T12:00:00Z".into()),
             }),
-            extra_usage: Some(ExtraUsageRaw { is_enabled: Some(true) }),
+            extra_usage: Some(ExtraUsageRaw {
+                is_enabled: Some(true),
+            }),
             limits: Vec::new(),
             member_dashboard_available: None,
         };
@@ -1455,7 +1564,10 @@ mod tests {
         assert_eq!(obs[0].plan_type.as_deref(), Some("default_claude_max_5x"));
         assert_eq!(obs[1].limit_id, "seven_day");
         // Microsecond-jittered ISO strings parse to stable ms.
-        assert_eq!(obs[1].resets_at_ms, parse_iso_ms("2026-08-04T12:00:00.322477+00:00").unwrap());
+        assert_eq!(
+            obs[1].resets_at_ms,
+            parse_iso_ms("2026-08-04T12:00:00.322477+00:00").unwrap()
+        );
     }
 
     #[test]

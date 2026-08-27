@@ -78,7 +78,10 @@ fn windows_reach_a_real_server_over_tcp() {
             format!("e2e_limit_{i}")
         };
         let mut sn = snap(
-            std::env::var("TOKI_E2E_PEAK").ok().and_then(|v| v.parse().ok()).unwrap_or(4200)
+            std::env::var("TOKI_E2E_PEAK")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(4200)
                 + (i % 100) as u16,
             anchor,
             &limit,
@@ -87,19 +90,26 @@ fn windows_reach_a_real_server_over_tcp() {
             sn.account = "a".repeat(64);
             sn.plan = "p".repeat(64);
         }
-        db.upsert_window_merge(&window_key(WindowKind::Session, i, 99, anchor), &sn).unwrap();
+        db.upsert_window_merge(&window_key(WindowKind::Session, i, 99, anchor), &sn)
+            .unwrap();
     }
 
     let mut client = toki::sync::client::SyncClient::connect(&addr, false, false)
         .expect("TCP connect to the containerized server");
     client
-        .auth(&jwt, "e2e-device", "e2e00000-0000-4000-8000-00000000e2e0", "codex")
+        .auth(
+            &jwt,
+            "e2e-device",
+            "e2e00000-0000-4000-8000-00000000e2e0",
+            "codex",
+        )
         .expect("auth handshake");
 
     // Print the outcome rather than asserting it: the driving script checks
     // both the accepted case and the throttled case, which are both correct
     // depending on how recently this user last uploaded.
-    let sent = toki::sync::thread::windows_sync_step_for_test(&db, "codex", now_ms, (0, 0), &mut client);
+    let sent =
+        toki::sync::thread::windows_sync_step_for_test(&db, "codex", now_ms, (0, 0), &mut client);
     println!("OUTCOME={}", if sent { "Sent" } else { "NotSent" });
 }
 
@@ -159,18 +169,27 @@ fn event_sync_and_window_sync_share_one_connection() {
         "cached_input".to_string(),
     ];
 
-    let mut client = toki::sync::client::SyncClient::connect(&addr, false, false)
-        .expect("TCP connect");
+    let mut client =
+        toki::sync::client::SyncClient::connect(&addr, false, false).expect("TCP connect");
     client
-        .auth(&jwt, "e2e-mixed", "e2e00000-0000-4000-8000-00000000e2e1", "codex")
+        .auth(
+            &jwt,
+            "e2e-mixed",
+            "e2e00000-0000-4000-8000-00000000e2e1",
+            "codex",
+        )
         .expect("auth handshake");
 
     // events -> windows
     client
         .sync_batch(vec![item.clone()], &dict, "codex", cols.clone())
         .expect("event batch before windows");
-    let sent = toki::sync::thread::windows_sync_step_for_test(&db, "codex", now_ms, (0, 0), &mut client);
-    println!("OUTCOME_AFTER_EVENTS={}", if sent { "Sent" } else { "NotSent" });
+    let sent =
+        toki::sync::thread::windows_sync_step_for_test(&db, "codex", now_ms, (0, 0), &mut client);
+    println!(
+        "OUTCOME_AFTER_EVENTS={}",
+        if sent { "Sent" } else { "NotSent" }
+    );
 
     // ...and events again AFTER windows, on the same connection: a window
     // frame must not leave the stream in a state event sync cannot use.
@@ -181,7 +200,6 @@ fn event_sync_and_window_sync_share_one_connection() {
         .expect("event batch after windows");
     println!("EVENTS_AFTER_WINDOWS_ACK={acked}");
 }
-
 
 /// Multi-device merge — the reason the server exists for this feature, and the
 /// one path never exercised: every earlier check was a single device
@@ -221,8 +239,8 @@ fn two_devices_merge_field_wise_on_one_window() {
         let db = Database::open(&dir.path().join(format!("{device}.fjall"))).unwrap();
         db.upsert_window_merge(&window_key(WindowKind::Session, 777, 42, anchor), &sn)
             .unwrap();
-        let mut client = toki::sync::client::SyncClient::connect(&addr, false, false)
-            .expect("connect");
+        let mut client =
+            toki::sync::client::SyncClient::connect(&addr, false, false).expect("connect");
         client.auth(&jwt, device, key, "codex").expect("auth");
         let sent = toki::sync::thread::windows_sync_step_for_test(
             &db,

@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
-use chrono::{NaiveDateTime, TimeZone, Datelike, Weekday};
+use chrono::{Datelike, NaiveDateTime, TimeZone, Weekday};
 use chrono_tz::Tz;
 
-use crate::common::types::{ModelUsageSummary, RawEvent, GroupedSummaryMap, SummaryMap};
+use crate::common::types::{GroupedSummaryMap, ModelUsageSummary, RawEvent, SummaryMap};
 use crate::db::Database;
 use crate::engine::{ReportFilter, ReportGroupBy};
 use crate::query_parser::{AggregationFunc, LabelFilter};
@@ -55,10 +55,18 @@ fn type_filter_mask(filter: Option<&LabelFilter>) -> [bool; 4] {
 
 /// Apply a type filter mask to a ModelUsageSummary, zeroing out non-matching token fields.
 fn apply_type_mask(summary: &mut ModelUsageSummary, mask: &[bool; 4]) {
-    if !mask[0] { summary.input_tokens = 0; }
-    if !mask[1] { summary.output_tokens = 0; }
-    if !mask[2] { summary.cache_creation_input_tokens = 0; }
-    if !mask[3] { summary.cache_read_input_tokens = 0; }
+    if !mask[0] {
+        summary.input_tokens = 0;
+    }
+    if !mask[1] {
+        summary.output_tokens = 0;
+    }
+    if !mask[2] {
+        summary.cache_creation_input_tokens = 0;
+    }
+    if !mask[3] {
+        summary.cache_read_input_tokens = 0;
+    }
 }
 
 /// Resolve (since, until) from filter into ms timestamps.
@@ -93,9 +101,13 @@ pub fn report_by_session_from_db(
     db.for_each_event(since, until, |_ts, event| {
         let session = dict.get(&event.session_id).unwrap_or(&unknown);
         let model = dict.get(&event.model_id).unwrap_or(&unknown);
-        let entry = grouped.entry(session.clone()).or_default()
-            .entry(model.clone()).or_insert_with(|| ModelUsageSummary {
-                model: model.clone(), ..Default::default()
+        let entry = grouped
+            .entry(session.clone())
+            .or_default()
+            .entry(model.clone())
+            .or_insert_with(|| ModelUsageSummary {
+                model: model.clone(),
+                ..Default::default()
             });
         accumulate_event(entry, &event);
     })?;
@@ -104,7 +116,9 @@ pub fn report_by_session_from_db(
 
 /// Collapse a SummaryMap (model → summary) into a single entry based on aggregation function.
 fn apply_aggregation_flat(summaries: &mut SummaryMap, func: AggregationFunc) {
-    if summaries.is_empty() { return; }
+    if summaries.is_empty() {
+        return;
+    }
 
     // Sum all values
     let mut total = ModelUsageSummary::default();
@@ -149,7 +163,11 @@ fn apply_aggregation_flat(summaries: &mut SummaryMap, func: AggregationFunc) {
 }
 
 /// Collapse model dimension within each group of a GroupedSummaryMap.
-fn apply_aggregation_grouped(grouped: &mut GroupedSummaryMap, func: AggregationFunc, group_by: &[String]) {
+fn apply_aggregation_grouped(
+    grouped: &mut GroupedSummaryMap,
+    func: AggregationFunc,
+    group_by: &[String],
+) {
     // When group_by is specified, the grouping key already encodes the requested
     // dimension (model, project, session, etc.). The "models" map within each group
     // should not be collapsed — each entry is already the sum for that dimension.
@@ -200,6 +218,7 @@ fn apply_aggregation_grouped(grouped: &mut GroupedSummaryMap, func: AggregationF
 /// `since_ms` and `until_ms` are millisecond timestamps representing the time range
 /// (0 and i64::MAX respectively mean "no bound"). The query's `offset` modifier shifts
 /// both bounds backward by the specified duration.
+#[allow(clippy::too_many_arguments)]
 pub fn execute_parsed_query(
     db: &Database,
     parsed: &crate::query_parser::Query,
@@ -213,7 +232,10 @@ pub fn execute_parsed_query(
     use crate::query_parser::Metric;
 
     // Apply offset: shift time range backward by offset duration
-    let offset_ms = parsed.offset.map(|b| b.as_secs() as i64 * 1000).unwrap_or(0);
+    let offset_ms = parsed
+        .offset
+        .map(|b| b.as_secs() as i64 * 1000)
+        .unwrap_or(0);
     let since_ms = since_ms - offset_ms;
     let until_ms = until_ms - offset_ms;
 
@@ -239,23 +261,32 @@ pub fn execute_parsed_query(
         Metric::Sessions => {
             let session_filter = parsed.get_filter("session");
             let project_filter = parsed.get_filter("project");
-            let has_time_or_project = since_ms > 0 || until_ms < i64::MAX || project_filter.is_some();
+            let has_time_or_project =
+                since_ms > 0 || until_ms < i64::MAX || project_filter.is_some();
 
             let sessions = if has_time_or_project {
                 // Need event-level scan to filter by time range and/or project
                 let dict = db.load_dict_reverse().map_err(|e| e.to_string())?;
                 let mut set = std::collections::HashSet::new();
                 db.for_each_event(since_ms, until_ms, |_ts, event| {
-                    let session = dict.get(&event.session_id).map(|s| s.as_str()).unwrap_or("");
+                    let session = dict
+                        .get(&event.session_id)
+                        .map(|s| s.as_str())
+                        .unwrap_or("");
                     if let Some(f) = session_filter {
-                        if !label_matches(f, session, |c, v| c.starts_with(v)) { return; }
+                        if !label_matches(f, session, |c, v| c.starts_with(v)) {
+                            return;
+                        }
                     }
                     if let Some(f) = project_filter {
                         let project = resolve_project(&dict, &event);
-                        if !label_matches(f, project, |c, v| c.contains(v)) { return; }
+                        if !label_matches(f, project, |c, v| c.contains(v)) {
+                            return;
+                        }
                     }
                     set.insert(session.to_string());
-                }).map_err(|e| e.to_string())?;
+                })
+                .map_err(|e| e.to_string())?;
                 let mut list: Vec<String> = set.into_iter().collect();
                 list.sort();
                 list
@@ -279,12 +310,17 @@ pub fn execute_parsed_query(
                 let mut set = std::collections::HashSet::new();
                 db.for_each_event(since_ms, until_ms, |_ts, event| {
                     let project = resolve_project(&dict, &event);
-                    if project == "unknown" { return; }
+                    if project == "unknown" {
+                        return;
+                    }
                     if let Some(f) = project_filter {
-                        if !label_matches(f, project, |c, v| c.contains(v)) { return; }
+                        if !label_matches(f, project, |c, v| c.contains(v)) {
+                            return;
+                        }
                     }
                     set.insert(project.to_string());
-                }).map_err(|e| e.to_string())?;
+                })
+                .map_err(|e| e.to_string())?;
                 let mut list: Vec<String> = set.into_iter().collect();
                 list.sort();
                 list
@@ -297,7 +333,11 @@ pub fn execute_parsed_query(
             };
             sink.emit_list(&projects, "projects");
         }
-        Metric::Events if parsed.bucket.is_none() && parsed.group_by.is_empty() && parsed.aggregation.is_none() => {
+        Metric::Events
+            if parsed.bucket.is_none()
+                && parsed.group_by.is_empty()
+                && parsed.aggregation.is_none() =>
+        {
             // Raw event listing (no bucket/group_by)
             let dict = db.load_dict_reverse().map_err(|e| e.to_string())?;
             let unknown = String::new();
@@ -309,15 +349,21 @@ pub fn execute_parsed_query(
             db.for_each_event(since_ms, until_ms, |ts, event| {
                 let model = dict.get(&event.model_id).unwrap_or(&unknown);
                 if let Some(f) = model_filter {
-                    if !label_matches(f, model, |c, v| c == v) { return; }
+                    if !label_matches(f, model, |c, v| c == v) {
+                        return;
+                    }
                 }
                 let session = dict.get(&event.session_id).unwrap_or(&unknown);
                 if let Some(f) = session_filter {
-                    if !label_matches(f, session, |c, v| c.starts_with(v)) { return; }
+                    if !label_matches(f, session, |c, v| c.starts_with(v)) {
+                        return;
+                    }
                 }
                 let project = resolve_project(&dict, &event);
                 if let Some(f) = project_filter {
-                    if !label_matches(f, project, |c, v| c.contains(v)) { return; }
+                    if !label_matches(f, project, |c, v| c.contains(v)) {
+                        return;
+                    }
                 }
 
                 let dt = ts_to_datetime(ts, tz);
@@ -332,7 +378,8 @@ pub fn execute_parsed_query(
                     cache_read_input_tokens: event.cache_read_input_tokens,
                     cost_usd: None,
                 });
-            }).map_err(|e| e.to_string())?;
+            })
+            .map_err(|e| e.to_string())?;
 
             sink.emit_events_batch(&events, pricing, None);
         }
@@ -349,7 +396,11 @@ pub fn execute_parsed_query(
                 None
             };
 
-            let filter = ReportFilter { since: since_dt, until: until_dt, tz };
+            let filter = ReportFilter {
+                since: since_dt,
+                until: until_dt,
+                tz,
+            };
             let model_filter = parsed.get_filter("model");
             let session_filter = parsed.get_filter("session");
             let project_filter = parsed.get_filter("project");
@@ -366,25 +417,38 @@ pub fn execute_parsed_query(
                         db.for_each_event(since_ms, until_ms, |_ts, event| {
                             let model = dict.get(&event.model_id).unwrap_or(&unknown);
                             if let Some(f) = model_filter {
-                                if !label_matches(f, model, |c, v| c == v) { return; }
+                                if !label_matches(f, model, |c, v| c == v) {
+                                    return;
+                                }
                             }
                             if let Some(f) = session_filter {
-                                let session = dict.get(&event.session_id).map(|s| s.as_str()).unwrap_or("");
-                                if !label_matches(f, session, |c, v| c.starts_with(v)) { return; }
+                                let session = dict
+                                    .get(&event.session_id)
+                                    .map(|s| s.as_str())
+                                    .unwrap_or("");
+                                if !label_matches(f, session, |c, v| c.starts_with(v)) {
+                                    return;
+                                }
                             }
                             if let Some(f) = project_filter {
                                 let project = resolve_project(&dict, &event);
-                                if !label_matches(f, project, |c, v| c.contains(v)) { return; }
+                                if !label_matches(f, project, |c, v| c.contains(v)) {
+                                    return;
+                                }
                             }
-                            let entry = sums.entry(model.clone()).or_insert_with(|| ModelUsageSummary {
-                                model: model.clone(), ..Default::default()
-                            });
+                            let entry =
+                                sums.entry(model.clone())
+                                    .or_insert_with(|| ModelUsageSummary {
+                                        model: model.clone(),
+                                        ..Default::default()
+                                    });
                             if is_events_metric {
                                 entry.event_count = entry.event_count.saturating_add(1);
                             } else {
                                 accumulate_event(entry, &event);
                             }
-                        }).map_err(|e| e.to_string())?;
+                        })
+                        .map_err(|e| e.to_string())?;
                         sums
                     };
                     if let Some(f) = model_filter {
@@ -411,15 +475,21 @@ pub fn execute_parsed_query(
                     db.for_each_event(since, until, |ts, event| {
                         let model = dict.get(&event.model_id).unwrap_or(&unknown);
                         if let Some(f) = model_filter {
-                            if !label_matches(f, model, |c, v| c == v) { return; }
+                            if !label_matches(f, model, |c, v| c == v) {
+                                return;
+                            }
                         }
                         let session = dict.get(&event.session_id).unwrap_or(&unknown);
                         if let Some(f) = session_filter {
-                            if !label_matches(f, session, |c, v| c.starts_with(v)) { return; }
+                            if !label_matches(f, session, |c, v| c.starts_with(v)) {
+                                return;
+                            }
                         }
                         if let Some(f) = project_filter {
                             let project = resolve_project(&dict, &event);
-                            if !label_matches(f, project, |c, v| c.contains(v)) { return; }
+                            if !label_matches(f, project, |c, v| c.contains(v)) {
+                                return;
+                            }
                         }
 
                         let bucket_key = if let Some(ref bucket) = parsed.bucket {
@@ -443,10 +513,13 @@ pub fn execute_parsed_query(
                             String::new()
                         };
 
-                        let group_key = build_group_key(&parsed.group_by, model, session, &dict, &event);
+                        let group_key =
+                            build_group_key(&parsed.group_by, model, session, &dict, &event);
 
                         // Determine inner key before group_key is moved into the period key.
-                        let inner_key = if !group_key.is_empty() && !parsed.group_by.iter().any(|g| g == "model") {
+                        let inner_key = if !group_key.is_empty()
+                            && !parsed.group_by.iter().any(|g| g == "model")
+                        {
                             group_key.clone()
                         } else {
                             model.clone()
@@ -461,16 +534,21 @@ pub fn execute_parsed_query(
                         } else {
                             "total".to_string()
                         };
-                        let entry = grouped.entry(key).or_default()
-                            .entry(inner_key.clone()).or_insert_with(|| ModelUsageSummary {
-                                model: inner_key, ..Default::default()
+                        let entry = grouped
+                            .entry(key)
+                            .or_default()
+                            .entry(inner_key.clone())
+                            .or_insert_with(|| ModelUsageSummary {
+                                model: inner_key,
+                                ..Default::default()
                             });
                         if is_events_metric {
                             entry.event_count = entry.event_count.saturating_add(1);
                         } else {
                             accumulate_event(entry, &event);
                         }
-                    }).map_err(|e| e.to_string())?;
+                    })
+                    .map_err(|e| e.to_string())?;
 
                     if type_filter.is_some() {
                         for models in grouped.values_mut() {
@@ -500,14 +578,20 @@ pub fn execute_parsed_query(
 /// Resolve the project name for a StoredEvent.
 /// Prefers project_name_id (dictionary lookup); falls back to source_file path extraction
 /// for backward compatibility with events stored before project_name_id was added.
-fn resolve_project<'a>(dict: &'a HashMap<u32, String>, event: &crate::common::types::StoredEvent) -> &'a str {
+fn resolve_project<'a>(
+    dict: &'a HashMap<u32, String>,
+    event: &crate::common::types::StoredEvent,
+) -> &'a str {
     if event.project_name_id != 0 {
         if let Some(name) = dict.get(&event.project_name_id) {
             return name.as_str();
         }
     }
     // Fallback: extract from source file path (works for Claude Code)
-    let source = dict.get(&event.source_file_id).map(|s| s.as_str()).unwrap_or("");
+    let source = dict
+        .get(&event.source_file_id)
+        .map(|s| s.as_str())
+        .unwrap_or("");
     crate::engine::extract_project_name(source).unwrap_or("unknown")
 }
 
@@ -526,9 +610,7 @@ fn build_group_key(
         match dim {
             "model" => model,
             "session" => session,
-            "project" => {
-                resolve_project(dict, event)
-            }
+            "project" => resolve_project(dict, event),
             _ => "",
         }
     };
@@ -540,7 +622,9 @@ fn build_group_key(
 
     let mut result = String::new();
     for (i, dim) in group_by.iter().enumerate() {
-        if i > 0 { result.push('|'); }
+        if i > 0 {
+            result.push('|');
+        }
         result.push_str(resolve(dim));
     }
     result
@@ -558,14 +642,18 @@ fn build_group_key(
 /// The `tz` parameter applies only to the compact formats (YYYYMMDD, YYYYMMDDhhmmss)
 /// where the input has no timezone information. Unix/RFC 3339 inputs are always UTC
 /// regardless of `tz`.
-pub fn parse_range_time(value: &str, is_until: bool, tz: Option<Tz>) -> Result<NaiveDateTime, String> {
+pub fn parse_range_time(
+    value: &str,
+    is_until: bool,
+    tz: Option<Tz>,
+) -> Result<NaiveDateTime, String> {
     let all_digits = value.chars().all(|c| c.is_ascii_digit());
 
     // ── Compact YYYYMMDD (must check before Unix seconds — both are all-digit) ─
     if value.len() == 8 && all_digits {
-        let year: i32  = value[0..4].parse().map_err(|_| "invalid year")?;
+        let year: i32 = value[0..4].parse().map_err(|_| "invalid year")?;
         let month: u32 = value[4..6].parse().map_err(|_| "invalid month")?;
-        let day: u32   = value[6..8].parse().map_err(|_| "invalid day")?;
+        let day: u32 = value[6..8].parse().map_err(|_| "invalid day")?;
         let date = chrono::NaiveDate::from_ymd_opt(year, month, day).ok_or("invalid date")?;
         let time = if is_until {
             // The event store treats `until_ms` as inclusive. Use the final
@@ -577,7 +665,8 @@ pub fn parse_range_time(value: &str, is_until: bool, tz: Option<Tz>) -> Result<N
         };
         let naive = NaiveDateTime::new(date, time);
         return match tz {
-            Some(tz) => tz.from_local_datetime(&naive)
+            Some(tz) => tz
+                .from_local_datetime(&naive)
                 .single()
                 .map(|d| d.naive_utc())
                 .ok_or_else(|| "ambiguous or invalid local time".to_string()),
@@ -587,17 +676,18 @@ pub fn parse_range_time(value: &str, is_until: bool, tz: Option<Tz>) -> Result<N
 
     // ── Compact YYYYMMDDhhmmss (must check before Unix ms — both are 14-digit) ─
     if value.len() == 14 && all_digits {
-        let year: i32  = value[0..4].parse().map_err(|_| "invalid year")?;
+        let year: i32 = value[0..4].parse().map_err(|_| "invalid year")?;
         let month: u32 = value[4..6].parse().map_err(|_| "invalid month")?;
-        let day: u32   = value[6..8].parse().map_err(|_| "invalid day")?;
-        let hour: u32  = value[8..10].parse().map_err(|_| "invalid hour")?;
-        let min: u32   = value[10..12].parse().map_err(|_| "invalid minute")?;
-        let sec: u32   = value[12..14].parse().map_err(|_| "invalid second")?;
+        let day: u32 = value[6..8].parse().map_err(|_| "invalid day")?;
+        let hour: u32 = value[8..10].parse().map_err(|_| "invalid hour")?;
+        let min: u32 = value[10..12].parse().map_err(|_| "invalid minute")?;
+        let sec: u32 = value[12..14].parse().map_err(|_| "invalid second")?;
         let date = chrono::NaiveDate::from_ymd_opt(year, month, day).ok_or("invalid date")?;
         let time = chrono::NaiveTime::from_hms_opt(hour, min, sec).ok_or("invalid time")?;
         let naive = NaiveDateTime::new(date, time);
         return match tz {
-            Some(tz) => tz.from_local_datetime(&naive)
+            Some(tz) => tz
+                .from_local_datetime(&naive)
                 .single()
                 .map(|d| d.naive_utc())
                 .ok_or_else(|| "ambiguous or invalid local time".to_string()),
@@ -608,7 +698,8 @@ pub fn parse_range_time(value: &str, is_until: bool, tz: Option<Tz>) -> Result<N
     // ── Unix timestamp (seconds or milliseconds) ─────────────────────────────
     // 13 digits = Unix ms; 1–10 digits = Unix seconds.
     // 8 and 14 are already handled above as compact date formats.
-    if all_digits && !value.is_empty() && value.len() != 8 && value.len() != 14 && value.len() <= 13 {
+    if all_digits && !value.is_empty() && value.len() != 8 && value.len() != 14 && value.len() <= 13
+    {
         let n: i64 = value.parse().map_err(|_| "invalid unix timestamp")?;
         let ms = if value.len() == 13 { n } else { n * 1000 };
         return chrono::DateTime::from_timestamp_millis(ms)
@@ -623,24 +714,23 @@ pub fn parse_range_time(value: &str, is_until: bool, tz: Option<Tz>) -> Result<N
     }
     // Naive ISO 8601 without timezone (treat as local / tz-aware)
     for fmt in &["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"] {
-        if let Ok(naive) = NaiveDateTime::parse_from_str(value, fmt)
-            .or_else(|_| {
-                chrono::NaiveDate::parse_from_str(value, fmt).map(|d| {
-                    // A dashed date-only bound denotes the whole day, exactly
-                    // as YYYYMMDD does above. Anchoring an end bound at
-                    // midnight dropped the entire end day — the same bug the
-                    // compact format was fixed for, in a documented format.
-                    let time = if is_until {
-                        chrono::NaiveTime::from_hms_milli_opt(23, 59, 59, 999).unwrap()
-                    } else {
-                        chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap()
-                    };
-                    NaiveDateTime::new(d, time)
-                })
+        if let Ok(naive) = NaiveDateTime::parse_from_str(value, fmt).or_else(|_| {
+            chrono::NaiveDate::parse_from_str(value, fmt).map(|d| {
+                // A dashed date-only bound denotes the whole day, exactly
+                // as YYYYMMDD does above. Anchoring an end bound at
+                // midnight dropped the entire end day — the same bug the
+                // compact format was fixed for, in a documented format.
+                let time = if is_until {
+                    chrono::NaiveTime::from_hms_milli_opt(23, 59, 59, 999).unwrap()
+                } else {
+                    chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap()
+                };
+                NaiveDateTime::new(d, time)
             })
-        {
+        }) {
             return match tz {
-                Some(tz) => tz.from_local_datetime(&naive)
+                Some(tz) => tz
+                    .from_local_datetime(&naive)
                     .single()
                     .map(|d| d.naive_utc())
                     .ok_or_else(|| "ambiguous or invalid local time".to_string()),
@@ -664,7 +754,10 @@ fn ts_to_datetime(ts_ms: i64, tz: Option<Tz>) -> NaiveDateTime {
         .unwrap_or_default()
         .naive_utc();
     match tz {
-        Some(tz) => chrono::Utc.from_utc_datetime(&utc).with_timezone(&tz).naive_local(),
+        Some(tz) => chrono::Utc
+            .from_utc_datetime(&utc)
+            .with_timezone(&tz)
+            .naive_local(),
         None => utc,
     }
 }
@@ -697,15 +790,17 @@ fn bucket_start_ms(ts_ms: i64, step_ms: i64, tz: Option<Tz>, start_of_week: Week
     // Local-calendar flooring applies to whole-day-multiple steps with a tz.
     let whole_day_multiple = step_ms >= DAY_MS && step_ms % DAY_MS == 0;
     if let (true, Some(tz)) = (whole_day_multiple, tz) {
-        if let Some(local) = chrono::DateTime::from_timestamp_millis(ts_ms)
-            .map(|dt| dt.with_timezone(&tz))
+        if let Some(local) =
+            chrono::DateTime::from_timestamp_millis(ts_ms).map(|dt| dt.with_timezone(&tz))
         {
             let date = local.date_naive();
             let start_date = if step_ms == WEEK_MS {
                 // Week: align to the start_of_week local midnight (honours the
                 // user's setting; the server matches this).
                 let back = (date.weekday().num_days_from_monday() as i64
-                    - start_of_week.num_days_from_monday() as i64 + 7) % 7;
+                    - start_of_week.num_days_from_monday() as i64
+                    + 7)
+                    % 7;
                 date - chrono::Duration::days(back)
             } else {
                 // day / 2d / 30d / 365d: floor the day index by step_days,
@@ -775,7 +870,9 @@ fn week_bucket(date: chrono::NaiveDate, start_of_week: Weekday) -> (i32, u32) {
         year -= 1;
     }
     let first_start = first_week_start(year, start_of_week);
-    let days = date_week_start.signed_duration_since(first_start).num_days();
+    let days = date_week_start
+        .signed_duration_since(first_start)
+        .num_days();
     let week = (days / 7 + 1) as u32;
     (year, week)
 }
@@ -851,9 +948,14 @@ mod tests {
         batch.commit().unwrap();
 
         let event = StoredEvent {
-            model_id: 1, session_id: 2, source_file_id: 3, project_name_id: 0,
-            input_tokens: 100, output_tokens: 50,
-            cache_creation_input_tokens: 10, cache_read_input_tokens: 20,
+            model_id: 1,
+            session_id: 2,
+            source_file_id: 3,
+            project_name_id: 0,
+            input_tokens: 100,
+            output_tokens: 50,
+            cache_creation_input_tokens: 10,
+            cache_read_input_tokens: 20,
         };
         db.insert_event(1000, "msg1", &event).unwrap();
         db.insert_event(2000, "msg2", &event).unwrap();
@@ -874,7 +976,10 @@ mod tests {
         // `--end 2026-03-01` denotes the whole date, exactly as `20260301`
         // does. Anchoring it at midnight dropped the entire end day.
         let dt = parse_range_time("2026-03-01", false, None).unwrap();
-        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2026-03-01 00:00:00");
+        assert_eq!(
+            dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-03-01 00:00:00"
+        );
 
         let dt_until = parse_range_time("2026-03-01", true, None).unwrap();
         assert_eq!(dt_until.format("%H:%M:%S").to_string(), "23:59:59");
@@ -891,7 +996,10 @@ mod tests {
     #[test]
     fn test_parse_range_time_yyyymmdd() {
         let dt = parse_range_time("20260301", false, None).unwrap();
-        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2026-03-01 00:00:00");
+        assert_eq!(
+            dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-03-01 00:00:00"
+        );
         let dt_until = parse_range_time("20260301", true, None).unwrap();
         assert_eq!(dt_until.format("%H:%M:%S").to_string(), "23:59:59");
         assert_eq!(dt_until.and_utc().timestamp_subsec_millis(), 999);
@@ -900,43 +1008,58 @@ mod tests {
     #[test]
     fn test_parse_range_time_yyyymmddhhmmss() {
         let dt = parse_range_time("20260301120000", false, None).unwrap();
-        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2026-03-01 12:00:00");
+        assert_eq!(
+            dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2026-03-01 12:00:00"
+        );
     }
 
     #[test]
     fn test_parse_range_time_unix_seconds() {
         // 2025-01-01 00:00:00 UTC = 1735689600
         let dt = parse_range_time("1735689600", false, None).unwrap();
-        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2025-01-01 00:00:00");
+        assert_eq!(
+            dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2025-01-01 00:00:00"
+        );
     }
 
     #[test]
     fn test_parse_range_time_unix_ms() {
         // Same moment as above, in milliseconds
         let dt = parse_range_time("1735689600000", false, None).unwrap();
-        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2025-01-01 00:00:00");
+        assert_eq!(
+            dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2025-01-01 00:00:00"
+        );
     }
 
     #[test]
     fn test_parse_range_time_rfc3339_utc() {
         let dt = parse_range_time("2025-01-01T12:00:00Z", false, None).unwrap();
-        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2025-01-01 12:00:00");
+        assert_eq!(
+            dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2025-01-01 12:00:00"
+        );
     }
 
     #[test]
     fn test_parse_range_time_rfc3339_offset() {
         // +09:00 offset — UTC should be 9 hours earlier
         let dt = parse_range_time("2025-01-01T21:00:00+09:00", false, None).unwrap();
-        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2025-01-01 12:00:00");
+        assert_eq!(
+            dt.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2025-01-01 12:00:00"
+        );
     }
 
     #[test]
     fn test_parse_range_time_all_same_moment() {
         // All four formats representing the same UTC moment
-        let secs  = parse_range_time("1735689600",          false, None).unwrap();
-        let ms    = parse_range_time("1735689600000",       false, None).unwrap();
-        let rfc   = parse_range_time("2025-01-01T00:00:00Z", false, None).unwrap();
-        let tz    = parse_range_time("2025-01-01T09:00:00+09:00", false, None).unwrap();
+        let secs = parse_range_time("1735689600", false, None).unwrap();
+        let ms = parse_range_time("1735689600000", false, None).unwrap();
+        let rfc = parse_range_time("2025-01-01T00:00:00Z", false, None).unwrap();
+        let tz = parse_range_time("2025-01-01T09:00:00+09:00", false, None).unwrap();
         assert_eq!(secs, ms);
         assert_eq!(secs, rfc);
         assert_eq!(secs, tz);
@@ -956,13 +1079,19 @@ mod tests {
         let day = 86_400_000i64;
 
         // 2026-03-10T20:00Z is 2026-03-11 05:00 KST → local day 03-11.
-        let ts = chrono::DateTime::parse_from_rfc3339("2026-03-10T20:00:00Z").unwrap()
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-03-10T20:00:00Z")
+            .unwrap()
             .timestamp_millis();
 
         // Local-aware bucket floors to 03-11 00:00 KST.
         let local = bucket_start_ms(ts, day, Some(tz), Weekday::Mon);
-        let local_dt = chrono::DateTime::from_timestamp_millis(local).unwrap().with_timezone(&tz);
-        assert_eq!(local_dt.format("%Y-%m-%d %H:%M").to_string(), "2026-03-11 00:00");
+        let local_dt = chrono::DateTime::from_timestamp_millis(local)
+            .unwrap()
+            .with_timezone(&tz);
+        assert_eq!(
+            local_dt.format("%Y-%m-%d %H:%M").to_string(),
+            "2026-03-11 00:00"
+        );
 
         // The rendered label (what actually keys the group) matches the local day.
         assert_eq!(
@@ -972,8 +1101,13 @@ mod tests {
 
         // UTC flooring (no tz) still lands on 03-10.
         let utc = bucket_start_ms(ts, day, None, Weekday::Mon);
-        let utc_dt = chrono::DateTime::from_timestamp_millis(utc).unwrap().naive_utc();
-        assert_eq!(utc_dt.format("%Y-%m-%d %H:%M").to_string(), "2026-03-10 00:00");
+        let utc_dt = chrono::DateTime::from_timestamp_millis(utc)
+            .unwrap()
+            .naive_utc();
+        assert_eq!(
+            utc_dt.format("%Y-%m-%d %H:%M").to_string(),
+            "2026-03-10 00:00"
+        );
     }
 
     #[test]
@@ -981,32 +1115,55 @@ mod tests {
         let tz: Tz = "Asia/Seoul".parse().unwrap();
         let day = 86_400_000i64;
         // 03-10T20:00Z → local 03-11; 03-11T20:00Z → local 03-12: different buckets.
-        let a = chrono::DateTime::parse_from_rfc3339("2026-03-10T20:00:00Z").unwrap().timestamp_millis();
-        let b = chrono::DateTime::parse_from_rfc3339("2026-03-11T20:00:00Z").unwrap().timestamp_millis();
-        assert_ne!(bucket_start_ms(a, day, Some(tz), Weekday::Mon), bucket_start_ms(b, day, Some(tz), Weekday::Mon));
+        let a = chrono::DateTime::parse_from_rfc3339("2026-03-10T20:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        let b = chrono::DateTime::parse_from_rfc3339("2026-03-11T20:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        assert_ne!(
+            bucket_start_ms(a, day, Some(tz), Weekday::Mon),
+            bucket_start_ms(b, day, Some(tz), Weekday::Mon)
+        );
     }
 
     #[test]
     fn test_bucket_start_ms_subday_stays_epoch_aligned() {
         let tz: Tz = "Asia/Seoul".parse().unwrap();
         let hour = 3_600_000i64;
-        let ts = chrono::DateTime::parse_from_rfc3339("2026-03-10T20:37:00Z").unwrap().timestamp_millis();
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-03-10T20:37:00Z")
+            .unwrap()
+            .timestamp_millis();
         // Sub-day steps ignore tz (epoch-aligned) whether or not a tz is given.
-        assert_eq!(bucket_start_ms(ts, hour, Some(tz), Weekday::Mon), (ts / hour) * hour);
-        assert_eq!(bucket_start_ms(ts, hour, None, Weekday::Mon), (ts / hour) * hour);
+        assert_eq!(
+            bucket_start_ms(ts, hour, Some(tz), Weekday::Mon),
+            (ts / hour) * hour
+        );
+        assert_eq!(
+            bucket_start_ms(ts, hour, None, Weekday::Mon),
+            (ts / hour) * hour
+        );
     }
 
     #[test]
     fn test_bucket_start_ms_non_whole_day_step_epoch_aligned() {
         let tz: Tz = "Asia/Seoul".parse().unwrap();
-        let ts = chrono::DateTime::parse_from_rfc3339("2026-03-10T20:37:00Z").unwrap().timestamp_millis();
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-03-10T20:37:00Z")
+            .unwrap()
+            .timestamp_millis();
         // 27h is > a day but not a whole-day multiple: must stay epoch-aligned,
         // NOT be truncated to a 1-day (86400) bucket.
         let step_27h = 27 * 3_600_000i64;
-        assert_eq!(bucket_start_ms(ts, step_27h, Some(tz), Weekday::Mon), (ts / step_27h) * step_27h);
+        assert_eq!(
+            bucket_start_ms(ts, step_27h, Some(tz), Weekday::Mon),
+            (ts / step_27h) * step_27h
+        );
         // Guard against the truncation bug: it must differ from a 1-day floor.
         let day = 86_400_000i64;
-        assert_ne!(bucket_start_ms(ts, step_27h, Some(tz), Weekday::Mon), bucket_start_ms(ts, day, Some(tz), Weekday::Mon));
+        assert_ne!(
+            bucket_start_ms(ts, step_27h, Some(tz), Weekday::Mon),
+            bucket_start_ms(ts, day, Some(tz), Weekday::Mon)
+        );
     }
 
     #[test]
@@ -1014,16 +1171,31 @@ mod tests {
         // 2d/30d/365d are whole-day multiples: with a tz they floor to a LOCAL
         // midnight (1970-anchored div_euclid), not UTC epoch alignment.
         let tz: Tz = "Asia/Seoul".parse().unwrap();
-        let ts = chrono::DateTime::parse_from_rfc3339("2026-03-10T20:37:00Z").unwrap().timestamp_millis();
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-03-10T20:37:00Z")
+            .unwrap()
+            .timestamp_millis();
         for step in [2 * 86_400_000i64, 30 * 86_400_000i64, 365 * 86_400_000i64] {
             let b = bucket_start_ms(ts, step, Some(tz), Weekday::Mon);
             // Boundary sits at local midnight...
-            let b_dt = chrono::DateTime::from_timestamp_millis(b).unwrap().with_timezone(&tz);
-            assert_eq!(b_dt.format("%H:%M:%S").to_string(), "00:00:00", "step {step} not local midnight");
+            let b_dt = chrono::DateTime::from_timestamp_millis(b)
+                .unwrap()
+                .with_timezone(&tz);
+            assert_eq!(
+                b_dt.format("%H:%M:%S").to_string(),
+                "00:00:00",
+                "step {step} not local midnight"
+            );
             // ...and differs from a pure UTC epoch floor (KST is +09:00).
-            assert_ne!(b, (ts / step) * step, "step {step} should be tz-floored, not epoch");
+            assert_ne!(
+                b,
+                (ts / step) * step,
+                "step {step} should be tz-floored, not epoch"
+            );
             // No-tz still epoch-aligned.
-            assert_eq!(bucket_start_ms(ts, step, None, Weekday::Mon), (ts / step) * step);
+            assert_eq!(
+                bucket_start_ms(ts, step, None, Weekday::Mon),
+                (ts / step) * step
+            );
         }
     }
 
@@ -1033,16 +1205,28 @@ mod tests {
         let week = 604_800_000i64;
         // 2026-03-11 is a Wednesday (KST). With Monday start → week floors to
         // Mon 2026-03-09 00:00 KST; with Sunday start → Sun 2026-03-08 00:00 KST.
-        let ts = chrono::DateTime::parse_from_rfc3339("2026-03-11T05:00:00Z").unwrap().timestamp_millis();
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-03-11T05:00:00Z")
+            .unwrap()
+            .timestamp_millis();
 
         let mon = bucket_start_ms(ts, week, Some(tz), Weekday::Mon);
-        let mon_dt = chrono::DateTime::from_timestamp_millis(mon).unwrap().with_timezone(&tz);
-        assert_eq!(mon_dt.format("%Y-%m-%d %H:%M").to_string(), "2026-03-09 00:00");
+        let mon_dt = chrono::DateTime::from_timestamp_millis(mon)
+            .unwrap()
+            .with_timezone(&tz);
+        assert_eq!(
+            mon_dt.format("%Y-%m-%d %H:%M").to_string(),
+            "2026-03-09 00:00"
+        );
         assert_eq!(mon_dt.weekday(), Weekday::Mon);
 
         let sun = bucket_start_ms(ts, week, Some(tz), Weekday::Sun);
-        let sun_dt = chrono::DateTime::from_timestamp_millis(sun).unwrap().with_timezone(&tz);
-        assert_eq!(sun_dt.format("%Y-%m-%d %H:%M").to_string(), "2026-03-08 00:00");
+        let sun_dt = chrono::DateTime::from_timestamp_millis(sun)
+            .unwrap()
+            .with_timezone(&tz);
+        assert_eq!(
+            sun_dt.format("%Y-%m-%d %H:%M").to_string(),
+            "2026-03-08 00:00"
+        );
         assert_eq!(sun_dt.weekday(), Weekday::Sun);
     }
 
@@ -1052,21 +1236,47 @@ mod tests {
         // the sync server (toki_sync metrics.rs). Event 2026-03-11T05:00Z is KST
         // 2026-03-11 14:00 (Wednesday). Values are the canonical ms boundaries.
         let tz: Tz = "Asia/Seoul".parse().unwrap();
-        let ts = chrono::DateTime::parse_from_rfc3339("2026-03-11T05:00:00Z").unwrap().timestamp_millis();
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-03-11T05:00:00Z")
+            .unwrap()
+            .timestamp_millis();
         let day = 86_400_000i64;
         // Whole-day-multiple steps floor to local midnight (1970-anchored).
-        assert_eq!(bucket_start_ms(ts, day, Some(tz), Weekday::Mon), 1_773_154_800_000);       // 1d  → KST 03-11 00:00
-        assert_eq!(bucket_start_ms(ts, 2 * day, Some(tz), Weekday::Mon), 1_773_068_400_000);   // 2d  → KST 03-10 00:00
-        assert_eq!(bucket_start_ms(ts, 30 * day, Some(tz), Weekday::Mon), 1_772_895_600_000);  // 30d → KST 03-08 00:00
-        // Week is the start_of_week exception (Monday → KST 03-09 00:00).
-        assert_eq!(bucket_start_ms(ts, 7 * day, Some(tz), Weekday::Mon), 1_772_982_000_000);
+        assert_eq!(
+            bucket_start_ms(ts, day, Some(tz), Weekday::Mon),
+            1_773_154_800_000
+        ); // 1d  → KST 03-11 00:00
+        assert_eq!(
+            bucket_start_ms(ts, 2 * day, Some(tz), Weekday::Mon),
+            1_773_068_400_000
+        ); // 2d  → KST 03-10 00:00
+        assert_eq!(
+            bucket_start_ms(ts, 30 * day, Some(tz), Weekday::Mon),
+            1_772_895_600_000
+        ); // 30d → KST 03-08 00:00
+           // Week is the start_of_week exception (Monday → KST 03-09 00:00).
+        assert_eq!(
+            bucket_start_ms(ts, 7 * day, Some(tz), Weekday::Mon),
+            1_772_982_000_000
+        );
         // 27h is not a whole-day multiple → epoch-aligned regardless of tz.
         let step_27h = 27 * 3_600_000i64;
-        assert_eq!(bucket_start_ms(ts, step_27h, Some(tz), Weekday::Mon), 1_773_122_400_000);
-        assert_eq!(bucket_start_ms(ts, step_27h, None, Weekday::Mon), 1_773_122_400_000);
+        assert_eq!(
+            bucket_start_ms(ts, step_27h, Some(tz), Weekday::Mon),
+            1_773_122_400_000
+        );
+        assert_eq!(
+            bucket_start_ms(ts, step_27h, None, Weekday::Mon),
+            1_773_122_400_000
+        );
         // No tz → epoch-aligned for day and week alike.
-        assert_eq!(bucket_start_ms(ts, day, None, Weekday::Mon), 1_773_187_200_000);
-        assert_eq!(bucket_start_ms(ts, 7 * day, None, Weekday::Mon), 1_772_668_800_000);
+        assert_eq!(
+            bucket_start_ms(ts, day, None, Weekday::Mon),
+            1_773_187_200_000
+        );
+        assert_eq!(
+            bucket_start_ms(ts, 7 * day, None, Weekday::Mon),
+            1_772_668_800_000
+        );
     }
 
     #[test]
@@ -1076,14 +1286,31 @@ mod tests {
         // (KST 19:30), Asia/Seoul, start_of_week=Monday. Values are epoch seconds
         // exactly as the server returns them; local must produce the same.
         let tz: Tz = "Asia/Seoul".parse().unwrap();
-        let ts = chrono::DateTime::parse_from_rfc3339("2024-03-15T10:30:00Z").unwrap().timestamp_millis();
+        let ts = chrono::DateTime::parse_from_rfc3339("2024-03-15T10:30:00Z")
+            .unwrap()
+            .timestamp_millis();
         let day = 86_400_000i64;
         let sec = |ms: i64| ms / 1000;
-        assert_eq!(sec(bucket_start_ms(ts, day, Some(tz), Weekday::Mon)), 1_710_428_400);       // 1d
-        assert_eq!(sec(bucket_start_ms(ts, 2 * day, Some(tz), Weekday::Mon)), 1_710_342_000);   // 2d
-        assert_eq!(sec(bucket_start_ms(ts, 7 * day, Some(tz), Weekday::Mon)), 1_710_082_800);   // 1w (Mon)
-        assert_eq!(sec(bucket_start_ms(ts, 30 * day, Some(tz), Weekday::Mon)), 1_708_095_600);  // 30d
-        assert_eq!(sec(bucket_start_ms(ts, 27 * 3_600_000, Some(tz), Weekday::Mon)), 1_710_428_400); // 27h (epoch)
+        assert_eq!(
+            sec(bucket_start_ms(ts, day, Some(tz), Weekday::Mon)),
+            1_710_428_400
+        ); // 1d
+        assert_eq!(
+            sec(bucket_start_ms(ts, 2 * day, Some(tz), Weekday::Mon)),
+            1_710_342_000
+        ); // 2d
+        assert_eq!(
+            sec(bucket_start_ms(ts, 7 * day, Some(tz), Weekday::Mon)),
+            1_710_082_800
+        ); // 1w (Mon)
+        assert_eq!(
+            sec(bucket_start_ms(ts, 30 * day, Some(tz), Weekday::Mon)),
+            1_708_095_600
+        ); // 30d
+        assert_eq!(
+            sec(bucket_start_ms(ts, 27 * 3_600_000, Some(tz), Weekday::Mon)),
+            1_710_428_400
+        ); // 27h (epoch)
     }
 
     #[test]
@@ -1091,9 +1318,17 @@ mod tests {
         // With no tz, weekly (like every other step) is pure epoch alignment —
         // start_of_week does not apply. Matches the server (no-tz → (ts/step)*step).
         let week = 604_800_000i64;
-        let ts = chrono::DateTime::parse_from_rfc3339("2026-03-11T05:00:00Z").unwrap().timestamp_millis();
-        assert_eq!(bucket_start_ms(ts, week, None, Weekday::Mon), (ts / week) * week);
-        assert_eq!(bucket_start_ms(ts, week, None, Weekday::Sun), (ts / week) * week);
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-03-11T05:00:00Z")
+            .unwrap()
+            .timestamp_millis();
+        assert_eq!(
+            bucket_start_ms(ts, week, None, Weekday::Mon),
+            (ts / week) * week
+        );
+        assert_eq!(
+            bucket_start_ms(ts, week, None, Weekday::Sun),
+            (ts / week) * week
+        );
     }
 
     #[test]
@@ -1106,12 +1341,22 @@ mod tests {
         let tz: Tz = "America/Sao_Paulo".parse().unwrap();
         let day = 86_400_000i64;
         // An event during 2018-11-04 (local 10:00 = 13:00Z).
-        let ts = chrono::DateTime::parse_from_rfc3339("2018-11-04T13:00:00Z").unwrap().timestamp_millis();
+        let ts = chrono::DateTime::parse_from_rfc3339("2018-11-04T13:00:00Z")
+            .unwrap()
+            .timestamp_millis();
         let b = bucket_start_ms(ts, day, Some(tz), Weekday::Mon);
-        assert_eq!(b, 1_541_300_400_000, "gap-day bucket must anchor to first valid local instant (2018-11-04T03:00Z)");
+        assert_eq!(
+            b, 1_541_300_400_000,
+            "gap-day bucket must anchor to first valid local instant (2018-11-04T03:00Z)"
+        );
         // Sanity: it is the local wall-clock 01:00 of that day, not epoch alignment.
-        let b_dt = chrono::DateTime::from_timestamp_millis(b).unwrap().with_timezone(&tz);
-        assert_eq!(b_dt.format("%Y-%m-%d %H:%M").to_string(), "2018-11-04 01:00");
+        let b_dt = chrono::DateTime::from_timestamp_millis(b)
+            .unwrap()
+            .with_timezone(&tz);
+        assert_eq!(
+            b_dt.format("%Y-%m-%d %H:%M").to_string(),
+            "2018-11-04 01:00"
+        );
         assert_ne!(b, (ts / day) * day, "must not be epoch-aligned fallback");
     }
 
@@ -1122,15 +1367,27 @@ mod tests {
         db.dict_put(&mut batch, "model-x", 1);
         batch.commit().unwrap();
         let ev = StoredEvent {
-            model_id: 1, session_id: 0, source_file_id: 0, project_name_id: 0,
-            input_tokens: input, output_tokens: 0,
-            cache_creation_input_tokens: 0, cache_read_input_tokens: 0,
+            model_id: 1,
+            session_id: 0,
+            source_file_id: 0,
+            project_name_id: 0,
+            input_tokens: input,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
         };
-        let ts = chrono::DateTime::parse_from_rfc3339(ts_rfc3339).unwrap().timestamp_millis();
+        let ts = chrono::DateTime::parse_from_rfc3339(ts_rfc3339)
+            .unwrap()
+            .timestamp_millis();
         db.insert_event(ts, "m1", &ev).unwrap();
     }
 
-    fn bucketed_usage_total(db: &Database, tz: Tz, since_rfc3339: &str, until_rfc3339: &str) -> u64 {
+    fn bucketed_usage_total(
+        db: &Database,
+        tz: Tz,
+        since_rfc3339: &str,
+        until_rfc3339: &str,
+    ) -> u64 {
         let q = crate::query_parser::Query {
             metric: crate::query_parser::Metric::Usage,
             filters: vec![],
@@ -1140,12 +1397,24 @@ mod tests {
             offset: None,
             aggregation: None,
         };
-        let since = chrono::DateTime::parse_from_rfc3339(since_rfc3339).unwrap().timestamp_millis();
-        let until = chrono::DateTime::parse_from_rfc3339(until_rfc3339).unwrap().timestamp_millis();
+        let since = chrono::DateTime::parse_from_rfc3339(since_rfc3339)
+            .unwrap()
+            .timestamp_millis();
+        let until = chrono::DateTime::parse_from_rfc3339(until_rfc3339)
+            .unwrap()
+            .timestamp_millis();
         let sink = CaptureSink::default();
         execute_parsed_query(db, &q, Some(tz), Weekday::Mon, None, &sink, since, until).unwrap();
         let grouped = sink.grouped.lock().unwrap();
-        grouped.get(0).map(|g| g.values().flat_map(|m| m.values()).map(|s| s.input_tokens).sum()).unwrap_or(0)
+        grouped
+            .first()
+            .map(|g| {
+                g.values()
+                    .flat_map(|m| m.values())
+                    .map(|s| s.input_tokens)
+                    .sum()
+            })
+            .unwrap_or(0)
     }
 
     #[test]
@@ -1161,7 +1430,10 @@ mod tests {
         let db = Database::open(&dir.path().join("t.fjall")).unwrap();
         seed_single_event(&db, "2024-11-04T04:45:00Z", 42);
         let total = bucketed_usage_total(&db, tz, "2024-11-04T04:30:00Z", "2024-11-05T00:00:00Z");
-        assert_eq!(total, 42, "late event in a 25h DST fall-back day must not be dropped");
+        assert_eq!(
+            total, 42,
+            "late event in a 25h DST fall-back day must not be dropped"
+        );
     }
 
     #[test]
@@ -1174,7 +1446,10 @@ mod tests {
         let db = Database::open(&dir.path().join("t.fjall")).unwrap();
         seed_single_event(&db, "2024-03-10T18:00:00Z", 9); // local 14:00
         let total = bucketed_usage_total(&db, tz, "2024-03-10T12:00:00Z", "2024-03-11T12:00:00Z");
-        assert_eq!(total, 9, "event on a 23h DST spring-forward day must be counted");
+        assert_eq!(
+            total, 9,
+            "event on a 23h DST spring-forward day must be counted"
+        );
     }
 
     // ── usage query session/project filtering (finding #1) ───────────────────
@@ -1189,15 +1464,38 @@ mod tests {
     }
 
     impl crate::sink::Sink for CaptureSink {
-        fn emit_summary(&self, summaries: &SummaryMap, _p: Option<&crate::pricing::PricingTable>, _s: Option<&dyn crate::common::schema::ProviderSchema>) {
+        fn emit_summary(
+            &self,
+            summaries: &SummaryMap,
+            _p: Option<&crate::pricing::PricingTable>,
+            _s: Option<&dyn crate::common::schema::ProviderSchema>,
+        ) {
             self.summaries.lock().unwrap().push(summaries.clone());
         }
-        fn emit_grouped(&self, grouped: &GroupedSummaryMap, _t: &str, _p: Option<&crate::pricing::PricingTable>, _s: Option<&dyn crate::common::schema::ProviderSchema>) {
+        fn emit_grouped(
+            &self,
+            grouped: &GroupedSummaryMap,
+            _t: &str,
+            _p: Option<&crate::pricing::PricingTable>,
+            _s: Option<&dyn crate::common::schema::ProviderSchema>,
+        ) {
             self.grouped.lock().unwrap().push(grouped.clone());
         }
-        fn emit_event(&self, _e: &crate::common::types::UsageEventWithTs, _p: Option<&crate::pricing::PricingTable>, _s: Option<&dyn crate::common::schema::ProviderSchema>) {}
+        fn emit_event(
+            &self,
+            _e: &crate::common::types::UsageEventWithTs,
+            _p: Option<&crate::pricing::PricingTable>,
+            _s: Option<&dyn crate::common::schema::ProviderSchema>,
+        ) {
+        }
         fn emit_list(&self, _items: &[String], _t: &str) {}
-        fn emit_events_batch(&self, _e: &[RawEvent], _p: Option<&crate::pricing::PricingTable>, _s: Option<&dyn crate::common::schema::ProviderSchema>) {}
+        fn emit_events_batch(
+            &self,
+            _e: &[RawEvent],
+            _p: Option<&crate::pricing::PricingTable>,
+            _s: Option<&dyn crate::common::schema::ProviderSchema>,
+        ) {
+        }
         fn emit_windows(&self, rows: &[crate::windows::WindowRow]) {
             self.windows.lock().unwrap().push(rows.to_vec());
         }
@@ -1227,13 +1525,31 @@ mod tests {
             plan: "max_5x".into(),
             account: "a".into(),
         };
-        db.upsert_window_merge(&window_key(WindowKind::Session, 1, 2, 1_000_000_000_000), &snap(4200, 1_000_000_000_000)).unwrap();
-        db.upsert_window_merge(&window_key(WindowKind::Session, 1, 2, 2_000_000_000_000), &snap(10_000, 2_000_000_000_000)).unwrap();
+        db.upsert_window_merge(
+            &window_key(WindowKind::Session, 1, 2, 1_000_000_000_000),
+            &snap(4200, 1_000_000_000_000),
+        )
+        .unwrap();
+        db.upsert_window_merge(
+            &window_key(WindowKind::Session, 1, 2, 2_000_000_000_000),
+            &snap(10_000, 2_000_000_000_000),
+        )
+        .unwrap();
 
         let sink = CaptureSink::default();
         let q = crate::query_parser::parse("windows").unwrap();
         // Range excludes the first row.
-        execute_parsed_query(&db, &q, None, chrono::Weekday::Mon, None, &sink, 1_500_000_000_000, i64::MAX).unwrap();
+        execute_parsed_query(
+            &db,
+            &q,
+            None,
+            chrono::Weekday::Mon,
+            None,
+            &sink,
+            1_500_000_000_000,
+            i64::MAX,
+        )
+        .unwrap();
         let captured = sink.windows.lock().unwrap();
         assert_eq!(captured.len(), 1);
         assert_eq!(captured[0].len(), 1);
@@ -1256,21 +1572,34 @@ mod tests {
 
         // session-aaa / proj-foo : input 100
         let ev_foo = StoredEvent {
-            model_id: 1, session_id: 2, source_file_id: 0, project_name_id: 4,
-            input_tokens: 100, output_tokens: 0,
-            cache_creation_input_tokens: 0, cache_read_input_tokens: 0,
+            model_id: 1,
+            session_id: 2,
+            source_file_id: 0,
+            project_name_id: 4,
+            input_tokens: 100,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
         };
         // session-bbb / proj-bar : input 7
         let ev_bar = StoredEvent {
-            model_id: 1, session_id: 3, source_file_id: 0, project_name_id: 5,
-            input_tokens: 7, output_tokens: 0,
-            cache_creation_input_tokens: 0, cache_read_input_tokens: 0,
+            model_id: 1,
+            session_id: 3,
+            source_file_id: 0,
+            project_name_id: 5,
+            input_tokens: 7,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
         };
         db.insert_event(1000, "m1", &ev_foo).unwrap();
         db.insert_event(2000, "m2", &ev_bar).unwrap();
     }
 
-    fn usage_query(filters: Vec<crate::query_parser::LabelFilter>, group_by: Vec<String>) -> crate::query_parser::Query {
+    fn usage_query(
+        filters: Vec<crate::query_parser::LabelFilter>,
+        group_by: Vec<String>,
+    ) -> crate::query_parser::Query {
         crate::query_parser::Query {
             metric: crate::query_parser::Metric::Usage,
             filters,
@@ -1283,7 +1612,11 @@ mod tests {
     }
 
     fn label(key: &str, value: &str) -> crate::query_parser::LabelFilter {
-        crate::query_parser::LabelFilter { key: key.into(), value: value.into(), regex: false }
+        crate::query_parser::LabelFilter {
+            key: key.into(),
+            value: value.into(),
+            regex: false,
+        }
     }
 
     #[test]
@@ -1329,7 +1662,11 @@ mod tests {
 
         let grouped = sink.grouped.lock().unwrap();
         let g = &grouped[0];
-        let total: u64 = g.values().flat_map(|m| m.values()).map(|s| s.input_tokens).sum();
+        let total: u64 = g
+            .values()
+            .flat_map(|m| m.values())
+            .map(|s| s.input_tokens)
+            .sum();
         assert_eq!(total, 100, "grouped usage must only sum proj-foo events");
         assert!(g.contains_key("session-aaa"));
         assert!(!g.contains_key("session-bbb"));
@@ -1338,7 +1675,11 @@ mod tests {
     // ── =~ regex (alternation) filtering (finding #4) ────────────────────────
 
     fn regex_label(key: &str, value: &str) -> crate::query_parser::LabelFilter {
-        crate::query_parser::LabelFilter { key: key.into(), value: value.into(), regex: true }
+        crate::query_parser::LabelFilter {
+            key: key.into(),
+            value: value.into(),
+            regex: true,
+        }
     }
 
     #[test]
@@ -1362,7 +1703,10 @@ mod tests {
         let db = Database::open(&dir.path().join("t.fjall")).unwrap();
         seed_filter_db(&db);
 
-        let q = usage_query(vec![regex_label("session", "session-aaa|session-bbb")], vec![]);
+        let q = usage_query(
+            vec![regex_label("session", "session-aaa|session-bbb")],
+            vec![],
+        );
         let sink = CaptureSink::default();
         execute_parsed_query(&db, &q, None, Weekday::Mon, None, &sink, 0, i64::MAX).unwrap();
         let summaries = sink.summaries.lock().unwrap();
@@ -1377,12 +1721,19 @@ mod tests {
         seed_filter_db(&db);
 
         // group by session, project=~"proj-foo|proj-bar" → both sessions appear.
-        let q = usage_query(vec![regex_label("project", "proj-foo|proj-bar")], vec!["session".into()]);
+        let q = usage_query(
+            vec![regex_label("project", "proj-foo|proj-bar")],
+            vec!["session".into()],
+        );
         let sink = CaptureSink::default();
         execute_parsed_query(&db, &q, None, Weekday::Mon, None, &sink, 0, i64::MAX).unwrap();
         let grouped = sink.grouped.lock().unwrap();
         let g = &grouped[0];
-        let total: u64 = g.values().flat_map(|m| m.values()).map(|s| s.input_tokens).sum();
+        let total: u64 = g
+            .values()
+            .flat_map(|m| m.values())
+            .map(|s| s.input_tokens)
+            .sum();
         assert_eq!(total, 107, "grouped =~ must sum both alternatives");
         assert!(g.contains_key("session-aaa"));
         assert!(g.contains_key("session-bbb"));
@@ -1401,6 +1752,9 @@ mod tests {
         execute_parsed_query(&db, &q, None, Weekday::Mon, None, &sink, 0, i64::MAX).unwrap();
         let summaries = sink.summaries.lock().unwrap();
         let total: u64 = summaries[0].values().map(|s| s.input_tokens).sum();
-        assert_eq!(total, 107, "flat =~ substring alternatives must match both projects");
+        assert_eq!(
+            total, 107,
+            "flat =~ substring alternatives must match both projects"
+        );
     }
 }

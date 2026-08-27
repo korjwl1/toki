@@ -4,7 +4,6 @@
 /// Linux: ~/.config/toki/sync.json with chmod 600
 ///
 /// Stored JSON: { "server_addr", "http_url", "access_token", "refresh_token" }
-
 use serde::{Deserialize, Serialize};
 
 const KEYRING_SERVICE: &str = "toki-sync";
@@ -50,8 +49,10 @@ pub fn save(creds: &Credentials) -> Result<(), String> {
         let service = keyring_service();
         let entry = keyring::Entry::new(&service, KEYRING_USER)
             .map_err(|e| format!("keychain entry: {e}"))?;
-        entry.set_password(&json).map_err(|e| format!("keychain write: {e}"))?;
-        return Ok(());
+        entry
+            .set_password(&json)
+            .map_err(|e| format!("keychain write: {e}"))?;
+        Ok(())
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -85,9 +86,9 @@ pub fn delete() -> Result<(), String> {
         let entry = keyring::Entry::new(&service, KEYRING_USER)
             .map_err(|e| format!("keychain entry: {e}"))?;
         match entry.delete_password() {
-            Ok(()) => return Ok(()),
-            Err(keyring::Error::NoEntry) => return Ok(()),
-            Err(e) => return Err(format!("keychain delete: {e}")),
+            Ok(()) => Ok(()),
+            Err(keyring::Error::NoEntry) => Ok(()),
+            Err(e) => Err(format!("keychain delete: {e}")),
         }
     }
 
@@ -123,7 +124,12 @@ pub fn check_file_permissions() {
 
 #[cfg(not(target_os = "macos"))]
 fn creds_file_path() -> Option<std::path::PathBuf> {
-    Some(crate::config::home_dir().join(".config").join("toki").join("sync.json"))
+    Some(
+        crate::config::home_dir()
+            .join(".config")
+            .join("toki")
+            .join("sync.json"),
+    )
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -144,7 +150,8 @@ fn save_to_file(json: &str) -> Result<(), String> {
             .mode(0o600)
             .open(&path)
             .map_err(|e| format!("open credentials: {e}"))?;
-        file.write_all(json.as_bytes()).map_err(|e| format!("write credentials: {e}"))?;
+        file.write_all(json.as_bytes())
+            .map_err(|e| format!("write credentials: {e}"))?;
     }
     #[cfg(not(unix))]
     {

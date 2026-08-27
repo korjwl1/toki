@@ -2,16 +2,16 @@ use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::db::Database;
 use super::backoff::Backoff;
 use super::client::{AuthError, SyncClient, BATCH_SIZE};
 use super::protocol::SyncItem;
+use crate::db::Database;
 
 /// Sync configuration read from settings DB.
 #[derive(Debug, Clone)]
 pub struct SyncConfig {
-    pub server_addr: String,   // host:port (e.g. "sync.example.com:9090")
-    pub access_token: String,  // JWT
+    pub server_addr: String,  // host:port (e.g. "sync.example.com:9090")
+    pub access_token: String, // JWT
     pub device_name: String,
     /// Stable UUID that uniquely identifies this device.
     /// Generated once at `toki sync enable`, persisted in settings.
@@ -38,8 +38,7 @@ impl SyncConfig {
         }
         let server = crate::config::get_setting("sync_server")?;
         let token = crate::config::get_setting("sync_access_token")?;
-        let device = crate::config::get_setting("sync_device_name")
-            .unwrap_or_else(gethostname);
+        let device = crate::config::get_setting("sync_device_name").unwrap_or_else(gethostname);
         let device_key = crate::config::device_id();
         // TLS: default to true unless explicitly "false" or server is localhost
         let use_tls = match crate::config::get_setting("sync_tls") {
@@ -122,7 +121,11 @@ fn probe_windows_capability(http_url: &str, tls_insecure: bool) -> Option<bool> 
     match agent.get(&url).timeout(Duration::from_secs(5)).call() {
         Ok(resp) => {
             let body: serde_json::Value = resp.into_json().ok()?;
-            Some(body.get("sync_windows_v1").and_then(|v| v.as_bool()).unwrap_or(false))
+            Some(
+                body.get("sync_windows_v1")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            )
         }
         Err(ureq::Error::Status(404, _)) => Some(false),
         Err(_) => None,
@@ -138,9 +141,12 @@ fn insecure_agent() -> Option<ureq::Agent> {
         .danger_accept_invalid_hostnames(true)
         .build()
         .ok()?;
-    Some(ureq::AgentBuilder::new().tls_connector(std::sync::Arc::new(tls)).build())
+    Some(
+        ureq::AgentBuilder::new()
+            .tls_connector(std::sync::Arc::new(tls))
+            .build(),
+    )
 }
-
 
 /// Test-only entry point for the end-to-end integration test, which drives a
 /// real `SyncClient` against a containerized server. Returns whether the batch
@@ -184,7 +190,10 @@ impl WindowSender for crate::sync::client::SyncClient {
 pub(crate) enum WindowsSyncOutcome {
     /// Nothing to send: empty set, or unchanged since the last ACCEPTED upload.
     Skipped,
-    Sent { count: usize, fingerprint: (usize, u64) },
+    Sent {
+        count: usize,
+        fingerprint: (usize, u64),
+    },
     /// Server said no (SyncErr). Connection stays usable, fingerprint must not
     /// latch, so the same set is retried.
     Rejected(String),
@@ -246,7 +255,10 @@ pub(crate) fn windows_sync_step_gated(
         step.nothing_stored_yet = true;
         return (step, writes);
     }
-    (windows_sync_step_inner(db, provider, now_ms, last_fingerprint, sender), writes)
+    (
+        windows_sync_step_inner(db, provider, now_ms, last_fingerprint, sender),
+        writes,
+    )
 }
 
 fn windows_sync_step_inner(
@@ -263,7 +275,9 @@ fn windows_sync_step_inner(
     let mut acc: u64 = 0;
     let _ = db.for_each_window_in(now_ms - WINDOWS_SYNC_HORIZON_MS, i64::MAX, |key, snap| {
         count += 1;
-        acc = acc.wrapping_mul(31).wrapping_add(window_row_fold(key, &snap));
+        acc = acc
+            .wrapping_mul(31)
+            .wrapping_add(window_row_fold(key, &snap));
     });
 
     // Over the server's cap the server keeps only the newest
@@ -315,7 +329,10 @@ fn windows_sync_step_inner(
     let items = collect_window_items(db, now_ms, cutoff, count);
     let n = items.len();
     let outcome = match sender.send_windows(provider, items) {
-        Ok(()) => WindowsSyncOutcome::Sent { count: n, fingerprint },
+        Ok(()) => WindowsSyncOutcome::Sent {
+            count: n,
+            fingerprint,
+        },
         // ErrorKind::Other is how the client reports a server-side SyncErr;
         // anything else means the link itself is gone.
         Err(e) if e.kind() == std::io::ErrorKind::Other => {
@@ -323,7 +340,11 @@ fn windows_sync_step_inner(
         }
         Err(e) => WindowsSyncOutcome::Disconnected(e.to_string()),
     };
-    WindowsSyncStep { outcome, over_cap_dropped, nothing_stored_yet: false }
+    WindowsSyncStep {
+        outcome,
+        over_cap_dropped,
+        nothing_stored_yet: false,
+    }
 }
 
 /// Pass 2 of the windows upload: materialize the wire items for the rows the
@@ -424,7 +445,10 @@ pub fn start_sync_thread(
                         } else {
                             "unknown panic".to_string()
                         };
-                        eprintln!("[toki:sync:{}] thread panicked: {}, restarting in 5s...", provider, msg);
+                        eprintln!(
+                            "[toki:sync:{}] thread panicked: {}, restarting in 5s...",
+                            provider, msg
+                        );
 
                         // Wait before respawn, but check stop signal
                         if stop_rx.recv_timeout(Duration::from_secs(5)).is_ok() {
@@ -466,7 +490,10 @@ fn run_sync_loop(
         // Try to load sync config. Even though toggle says enabled,
         // config may be incomplete (e.g. server not set yet).
         let Some(mut config) = SyncConfig::load(&provider) else {
-            eprintln!("[toki:sync:{}] enabled but config incomplete, waiting...", provider);
+            eprintln!(
+                "[toki:sync:{}] enabled but config incomplete, waiting...",
+                provider
+            );
             // Sleep briefly and re-check toggle / config
             if stop_rx.recv_timeout(Duration::from_secs(5)).is_ok() {
                 return;
@@ -544,15 +571,19 @@ fn run_sync_inner(
             let (lock, cvar) = &**flush_notify;
             let guard = lock.lock().unwrap();
             let timeout = PING_INTERVAL.saturating_sub(last_ping.elapsed());
-            let (mut guard, _) = cvar.wait_timeout_while(
-                guard, timeout, |dirty| !*dirty
-            ).unwrap();
+            let (mut guard, _) = cvar
+                .wait_timeout_while(guard, timeout, |dirty| !*dirty)
+                .unwrap();
             *guard = false;
 
             // Check stop/toggle after wakeup
-            if stop_rx.try_recv().is_ok() { return; }
+            if stop_rx.try_recv().is_ok() {
+                return;
+            }
             let enabled = sync_toggle.0.lock().unwrap();
-            if !*enabled { return; }
+            if !*enabled {
+                return;
+            }
         }
 
         // Ensure connection
@@ -567,9 +598,17 @@ fn run_sync_inner(
 
             match SyncClient::connect(&config.server_addr, config.use_tls, config.tls_insecure) {
                 Ok(mut c) => {
-                    match c.auth(&config.access_token, &config.device_name, &config.device_key, &config.provider) {
+                    match c.auth(
+                        &config.access_token,
+                        &config.device_name,
+                        &config.device_key,
+                        &config.provider,
+                    ) {
                         Ok(device_id) => {
-                            eprintln!("[toki:sync] connected (device_id={})", truncate(&device_id, 12));
+                            eprintln!(
+                                "[toki:sync] connected (device_id={})",
+                                truncate(&device_id, 12)
+                            );
                             backoff.reset();
                             dict_cache = db.load_dict_reverse().unwrap_or_default();
                             client = Some(c);
@@ -585,11 +624,16 @@ fn run_sync_inner(
                             sw.set("sync_status", "connected");
                             sw.set("sync_last_success", &now_epoch().to_string());
                         }
-                        Err(AuthError::Rejected { reason, reset_required }) => {
+                        Err(AuthError::Rejected {
+                            reason,
+                            reset_required,
+                        }) => {
                             eprintln!("[toki:sync] auth rejected: {reason}");
 
                             if reason.contains("device_removed") {
-                                eprintln!("[toki:sync] device was removed from server — disabling sync");
+                                eprintln!(
+                                    "[toki:sync] device was removed from server — disabling sync"
+                                );
                                 let _ = crate::config::set_setting("sync_enabled", "false");
                                 sw.set("sync_status", "device_removed");
                                 {
@@ -604,13 +648,13 @@ fn run_sync_inner(
                             }
 
                             // JWT expired — try refresh before giving up
-                            if reason.contains("Expired") || reason.contains("expired") {
-                                if try_refresh_token(config) {
-                                    eprintln!("[toki:sync] token refreshed after expiry, retrying");
-                                    backoff.reset();
-                                    last_refresh = Instant::now();
-                                    continue; // retry auth immediately
-                                }
+                            if (reason.contains("Expired") || reason.contains("expired"))
+                                && try_refresh_token(config)
+                            {
+                                eprintln!("[toki:sync] token refreshed after expiry, retrying");
+                                backoff.reset();
+                                last_refresh = Instant::now();
+                                continue; // retry auth immediately
                             }
 
                             sw.set("sync_status", "auth_failed");
@@ -659,7 +703,9 @@ fn run_sync_inner(
             }
         }
 
-        if client.is_none() { continue; }
+        if client.is_none() {
+            continue;
+        }
 
         // Sync cycle: upload everything until server ts == local ts.
         // After catching up, re-check dirty flag to avoid missing events
@@ -668,10 +714,14 @@ fn run_sync_inner(
             let mut sync_error = false;
             loop {
                 // Check stop/disable between batches
-                if stop_rx.try_recv().is_ok() { return; }
+                if stop_rx.try_recv().is_ok() {
+                    return;
+                }
                 {
                     let enabled = sync_toggle.0.lock().unwrap();
-                    if !*enabled { return; }
+                    if !*enabled {
+                        return;
+                    }
                 }
 
                 let c = client.as_mut().unwrap();
@@ -731,7 +781,9 @@ fn run_sync_inner(
         if last_ping.elapsed() >= PING_INTERVAL {
             if let Some(ref mut c) = client {
                 match c.ping() {
-                    Ok(()) => { last_ping = Instant::now(); }
+                    Ok(()) => {
+                        last_ping = Instant::now();
+                    }
                     Err(e) => {
                         eprintln!("[toki:sync] ping failed: {e}");
                         client = None;
@@ -746,9 +798,7 @@ fn run_sync_inner(
         // `client.is_some()`: the ping-failure path above nulls the client and
         // falls through here, where both passes would run and be thrown away.
         if client.is_some() && last_windows_sync.elapsed() >= WINDOWS_SYNC_INTERVAL {
-            if windows_cap == WindowsCapability::Unsupported
-                && Instant::now() >= next_cap_probe
-            {
+            if windows_cap == WindowsCapability::Unsupported && Instant::now() >= next_cap_probe {
                 windows_cap = WindowsCapability::Unknown;
             }
             if windows_cap == WindowsCapability::Unknown && Instant::now() >= next_cap_probe {
@@ -762,7 +812,9 @@ fn run_sync_inner(
                             Some(false) => {
                                 windows_cap = WindowsCapability::Unsupported;
                                 next_cap_probe = Instant::now() + CAP_UNSUPPORTED_TTL;
-                                eprintln!("[toki:sync] server predates windows sync (re-probe in 6h)");
+                                eprintln!(
+                                    "[toki:sync] server predates windows sync (re-probe in 6h)"
+                                );
                             }
                             None => {
                                 // Transient (network/TLS/5xx): back off instead
@@ -792,7 +844,7 @@ fn run_sync_inner(
                 let step = match client {
                     Some(ref mut c) => {
                         let (s, w) = windows_sync_step_gated(
-                            &db,
+                            db,
                             &config.provider,
                             now_ms,
                             last_windows_fingerprint,
@@ -802,7 +854,10 @@ fn run_sync_inner(
                         // Only latch the counter on an ACCEPTED upload: a
                         // rejection or a dropped link must leave the set
                         // looking dirty so the next cycle retries it.
-                        if matches!(s.outcome, WindowsSyncOutcome::Sent { .. } | WindowsSyncOutcome::Skipped) {
+                        if matches!(
+                            s.outcome,
+                            WindowsSyncOutcome::Sent { .. } | WindowsSyncOutcome::Skipped
+                        ) {
                             last_windows_writes = Some(w);
                         }
                         s
@@ -854,7 +909,6 @@ fn run_sync_inner(
                 }
             }
         }
-
     }
 }
 
@@ -873,9 +927,16 @@ impl SyncStateWriter {
         let _ = std::fs::create_dir_all(dir);
         let path = dir.join("sync_state.json");
         let file = std::fs::OpenOptions::new()
-            .create(true).write(true).read(true)
-            .open(&path).ok();
-        Self { file, state: HashMap::new() }
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .read(true)
+            .open(&path)
+            .ok();
+        Self {
+            file,
+            state: HashMap::new(),
+        }
     }
 
     fn set(&mut self, key: &str, value: &str) {
@@ -883,7 +944,9 @@ impl SyncStateWriter {
         // from other provider threads. flock blocks until lock is available.
         if let Some(ref f) = self.file {
             use std::os::unix::io::AsRawFd;
-            unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX); }
+            unsafe {
+                libc::flock(f.as_raw_fd(), libc::LOCK_EX);
+            }
         }
 
         self.reload();
@@ -892,7 +955,9 @@ impl SyncStateWriter {
 
         if let Some(ref f) = self.file {
             use std::os::unix::io::AsRawFd;
-            unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN); }
+            unsafe {
+                libc::flock(f.as_raw_fd(), libc::LOCK_UN);
+            }
         }
     }
 
@@ -943,9 +1008,13 @@ fn send_sync_notification(title: &str, message: &str) {
         let esc_title = escape_applescript(title);
         let esc_msg = escape_applescript(message);
         let _ = std::process::Command::new("osascript")
-            .args(["-e", &format!(
-                "display notification \"{}\" with title \"{}\"", esc_msg, esc_title
-            )])
+            .args([
+                "-e",
+                &format!(
+                    "display notification \"{}\" with title \"{}\"",
+                    esc_msg, esc_title
+                ),
+            ])
             .spawn();
     }
     #[cfg(target_os = "linux")]
@@ -968,7 +1037,8 @@ fn sync_new_events(
     sw: &mut SyncStateWriter,
 ) -> Result<usize, String> {
     // Get server's last known ts
-    let server_last_ts = client.get_last_ts(provider)
+    let server_last_ts = client
+        .get_last_ts(provider)
         .map_err(|e| format!("get_last_ts failed: {e}"))?;
 
     let cursor_key = format!("sync_last_ts_{provider}");
@@ -995,9 +1065,14 @@ fn sync_new_events(
 
         // Check if any dict IDs in this batch are missing from cache; merge if so
         let needs_reload = events.iter().any(|(_, _, event)| {
-            [event.model_id, event.session_id, event.source_file_id, event.project_name_id]
-                .iter()
-                .any(|id| !dict.contains_key(id))
+            [
+                event.model_id,
+                event.session_id,
+                event.source_file_id,
+                event.project_name_id,
+            ]
+            .iter()
+            .any(|id| !dict.contains_key(id))
         });
         if needs_reload {
             if let Ok(fresh) = db.load_dict_reverse() {
@@ -1005,38 +1080,52 @@ fn sync_new_events(
             }
         }
 
-        let items: Vec<SyncItem> = events.iter().map(|(ts_ms, msg_id, event)| {
-            let usage_total = match provider {
-                "codex" => event.input_tokens.saturating_add(event.output_tokens),
-                _ => event.input_tokens
-                    .saturating_add(event.output_tokens)
-                    .saturating_add(event.cache_creation_input_tokens)
-                    .saturating_add(event.cache_read_input_tokens),
-            };
+        let items: Vec<SyncItem> = events
+            .iter()
+            .map(|(ts_ms, msg_id, event)| {
+                let usage_total = match provider {
+                    "codex" => event.input_tokens.saturating_add(event.output_tokens),
+                    _ => event
+                        .input_tokens
+                        .saturating_add(event.output_tokens)
+                        .saturating_add(event.cache_creation_input_tokens)
+                        .saturating_add(event.cache_read_input_tokens),
+                };
 
-            SyncItem {
-                ts_ms: *ts_ms,
-                message_id: crate::db::Database::bare_msg_id(msg_id).to_string(),
-                event: toki_sync_protocol::StoredEvent {
-                    model_id: event.model_id,
-                    session_id: event.session_id,
-                    source_file_id: event.source_file_id,
-                    project_name_id: event.project_name_id,
-                    tokens: vec![
-                        event.input_tokens,
-                        event.output_tokens,
-                        event.cache_creation_input_tokens,
-                        event.cache_read_input_tokens,
-                    ],
-                },
-                usage_total,
-                ..Default::default()
-            }
-        }).collect();
+                SyncItem {
+                    ts_ms: *ts_ms,
+                    message_id: crate::db::Database::bare_msg_id(msg_id).to_string(),
+                    event: toki_sync_protocol::StoredEvent {
+                        model_id: event.model_id,
+                        session_id: event.session_id,
+                        source_file_id: event.source_file_id,
+                        project_name_id: event.project_name_id,
+                        tokens: vec![
+                            event.input_tokens,
+                            event.output_tokens,
+                            event.cache_creation_input_tokens,
+                            event.cache_read_input_tokens,
+                        ],
+                    },
+                    usage_total,
+                    ..Default::default()
+                }
+            })
+            .collect();
 
         let token_columns: Vec<String> = match provider {
-            "codex" => vec!["input".into(), "output".into(), "reasoning_output".into(), "cached_input".into()],
-            _ => vec!["input".into(), "output".into(), "cache_create".into(), "cache_read".into()],
+            "codex" => vec![
+                "input".into(),
+                "output".into(),
+                "reasoning_output".into(),
+                "cached_input".into(),
+            ],
+            _ => vec![
+                "input".into(),
+                "output".into(),
+                "cache_create".into(),
+                "cache_read".into(),
+            ],
         };
 
         // Record the last event key for exact resume (avoids +1ms skip)
@@ -1075,8 +1164,12 @@ fn sync_new_events(
 
 fn try_refresh_token(config: &mut SyncConfig) -> bool {
     // Load credentials from Keychain/file
-    let Some(creds) = crate::sync::credentials::load() else { return false };
-    if creds.refresh_token.is_empty() { return false; }
+    let Some(creds) = crate::sync::credentials::load() else {
+        return false;
+    };
+    if creds.refresh_token.is_empty() {
+        return false;
+    }
 
     // Build HTTP URL from credentials
     let http_url = if creds.http_url.is_empty() {
@@ -1086,10 +1179,9 @@ fn try_refresh_token(config: &mut SyncConfig) -> bool {
     };
 
     // POST /token/refresh
-    let resp = match ureq::post(&format!("{http_url}/token/refresh"))
-        .send_json(ureq::json!({
-            "refresh_token": creds.refresh_token,
-        })) {
+    let resp = match ureq::post(&format!("{http_url}/token/refresh")).send_json(ureq::json!({
+        "refresh_token": creds.refresh_token,
+    })) {
         Ok(r) => r,
         Err(_) => return false,
     };
@@ -1101,7 +1193,9 @@ fn try_refresh_token(config: &mut SyncConfig) -> bool {
 
     let new_access = body["access_token"].as_str().unwrap_or_default();
     let new_refresh = body["refresh_token"].as_str().unwrap_or_default();
-    if new_access.is_empty() { return false; }
+    if new_access.is_empty() {
+        return false;
+    }
 
     // Update credentials
     let mut new_creds = creds;
@@ -1140,7 +1234,10 @@ mod windows_sync_tests {
 
     impl RecordingSender {
         pub(crate) fn ok() -> Self {
-            RecordingSender { sent: Vec::new(), result: || Ok(()) }
+            RecordingSender {
+                sent: Vec::new(),
+                result: || Ok(()),
+            }
         }
         fn rejecting() -> Self {
             RecordingSender {
@@ -1211,7 +1308,11 @@ mod windows_sync_tests {
         let mut sender = RecordingSender::ok();
         let step = windows_sync_step(&db, "codex", now, (0, 0), &mut sender);
 
-        assert_eq!(sender.sent, vec![("codex".to_string(), 3)], "payload must reach the sender");
+        assert_eq!(
+            sender.sent,
+            vec![("codex".to_string(), 3)],
+            "payload must reach the sender"
+        );
         match step.outcome {
             WindowsSyncOutcome::Sent { count, .. } => assert_eq!(count, 3),
             other => panic!("expected Sent, got {other:?}"),
@@ -1233,7 +1334,10 @@ mod windows_sync_tests {
         let mut second = RecordingSender::ok();
         let step = windows_sync_step(&db, "codex", now, fp, &mut second);
         assert_eq!(step.outcome, WindowsSyncOutcome::Skipped);
-        assert!(second.sent.is_empty(), "an unchanged set must not re-upload");
+        assert!(
+            second.sent.is_empty(),
+            "an unchanged set must not re-upload"
+        );
     }
 
     #[test]
@@ -1301,7 +1405,10 @@ mod windows_sync_tests {
         let step = windows_sync_step(&db, "codex", now, (0, 0), &mut sender);
 
         assert_eq!(step.over_cap_dropped, 25);
-        assert_eq!(sender.sent[0].1, MAX_WINDOWS_PER_SYNC, "must send exactly the cap");
+        assert_eq!(
+            sender.sent[0].1, MAX_WINDOWS_PER_SYNC,
+            "must send exactly the cap"
+        );
         let fp = match step.outcome {
             WindowsSyncOutcome::Sent { count, fingerprint } => {
                 assert_eq!(count, MAX_WINDOWS_PER_SYNC);
@@ -1357,7 +1464,6 @@ mod windows_sync_tests {
         );
     }
 
-
     /// A just-started daemon runs its first window sync BEFORE the backfill has
     /// written anything. Burning the 5-minute interval on that empty look
     /// postponed the first upload by a full interval; the write-counter gate
@@ -1382,7 +1488,10 @@ mod windows_sync_tests {
         // not to spend its interval.
         let (second, _) = windows_sync_step_gated(&db, "codex", now, (0, 0), Some(w0), &mut s0);
         assert_eq!(second.outcome, WindowsSyncOutcome::Skipped);
-        assert!(second.nothing_stored_yet, "an untouched store must not burn the interval");
+        assert!(
+            second.nothing_stored_yet,
+            "an untouched store must not burn the interval"
+        );
 
         // Backfill lands -> the very next attempt uploads.
         put(&db, now, 0, 5000);

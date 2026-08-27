@@ -2,7 +2,6 @@
 ///
 /// Wire types are defined in the shared `toki-sync-protocol` crate.
 /// This module provides synchronous (std::io) frame I/O.
-
 use std::io::{self, Read, Write};
 
 // Re-export shared wire types so existing imports continue to work.
@@ -10,10 +9,8 @@ use std::io::{self, Read, Write};
 // crate::common::types. The wire protocol StoredEvent (with Vec<u64> tokens) is
 // accessed as toki_sync_protocol::StoredEvent when building sync batches.
 pub use toki_sync_protocol::{
-    MsgType, AuthPayload, AuthOkPayload, AuthErrPayload,
-    GetLastTsPayload, LastTsPayload,
-    SyncItem, SyncBatchPayload, SyncAckPayload, SyncErrPayload,
-    PROTOCOL_VERSION, MAX_PAYLOAD_SIZE,
+    AuthErrPayload, AuthOkPayload, AuthPayload, GetLastTsPayload, LastTsPayload, MsgType,
+    SyncAckPayload, SyncBatchPayload, SyncErrPayload, SyncItem, MAX_PAYLOAD_SIZE, PROTOCOL_VERSION,
 };
 
 // ─── Frame read/write (synchronous) ────────────────────────────────────────
@@ -22,7 +19,10 @@ pub fn write_frame<W: Write>(w: &mut W, msg_type: MsgType, payload: &[u8]) -> io
     if payload.len() > MAX_PAYLOAD_SIZE as usize {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("payload too large: {} bytes (max {MAX_PAYLOAD_SIZE})", payload.len()),
+            format!(
+                "payload too large: {} bytes (max {MAX_PAYLOAD_SIZE})",
+                payload.len()
+            ),
         ));
     }
     let len = payload.len() as u32;
@@ -45,7 +45,10 @@ pub fn read_frame<R: Read>(r: &mut R) -> io::Result<(MsgType, Vec<u8>)> {
     let len = u32::from_le_bytes(header[4..8].try_into().unwrap());
 
     let msg_type = MsgType::from_u32(type_u32).ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidData, format!("unknown msg_type: {type_u32}"))
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unknown msg_type: {type_u32}"),
+        )
     })?;
 
     if len > MAX_PAYLOAD_SIZE {

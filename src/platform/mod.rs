@@ -10,31 +10,49 @@ pub mod linux;
 /// Enable auto-start on login (platform-specific).
 pub fn enable_autostart() -> Result<(), String> {
     #[cfg(target_os = "macos")]
-    { return macos::enable_autostart(); }
+    {
+        macos::enable_autostart()
+    }
     #[cfg(target_os = "linux")]
-    { return linux::enable_autostart(); }
+    {
+        linux::enable_autostart()
+    }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    { Err("auto-start not supported on this platform".to_string()) }
+    {
+        Err("auto-start not supported on this platform".to_string())
+    }
 }
 
 /// Disable auto-start on login (platform-specific).
 pub fn disable_autostart() -> Result<(), String> {
     #[cfg(target_os = "macos")]
-    { return macos::disable_autostart(); }
+    {
+        macos::disable_autostart()
+    }
     #[cfg(target_os = "linux")]
-    { return linux::disable_autostart(); }
+    {
+        linux::disable_autostart()
+    }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    { Err("auto-start not supported on this platform".to_string()) }
+    {
+        Err("auto-start not supported on this platform".to_string())
+    }
 }
 
 /// Check if auto-start is enabled (platform-specific).
 pub fn is_autostart_enabled() -> bool {
     #[cfg(target_os = "macos")]
-    { return macos::is_autostart_enabled(); }
+    {
+        macos::is_autostart_enabled()
+    }
     #[cfg(target_os = "linux")]
-    { return linux::is_autostart_enabled(); }
+    {
+        linux::is_autostart_enabled()
+    }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    { false }
+    {
+        false
+    }
 }
 
 /// (Re)start the daemon through the OS service supervisor when it manages the
@@ -48,9 +66,14 @@ pub fn is_autostart_enabled() -> bool {
 /// existing detached-start behaviour.
 pub fn supervised_kickstart(force_restart: bool) -> Option<Result<(), String>> {
     #[cfg(target_os = "macos")]
-    { return macos::supervised_kickstart(force_restart); }
+    {
+        macos::supervised_kickstart(force_restart)
+    }
     #[cfg(not(target_os = "macos"))]
-    { let _ = force_restart; None }
+    {
+        let _ = force_restart;
+        None
+    }
 }
 
 /// Stable wrapper symlinks a package manager keeps pointing at the current
@@ -90,6 +113,7 @@ fn resolve_stable_path(exe: &Path, candidates: &[&str]) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod stable_path_tests {
     use super::resolve_stable_path;
 
@@ -120,15 +144,16 @@ use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::Path;
 
 /// Create a file watcher that sends changed file paths over a crossbeam channel.
-pub fn create_watcher(
-    tx: Sender<String>,
-) -> notify::Result<RecommendedWatcher> {
-    let debug = std::env::var("TOKI_DEBUG").map_or(false, |v| v == "1" || v == "2" || v == "true");
-    let watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-        match &res {
+pub fn create_watcher(tx: Sender<String>) -> notify::Result<RecommendedWatcher> {
+    let debug = std::env::var("TOKI_DEBUG").is_ok_and(|v| v == "1" || v == "2" || v == "true");
+    let watcher =
+        notify::recommended_watcher(move |res: Result<Event, notify::Error>| match &res {
             Ok(event) => {
                 if debug {
-                    eprintln!("[toki:watcher] event: kind={:?} paths={:?}", event.kind, event.paths);
+                    eprintln!(
+                        "[toki:watcher] event: kind={:?} paths={:?}",
+                        event.kind, event.paths
+                    );
                 }
                 match event.kind {
                     EventKind::Create(_) | EventKind::Modify(_) => {
@@ -148,17 +173,13 @@ pub fn create_watcher(
                     eprintln!("[toki:watcher] error: {:?}", e);
                 }
             }
-        }
-    })?;
+        })?;
 
     Ok(watcher)
 }
 
 /// Register a directory for recursive watching.
-pub fn watch_directory(
-    watcher: &mut RecommendedWatcher,
-    dir: &str,
-) -> notify::Result<()> {
+pub fn watch_directory(watcher: &mut RecommendedWatcher, dir: &str) -> notify::Result<()> {
     let path = Path::new(dir);
     if path.exists() {
         watcher.watch(path, RecursiveMode::Recursive)?;

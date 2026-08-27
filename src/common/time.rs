@@ -37,7 +37,11 @@ fn fast_parse_ts_to_ms(ts: &str) -> Option<i64> {
         let frac_end = b.len() - 1; // before 'Z'
         if frac_end > frac_start {
             // Cap at 9 fractional digits to avoid u32 overflow
-            let effective_end = if frac_end - frac_start > 9 { frac_start + 9 } else { frac_end };
+            let effective_end = if frac_end - frac_start > 9 {
+                frac_start + 9
+            } else {
+                frac_end
+            };
             let frac_str = std::str::from_utf8(&b[frac_start..effective_end]).ok()?;
             let frac: u32 = frac_str.parse().ok()?;
             let digits = (effective_end - frac_start) as u32;
@@ -66,7 +70,11 @@ fn fast_parse_ts_to_ms(ts: &str) -> Option<i64> {
 fn parse_digits2(b: &[u8], i: usize) -> Option<u32> {
     let d1 = (b[i] as u32).wrapping_sub(b'0' as u32);
     let d2 = (b[i + 1] as u32).wrapping_sub(b'0' as u32);
-    if d1 <= 9 && d2 <= 9 { Some(d1 * 10 + d2) } else { None }
+    if d1 <= 9 && d2 <= 9 {
+        Some(d1 * 10 + d2)
+    } else {
+        None
+    }
 }
 
 #[inline]
@@ -86,14 +94,20 @@ fn parse_digits4(b: &[u8], i: usize) -> Option<u32> {
 /// Algorithm from Howard Hinnant's date library.
 #[inline]
 fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
-    if month < 1 || month > 12 || day < 1 {
+    if !(1..=12).contains(&month) || day < 1 {
         return None;
     }
     let is_leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
     let max_day = match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
-        2 => if is_leap { 29 } else { 28 },
+        2 => {
+            if is_leap {
+                29
+            } else {
+                28
+            }
+        }
         _ => return None,
     };
     if day > max_day {

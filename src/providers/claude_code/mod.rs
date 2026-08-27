@@ -13,15 +13,10 @@ pub use parser::ClaudeCodeParser;
 /// outright and 4.6 runs at standard speed and standard rates, so neither
 /// takes a multiplier. The previous 6x on 4.6/4.7 came from the $30/$150 era
 /// and survived the price change.
-pub const FAST_MULTIPLIER: &[(&str, f64)] = &[
-    ("claude-opus-5", 2.0),
-    ("claude-opus-4-8", 2.0),
-];
+pub const FAST_MULTIPLIER: &[(&str, f64)] = &[("claude-opus-5", 2.0), ("claude-opus-4-8", 2.0)];
 
 use crate::common::types::{LogParser, LogParserWithTs, SessionGroup};
-use crate::providers::{
-    ColdStartParsed, FileParser, Provider,
-};
+use crate::providers::{ColdStartParsed, FileParser, Provider};
 
 /// Claude Code provider implementation.
 pub struct ClaudeCodeProvider {
@@ -103,9 +98,12 @@ impl Provider for ClaudeCodeProvider {
     }
 
     /// Override: use concrete ClaudeCodeParser directly for inlining (no dyn dispatch).
-    fn scan_file_cold_start(&self, path: &str, offset: u64, emit: &mut dyn FnMut(ColdStartParsed))
-        -> std::io::Result<Option<(u64, u64, u64)>>
-    {
+    fn scan_file_cold_start(
+        &self,
+        path: &str,
+        offset: u64,
+        emit: &mut dyn FnMut(ColdStartParsed),
+    ) -> std::io::Result<Option<(u64, u64, u64)>> {
         let parser = ClaudeCodeParser;
         crate::checkpoint::process_lines_streaming(path, offset, |line| {
             if let Some(parsed) = parser.parse_for_cold_start(line) {

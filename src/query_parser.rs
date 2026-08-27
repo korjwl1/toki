@@ -1,42 +1,42 @@
-/// Minimal PromQL-inspired query parser for toki.
-///
-/// Grammar (two accepted forms):
-///
-///   Standard PromQL (preferred):
-///     query        = agg_by_expr | increase_expr | metric_expr
-///     agg_by_expr  = agg_func "by" "(" group_key* ")" "(" increase_expr | metric_expr ")"
-///     increase_expr = "increase" "(" metric_expr ")"
-///     metric_expr  = metric filters? bucket? offset?
-///     metric       = "toki_tokens_total" | "usage" | "sessions" | "projects" | "events"
-///     agg_func     = "sum" | "avg" | "count"
-///
-///   Legacy toki form (still accepted for backwards compatibility):
-///     query   = agg_start? metric filters? bucket? offset? agg_end? group_by?
-///     agg_start = ("sum" | "avg" | "count") "("
-///     agg_end = ")"
-///
-///   Shared:
-///     filters  = "{" (filter ("," filter)*)? "}"
-///     filter   = key "=" quoted_string
-///     bucket   = "[" duration "]"
-///     offset   = "offset" duration
-///     group_by = "by" "(" key ("," key)* ")"
-///
-/// Time range is NOT part of the query string. Pass --since/--until as CLI flags;
-/// they are transmitted as separate `start`/`end` fields in the daemon protocol.
-///
-/// Examples:
-///   sum by (model) (increase(toki_tokens_total{provider="claude_code"}[1h]))
-///   increase(toki_tokens_total[1h]) by (model)
-///   toki_tokens_total{provider="claude_code"}[1h]
-///   usage{model="claude-opus-4-6"}[5m] by (model)
-///   usage{project="myapp"}[1h]
-///   events{session="abc123"}
-///   usage[1d] offset 7d
-///   sum(usage[1d])
-///   avg(usage[1d]) by (project)
-///   sessions{project="myapp"}
-///   projects
+//! Minimal PromQL-inspired query parser for toki.
+//!
+//! Grammar (two accepted forms):
+//!
+//!   Standard PromQL (preferred):
+//!     query        = agg_by_expr | increase_expr | metric_expr
+//!     agg_by_expr  = agg_func "by" "(" group_key* ")" "(" increase_expr | metric_expr ")"
+//!     increase_expr = "increase" "(" metric_expr ")"
+//!     metric_expr  = metric filters? bucket? offset?
+//!     metric       = "toki_tokens_total" | "usage" | "sessions" | "projects" | "events"
+//!     agg_func     = "sum" | "avg" | "count"
+//!
+//!   Legacy toki form (still accepted for backwards compatibility):
+//!     query   = agg_start? metric filters? bucket? offset? agg_end? group_by?
+//!     agg_start = ("sum" | "avg" | "count") "("
+//!     agg_end = ")"
+//!
+//!   Shared:
+//!     filters  = "{" (filter ("," filter)*)? "}"
+//!     filter   = key "=" quoted_string
+//!     bucket   = "[" duration "]"
+//!     offset   = "offset" duration
+//!     group_by = "by" "(" key ("," key)* ")"
+//!
+//! Time range is NOT part of the query string. Pass --since/--until as CLI flags;
+//! they are transmitted as separate `start`/`end` fields in the daemon protocol.
+//!
+//! Examples:
+//!   sum by (model) (increase(toki_tokens_total{provider="claude_code"}[1h]))
+//!   increase(toki_tokens_total[1h]) by (model)
+//!   toki_tokens_total{provider="claude_code"}[1h]
+//!   usage{model="claude-opus-4-6"}[5m] by (model)
+//!   usage{project="myapp"}[1h]
+//!   events{session="abc123"}
+//!   usage[1d] offset 7d
+//!   sum(usage[1d])
+//!   avg(usage[1d]) by (project)
+//!   sessions{project="myapp"}
+//!   projects
 
 /// Aggregation function for collapsing model dimension.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -151,7 +151,8 @@ pub struct Query {
 impl Query {
     /// Get filter value for a given key, if present.
     pub fn filter_value(&self, key: &str) -> Option<&str> {
-        self.filters.iter()
+        self.filters
+            .iter()
             .find(|f| f.key == key)
             .map(|f| f.value.as_str())
     }
@@ -179,7 +180,9 @@ impl Query {
             Metric::Windows => "windows".to_string(),
         };
 
-        let mut filters: Vec<(&str, &str, bool)> = self.filters.iter()
+        let mut filters: Vec<(&str, &str, bool)> = self
+            .filters
+            .iter()
             .map(|f| (f.key.as_str(), f.value.as_str(), f.regex))
             .collect();
         if let Some(ref provider) = self.provider {
@@ -188,7 +191,9 @@ impl Query {
         if !filters.is_empty() {
             s.push('{');
             for (i, (k, v, regex)) in filters.iter().enumerate() {
-                if i > 0 { s.push_str(", "); }
+                if i > 0 {
+                    s.push_str(", ");
+                }
                 let escaped = v.replace('\\', "\\\\").replace('"', "\\\"");
                 let op = if *regex { "=~" } else { "=" };
                 s.push_str(&format!("{}{}\"{}\"", k, op, escaped));
@@ -207,7 +212,13 @@ impl Query {
         let agg_suffix = if self.aggregation.is_some() { ")" } else { "" };
 
         if !self.group_by.is_empty() {
-            format!("{}{}{} by ({})", agg_prefix, s, agg_suffix, self.group_by.join(", "))
+            format!(
+                "{}{}{} by ({})",
+                agg_prefix,
+                s,
+                agg_suffix,
+                self.group_by.join(", ")
+            )
         } else {
             format!("{}{}{}", agg_prefix, s, agg_suffix)
         }
@@ -225,10 +236,16 @@ impl Query {
 
         let base = self.to_query_string();
         // Insert bucket before " offset" or " by" or at end
-        let insert_pos = base.find(" offset ")
+        let insert_pos = base
+            .find(" offset ")
             .or_else(|| base.find(" by "))
             .unwrap_or(base.len());
-        format!("{}{}{}", &base[..insert_pos], bucket_str, &base[insert_pos..])
+        format!(
+            "{}{}{}",
+            &base[..insert_pos],
+            bucket_str,
+            &base[insert_pos..]
+        )
     }
 }
 
@@ -274,9 +291,7 @@ pub fn parse(input: &str) -> Result<Query, String> {
 
     // Parse metric name — "toki_tokens_total" is standard PromQL name for Metric::Usage
     p.skip_ws();
-    let metric = if p.consume_literal("toki_tokens_total") {
-        Metric::Usage
-    } else if p.consume_literal("usage") {
+    let metric = if p.consume_literal("toki_tokens_total") || p.consume_literal("usage") {
         Metric::Usage
     } else if p.consume_literal("cost") {
         Metric::Cost
@@ -357,20 +372,30 @@ pub fn parse(input: &str) -> Result<Query, String> {
             return Err(format!("{:?} does not support group by", metric));
         }
         if aggregation.is_some() {
-            return Err(format!("{:?} does not support aggregation functions", metric));
+            return Err(format!(
+                "{:?} does not support aggregation functions",
+                metric
+            ));
         }
     }
 
-    Ok(Query { metric, filters: raw_filters, bucket, group_by, provider, offset, aggregation })
+    Ok(Query {
+        metric,
+        filters: raw_filters,
+        bucket,
+        group_by,
+        provider,
+        offset,
+        aggregation,
+    })
 }
 
 /// Extract and remove a filter by key, returning its value if present.
 fn extract_filter(filters: &mut Vec<LabelFilter>, key: &str) -> Option<String> {
-    if let Some(pos) = filters.iter().position(|f| f.key == key) {
-        Some(filters.remove(pos).value)
-    } else {
-        None
-    }
+    filters
+        .iter()
+        .position(|f| f.key == key)
+        .map(|pos| filters.remove(pos).value)
 }
 
 struct Parser<'a> {
@@ -505,7 +530,11 @@ impl<'a> Parser<'a> {
         loop {
             let key = self.parse_ident()?;
             if !VALID_FILTER_KEYS.contains(&key.as_str()) {
-                return Err(format!("unknown filter key '{}' (valid: {})", key, VALID_FILTER_KEYS.join(", ")));
+                return Err(format!(
+                    "unknown filter key '{}' (valid: {})",
+                    key,
+                    VALID_FILTER_KEYS.join(", ")
+                ));
             }
             // Support both `=` (exact) and `=~` (regex) operators
             let regex = if self.consume_op("=~") {
@@ -521,8 +550,13 @@ impl<'a> Parser<'a> {
             filters.push(LabelFilter { key, value, regex });
 
             match self.peek() {
-                Some(',') => { self.pos += 1; }
-                Some('}') => { self.pos += 1; break; }
+                Some(',') => {
+                    self.pos += 1;
+                }
+                Some('}') => {
+                    self.pos += 1;
+                    break;
+                }
                 Some(c) => return Err(format!("expected ',' or '}}', found '{}'", c)),
                 None => return Err("unterminated filter block".into()),
             }
@@ -562,19 +596,25 @@ impl<'a> Parser<'a> {
                 }
                 break;
             }
-            let num: u64 = self.input[start..self.pos].parse()
+            let num: u64 = self.input[start..self.pos]
+                .parse()
                 .map_err(|_| "invalid duration number")?;
             if num == 0 && !parsed_any {
                 return Err("duration must be > 0".into());
             }
 
             // Parse unit
-            let c = self.input[self.pos..].chars().next()
+            let c = self.input[self.pos..]
+                .chars()
+                .next()
                 .ok_or("expected duration unit (w/d/h/m/s)")?;
             let (multiplier, rank) = unit_rank(c)
                 .ok_or_else(|| format!("unknown duration unit '{}' (use w/d/h/m/s)", c))?;
             if rank >= last_rank {
-                return Err(format!("duration units must be in descending order, got '{}' after smaller/equal unit", c));
+                return Err(format!(
+                    "duration units must be in descending order, got '{}' after smaller/equal unit",
+                    c
+                ));
             }
             self.pos += 1;
             last_rank = rank;
@@ -609,13 +649,22 @@ impl<'a> Parser<'a> {
         loop {
             let key = self.parse_ident()?;
             if !VALID_GROUP_KEYS.contains(&key.as_str()) {
-                return Err(format!("unknown group key '{}' (valid: {})", key, VALID_GROUP_KEYS.join(", ")));
+                return Err(format!(
+                    "unknown group key '{}' (valid: {})",
+                    key,
+                    VALID_GROUP_KEYS.join(", ")
+                ));
             }
             keys.push(key);
 
             match self.peek() {
-                Some(',') => { self.pos += 1; }
-                Some(')') => { self.pos += 1; break; }
+                Some(',') => {
+                    self.pos += 1;
+                }
+                Some(')') => {
+                    self.pos += 1;
+                    break;
+                }
                 Some(c) => return Err(format!("expected ',' or ')', found '{}'", c)),
                 None => return Err("unterminated group by".into()),
             }
@@ -1081,7 +1130,9 @@ mod tests {
 
     #[test]
     fn test_sum_by_increase_standard_promql() {
-        let q = parse(r#"sum by (model) (increase(toki_tokens_total{provider="claude_code"}[1h]))"#).unwrap();
+        let q =
+            parse(r#"sum by (model) (increase(toki_tokens_total{provider="claude_code"}[1h]))"#)
+                .unwrap();
         assert_eq!(q.metric, Metric::Usage);
         assert_eq!(q.aggregation, Some(AggregationFunc::Sum));
         assert_eq!(q.group_by, vec!["model"]);
@@ -1109,7 +1160,9 @@ mod tests {
 
     #[test]
     fn test_sum_by_increase_with_model_filter() {
-        let q = parse(r#"sum by (model) (increase(toki_tokens_total{model="claude-opus-4-6"}[1h]))"#).unwrap();
+        let q =
+            parse(r#"sum by (model) (increase(toki_tokens_total{model="claude-opus-4-6"}[1h]))"#)
+                .unwrap();
         assert_eq!(q.group_by, vec!["model"]);
         assert_eq!(q.filter_value("model"), Some("claude-opus-4-6"));
         assert_eq!(q.bucket, Some(Bucket(3600)));
@@ -1123,7 +1176,10 @@ mod tests {
         assert_eq!(parse("usage[1d12h]").unwrap().bucket, Some(Bucket(129600)));
         assert_eq!(parse("usage[1h30s]").unwrap().bucket, Some(Bucket(3630)));
         assert_eq!(parse("usage[1w2d]").unwrap().bucket, Some(Bucket(777600)));
-        assert_eq!(parse("usage[1d6h30m]").unwrap().bucket, Some(Bucket(109800)));
+        assert_eq!(
+            parse("usage[1d6h30m]").unwrap().bucket,
+            Some(Bucket(109800))
+        );
     }
 
     #[test]

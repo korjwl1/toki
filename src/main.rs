@@ -1,18 +1,18 @@
 use std::io::BufRead;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-use clap::{Args, Parser, Subcommand};
 use chrono::{NaiveDateTime, Weekday};
 use chrono_tz::Tz;
-use toki::Config;
+use clap::{Args, Parser, Subcommand};
 use fs2::FileExt;
+use toki::Config;
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
@@ -63,6 +63,7 @@ enum WindowsCommands {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Daemon management: start/stop/status
     Daemon {
@@ -365,7 +366,10 @@ fn acquire_trace_lock(db_path: &std::path::Path) -> std::io::Result<std::fs::Fil
                 file.try_lock_exclusive()?;
                 Ok(file)
             } else {
-                Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "lock held by running daemon"))
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "lock held by running daemon",
+                ))
             }
         }
     }
@@ -384,7 +388,10 @@ fn parse_client_opts(opts: &ReportOptions) -> (Option<Tz>, bool, Option<&str>) {
         Some(name) => match name.parse::<Tz>() {
             Ok(tz) => Some(tz),
             Err(_) => {
-                eprintln!("[toki] Invalid --timezone: {} (use IANA name like Asia/Seoul)", name);
+                eprintln!(
+                    "[toki] Invalid --timezone: {} (use IANA name like Asia/Seoul)",
+                    name
+                );
                 std::process::exit(1);
             }
         },
@@ -406,7 +413,10 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Settings { db_path: _, command } => {
+        Commands::Settings {
+            db_path: _,
+            command,
+        } => {
             match command {
                 None => {
                     let restart_requested = toki::settings::run_settings();
@@ -415,7 +425,8 @@ fn main() {
                         let config = build_config(None, false, None);
                         stop_running_daemon(&config);
                         eprintln!("[toki] Starting daemon...");
-                        let toki_bin = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("toki"));
+                        let toki_bin =
+                            std::env::current_exe().unwrap_or_else(|_| PathBuf::from("toki"));
                         std::process::Command::new(toki_bin)
                             .args(["daemon", "start"])
                             .stdin(std::process::Stdio::null())
@@ -432,7 +443,12 @@ fn main() {
                         }
                     }
                 }
-                Some(SettingsCommands::Set { key, value, add, remove }) => {
+                Some(SettingsCommands::Set {
+                    key,
+                    value,
+                    add,
+                    remove,
+                }) => {
                     if key == "providers" {
                         handle_providers_set(add.as_deref(), remove.as_deref());
                     } else {
@@ -470,14 +486,33 @@ fn main() {
         }
         Commands::Windows { command } => {
             let config = build_config(None, false, None);
-            handle_windows(&config, command.unwrap_or(WindowsCommands::Status { fresh: false, json: false }));
+            handle_windows(
+                &config,
+                command.unwrap_or(WindowsCommands::Status {
+                    fresh: false,
+                    json: false,
+                }),
+            );
         }
-        Commands::Query { query, remote, timezone, start_of_week: cli_start_of_week, output_format: cli_fmt, start, end, step, no_cost: cli_no_cost } => {
+        Commands::Query {
+            query,
+            remote,
+            timezone,
+            start_of_week: cli_start_of_week,
+            output_format: cli_fmt,
+            start,
+            end,
+            step,
+            no_cost: cli_no_cost,
+        } => {
             let cli_tz: Option<Tz> = match timezone.as_deref() {
                 Some(name) => match name.parse::<Tz>() {
                     Ok(tz) => Some(tz),
                     Err(_) => {
-                        eprintln!("[toki] Invalid --timezone: {} (use IANA name like Asia/Seoul)", name);
+                        eprintln!(
+                            "[toki] Invalid --timezone: {} (use IANA name like Asia/Seoul)",
+                            name
+                        );
                         std::process::exit(1);
                     }
                 },
@@ -507,16 +542,21 @@ fn main() {
             // Resolve the effective week start: --start-of-week override, else the
             // config default. Only affects [1w] buckets; sent to both the local
             // daemon and the remote server so weekly boundaries match either way.
-            let sow = cli_start_of_week.as_deref()
+            let sow = cli_start_of_week
+                .as_deref()
                 .map(parse_weekday)
                 .unwrap_or(config.start_of_week);
             let sow_str = sow.to_string().to_lowercase();
 
             let pricing = if remote || config.no_cost {
-                None  // Remote: server handles pricing. no_cost: skip entirely.
+                None // Remote: server handles pricing. no_cost: skip entirely.
             } else {
                 let p = toki::pricing::fetch_pricing(&toki::pricing::default_cache_path());
-                if p.is_empty() { None } else { Some(p) }
+                if p.is_empty() {
+                    None
+                } else {
+                    Some(p)
+                }
             };
 
             let response = if remote {
@@ -539,7 +579,14 @@ fn main() {
                     eprintln!("[toki] Start the daemon first: toki daemon start");
                     std::process::exit(1);
                 }
-                send_report_query(&sock_path, &query, config.tz, start.as_deref(), end.as_deref(), &sow_str)
+                send_report_query(
+                    &sock_path,
+                    &query,
+                    config.tz,
+                    start.as_deref(),
+                    end.as_deref(),
+                    &sow_str,
+                )
             };
 
             match response {
@@ -558,7 +605,18 @@ fn main() {
                 }
             }
         }
-        Commands::Report { opts, start, end, since, until, group_by_session, session_id, project, provider, command } => {
+        Commands::Report {
+            opts,
+            start,
+            end,
+            since,
+            until,
+            group_by_session,
+            session_id,
+            project,
+            provider,
+            command,
+        } => {
             // --start/--end take priority over deprecated --since/--until
             let since = start.or(since);
             let until = end.or(until);
@@ -571,13 +629,27 @@ fn main() {
             if let Some(ref p) = provider {
                 if !toki::providers::KNOWN_PROVIDERS.contains(&p.as_str()) {
                     eprintln!("[toki] Unknown provider: {}", p);
-                    eprintln!("[toki] Known providers: {}", toki::providers::KNOWN_PROVIDERS.join(", "));
+                    eprintln!(
+                        "[toki] Known providers: {}",
+                        toki::providers::KNOWN_PROVIDERS.join(", ")
+                    );
                     std::process::exit(1);
                 }
             }
 
-            handle_report(since, until, group_by_session, session_id, project, provider, command,
-                          &config, &sink_specs, output_format, config.no_cost);
+            handle_report(
+                since,
+                until,
+                group_by_session,
+                session_id,
+                project,
+                provider,
+                command,
+                &config,
+                &sink_specs,
+                output_format,
+                config.no_cost,
+            );
         }
     }
 }
@@ -585,39 +657,68 @@ fn main() {
 // ── Settings (non-interactive) ──────────────────────────
 
 const VALID_SETTINGS: &[&str] = &[
-    "claude_code_root", "codex_root", "daemon_sock", "timezone", "output_format",
-    "start_of_week", "no_cost", "retention_days",
-    "window_tracking", "window_polling", "window_retention_days",
-    "providers", "daemon_autostart",
-    "sync_enabled", "sync_server", "sync_access_token", "sync_device_name",
-    "sync_tls", "sync_tls_insecure",
+    "claude_code_root",
+    "codex_root",
+    "daemon_sock",
+    "timezone",
+    "output_format",
+    "start_of_week",
+    "no_cost",
+    "retention_days",
+    "window_tracking",
+    "window_polling",
+    "window_retention_days",
+    "providers",
+    "daemon_autostart",
+    "sync_enabled",
+    "sync_server",
+    "sync_access_token",
+    "sync_device_name",
+    "sync_tls",
+    "sync_tls_insecure",
 ];
 
 /// Settings that require daemon restart to take effect.
 /// Hot-reloadable settings (sync_enabled, retention_days, etc.) are NOT listed here
 /// because the daemon picks them up automatically via the settings file watcher.
 const RESTART_SETTINGS: &[&str] = &[
-    "claude_code_root", "codex_root", "daemon_sock", "providers",
+    "claude_code_root",
+    "codex_root",
+    "daemon_sock",
+    "providers",
     // Passive window tracking is wired into the engine/writer at startup;
     // window_polling is hot-reloaded via the settings watcher.
-    "window_tracking", "window_retention_days",
+    "window_tracking",
+    "window_retention_days",
 ];
 
 /// Settings that are hot-reloadable by the daemon (no restart needed).
 const HOT_RELOAD_SETTINGS: &[&str] = &[
-    "sync_enabled", "sync_server", "sync_access_token", "sync_device_name",
-    "sync_tls", "sync_tls_insecure",
+    "sync_enabled",
+    "sync_server",
+    "sync_access_token",
+    "sync_device_name",
+    "sync_tls",
+    "sync_tls_insecure",
     "window_polling",
     "retention_days",
-    "timezone", "output_format", "start_of_week", "no_cost",
+    "timezone",
+    "output_format",
+    "start_of_week",
+    "no_cost",
 ];
 
 fn handle_settings_set(key: &str, value: &str) {
     // Boolean settings: reject values we would otherwise silently coerce.
     // `window_polling off` used to mean "keep polling".
     const BOOL_SETTINGS: &[&str] = &[
-        "window_tracking", "window_polling", "no_cost", "daemon_autostart",
-        "sync_enabled", "sync_tls", "sync_tls_insecure",
+        "window_tracking",
+        "window_polling",
+        "no_cost",
+        "daemon_autostart",
+        "sync_enabled",
+        "sync_tls",
+        "sync_tls_insecure",
     ];
     // Normalize on WRITE rather than teaching every reader the full vocabulary:
     // several readers (the TUI, sync toggles) compare against "true" verbatim,
@@ -631,7 +732,10 @@ fn handle_settings_set(key: &str, value: &str) {
                 canonical
             }
             None => {
-                eprintln!("[toki] '{}' expects a boolean (true/false, on/off, yes/no, 1/0), got '{}'", key, value);
+                eprintln!(
+                    "[toki] '{}' expects a boolean (true/false, on/off, yes/no, 1/0), got '{}'",
+                    key, value
+                );
                 std::process::exit(1);
             }
         }
@@ -650,7 +754,10 @@ fn handle_settings_set(key: &str, value: &str) {
     // `--timezone` flag and the settings TUI already validate; only this path
     // did not.
     if key == "timezone" && !value.is_empty() && value.parse::<chrono_tz::Tz>().is_err() {
-        eprintln!("[toki] Invalid timezone: {} (use an IANA name like Asia/Seoul)", value);
+        eprintln!(
+            "[toki] Invalid timezone: {} (use an IANA name like Asia/Seoul)",
+            value
+        );
         std::process::exit(1);
     }
 
@@ -676,7 +783,9 @@ fn handle_settings_set(key: &str, value: &str) {
             eprintln!("[toki] This setting requires daemon restart to take effect.");
             eprint!("[toki] Restart daemon now? [y/N]: ");
             let mut input = String::new();
-            if std::io::stdin().read_line(&mut input).is_ok() && input.trim().eq_ignore_ascii_case("y") {
+            if std::io::stdin().read_line(&mut input).is_ok()
+                && input.trim().eq_ignore_ascii_case("y")
+            {
                 let config = Config::new();
                 stop_running_daemon(&config);
                 RUNNING.store(true, Ordering::Relaxed);
@@ -714,20 +823,31 @@ fn handle_settings_get(key: &str) {
         let enabled = toki::config::get_providers();
         let config = Config::new();
         let all_providers = toki::providers::create_providers(
-            &toki::providers::KNOWN_PROVIDERS.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            &toki::providers::KNOWN_PROVIDERS
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
             &config,
         );
 
-        println!("{:<16} {:<16} {:<30} {}", "ID", "Name", "Root", "Status");
+        println!("{:<16} {:<16} {:<30} Status", "ID", "Name", "Root");
         println!("{}", "-".repeat(76));
         for provider in &all_providers {
-            let root = provider.root_dir().unwrap_or_else(|| "(not found)".to_string());
+            let root = provider
+                .root_dir()
+                .unwrap_or_else(|| "(not found)".to_string());
             let status = if enabled.contains(&provider.name().to_string()) {
                 "[enabled]"
             } else {
                 "[disabled]"
             };
-            println!("{:<16} {:<16} {:<30} {}", provider.name(), provider.display_name(), root, status);
+            println!(
+                "{:<16} {:<16} {:<30} {}",
+                provider.name(),
+                provider.display_name(),
+                root,
+                status
+            );
         }
         return;
     }
@@ -744,7 +864,10 @@ fn handle_settings_list() {
     let _ = Config::new();
     let settings = toki::config::list_settings();
     for key in VALID_SETTINGS {
-        let value = settings.get(*key).map(|s| s.as_str()).unwrap_or("(not set)");
+        let value = settings
+            .get(*key)
+            .map(|s| s.as_str())
+            .unwrap_or("(not set)");
         println!("{:>24} = {}", key, value);
     }
 }
@@ -755,8 +878,14 @@ fn stop_running_daemon(config: &Config) -> bool {
     let pidfile = toki::daemon::default_pidfile_path();
     let sock_path = &config.daemon_sock;
     match toki::daemon::stop_daemon(&pidfile, sock_path) {
-        Ok(true) => { println!("[toki] Daemon stopped."); true }
-        Ok(false) => { println!("[toki] Daemon is not running."); false }
+        Ok(true) => {
+            println!("[toki] Daemon stopped.");
+            true
+        }
+        Ok(false) => {
+            println!("[toki] Daemon is not running.");
+            false
+        }
         Err(e) => {
             eprintln!("[toki] Error stopping daemon: {}", e);
             std::process::exit(1);
@@ -769,7 +898,10 @@ fn report_supervised(res: Result<(), String>, action: &str) {
     match res {
         Ok(()) => println!("[toki] Daemon {} via the service supervisor.", action),
         Err(e) => {
-            eprintln!("[toki] Failed to {} daemon via the service supervisor: {}", action, e);
+            eprintln!(
+                "[toki] Failed to {} daemon via the service supervisor: {}",
+                action, e
+            );
             std::process::exit(1);
         }
     }
@@ -814,9 +946,7 @@ fn start_daemon_detached() {
         if toki::daemon::daemon_status(&pidfile).is_some()
             && std::path::Path::new(&sock_path).exists()
         {
-            let pid = toki::daemon::daemon_status(&pidfile)
-                .map(|p| p as u32)
-                .unwrap_or(child.id());
+            let pid = toki::daemon::daemon_status(&pidfile).unwrap_or(child.id());
             eprintln!("[toki] Daemon started (PID {})", pid);
             return;
         }
@@ -852,7 +982,10 @@ fn run_daemon_foreground(config: &Config) {
 
     eprintln!("[toki:daemon] Starting...");
     eprintln!("[toki:daemon] Providers: {:?}", config.providers);
-    eprintln!("[toki:daemon] Database dir: {}", config.db_base_dir.display());
+    eprintln!(
+        "[toki:daemon] Database dir: {}",
+        config.db_base_dir.display()
+    );
     eprintln!("[toki:daemon] Socket: {}", sock_path.display());
 
     let handle = match toki::start(config.clone(), Box::new(broadcast.clone())) {
@@ -882,14 +1015,22 @@ fn run_daemon_foreground(config: &Config) {
     let (listener_stop_tx, listener_stop_rx) = crossbeam_channel::bounded::<()>(1);
     let listener_sock = sock_path.clone();
     let listener_broadcast = broadcast.clone();
-    let listener_dbs: Vec<(String, Arc<toki::db::Database>)> = handle.dbs().into_iter()
+    let listener_dbs: Vec<(String, Arc<toki::db::Database>)> = handle
+        .dbs()
+        .into_iter()
         .map(|(name, db)| (name.to_string(), db.clone()))
         .collect();
     let listener_hub = handle.windows_hub();
     let listener_handle = std::thread::Builder::new()
         .name("toki-listener".to_string())
         .spawn(move || {
-            toki::daemon::run_listener(&listener_sock, listener_broadcast, listener_dbs, listener_stop_rx, listener_hub);
+            toki::daemon::run_listener(
+                &listener_sock,
+                listener_broadcast,
+                listener_dbs,
+                listener_stop_rx,
+                listener_hub,
+            );
         })
         .expect("Failed to spawn listener thread");
 
@@ -898,8 +1039,10 @@ fn run_daemon_foreground(config: &Config) {
         libc::signal(libc::SIGTERM, sighandler as *const () as libc::sighandler_t);
     }
 
-    eprintln!("[toki:daemon] Running (PID {}). Send SIGTERM or use 'toki daemon stop' to stop.",
-        std::process::id());
+    eprintln!(
+        "[toki:daemon] Running (PID {}). Send SIGTERM or use 'toki daemon stop' to stop.",
+        std::process::id()
+    );
 
     while RUNNING.load(Ordering::Relaxed) {
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -910,11 +1053,17 @@ fn run_daemon_foreground(config: &Config) {
     let t0 = std::time::Instant::now();
     let _ = listener_stop_tx.send(());
     let _ = listener_handle.join();
-    eprintln!("[toki:daemon] Listener stopped ({}ms)", t0.elapsed().as_millis());
+    eprintln!(
+        "[toki:daemon] Listener stopped ({}ms)",
+        t0.elapsed().as_millis()
+    );
 
     let t1 = std::time::Instant::now();
     handle.stop();
-    eprintln!("[toki:daemon] Engine + writers stopped ({}ms)", t1.elapsed().as_millis());
+    eprintln!(
+        "[toki:daemon] Engine + writers stopped ({}ms)",
+        t1.elapsed().as_millis()
+    );
 
     toki::daemon::remove_pidfile(&pidfile);
     let _ = std::fs::remove_file(&sock_path);
@@ -1001,36 +1150,35 @@ fn handle_daemon(command: DaemonCommands, config: &Config) {
             }
 
             if !deleted_any {
-                println!("[toki] No databases found in {}", config.db_base_dir.display());
+                println!(
+                    "[toki] No databases found in {}",
+                    config.db_base_dir.display()
+                );
             }
             println!("[toki] Reset complete. Start the daemon to rebuild: toki daemon start");
         }
 
-        DaemonCommands::Enable => {
-            match toki::platform::enable_autostart() {
-                Ok(()) => {
-                    let _ = toki::config::set_setting("daemon_autostart", "true");
-                    println!("[toki] Auto-start enabled. toki daemon will start on login.");
-                }
-                Err(e) => {
-                    eprintln!("[toki] Failed to enable auto-start: {}", e);
-                    std::process::exit(1);
-                }
+        DaemonCommands::Enable => match toki::platform::enable_autostart() {
+            Ok(()) => {
+                let _ = toki::config::set_setting("daemon_autostart", "true");
+                println!("[toki] Auto-start enabled. toki daemon will start on login.");
             }
-        }
+            Err(e) => {
+                eprintln!("[toki] Failed to enable auto-start: {}", e);
+                std::process::exit(1);
+            }
+        },
 
-        DaemonCommands::Disable => {
-            match toki::platform::disable_autostart() {
-                Ok(()) => {
-                    let _ = toki::config::set_setting("daemon_autostart", "false");
-                    println!("[toki] Auto-start disabled.");
-                }
-                Err(e) => {
-                    eprintln!("[toki] Failed to disable auto-start: {}", e);
-                    std::process::exit(1);
-                }
+        DaemonCommands::Disable => match toki::platform::disable_autostart() {
+            Ok(()) => {
+                let _ = toki::config::set_setting("daemon_autostart", "false");
+                println!("[toki] Auto-start disabled.");
             }
-        }
+            Err(e) => {
+                eprintln!("[toki] Failed to disable auto-start: {}", e);
+                std::process::exit(1);
+            }
+        },
     }
 }
 
@@ -1070,7 +1218,11 @@ fn windows_status(config: &toki::config::Config, fresh: bool, json: bool) {
         std::process::exit(1);
     }
     let mut line = String::new();
-    if std::io::BufReader::new(&stream).read_line(&mut line).is_err() || line.trim().is_empty() {
+    if std::io::BufReader::new(&stream)
+        .read_line(&mut line)
+        .is_err()
+        || line.trim().is_empty()
+    {
         eprintln!("[toki] No response from daemon");
         std::process::exit(1);
     }
@@ -1086,7 +1238,10 @@ fn windows_status(config: &toki::config::Config, fresh: bool, json: bool) {
         return;
     }
     if v.get("ok").and_then(|b| b.as_bool()) != Some(true) {
-        let err = v.get("error").and_then(|e| e.as_str()).unwrap_or("unknown error");
+        let err = v
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("unknown error");
         eprintln!("[toki] {}", err);
         std::process::exit(1);
     }
@@ -1105,7 +1260,12 @@ fn windows_status(config: &toki::config::Config, fresh: bool, json: bool) {
         let auth = e.get("auth_status").and_then(|a| a.as_str()).unwrap_or("?");
         let source = e.get("source").and_then(|a| a.as_str()).unwrap_or("?");
         let plan = e.get("plan").and_then(|a| a.as_str()).unwrap_or("");
-        print!("[toki] {} — auth {}, {}", display_provider(name), auth, source);
+        print!(
+            "[toki] {} — auth {}, {}",
+            display_provider(name),
+            auth,
+            source
+        );
         if !plan.is_empty() {
             print!(", plan {}", plan);
         }
@@ -1114,17 +1274,28 @@ fn windows_status(config: &toki::config::Config, fresh: bool, json: bool) {
             println!("       storage error: {}", err);
             continue;
         }
-        let rows = e.get("windows").and_then(|r| r.as_array()).cloned().unwrap_or_default();
+        let rows = e
+            .get("windows")
+            .and_then(|r| r.as_array())
+            .cloned()
+            .unwrap_or_default();
         // Only windows that have not reset yet: a finished one is history,
         // which is what `windows list` is for.
         let mut live: Vec<&serde_json::Value> = rows
             .iter()
             .filter(|w| {
                 w.get("finalized").and_then(|f| f.as_bool()) == Some(false)
-                    && w.get("raw_resets_at_ms").and_then(|r| r.as_i64()).unwrap_or(0) > now_ms
+                    && w.get("raw_resets_at_ms")
+                        .and_then(|r| r.as_i64())
+                        .unwrap_or(0)
+                        > now_ms
             })
             .collect();
-        live.sort_by_key(|w| w.get("window_minutes").and_then(|m| m.as_i64()).unwrap_or(0));
+        live.sort_by_key(|w| {
+            w.get("window_minutes")
+                .and_then(|m| m.as_i64())
+                .unwrap_or(0)
+        });
         if live.is_empty() {
             println!("       no active window (nothing used since the last reset)");
             continue;
@@ -1136,8 +1307,14 @@ fn windows_status(config: &toki::config::Config, fresh: bool, json: bool) {
                 .or_else(|| w.get("peak_pct"))
                 .and_then(|x| x.as_f64())
                 .unwrap_or(0.0);
-            let mins = w.get("window_minutes").and_then(|x| x.as_i64()).unwrap_or(0);
-            let reset = w.get("raw_resets_at_ms").and_then(|x| x.as_i64()).unwrap_or(0);
+            let mins = w
+                .get("window_minutes")
+                .and_then(|x| x.as_i64())
+                .unwrap_or(0);
+            let reset = w
+                .get("raw_resets_at_ms")
+                .and_then(|x| x.as_i64())
+                .unwrap_or(0);
             println!(
                 "       {:<16} {:>5.1}%  {}  resets in {}",
                 if id.is_empty() { "(unnamed)" } else { id },
@@ -1213,7 +1390,14 @@ fn windows_list(
     // Reuses the exact path `toki query windows` takes, so the range
     // semantics have one implementation rather than two.
     let sow_str = config.start_of_week.to_string().to_lowercase();
-    match send_report_query(&sock_path, "windows", config.tz, Some(&start), Some(&end), &sow_str) {
+    match send_report_query(
+        &sock_path,
+        "windows",
+        config.tz,
+        Some(&start),
+        Some(&end),
+        &sow_str,
+    ) {
         Ok(resp) => {
             if output_format == toki::sink::OutputFormat::Json {
                 emit_json_report(&resp, config, config.start_of_week, None);
@@ -1253,7 +1437,9 @@ fn handle_trace(config: &Config, sink_specs: &[String], no_cost: bool) {
     let sink = toki::sink::create_sinks(sink_specs, toki::sink::OutputFormat::Json);
 
     // BufReader + read_line — same approach as report
-    stream.set_read_timeout(Some(std::time::Duration::from_millis(200))).ok();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+        .ok();
     let mut reader = std::io::BufReader::new(stream);
 
     // Register SIGINT without SA_RESTART so read() returns EINTR immediately
@@ -1301,9 +1487,11 @@ fn handle_trace(config: &Config, sink_specs: &[String], no_cost: bool) {
                     }
                 }
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
-                || e.kind() == std::io::ErrorKind::TimedOut
-                || e.kind() == std::io::ErrorKind::Interrupted => {
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::Interrupted =>
+            {
                 continue;
             }
             Err(_) => {
@@ -1326,6 +1514,7 @@ fn print_update_hint() {
 
 // ── Report ──────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn handle_report(
     since: Option<String>,
     until: Option<String>,
@@ -1378,58 +1567,82 @@ fn handle_report(
     // Returns (query_str, start, end, start_of_week) — the last three are sent as
     // separate protocol fields. start_of_week reflects a weekly `--start-of-week`
     // override when present, else the config default; it only affects [1w] buckets.
-    let (query_str, req_start, req_end, req_sow): (String, Option<String>, Option<String>, chrono::Weekday) =
-        if let Some(cmd) = command {
-            // Time-grouped subcommands
-            let (filter_args, group_by) = match cmd {
-                ReportCommands::Hourly { filter } => (filter, toki::engine::ReportGroupBy::Hour),
-                ReportCommands::Daily { filter } => (filter, toki::engine::ReportGroupBy::Date),
-                ReportCommands::Weekly { start_of_week, filter } => {
-                    let start = start_of_week.as_deref()
-                        .map(parse_weekday)
-                        .unwrap_or(config.start_of_week);
-                    (filter, toki::engine::ReportGroupBy::Week { start_of_week: start })
-                }
-                ReportCommands::Monthly { filter } => (filter, toki::engine::ReportGroupBy::Month),
-                ReportCommands::Yearly { filter } => (filter, toki::engine::ReportGroupBy::Year),
-            };
-
-            let eff_since = filter_args.start.or(filter_args.since).or(since.clone());
-            let eff_until = filter_args.end.or(filter_args.until).or(until.clone());
-            let eff_session = filter_args.session_id.or(session_id.clone());
-            let eff_project = filter_args.project.or(project.clone());
-            let eff_provider = filter_args.provider.or(provider.clone());
-
-            if let Some(ref p) = eff_provider {
-                if !toki::providers::KNOWN_PROVIDERS.contains(&p.as_str()) {
-                    eprintln!("[toki] Unknown provider: {}", p);
-                    eprintln!("[toki] Known providers: {}", toki::providers::KNOWN_PROVIDERS.join(", "));
-                    std::process::exit(1);
-                }
+    let (query_str, req_start, req_end, req_sow): (
+        String,
+        Option<String>,
+        Option<String>,
+        chrono::Weekday,
+    ) = if let Some(cmd) = command {
+        // Time-grouped subcommands
+        let (filter_args, group_by) = match cmd {
+            ReportCommands::Hourly { filter } => (filter, toki::engine::ReportGroupBy::Hour),
+            ReportCommands::Daily { filter } => (filter, toki::engine::ReportGroupBy::Date),
+            ReportCommands::Weekly {
+                start_of_week,
+                filter,
+            } => {
+                let start = start_of_week
+                    .as_deref()
+                    .map(parse_weekday)
+                    .unwrap_or(config.start_of_week);
+                (
+                    filter,
+                    toki::engine::ReportGroupBy::Week {
+                        start_of_week: start,
+                    },
+                )
             }
-
-            // Capture the resolved week start (honours --start-of-week) before
-            // group_by is consumed; to_query_string_with_bucket drops it.
-            let sow = if let toki::engine::ReportGroupBy::Week { start_of_week } = &group_by {
-                *start_of_week
-            } else {
-                config.start_of_week
-            };
-            let q = build_query_from_flags(
-                eff_session.as_deref(), eff_project.as_deref(),
-                eff_provider.as_deref(),
-                &[], // group_by handled via bucket
-            ).to_query_string_with_bucket(group_by);
-            (q, eff_since, eff_until, sow)
-        } else {
-            // No subcommand — summary or session grouping
-            let q = build_query_from_flags(
-                session_id.as_deref(), project.as_deref(),
-                provider.as_deref(),
-                if group_by_session { &["session"][..] } else { &[] },
-            ).to_query_string();
-            (q, since.clone(), until.clone(), config.start_of_week)
+            ReportCommands::Monthly { filter } => (filter, toki::engine::ReportGroupBy::Month),
+            ReportCommands::Yearly { filter } => (filter, toki::engine::ReportGroupBy::Year),
         };
+
+        let eff_since = filter_args.start.or(filter_args.since).or(since.clone());
+        let eff_until = filter_args.end.or(filter_args.until).or(until.clone());
+        let eff_session = filter_args.session_id.or(session_id.clone());
+        let eff_project = filter_args.project.or(project.clone());
+        let eff_provider = filter_args.provider.or(provider.clone());
+
+        if let Some(ref p) = eff_provider {
+            if !toki::providers::KNOWN_PROVIDERS.contains(&p.as_str()) {
+                eprintln!("[toki] Unknown provider: {}", p);
+                eprintln!(
+                    "[toki] Known providers: {}",
+                    toki::providers::KNOWN_PROVIDERS.join(", ")
+                );
+                std::process::exit(1);
+            }
+        }
+
+        // Capture the resolved week start (honours --start-of-week) before
+        // group_by is consumed; to_query_string_with_bucket drops it.
+        let sow = if let toki::engine::ReportGroupBy::Week { start_of_week } = &group_by {
+            *start_of_week
+        } else {
+            config.start_of_week
+        };
+        let q = build_query_from_flags(
+            eff_session.as_deref(),
+            eff_project.as_deref(),
+            eff_provider.as_deref(),
+            &[], // group_by handled via bucket
+        )
+        .to_query_string_with_bucket(group_by);
+        (q, eff_since, eff_until, sow)
+    } else {
+        // No subcommand — summary or session grouping
+        let q = build_query_from_flags(
+            session_id.as_deref(),
+            project.as_deref(),
+            provider.as_deref(),
+            if group_by_session {
+                &["session"][..]
+            } else {
+                &[]
+            },
+        )
+        .to_query_string();
+        (q, since.clone(), until.clone(), config.start_of_week)
+    };
 
     // Validate the resolved bounds for BOTH arms. Living inside the
     // subcommand arm, this check let `toki report --start B --end A` through
@@ -1444,17 +1657,27 @@ fn handle_report(
         None
     } else {
         let p = toki::pricing::fetch_pricing(&toki::pricing::default_cache_path());
-        if p.is_empty() { None } else { Some(p) }
+        if p.is_empty() {
+            None
+        } else {
+            Some(p)
+        }
     };
 
     // Send query to local daemon via UDS
-    let response = send_report_query(&sock_path, &query_str, tz, req_start.as_deref(), req_end.as_deref(),
-        &req_sow.to_string().to_lowercase());
+    let response = send_report_query(
+        &sock_path,
+        &query_str,
+        tz,
+        req_start.as_deref(),
+        req_end.as_deref(),
+        &req_sow.to_string().to_lowercase(),
+    );
 
     match response {
         Ok(resp) => {
             if output_format == toki::sink::OutputFormat::Json {
-                emit_json_report(&resp, &config, req_sow, pricing.as_ref());
+                emit_json_report(&resp, config, req_sow, pricing.as_ref());
             } else {
                 for item in resp.data.as_array().unwrap_or(&vec![]) {
                     dispatch_result_to_sink(item, sink.as_ref(), pricing.as_ref());
@@ -1480,14 +1703,20 @@ fn emit_json_report(
     let items = resp.data.as_array().cloned().unwrap_or_default();
 
     // Detect type from first item (all items share the same type within a query)
-    let report_type = items.first()
+    let report_type = items
+        .first()
         .and_then(|item| item["type"].as_str())
         .unwrap_or("summary");
 
-    let now_secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let generated_at = chrono::DateTime::from_timestamp(now_secs as i64, 0)
-        .unwrap().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let information = build_report_information(report_type, resp, config, start_of_week, &generated_at);
+        .unwrap()
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let information =
+        build_report_information(report_type, resp, config, start_of_week, &generated_at);
 
     // Group items by provider (schema field)
     let mut provider_map: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
@@ -1506,7 +1735,10 @@ fn emit_json_report(
         "providers": provider_map,
     });
 
-    println!("{}", serde_json::to_string_pretty(&output).unwrap_or_default());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output).unwrap_or_default()
+    );
 }
 
 /// Build the JSON report `information` block. `start_of_week` is the EFFECTIVE
@@ -1520,10 +1752,16 @@ fn build_report_information(
     generated_at: &str,
 ) -> serde_json::Value {
     // Convert data range epoch ms to ISO 8601
-    let data_since = resp.meta.get("data_since").and_then(|v| v.as_i64())
+    let data_since = resp
+        .meta
+        .get("data_since")
+        .and_then(|v| v.as_i64())
         .and_then(|ms| chrono::DateTime::from_timestamp(ms / 1000, 0))
         .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
-    let data_until = resp.meta.get("data_until").and_then(|v| v.as_i64())
+    let data_until = resp
+        .meta
+        .get("data_until")
+        .and_then(|v| v.as_i64())
         .and_then(|ms| chrono::DateTime::from_timestamp(ms / 1000, 0))
         .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
 
@@ -1548,8 +1786,11 @@ fn reprocess_item_data(
 ) -> serde_json::Value {
     match item["type"].as_str() {
         Some("summary") => {
-            if let Ok(summaries_vec) = serde_json::from_value::<Vec<toki::ModelUsageSummary>>(item["data"].clone()) {
-                let data: Vec<serde_json::Value> = summaries_vec.iter()
+            if let Ok(summaries_vec) =
+                serde_json::from_value::<Vec<toki::ModelUsageSummary>>(item["data"].clone())
+            {
+                let data: Vec<serde_json::Value> = summaries_vec
+                    .iter()
                     .map(|s| toki::sink::json::summary_to_json(s, pricing, schema))
                     .collect();
                 serde_json::Value::Array(data)
@@ -1558,7 +1799,9 @@ fn reprocess_item_data(
             }
         }
         Some("events") => {
-            if let Ok(events) = serde_json::from_value::<Vec<toki::common::types::RawEvent>>(item["data"].clone()) {
+            if let Ok(events) =
+                serde_json::from_value::<Vec<toki::common::types::RawEvent>>(item["data"].clone())
+            {
                 let json = toki::sink::json::events_batch_to_json(&events, pricing, schema);
                 json["data"].clone()
             } else {
@@ -1572,19 +1815,30 @@ fn reprocess_item_data(
         Some(_) => {
             // Grouped data (daily, weekly, etc.)
             if let Some(data_arr) = item["data"].as_array() {
-                let mut grouped: std::collections::HashMap<String, std::collections::HashMap<String, toki::ModelUsageSummary>> =
-                    std::collections::HashMap::new();
+                let mut grouped: std::collections::HashMap<
+                    String,
+                    std::collections::HashMap<String, toki::ModelUsageSummary>,
+                > = std::collections::HashMap::new();
                 for entry in data_arr {
-                    let period = entry["period"].as_str()
+                    let period = entry["period"]
+                        .as_str()
                         .or_else(|| entry["session"].as_str())
-                        .unwrap_or("total").to_string();
-                    if let Ok(models) = serde_json::from_value::<Vec<toki::ModelUsageSummary>>(entry["usage_per_models"].clone()) {
+                        .unwrap_or("total")
+                        .to_string();
+                    if let Ok(models) = serde_json::from_value::<Vec<toki::ModelUsageSummary>>(
+                        entry["usage_per_models"].clone(),
+                    ) {
                         let map: std::collections::HashMap<String, toki::ModelUsageSummary> =
                             models.into_iter().map(|s| (s.model.clone(), s)).collect();
                         grouped.insert(period, map);
                     }
                 }
-                let json = toki::sink::json::grouped_to_json(&grouped, item["type"].as_str().unwrap_or(""), pricing, schema);
+                let json = toki::sink::json::grouped_to_json(
+                    &grouped,
+                    item["type"].as_str().unwrap_or(""),
+                    pricing,
+                    schema,
+                );
                 json["data"].clone()
             } else {
                 serde_json::Value::Array(vec![])
@@ -1625,17 +1879,22 @@ fn send_report_query(
     });
     let line = serde_json::to_string(&request).unwrap();
     writeln!(stream, "{}", line).map_err(|e| format!("Failed to send query: {}", e))?;
-    stream.flush().map_err(|e| format!("Failed to flush: {}", e))?;
+    stream
+        .flush()
+        .map_err(|e| format!("Failed to flush: {}", e))?;
 
     // Read response
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(60))).ok();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+        .ok();
     let mut reader = std::io::BufReader::new(stream);
     let mut response_line = String::new();
-    reader.read_line(&mut response_line)
+    reader
+        .read_line(&mut response_line)
         .map_err(|e| format!("Failed to read response: {}", e))?;
 
-    let resp: serde_json::Value = serde_json::from_str(&response_line)
-        .map_err(|e| format!("Invalid response: {}", e))?;
+    let resp: serde_json::Value =
+        serde_json::from_str(&response_line).map_err(|e| format!("Invalid response: {}", e))?;
 
     if resp["ok"].as_bool() == Some(true) {
         Ok(ReportResponse {
@@ -1643,7 +1902,10 @@ fn send_report_query(
             meta: resp["meta"].clone(),
         })
     } else {
-        Err(resp["error"].as_str().unwrap_or("Unknown error").to_string())
+        Err(resp["error"]
+            .as_str()
+            .unwrap_or("Unknown error")
+            .to_string())
     }
 }
 
@@ -1660,11 +1922,21 @@ fn remote_query_params<'a>(
     no_cost: bool,
 ) -> Vec<(&'a str, &'a str)> {
     let mut params = vec![("query", query), ("start_of_week", start_of_week)];
-    if let Some(s) = start { params.push(("start", s)); }
-    if let Some(e) = end { params.push(("end", e)); }
-    if let Some(st) = step { params.push(("step", st)); }
-    if let Some(tz) = timezone { params.push(("tz", tz)); }
-    if no_cost { params.push(("no_cost", "true")); }
+    if let Some(s) = start {
+        params.push(("start", s));
+    }
+    if let Some(e) = end {
+        params.push(("end", e));
+    }
+    if let Some(st) = step {
+        params.push(("step", st));
+    }
+    if let Some(tz) = timezone {
+        params.push(("tz", tz));
+    }
+    if no_cost {
+        params.push(("no_cost", "true"));
+    }
     params
 }
 
@@ -1726,8 +1998,10 @@ fn send_remote_query(
     timezone: Option<chrono_tz::Tz>,
     no_cost: bool,
 ) -> Result<ReportResponse, String> {
-    let creds = toki::sync::credentials::load()
-        .ok_or_else(|| "Not configured for remote query. Run: toki settings sync enable --server <host>".to_string())?;
+    let creds = toki::sync::credentials::load().ok_or_else(|| {
+        "Not configured for remote query. Run: toki settings sync enable --server <host>"
+            .to_string()
+    })?;
 
     // Send query as-is to server's toki query endpoint.
     // Server handles PromQL translation, time range, and pricing — same as local daemon.
@@ -1738,8 +2012,7 @@ fn send_remote_query(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0);
-    let (derived_start, derived_end) =
-        derived_remote_query_bounds(query, start, end, now_secs);
+    let (derived_start, derived_end) = derived_remote_query_bounds(query, start, end, now_secs);
     let timezone_name = timezone.map(|tz| tz.to_string());
     let resolved_step = resolved_remote_step(query, step);
     let params = remote_query_params(
@@ -1753,9 +2026,10 @@ fn send_remote_query(
     );
 
     let do_request = |token: &str| -> Result<ureq::Response, ureq::Error> {
-        let mut req = ureq::get(&url)
-            .set("Authorization", &format!("Bearer {}", token));
-        for (k, v) in &params { req = req.query(k, v); }
+        let mut req = ureq::get(&url).set("Authorization", &format!("Bearer {}", token));
+        for (k, v) in &params {
+            req = req.query(k, v);
+        }
         req.call()
     };
 
@@ -1768,36 +2042,55 @@ fn send_remote_query(
                 .send_json(serde_json::json!({ "refresh_token": creds.refresh_token }))
                 .map_err(|e| format!("Token refresh failed: {e}"))?;
 
-            let refresh_body: serde_json::Value = refresh_resp.into_json()
+            let refresh_body: serde_json::Value = refresh_resp
+                .into_json()
                 .map_err(|e| format!("Invalid refresh response: {e}"))?;
 
-            let new_access = refresh_body["access_token"].as_str().unwrap_or("").to_string();
-            let new_refresh = refresh_body["refresh_token"].as_str().unwrap_or("").to_string();
+            let new_access = refresh_body["access_token"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let new_refresh = refresh_body["refresh_token"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
 
             if new_access.is_empty() {
-                return Err("Token refresh did not return access_token. Re-enable sync.".to_string());
+                return Err(
+                    "Token refresh did not return access_token. Re-enable sync.".to_string()
+                );
             }
 
             // Save updated credentials
             let updated = toki::sync::credentials::Credentials {
                 access_token: new_access.clone(),
-                refresh_token: if new_refresh.is_empty() { creds.refresh_token } else { new_refresh },
+                refresh_token: if new_refresh.is_empty() {
+                    creds.refresh_token
+                } else {
+                    new_refresh
+                },
                 ..creds
             };
             let _ = toki::sync::credentials::save(&updated);
             let _ = toki::config::set_setting("sync_access_token", &new_access);
 
             // Retry with new token
-            do_request(&new_access).map_err(|e| format!("Remote query failed after refresh: {e}"))?
+            do_request(&new_access)
+                .map_err(|e| format!("Remote query failed after refresh: {e}"))?
         }
         Err(ureq::Error::Status(code, resp)) => {
             let body = resp.into_string().unwrap_or_default();
-            return Err(format!("Remote query failed (HTTP {}): {}", code, body.trim()));
+            return Err(format!(
+                "Remote query failed (HTTP {}): {}",
+                code,
+                body.trim()
+            ));
         }
         Err(e) => return Err(format!("Remote query error: {e}")),
     };
 
-    let body: serde_json::Value = resp.into_json()
+    let body: serde_json::Value = resp
+        .into_json()
         .map_err(|e| format!("Invalid remote query response: {e}"))?;
 
     // Windows metric: the server answers {"schema":1,"windows":{provider:[rows]}}
@@ -1806,11 +2099,13 @@ fn send_remote_query(
     if let Some(windows) = body.get("windows").and_then(|w| w.as_object()) {
         let items: Vec<serde_json::Value> = windows
             .iter()
-            .map(|(provider, rows)| serde_json::json!({
-                "type": "windows",
-                "schema": provider,
-                "data": rows,
-            }))
+            .map(|(provider, rows)| {
+                serde_json::json!({
+                    "type": "windows",
+                    "schema": provider,
+                    "data": rows,
+                })
+            })
             .collect();
         return Ok(ReportResponse {
             data: serde_json::Value::Array(items),
@@ -1924,12 +2219,13 @@ fn flatten_native_periods(rows: &serde_json::Value) -> serde_json::Value {
             Err(_) => continue,
         };
         for model in models {
-            let entry = summaries
-                .entry(model.model.clone())
-                .or_insert_with(|| toki::ModelUsageSummary {
-                    model: model.model.clone(),
-                    ..Default::default()
-                });
+            let entry =
+                summaries
+                    .entry(model.model.clone())
+                    .or_insert_with(|| toki::ModelUsageSummary {
+                        model: model.model.clone(),
+                        ..Default::default()
+                    });
             entry.input_tokens = entry.input_tokens.saturating_add(model.input_tokens);
             entry.output_tokens = entry.output_tokens.saturating_add(model.output_tokens);
             entry.cache_creation_input_tokens = entry
@@ -1979,27 +2275,43 @@ fn prometheus_response_to_toki_data(body: &serde_json::Value) -> serde_json::Val
 
         // Extract the numeric value: last element of `values` (matrix) or `value` (vector).
         let val: f64 = if result_type == "matrix" {
-            series["values"].as_array()
+            series["values"]
+                .as_array()
                 .and_then(|vals| vals.last())
                 .and_then(|pair| pair.get(1))
-                .and_then(|v| v.as_str().or_else(|| v.as_f64().map(|_| "")).and_then(|s| if s.is_empty() { v.as_f64() } else { s.parse::<f64>().ok() }))
+                .and_then(|v| {
+                    v.as_str().or_else(|| v.as_f64().map(|_| "")).and_then(|s| {
+                        if s.is_empty() {
+                            v.as_f64()
+                        } else {
+                            s.parse::<f64>().ok()
+                        }
+                    })
+                })
                 .unwrap_or(0.0)
         } else {
             // vector: value is [timestamp, "string_value"]
-            series["value"].get(1)
-                .and_then(|v| v.as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| v.as_f64()))
+            series["value"]
+                .get(1)
+                .and_then(|v| {
+                    v.as_str()
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .or_else(|| v.as_f64())
+                })
                 .unwrap_or(0.0)
         };
 
-        let entry = model_map.entry(model.clone()).or_insert_with(|| toki::ModelUsageSummary {
-            model,
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-            event_count: 0,
-            cost_usd: None,
-        });
+        let entry = model_map
+            .entry(model.clone())
+            .or_insert_with(|| toki::ModelUsageSummary {
+                model,
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                event_count: 0,
+                cost_usd: None,
+            });
 
         // Server-computed cost: use the last eval point value (covers the full window)
         if toki_metric == "cost" {
@@ -2011,20 +2323,29 @@ fn prometheus_response_to_toki_data(body: &serde_json::Value) -> serde_json::Val
         match type_label {
             "input" => entry.input_tokens = entry.input_tokens.saturating_add(count),
             "output" => entry.output_tokens = entry.output_tokens.saturating_add(count),
-            "cache_create" => entry.cache_creation_input_tokens = entry.cache_creation_input_tokens.saturating_add(count),
-            "cache_read" => entry.cache_read_input_tokens = entry.cache_read_input_tokens.saturating_add(count),
+            "cache_create" => {
+                entry.cache_creation_input_tokens =
+                    entry.cache_creation_input_tokens.saturating_add(count)
+            }
+            "cache_read" => {
+                entry.cache_read_input_tokens = entry.cache_read_input_tokens.saturating_add(count)
+            }
             "" => {
                 // No type label — pre-aggregated total (usage via toki_usage_total).
                 entry.input_tokens = entry.input_tokens.saturating_add(count);
             }
             other => {
-                eprintln!("[toki] Warning: unknown token type label '{}', counted as input", other);
+                eprintln!(
+                    "[toki] Warning: unknown token type label '{}', counted as input",
+                    other
+                );
                 entry.input_tokens = entry.input_tokens.saturating_add(count);
             }
         }
     }
 
-    let summaries: Vec<serde_json::Value> = model_map.values()
+    let summaries: Vec<serde_json::Value> = model_map
+        .values()
         .map(|s| serde_json::to_value(s).unwrap_or_default())
         .collect();
 
@@ -2039,14 +2360,17 @@ fn dispatch_result_to_sink(
     pricing: Option<&toki::pricing::PricingTable>,
 ) {
     // Detect schema from daemon response tag
-    let schema: Option<&dyn toki::common::schema::ProviderSchema> = item["schema"].as_str()
+    let schema: Option<&dyn toki::common::schema::ProviderSchema> = item["schema"]
+        .as_str()
         .map(toki::common::schema::schema_for_provider);
 
     match item["type"].as_str() {
         Some("windows") => {
             // Typed pass-through — the grouped catch-all below would look for
             // usage_per_models, find none, and silently print nothing.
-            if let Ok(rows) = serde_json::from_value::<Vec<toki::windows::WindowRow>>(item["data"].clone()) {
+            if let Ok(rows) =
+                serde_json::from_value::<Vec<toki::windows::WindowRow>>(item["data"].clone())
+            {
                 if rows.is_empty() {
                     return;
                 }
@@ -2064,20 +2388,28 @@ fn dispatch_result_to_sink(
         }
         Some("summary") => {
             // data is an array of model summaries → convert to HashMap
-            if let Ok(summaries_vec) = serde_json::from_value::<Vec<toki::ModelUsageSummary>>(item["data"].clone()) {
+            if let Ok(summaries_vec) =
+                serde_json::from_value::<Vec<toki::ModelUsageSummary>>(item["data"].clone())
+            {
                 let summaries: std::collections::HashMap<String, toki::ModelUsageSummary> =
-                    summaries_vec.into_iter().map(|s| (s.model.clone(), s)).collect();
+                    summaries_vec
+                        .into_iter()
+                        .map(|s| (s.model.clone(), s))
+                        .collect();
                 sink.emit_summary(&summaries, pricing, schema);
             }
         }
         Some("events") => {
-            if let Ok(events) = serde_json::from_value::<Vec<toki::common::types::RawEvent>>(item["data"].clone()) {
+            if let Ok(events) =
+                serde_json::from_value::<Vec<toki::common::types::RawEvent>>(item["data"].clone())
+            {
                 sink.emit_events_batch(&events, pricing, schema);
             }
         }
         Some(type_name) if type_name == "sessions" || type_name == "projects" => {
             if let Some(items) = item["items"].as_array() {
-                let strings: Vec<String> = items.iter()
+                let strings: Vec<String> = items
+                    .iter()
                     .filter_map(|v| v.as_str().map(|s| s.to_string()))
                     .collect();
                 // Show provider label if present
@@ -2093,14 +2425,20 @@ fn dispatch_result_to_sink(
         Some(type_name) => {
             // Grouped data: { data: [ { period: "...", usage_per_models: [...] } ] }
             if let Some(data_arr) = item["data"].as_array() {
-                let mut grouped: std::collections::HashMap<String, std::collections::HashMap<String, toki::ModelUsageSummary>> =
-                    std::collections::HashMap::new();
+                let mut grouped: std::collections::HashMap<
+                    String,
+                    std::collections::HashMap<String, toki::ModelUsageSummary>,
+                > = std::collections::HashMap::new();
                 for entry in data_arr {
-                    let period = entry["period"].as_str()
+                    let period = entry["period"]
+                        .as_str()
                         .or_else(|| entry["provider"].as_str())
                         .or_else(|| entry["session"].as_str())
-                        .unwrap_or("total").to_string();
-                    if let Ok(models) = serde_json::from_value::<Vec<toki::ModelUsageSummary>>(entry["usage_per_models"].clone()) {
+                        .unwrap_or("total")
+                        .to_string();
+                    if let Ok(models) = serde_json::from_value::<Vec<toki::ModelUsageSummary>>(
+                        entry["usage_per_models"].clone(),
+                    ) {
                         let map: std::collections::HashMap<String, toki::ModelUsageSummary> =
                             models.into_iter().map(|s| (s.model.clone(), s)).collect();
                         grouped.insert(period, map);
@@ -2120,13 +2458,21 @@ fn build_query_from_flags(
     provider: Option<&str>,
     group_by: &[&str],
 ) -> toki::query_parser::Query {
-    use toki::query_parser::{Query, Metric, LabelFilter};
+    use toki::query_parser::{LabelFilter, Metric, Query};
     let mut filters = Vec::new();
     if let Some(s) = session_id {
-        filters.push(LabelFilter { key: "session".into(), value: s.into(), regex: false });
+        filters.push(LabelFilter {
+            key: "session".into(),
+            value: s.into(),
+            regex: false,
+        });
     }
     if let Some(p) = project {
-        filters.push(LabelFilter { key: "project".into(), value: p.into(), regex: false });
+        filters.push(LabelFilter {
+            key: "project".into(),
+            value: p.into(),
+            regex: false,
+        });
     }
     Query {
         metric: Metric::Usage,
@@ -2147,7 +2493,10 @@ fn handle_providers_set(add: Option<&str>, remove: Option<&str>) {
             // --add
             if !toki::providers::KNOWN_PROVIDERS.contains(&name) {
                 eprintln!("[toki] Unknown provider: {}", name);
-                eprintln!("[toki] Known providers: {}", toki::providers::KNOWN_PROVIDERS.join(", "));
+                eprintln!(
+                    "[toki] Known providers: {}",
+                    toki::providers::KNOWN_PROVIDERS.join(", ")
+                );
                 std::process::exit(1);
             }
 
@@ -2199,7 +2548,10 @@ fn handle_providers_set(add: Option<&str>, remove: Option<&str>) {
             eprintln!("[toki] Usage: toki settings set providers --add <name>");
             eprintln!("[toki]        toki settings set providers --remove <name>");
             eprintln!("[toki] To view providers: toki settings get providers");
-            eprintln!("[toki] Known providers: {}", toki::providers::KNOWN_PROVIDERS.join(", "));
+            eprintln!(
+                "[toki] Known providers: {}",
+                toki::providers::KNOWN_PROVIDERS.join(", ")
+            );
             std::process::exit(1);
         }
 
@@ -2212,7 +2564,11 @@ fn handle_providers_set(add: Option<&str>, remove: Option<&str>) {
 
 // ── Helpers ─────────────────────────────────────────────
 
-fn parse_opt_range(value: &Option<String>, is_until: bool, tz: Option<chrono_tz::Tz>) -> Option<NaiveDateTime> {
+fn parse_opt_range(
+    value: &Option<String>,
+    is_until: bool,
+    tz: Option<chrono_tz::Tz>,
+) -> Option<NaiveDateTime> {
     value.as_deref().map(|v| {
         toki::query::parse_range_time(v, is_until, tz).unwrap_or_else(|e| {
             let label = if is_until { "--until" } else { "--since" };
@@ -2238,8 +2594,24 @@ fn handle_sync(command: SyncCommands) {
     toki::sync::credentials::check_file_permissions();
 
     match command {
-        SyncCommands::Enable { server, sync_port, http_port, headless, insecure, no_tls, device_name } => {
-            handle_sync_enable(server, sync_port, http_port, headless, insecure, no_tls, device_name);
+        SyncCommands::Enable {
+            server,
+            sync_port,
+            http_port,
+            headless,
+            insecure,
+            no_tls,
+            device_name,
+        } => {
+            handle_sync_enable(
+                server,
+                sync_port,
+                http_port,
+                headless,
+                insecure,
+                no_tls,
+                device_name,
+            );
         }
         SyncCommands::Disable { delete, keep } => {
             handle_sync_disable(delete, keep);
@@ -2308,7 +2680,9 @@ fn handle_sync_enable(
             .danger_accept_invalid_hostnames(true)
             .build()
             .expect("TLS connector");
-        ureq::AgentBuilder::new().tls_connector(std::sync::Arc::new(tls)).build()
+        ureq::AgentBuilder::new()
+            .tls_connector(std::sync::Arc::new(tls))
+            .build()
     } else {
         ureq::Agent::new()
     };
@@ -2325,7 +2699,10 @@ fn handle_sync_enable(
     let dc_body: serde_json::Value = dc_resp.into_json().unwrap_or_default();
     let device_code = dc_body["device_code"].as_str().unwrap_or("").to_string();
     let user_code = dc_body["user_code"].as_str().unwrap_or("").to_string();
-    let verification_url = dc_body["verification_url"].as_str().unwrap_or("").to_string();
+    let verification_url = dc_body["verification_url"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
     let poll_interval = dc_body["interval"].as_u64().unwrap_or(5);
     let expires_in = dc_body["expires_in"].as_u64().unwrap_or(300);
 
@@ -2335,20 +2712,31 @@ fn handle_sync_enable(
     }
 
     // Step 2: Try to open browser (append code to URL for auto-fill)
-    let browser_url_base = if verification_url.starts_with("http://") || verification_url.starts_with("https://") {
-        verification_url
-    } else {
-        // Relative path or empty — prepend http_base
-        let path = if verification_url.is_empty() { "/login" } else { &verification_url };
-        format!("{}{}", http_base, path)
-    };
+    let browser_url_base =
+        if verification_url.starts_with("http://") || verification_url.starts_with("https://") {
+            verification_url
+        } else {
+            // Relative path or empty — prepend http_base
+            let path = if verification_url.is_empty() {
+                "/login"
+            } else {
+                &verification_url
+            };
+            format!("{}{}", http_base, path)
+        };
     let browser_url = format!("{}?device={}", browser_url_base, user_code);
 
     if !headless {
         #[cfg(target_os = "macos")]
-        { let _ = std::process::Command::new("open").arg(&browser_url).spawn(); }
+        {
+            let _ = std::process::Command::new("open").arg(&browser_url).spawn();
+        }
         #[cfg(target_os = "linux")]
-        { let _ = std::process::Command::new("xdg-open").arg(&browser_url).spawn(); }
+        {
+            let _ = std::process::Command::new("xdg-open")
+                .arg(&browser_url)
+                .spawn();
+        }
     }
 
     // Step 3: Print instructions
@@ -2363,9 +2751,10 @@ fn handle_sync_enable(
     // Step 4: Poll POST /device/token every `poll_interval` seconds
     // Prepare device identity for registration during token exchange
     let device_key_for_poll = toki::config::device_id();
-    let device_name_for_poll = custom_device_name.clone()
+    let device_name_for_poll = custom_device_name
+        .clone()
         .or_else(|| toki::config::get_setting("sync_device_name").filter(|n| !n.is_empty()))
-        .unwrap_or_else(|| toki::sync::thread::SyncConfig::default_device_name());
+        .unwrap_or_else(toki::sync::thread::SyncConfig::default_device_name);
 
     let device_token_url = format!("{}/device/token", http_base);
     let timeout = std::time::Duration::from_secs(expires_in);
@@ -2373,19 +2762,22 @@ fn handle_sync_enable(
 
     let (access_token, refresh_token) = loop {
         if start.elapsed() > timeout {
-            eprintln!("[toki] Device authorization timed out ({} seconds). Please try again.", expires_in);
+            eprintln!(
+                "[toki] Device authorization timed out ({} seconds). Please try again.",
+                expires_in
+            );
             std::process::exit(1);
         }
 
         std::thread::sleep(std::time::Duration::from_secs(poll_interval));
 
-        let resp = match http_agent.post(&device_token_url)
+        let resp = match http_agent
+            .post(&device_token_url)
             .send_json(serde_json::json!({
                 "device_code": device_code,
                 "device_key": device_key_for_poll,
                 "device_name": device_name_for_poll,
-            }))
-        {
+            })) {
             Ok(r) => r,
             Err(ureq::Error::Status(400, resp)) => {
                 // RFC 8628: authorization_pending and slow_down come as HTTP 400
@@ -2463,7 +2855,7 @@ fn handle_sync_enable(
     // Save credentials
     let device_name = custom_device_name
         .or_else(|| toki::config::get_setting("sync_device_name").filter(|n| !n.is_empty()))
-        .unwrap_or_else(|| toki::sync::thread::SyncConfig::default_device_name());
+        .unwrap_or_else(toki::sync::thread::SyncConfig::default_device_name);
     let creds = toki::sync::credentials::Credentials {
         server_addr: server_addr.clone(),
         http_url: http_base.clone(),
@@ -2562,26 +2954,40 @@ fn try_refresh_and_call(
                 .send_json(serde_json::json!({ "refresh_token": creds.refresh_token }))
                 .map_err(|e| format!("Token refresh failed: {e}"))?;
 
-            let refresh_body: serde_json::Value = refresh_resp.into_json()
+            let refresh_body: serde_json::Value = refresh_resp
+                .into_json()
                 .map_err(|e| format!("Invalid refresh response: {e}"))?;
 
-            let new_access = refresh_body["access_token"].as_str().unwrap_or("").to_string();
-            let new_refresh = refresh_body["refresh_token"].as_str().unwrap_or("").to_string();
+            let new_access = refresh_body["access_token"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let new_refresh = refresh_body["refresh_token"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
 
             if new_access.is_empty() {
-                return Err("Token refresh did not return access_token. Re-enable sync.".to_string());
+                return Err(
+                    "Token refresh did not return access_token. Re-enable sync.".to_string()
+                );
             }
 
             // Save updated credentials
             let updated = toki::sync::credentials::Credentials {
                 access_token: new_access.clone(),
-                refresh_token: if new_refresh.is_empty() { creds.refresh_token.clone() } else { new_refresh },
+                refresh_token: if new_refresh.is_empty() {
+                    creds.refresh_token.clone()
+                } else {
+                    new_refresh
+                },
                 ..creds.clone()
             };
             let _ = toki::sync::credentials::save(&updated);
             let _ = toki::config::set_setting("sync_access_token", &new_access);
 
-            make_request(&new_access).map_err(|e| format!("Request failed after token refresh: {e}"))
+            make_request(&new_access)
+                .map_err(|e| format!("Request failed after token refresh: {e}"))
         }
         Err(e) => Err(format!("Request failed: {e}")),
     }
@@ -2624,9 +3030,12 @@ fn delete_remote_device(
     };
 
     // Find device_id matching our device_key
-    let device_id = body["devices"].as_array()
+    let device_id = body["devices"]
+        .as_array()
         .and_then(|devices| {
-            devices.iter().find(|d| d["device_key"].as_str() == Some(device_key))
+            devices
+                .iter()
+                .find(|d| d["device_key"].as_str() == Some(device_key))
         })
         .and_then(|d| d["id"].as_str())
         .map(|s| s.to_string());
@@ -2651,16 +3060,20 @@ fn delete_remote_device(
 
 fn handle_sync_status() {
     let enabled = toki::config::get_setting("sync_enabled")
-        .map(|v| v == "true").unwrap_or(false);
-    let server = toki::config::get_setting("sync_server").unwrap_or_else(|| "(not set)".to_string());
-    let device = toki::config::get_setting("sync_device_name").unwrap_or_else(|| "(not set)".to_string());
+        .map(|v| v == "true")
+        .unwrap_or(false);
+    let server =
+        toki::config::get_setting("sync_server").unwrap_or_else(|| "(not set)".to_string());
+    let device =
+        toki::config::get_setting("sync_device_name").unwrap_or_else(|| "(not set)".to_string());
     println!("Sync status:");
     println!("  enabled:    {}", if enabled { "yes" } else { "no" });
     println!("  server:     {}", server);
     println!("  device:     {}", device);
 
     // Show sync health status
-    let status = toki::config::get_sync_state("sync_status").unwrap_or_else(|| "(unknown)".to_string());
+    let status =
+        toki::config::get_sync_state("sync_status").unwrap_or_else(|| "(unknown)".to_string());
     let status_display = match status.as_str() {
         "connected" => "connected".to_string(),
         "disconnected" => "disconnected".to_string(),
@@ -2671,8 +3084,8 @@ fn handle_sync_status() {
     println!("  status:     {}", status_display);
 
     // Show last successful sync time
-    if let Some(last_success) = toki::config::get_sync_state("sync_last_success")
-        .and_then(|s| s.parse::<i64>().ok())
+    if let Some(last_success) =
+        toki::config::get_sync_state("sync_last_success").and_then(|s| s.parse::<i64>().ok())
     {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2729,7 +3142,8 @@ fn handle_sync_status() {
     for &provider in toki::providers::KNOWN_PROVIDERS {
         let key = format!("sync_last_ts_{}", provider);
         let last_ts: i64 = toki::config::get_sync_state(&key)
-            .and_then(|s| s.parse().ok()).unwrap_or(0);
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
         if last_ts > 0 {
             let last_dt = chrono::DateTime::from_timestamp_millis(last_ts)
                 .map(|dt| dt.format("%Y-%m-%d %H:%M:%S UTC").to_string())
@@ -2744,7 +3158,10 @@ fn handle_sync_status() {
 
     // Check if credentials are present
     let has_creds = toki::sync::credentials::load().is_some();
-    println!("  credentials: {}", if has_creds { "stored" } else { "not found" });
+    println!(
+        "  credentials: {}",
+        if has_creds { "stored" } else { "not found" }
+    );
 }
 
 fn handle_sync_rename(name: &str) {
@@ -2810,12 +3227,13 @@ fn handle_sync_devices() {
         return;
     }
 
-    println!("{:<36}  {:<24}  {}", "Device ID", "Name", "Last Seen");
+    println!("{:<36}  {:<24}  Last Seen", "Device ID", "Name");
     println!("{}", "-".repeat(80));
     for d in &devices {
-        let id        = d["id"].as_str().unwrap_or("-");
-        let name      = d["name"].as_str().unwrap_or("-");
-        let last_seen = d["last_seen_at"].as_i64()
+        let id = d["id"].as_str().unwrap_or("-");
+        let name = d["name"].as_str().unwrap_or("-");
+        let last_seen = d["last_seen_at"]
+            .as_i64()
             .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
             .map(|dt| dt.format("%Y-%m-%d %H:%M UTC").to_string())
             .unwrap_or_else(|| "-".to_string());
@@ -2853,8 +3271,12 @@ fn handle_sync_remove(device_id: &str) {
 
 fn parse_weekday(s: &str) -> Weekday {
     match s {
-        "mon" => Weekday::Mon, "tue" => Weekday::Tue, "wed" => Weekday::Wed,
-        "thu" => Weekday::Thu, "fri" => Weekday::Fri, "sat" => Weekday::Sat,
+        "mon" => Weekday::Mon,
+        "tue" => Weekday::Tue,
+        "wed" => Weekday::Wed,
+        "thu" => Weekday::Thu,
+        "fri" => Weekday::Fri,
+        "sat" => Weekday::Sat,
         "sun" => Weekday::Sun,
         _ => {
             eprintln!("[toki] Invalid start-of-week (use mon|tue|wed|thu|fri|sat|sun)");
@@ -2922,9 +3344,18 @@ mod tests {
         // week collapsed remotely into a single bucket carrying a date that
         // held no data, while the same query locally produced one bucket per
         // day. Same question, two answers.
-        assert_eq!(resolved_remote_step("usage[1d]", None).as_deref(), Some("86400s"));
-        assert_eq!(resolved_remote_step("usage[1w]", None).as_deref(), Some("604800s"));
-        assert_eq!(resolved_remote_step("usage[24h]", None).as_deref(), Some("86400s"));
+        assert_eq!(
+            resolved_remote_step("usage[1d]", None).as_deref(),
+            Some("86400s")
+        );
+        assert_eq!(
+            resolved_remote_step("usage[1w]", None).as_deref(),
+            Some("604800s")
+        );
+        assert_eq!(
+            resolved_remote_step("usage[24h]", None).as_deref(),
+            Some("86400s")
+        );
 
         // An explicit --step wins over the selector.
         assert_eq!(
@@ -2954,7 +3385,8 @@ mod tests {
 
     #[test]
     fn remote_bucket_derives_a_rolling_server_scan_range() {
-        let (start, end) = derived_remote_query_bounds("usage[24h] by (model)", None, None, 2_000_000);
+        let (start, end) =
+            derived_remote_query_bounds("usage[24h] by (model)", None, None, 2_000_000);
         assert_eq!(start.as_deref(), Some("1913600"));
         assert_eq!(end.as_deref(), Some("2000000"));
 
@@ -3068,12 +3500,25 @@ mod tests {
         // Config defaults to Monday, but the query resolved Sunday via
         // --start-of-week. The JSON metadata must report the effective value so it
         // matches the weekly buckets actually produced, not the config default.
-        let config = Config { start_of_week: chrono::Weekday::Mon, tz: None, ..Default::default() };
+        let config = Config {
+            start_of_week: chrono::Weekday::Mon,
+            tz: None,
+            ..Default::default()
+        };
         let resp = ReportResponse {
             data: serde_json::json!([]),
             meta: serde_json::json!({ "since": "20240101", "until": "20240108" }),
         };
-        let info = build_report_information("summary", &resp, &config, chrono::Weekday::Sun, "2024-01-01T00:00:00Z");
-        assert_eq!(info["start_of_week"], "sun", "must reflect the effective override, not the config default");
+        let info = build_report_information(
+            "summary",
+            &resp,
+            &config,
+            chrono::Weekday::Sun,
+            "2024-01-01T00:00:00Z",
+        );
+        assert_eq!(
+            info["start_of_week"], "sun",
+            "must reflect the effective override, not the config default"
+        );
     }
 }

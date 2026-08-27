@@ -57,8 +57,8 @@ pub struct Database {
 /// - v2: added idx_msg keyspace for msg_id dedup (streaming snapshot handling)
 /// - v3: added message_id to event key, changed dedup to bare_msg_id
 /// - v4: Codex event_key now leads with a per-event hash so bare_msg_id dedup no
-///       longer collapses Codex events to one (issue #11). Bump forces a one-time
-///       rescan that re-aggregates the full (previously dropped) Codex history.
+///   longer collapses Codex events to one (issue #11). Bump forces a one-time
+///   rescan that re-aggregates the full (previously dropped) Codex history.
 pub const SCHEMA_VERSION: u32 = 4;
 
 /// Layout version for the window database.
@@ -82,7 +82,10 @@ pub fn windows_db_path(event_db_path: &Path) -> PathBuf {
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "toki".to_string());
-    let parent = event_db_path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let parent = event_db_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
     parent.join(format!("{name}.windows.fjall"))
 }
 
@@ -116,22 +119,27 @@ impl Database {
                             }
                         }
                         if !orphaned_windows.is_empty() {
-                            eprintln!("[toki] moving {} window rows out of the event database",
-                                orphaned_windows.len());
+                            eprintln!(
+                                "[toki] moving {} window rows out of the event database",
+                                orphaned_windows.len()
+                            );
                         }
                     }
                 }
 
                 if let Ok(meta) = db.keyspace("meta", opts) {
-                    let stored_version = meta.get("schema_version")
+                    let stored_version = meta
+                        .get("schema_version")
                         .ok()
                         .flatten()
                         .and_then(|b| String::from_utf8_lossy(&b).parse::<u32>().ok())
                         .unwrap_or(0);
 
                     if stored_version != SCHEMA_VERSION {
-                        eprintln!("[toki] Schema version changed ({} → {}), resetting database...",
-                            stored_version, SCHEMA_VERSION);
+                        eprintln!(
+                            "[toki] Schema version changed ({} → {}), resetting database...",
+                            stored_version, SCHEMA_VERSION
+                        );
                         drop(meta);
                         drop(db);
                         std::fs::remove_dir_all(path).ok();
@@ -142,8 +150,7 @@ impl Database {
             }
         }
 
-        let db = FjallDatabase::builder(path)
-            .open()?;
+        let db = FjallDatabase::builder(path).open()?;
 
         let opts = || KeyspaceCreateOptions::default();
         let checkpoints = db.keyspace("checkpoints", opts)?;
@@ -197,7 +204,15 @@ impl Database {
         meta.insert("schema_version", SCHEMA_VERSION.to_string().as_bytes())?;
 
         Ok(Database {
-            db, checkpoints, meta, events, idx_sessions, idx_projects, dict, idx_msg, windows,
+            db,
+            checkpoints,
+            meta,
+            events,
+            idx_sessions,
+            idx_projects,
+            dict,
+            idx_msg,
+            windows,
             _windows_db: windows_db,
             windows_writable,
             window_writes: std::sync::atomic::AtomicU64::new(0),
@@ -289,7 +304,12 @@ impl Database {
         key
     }
 
-    pub fn insert_event(&self, ts_ms: i64, message_id: &str, event: &StoredEvent) -> Result<(), fjall::Error> {
+    pub fn insert_event(
+        &self,
+        ts_ms: i64,
+        message_id: &str,
+        event: &StoredEvent,
+    ) -> Result<(), fjall::Error> {
         let key = Self::event_key(ts_ms, message_id);
         let value = bincode::serialize(event).expect("StoredEvent serialization failed");
         self.events.insert(key, value)?;
@@ -297,7 +317,13 @@ impl Database {
     }
 
     /// Insert a batch of events in a single transaction.
-    pub fn insert_event_batch(&self, batch: &mut fjall::OwnedWriteBatch, ts_ms: i64, message_id: &str, event: &StoredEvent) {
+    pub fn insert_event_batch(
+        &self,
+        batch: &mut fjall::OwnedWriteBatch,
+        ts_ms: i64,
+        message_id: &str,
+        event: &StoredEvent,
+    ) {
         let key = Self::event_key(ts_ms, message_id);
         let value = bincode::serialize(event).expect("StoredEvent serialization failed");
         batch.insert(&self.events, key, value);
@@ -324,17 +350,28 @@ impl Database {
         let value = bincode::serialize(event).expect("StoredEvent serialization failed");
 
         // Check if previous event exists for this msg_id
-        let prev = self.idx_msg.get(bare_id.as_bytes()).ok().flatten().and_then(|prev_key| {
-            // prev_key = [ts_ms(8)][event_key]
-            if prev_key.len() < 8 { return None; }
-            let prev_ts = i64::from_be_bytes(prev_key[..8].try_into().ok()?);
-            // Read previous event value
-            let prev_event = self.events.get(&prev_key).ok().flatten()
-                .and_then(|v| bincode::deserialize::<StoredEvent>(&v).ok())?;
-            // Delete previous event
-            batch.remove(&self.events, prev_key.to_vec());
-            Some((prev_ts, prev_event))
-        });
+        let prev = self
+            .idx_msg
+            .get(bare_id.as_bytes())
+            .ok()
+            .flatten()
+            .and_then(|prev_key| {
+                // prev_key = [ts_ms(8)][event_key]
+                if prev_key.len() < 8 {
+                    return None;
+                }
+                let prev_ts = i64::from_be_bytes(prev_key[..8].try_into().ok()?);
+                // Read previous event value
+                let prev_event = self
+                    .events
+                    .get(&prev_key)
+                    .ok()
+                    .flatten()
+                    .and_then(|v| bincode::deserialize::<StoredEvent>(&v).ok())?;
+                // Delete previous event
+                batch.remove(&self.events, prev_key.to_vec());
+                Some((prev_ts, prev_event))
+            });
 
         // Insert new event + update msg index
         batch.insert(&self.events, new_key.clone(), value);
@@ -351,13 +388,15 @@ impl Database {
     /// Window rows written so far. Monotonic; if it has not moved since the
     /// last upload, the stored set cannot have changed.
     pub fn window_writes(&self) -> u64 {
-        self.window_writes.load(std::sync::atomic::Ordering::Relaxed)
+        self.window_writes
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Failed window writes so far. Monotonic; compare two reads to learn
     /// whether anything was lost in between.
     pub fn window_write_errors(&self) -> u64 {
-        self.window_write_errors.load(std::sync::atomic::Ordering::Relaxed)
+        self.window_write_errors
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn note_window_write_error(&self) {
@@ -490,7 +529,13 @@ impl Database {
     // -- Index operations --
 
     /// Insert session index entry: key = "{session_id}\0[ts:8][msg_id]", value = empty
-    pub fn insert_session_index(&self, batch: &mut fjall::OwnedWriteBatch, session_id: &str, ts_ms: i64, message_id: &str) {
+    pub fn insert_session_index(
+        &self,
+        batch: &mut fjall::OwnedWriteBatch,
+        session_id: &str,
+        ts_ms: i64,
+        message_id: &str,
+    ) {
         let mut key = Vec::with_capacity(session_id.len() + 1 + 8 + message_id.len());
         key.extend_from_slice(session_id.as_bytes());
         key.push(0);
@@ -500,7 +545,13 @@ impl Database {
     }
 
     /// Insert project index entry: key = "{project}\0[ts:8][msg_id]", value = empty
-    pub fn insert_project_index(&self, batch: &mut fjall::OwnedWriteBatch, project: &str, ts_ms: i64, message_id: &str) {
+    pub fn insert_project_index(
+        &self,
+        batch: &mut fjall::OwnedWriteBatch,
+        project: &str,
+        ts_ms: i64,
+        message_id: &str,
+    ) {
         let mut key = Vec::with_capacity(project.len() + 1 + 8 + message_id.len());
         key.extend_from_slice(project.as_bytes());
         key.push(0);
@@ -591,7 +642,12 @@ impl Database {
     /// Query events in a timestamp range [since_ms, until_ms], returning at most `limit` results.
     /// Query events starting after the given composite key (ts_ms + msg_id).
     /// This avoids the +1ms gap that skips same-timestamp events.
-    pub fn query_events_after_key(&self, after_key: &[u8], until_ms: i64, limit: usize) -> Result<Vec<(i64, String, StoredEvent)>, fjall::Error> {
+    pub fn query_events_after_key(
+        &self,
+        after_key: &[u8],
+        until_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<(i64, String, StoredEvent)>, fjall::Error> {
         let mut results = Vec::new();
         // Start scan from the key AFTER the given one
         let mut started = false;
@@ -606,36 +662,51 @@ impl Database {
                 }
                 started = true;
             }
-            if key.len() < 8 { continue; }
+            if key.len() < 8 {
+                continue;
+            }
             let ts_bytes: [u8; 8] = match key[..8].try_into() {
                 Ok(b) => b,
                 Err(_) => continue,
             };
             let ts = i64::from_be_bytes(ts_bytes);
-            if ts > until_ms { break; }
+            if ts > until_ms {
+                break;
+            }
             let msg_id = String::from_utf8_lossy(&key[8..]).into_owned();
             if let Ok(event) = bincode::deserialize::<StoredEvent>(&kv.1) {
                 results.push((ts, msg_id, event));
-                if results.len() >= limit { break; }
+                if results.len() >= limit {
+                    break;
+                }
             }
         }
         Ok(results)
     }
 
-    pub fn query_events_range_limit(&self, since_ms: i64, until_ms: i64, limit: usize) -> Result<Vec<(i64, String, StoredEvent)>, fjall::Error> {
+    pub fn query_events_range_limit(
+        &self,
+        since_ms: i64,
+        until_ms: i64,
+        limit: usize,
+    ) -> Result<Vec<(i64, String, StoredEvent)>, fjall::Error> {
         let start_key = since_ms.to_be_bytes().to_vec();
 
         let mut results = Vec::new();
         for guard in self.events.range(start_key..).take(limit) {
             let kv = guard.into_inner()?;
             let key = &kv.0;
-            if key.len() < 8 { continue; }
+            if key.len() < 8 {
+                continue;
+            }
             let ts_bytes: [u8; 8] = match key[..8].try_into() {
                 Ok(b) => b,
                 Err(_) => continue,
             };
             let ts = i64::from_be_bytes(ts_bytes);
-            if ts > until_ms { break; }
+            if ts > until_ms {
+                break;
+            }
             let msg_id = String::from_utf8_lossy(&key[8..]).into_owned();
             if let Ok(event) = bincode::deserialize::<StoredEvent>(&kv.1) {
                 results.push((ts, msg_id, event));
@@ -645,20 +716,28 @@ impl Database {
     }
 
     /// Query events in a timestamp range [since_ms, until_ms].
-    pub fn query_events_range(&self, since_ms: i64, until_ms: i64) -> Result<Vec<(i64, String, StoredEvent)>, fjall::Error> {
+    pub fn query_events_range(
+        &self,
+        since_ms: i64,
+        until_ms: i64,
+    ) -> Result<Vec<(i64, String, StoredEvent)>, fjall::Error> {
         let start_key = since_ms.to_be_bytes().to_vec();
 
         let mut results = Vec::new();
         for guard in self.events.range(start_key..) {
             let kv = guard.into_inner()?;
             let key = &kv.0;
-            if key.len() < 8 { continue; }
+            if key.len() < 8 {
+                continue;
+            }
             let ts_bytes: [u8; 8] = match key[..8].try_into() {
                 Ok(b) => b,
                 Err(_) => continue,
             };
             let ts = i64::from_be_bytes(ts_bytes);
-            if ts > until_ms { break; }
+            if ts > until_ms {
+                break;
+            }
             let msg_id = String::from_utf8_lossy(&key[8..]).into_owned();
             if let Ok(event) = bincode::deserialize::<StoredEvent>(&kv.1) {
                 results.push((ts, msg_id, event));
@@ -668,7 +747,12 @@ impl Database {
     }
 
     /// Iterate events in [since_ms, until_ms] range, calling `f` for each.
-    pub fn for_each_event<F>(&self, since_ms: i64, until_ms: i64, mut f: F) -> Result<(), fjall::Error>
+    pub fn for_each_event<F>(
+        &self,
+        since_ms: i64,
+        until_ms: i64,
+        mut f: F,
+    ) -> Result<(), fjall::Error>
     where
         F: FnMut(i64, StoredEvent),
     {
@@ -676,13 +760,17 @@ impl Database {
         for guard in self.events.range(start_key..) {
             let kv = guard.into_inner()?;
             let key = &kv.0;
-            if key.len() < 8 { continue; }
+            if key.len() < 8 {
+                continue;
+            }
             let ts_bytes: [u8; 8] = match key[..8].try_into() {
                 Ok(b) => b,
                 Err(_) => continue,
             };
             let ts = i64::from_be_bytes(ts_bytes);
-            if ts > until_ms { break; }
+            if ts > until_ms {
+                break;
+            }
             if let Ok(event) = bincode::deserialize::<StoredEvent>(&kv.1) {
                 f(ts, event);
             }
@@ -696,7 +784,9 @@ impl Database {
         let extract_ts = |guard: fjall::Guard| -> Option<i64> {
             let kv = guard.into_inner().ok()?;
             let key = &kv.0;
-            if key.len() < 8 { return None; }
+            if key.len() < 8 {
+                return None;
+            }
             Some(i64::from_be_bytes(key[..8].try_into().ok()?))
         };
 
@@ -756,7 +846,8 @@ impl Database {
                 if let Some(null_pos) = key.iter().position(|&b| b == 0) {
                     let ts_start = null_pos + 1;
                     if key.len() >= ts_start + 8 {
-                        let ts = i64::from_be_bytes(key[ts_start..ts_start + 8].try_into().unwrap());
+                        let ts =
+                            i64::from_be_bytes(key[ts_start..ts_start + 8].try_into().unwrap());
                         if ts < cutoff_ms {
                             keys_to_delete.push(key.to_vec());
                         }
@@ -809,7 +900,10 @@ impl Database {
     ///
     /// New IDs are never reused (the writer only ever increments its counter), so
     /// a later re-appearance of a removed string is safely assigned a fresh id.
-    pub fn gc_dict(&self, live_ids: &std::collections::HashSet<u32>) -> Result<Vec<String>, fjall::Error> {
+    pub fn gc_dict(
+        &self,
+        live_ids: &std::collections::HashSet<u32>,
+    ) -> Result<Vec<String>, fjall::Error> {
         let mut to_remove: Vec<(Vec<u8>, String)> = Vec::new();
         for guard in self.dict.iter() {
             let kv = guard.into_inner()?;
@@ -928,7 +1022,8 @@ mod tests {
         // The last representable millisecond of the end date.
         db.insert_event(until_ms, "last-ms", &ev(1)).unwrap();
         // The first millisecond of the following day.
-        db.insert_event(until_ms + 1, "next-midnight", &ev(2)).unwrap();
+        db.insert_event(until_ms + 1, "next-midnight", &ev(2))
+            .unwrap();
 
         let mut seen = Vec::new();
         db.for_each_event(day_start_ms, until_ms, |ts, e| {
@@ -978,7 +1073,8 @@ mod tests {
         db.upsert_window_merge(&key, &later).unwrap();
 
         let mut rows = Vec::new();
-        db.for_each_window(|k, v| rows.push((k.to_vec(), v))).unwrap();
+        db.for_each_window(|k, v| rows.push((k.to_vec(), v)))
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].1.peak_pct_x100, 4000); // max survived
         assert!(rows[0].1.finalized); // OR merged
@@ -1161,9 +1257,14 @@ mod tests {
         let (db, _dir) = temp_db();
 
         let event = StoredEvent {
-            model_id: 1, session_id: 1, source_file_id: 1, project_name_id: 0,
-            input_tokens: 10, output_tokens: 5,
-            cache_creation_input_tokens: 0, cache_read_input_tokens: 0,
+            model_id: 1,
+            session_id: 1,
+            source_file_id: 1,
+            project_name_id: 0,
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
         };
         db.insert_event(1000, "a", &event).unwrap();
         db.insert_event(2000, "b", &event).unwrap();
@@ -1214,12 +1315,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("claude_code.fjall");
         let db = Database::open(&path).unwrap();
-        db.upsert_window_merge(&a_window_key(), &sample_snapshot(4_200)).unwrap();
+        db.upsert_window_merge(&a_window_key(), &sample_snapshot(4_200))
+            .unwrap();
         drop(db);
 
-        assert!(windows_db_path(&path).exists(), "windows get their own database");
-        assert!(windows_db_path(&path).file_name().unwrap()
-            .to_string_lossy().contains("windows"));
+        assert!(
+            windows_db_path(&path).exists(),
+            "windows get their own database"
+        );
+        assert!(windows_db_path(&path)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains("windows"));
     }
 
     /// The whole point of the split. A schema bump wipes events — which come
@@ -1231,13 +1339,16 @@ mod tests {
         let path = dir.path().join("claude_code.fjall");
 
         let db = Database::open(&path).unwrap();
-        db.upsert_window_merge(&a_window_key(), &sample_snapshot(4_200)).unwrap();
+        db.upsert_window_merge(&a_window_key(), &sample_snapshot(4_200))
+            .unwrap();
         drop(db);
 
         // Simulate the next release bumping SCHEMA_VERSION.
         {
             let raw = FjallDatabase::builder(&path).open().unwrap();
-            let meta = raw.keyspace("meta", || KeyspaceCreateOptions::default()).unwrap();
+            let meta = raw
+                .keyspace("meta", KeyspaceCreateOptions::default)
+                .unwrap();
             meta.insert("schema_version", b"999").unwrap();
         }
 
@@ -1259,9 +1370,12 @@ mod tests {
             let raw = FjallDatabase::builder(&path).open().unwrap();
             let opts = || KeyspaceCreateOptions::default();
             let meta = raw.keyspace("meta", opts).unwrap();
-            meta.insert("schema_version", SCHEMA_VERSION.to_string().as_bytes()).unwrap();
+            meta.insert("schema_version", SCHEMA_VERSION.to_string().as_bytes())
+                .unwrap();
             let windows = raw.keyspace("windows", opts).unwrap();
-            windows.insert(a_window_key(), sample_snapshot(7_700).encode()).unwrap();
+            windows
+                .insert(a_window_key(), sample_snapshot(7_700).encode())
+                .unwrap();
         }
         assert!(!windows_db_path(&path).exists());
 
@@ -1281,31 +1395,55 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("claude_code.fjall");
         let db = Database::open(&path).unwrap();
-        db.upsert_window_merge(&a_window_key(), &sample_snapshot(1_100)).unwrap();
+        db.upsert_window_merge(&a_window_key(), &sample_snapshot(1_100))
+            .unwrap();
         drop(db);
 
         {
-            let raw = FjallDatabase::builder(windows_db_path(&path)).open().unwrap();
-            let meta = raw.keyspace("meta", || KeyspaceCreateOptions::default()).unwrap();
+            let raw = FjallDatabase::builder(windows_db_path(&path))
+                .open()
+                .unwrap();
+            let meta = raw
+                .keyspace("meta", KeyspaceCreateOptions::default)
+                .unwrap();
             meta.insert("windows_schema_version", b"999").unwrap();
         }
 
         let db = Database::open(&path).unwrap();
         let mut new_key = a_window_key();
         new_key[1] ^= 1;
-        db.upsert_window_merge(&a_window_key(), &sample_snapshot(9_900)).unwrap();
-        db.upsert_window_merge(&new_key, &sample_snapshot(2_200)).unwrap();
+        db.upsert_window_merge(&a_window_key(), &sample_snapshot(9_900))
+            .unwrap();
+        db.upsert_window_merge(&new_key, &sample_snapshot(2_200))
+            .unwrap();
         assert_eq!(db.finalize_stale_windows(i64::MAX).unwrap(), 0);
         assert_eq!(db.delete_windows_before(i64::MAX).unwrap(), 0);
         let mut found = Vec::new();
         db.for_each_window(|_k, snap| found.push(snap)).unwrap();
-        assert_eq!(found.len(), 1, "an unreadable marker must not cost the data");
-        assert_eq!(found[0].peak_pct_x100, 1_100, "future-layout rows are read-only");
+        assert_eq!(
+            found.len(),
+            1,
+            "an unreadable marker must not cost the data"
+        );
+        assert_eq!(
+            found[0].peak_pct_x100, 1_100,
+            "future-layout rows are read-only"
+        );
         drop(db);
 
-        let raw = FjallDatabase::builder(windows_db_path(&path)).open().unwrap();
-        let meta = raw.keyspace("meta", || KeyspaceCreateOptions::default()).unwrap();
-        assert_eq!(meta.get("windows_schema_version").unwrap().unwrap().as_ref(), b"999");
+        let raw = FjallDatabase::builder(windows_db_path(&path))
+            .open()
+            .unwrap();
+        let meta = raw
+            .keyspace("meta", KeyspaceCreateOptions::default)
+            .unwrap();
+        assert_eq!(
+            meta.get("windows_schema_version")
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            b"999"
+        );
     }
 
     /// A renamed or newly appearing limit is a data event, not a schema one:
@@ -1320,17 +1458,25 @@ mod tests {
         let old = crate::windows::window_key(
             crate::windows::WindowKind::Weekly,
             crate::windows::hash_str("seven_day_sonnet"),
-            crate::windows::hash_str("acct"), 1_800_000_000_000);
+            crate::windows::hash_str("acct"),
+            1_800_000_000_000,
+        );
         let new = crate::windows::window_key(
             crate::windows::WindowKind::Weekly,
             crate::windows::hash_str("seven_day_fable"),
-            crate::windows::hash_str("acct"), 1_800_000_000_000);
-        db.upsert_window_merge(&old, &sample_snapshot(3_000)).unwrap();
-        db.upsert_window_merge(&new, &sample_snapshot(1_000)).unwrap();
+            crate::windows::hash_str("acct"),
+            1_800_000_000_000,
+        );
+        db.upsert_window_merge(&old, &sample_snapshot(3_000))
+            .unwrap();
+        db.upsert_window_merge(&new, &sample_snapshot(1_000))
+            .unwrap();
 
         let mut count = 0;
         db.for_each_window(|_k, _s| count += 1).unwrap();
-        assert_eq!(count, 2, "the rename kept its history and started a new series");
+        assert_eq!(
+            count, 2,
+            "the rename kept its history and started a new series"
+        );
     }
-
 }

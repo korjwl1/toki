@@ -91,19 +91,23 @@ impl PricingTable {
         Some(Cow::Owned(ModelPricing {
             input_cost_per_token: base_p.input_cost_per_token * mul,
             output_cost_per_token: base_p.output_cost_per_token * mul,
-            cache_creation_input_token_cost:
-                base_p.cache_creation_input_token_cost.map(|c| c * mul),
-            cache_read_input_token_cost:
-                base_p.cache_read_input_token_cost.map(|c| c * mul),
+            cache_creation_input_token_cost: base_p
+                .cache_creation_input_token_cost
+                .map(|c| c * mul),
+            cache_read_input_token_cost: base_p.cache_read_input_token_cost.map(|c| c * mul),
         }))
     }
 
     /// Calculate cost for a ModelUsageSummary.
     pub fn summary_cost(&self, s: &ModelUsageSummary) -> Option<f64> {
-        self.get(&s.model).map(|p| p.cost(
-            s.input_tokens, s.output_tokens,
-            s.cache_creation_input_tokens, s.cache_read_input_tokens,
-        ))
+        self.get(&s.model).map(|p| {
+            p.cost(
+                s.input_tokens,
+                s.output_tokens,
+                s.cache_creation_input_tokens,
+                s.cache_read_input_tokens,
+            )
+        })
     }
 
     pub fn summary_cost_for_schema(
@@ -118,18 +122,26 @@ impl PricingTable {
 
     /// Calculate cost for a single UsageEvent.
     pub fn event_cost(&self, e: &UsageEvent) -> Option<f64> {
-        self.get(&e.model).map(|p| p.cost(
-            e.input_tokens, e.output_tokens,
-            e.cache_creation_input_tokens, e.cache_read_input_tokens,
-        ))
+        self.get(&e.model).map(|p| {
+            p.cost(
+                e.input_tokens,
+                e.output_tokens,
+                e.cache_creation_input_tokens,
+                e.cache_read_input_tokens,
+            )
+        })
     }
 
     /// Calculate cost for a UsageEventWithTs.
     pub fn event_cost_with_ts(&self, e: &crate::common::types::UsageEventWithTs) -> Option<f64> {
-        self.get(&e.model).map(|p| p.cost(
-            e.input_tokens, e.output_tokens,
-            e.cache_creation_input_tokens, e.cache_read_input_tokens,
-        ))
+        self.get(&e.model).map(|p| {
+            p.cost(
+                e.input_tokens,
+                e.output_tokens,
+                e.cache_creation_input_tokens,
+                e.cache_read_input_tokens,
+            )
+        })
     }
 
     pub fn event_cost_with_ts_for_schema(
@@ -164,10 +176,11 @@ fn parse_litellm_json(json_str: &str) -> HashMap<String, ModelPricing> {
     let mut prices = HashMap::with_capacity(raw.len());
 
     for (key, entry) in &raw {
-        let (input_cost, output_cost) = match (entry.input_cost_per_token, entry.output_cost_per_token) {
-            (Some(i), Some(o)) if i > 0.0 || o > 0.0 => (i, o),
-            _ => continue,
-        };
+        let (input_cost, output_cost) =
+            match (entry.input_cost_per_token, entry.output_cost_per_token) {
+                (Some(i), Some(o)) if i > 0.0 || o > 0.0 => (i, o),
+                _ => continue,
+            };
 
         let pricing = ModelPricing {
             input_cost_per_token: input_cost,
@@ -266,14 +279,17 @@ pub fn fetch_pricing(cache_path: &Path) -> PricingTable {
     let cached = load_cache(cache_path);
 
     // Invalidate cache if parser version changed (e.g., added new provider support)
-    let cache_valid = cached.as_ref().map_or(false, |c| c.version == PRICING_CACHE_VERSION);
+    let cache_valid = cached
+        .as_ref()
+        .is_some_and(|c| c.version == PRICING_CACHE_VERSION);
 
     // Also invalidate etag if cache file is older than 24 hours.
     // LiteLLM's CDN sometimes returns the same etag even when prices change,
     // so we force a full fetch periodically to pick up updates.
-    let cache_age_ok = cache_path.metadata()
+    let cache_age_ok = cache_path
+        .metadata()
         .and_then(|m| m.modified())
-        .map(|t| t.elapsed().map_or(false, |age| age.as_secs() < 86400))
+        .map(|t| t.elapsed().is_ok_and(|age| age.as_secs() < 86400))
         .unwrap_or(false);
 
     let cached_etag = if cache_valid && cache_age_ok {
@@ -294,7 +310,8 @@ pub fn fetch_pricing(cache_path: &Path) -> PricingTable {
         Ok(resp) => {
             if resp.status() == 304 {
                 // Cache hit — silent
-                return cached.map(|c| PricingTable::new(c.prices))
+                return cached
+                    .map(|c| PricingTable::new(c.prices))
                     .unwrap_or_else(|| PricingTable::new(HashMap::new()));
             }
 
@@ -314,7 +331,14 @@ pub fn fetch_pricing(cache_path: &Path) -> PricingTable {
             }
 
             // Updated — silent
-            save_cache(cache_path, &PricingCache { etag: new_etag, version: PRICING_CACHE_VERSION, prices: prices.clone() });
+            save_cache(
+                cache_path,
+                &PricingCache {
+                    etag: new_etag,
+                    version: PRICING_CACHE_VERSION,
+                    prices: prices.clone(),
+                },
+            );
             PricingTable::new(prices)
         }
         Err(ureq::Error::Status(304, _)) => {
@@ -424,12 +448,15 @@ mod tests {
     #[test]
     fn test_pricing_table_exact_match() {
         let mut prices = HashMap::new();
-        prices.insert("claude-sonnet-4-20250514".to_string(), ModelPricing {
-            input_cost_per_token: 0.000003,
-            output_cost_per_token: 0.000015,
-            cache_creation_input_token_cost: Some(0.00000375),
-            cache_read_input_token_cost: Some(0.0000003),
-        });
+        prices.insert(
+            "claude-sonnet-4-20250514".to_string(),
+            ModelPricing {
+                input_cost_per_token: 0.000003,
+                output_cost_per_token: 0.000015,
+                cache_creation_input_token_cost: Some(0.00000375),
+                cache_read_input_token_cost: Some(0.0000003),
+            },
+        );
         let table = PricingTable::new(prices);
         assert!(table.get("claude-sonnet-4-20250514").is_some());
     }
@@ -437,12 +464,15 @@ mod tests {
     #[test]
     fn test_pricing_table_no_match() {
         let mut prices = HashMap::new();
-        prices.insert("claude-sonnet-4-20250514".to_string(), ModelPricing {
-            input_cost_per_token: 0.000003,
-            output_cost_per_token: 0.000015,
-            cache_creation_input_token_cost: None,
-            cache_read_input_token_cost: None,
-        });
+        prices.insert(
+            "claude-sonnet-4-20250514".to_string(),
+            ModelPricing {
+                input_cost_per_token: 0.000003,
+                output_cost_per_token: 0.000015,
+                cache_creation_input_token_cost: None,
+                cache_read_input_token_cost: None,
+            },
+        );
         let table = PricingTable::new(prices);
         // Different model name → no match (exact only)
         assert!(table.get("claude-sonnet-4-20250601").is_none());
@@ -452,12 +482,15 @@ mod tests {
     #[test]
     fn test_summary_cost() {
         let mut prices = HashMap::new();
-        prices.insert("claude-sonnet-4-20250514".to_string(), ModelPricing {
-            input_cost_per_token: 0.000003,
-            output_cost_per_token: 0.000015,
-            cache_creation_input_token_cost: Some(0.00000375),
-            cache_read_input_token_cost: Some(0.0000003),
-        });
+        prices.insert(
+            "claude-sonnet-4-20250514".to_string(),
+            ModelPricing {
+                input_cost_per_token: 0.000003,
+                output_cost_per_token: 0.000015,
+                cache_creation_input_token_cost: Some(0.00000375),
+                cache_read_input_token_cost: Some(0.0000003),
+            },
+        );
         let table = PricingTable::new(prices);
 
         let summary = ModelUsageSummary {
@@ -555,12 +588,15 @@ mod tests {
     #[test]
     fn test_event_cost() {
         let mut prices = HashMap::new();
-        prices.insert("claude-sonnet-4-20250514".to_string(), ModelPricing {
-            input_cost_per_token: 0.000003,
-            output_cost_per_token: 0.000015,
-            cache_creation_input_token_cost: None,
-            cache_read_input_token_cost: None,
-        });
+        prices.insert(
+            "claude-sonnet-4-20250514".to_string(),
+            ModelPricing {
+                input_cost_per_token: 0.000003,
+                output_cost_per_token: 0.000015,
+                cache_creation_input_token_cost: None,
+                cache_read_input_token_cost: None,
+            },
+        );
         let table = PricingTable::new(prices);
 
         let event = UsageEvent {
@@ -581,20 +617,26 @@ mod tests {
         // If LiteLLM ever ships a "-fast" row directly, it must take precedence
         // over the multiplier fallback.
         let mut prices = HashMap::new();
-        prices.insert("claude-opus-4-7".to_string(), ModelPricing {
-            input_cost_per_token: 0.000005,
-            output_cost_per_token: 0.000025,
-            cache_creation_input_token_cost: None,
-            cache_read_input_token_cost: None,
-        });
-        prices.insert("claude-opus-4-7-fast".to_string(), ModelPricing {
-            // Pretend LiteLLM ships a hand-tuned (not 6x) value — must not be
-            // overwritten by the fallback table.
-            input_cost_per_token: 0.0000777,
-            output_cost_per_token: 0.0001111,
-            cache_creation_input_token_cost: None,
-            cache_read_input_token_cost: None,
-        });
+        prices.insert(
+            "claude-opus-4-7".to_string(),
+            ModelPricing {
+                input_cost_per_token: 0.000005,
+                output_cost_per_token: 0.000025,
+                cache_creation_input_token_cost: None,
+                cache_read_input_token_cost: None,
+            },
+        );
+        prices.insert(
+            "claude-opus-4-7-fast".to_string(),
+            ModelPricing {
+                // Pretend LiteLLM ships a hand-tuned (not 6x) value — must not be
+                // overwritten by the fallback table.
+                input_cost_per_token: 0.0000777,
+                output_cost_per_token: 0.0001111,
+                cache_creation_input_token_cost: None,
+                cache_read_input_token_cost: None,
+            },
+        );
         let table = PricingTable::new(prices);
         let p = table.get("claude-opus-4-7-fast").unwrap();
         assert!((p.input_cost_per_token - 0.0000777).abs() < 1e-12);
@@ -605,37 +647,37 @@ mod tests {
     fn test_fast_suffix_multiplier_fallback() {
         // Base model priced, "-fast" row missing → apply the 2x multiplier.
         let mut prices = HashMap::new();
-        prices.insert("claude-opus-5".to_string(), ModelPricing {
-            input_cost_per_token: 0.000005,
-            output_cost_per_token: 0.000025,
-            cache_creation_input_token_cost: Some(0.00000625),
-            cache_read_input_token_cost: Some(0.0000005),
-        });
+        prices.insert(
+            "claude-opus-5".to_string(),
+            ModelPricing {
+                input_cost_per_token: 0.000005,
+                output_cost_per_token: 0.000025,
+                cache_creation_input_token_cost: Some(0.00000625),
+                cache_read_input_token_cost: Some(0.0000005),
+            },
+        );
         let table = PricingTable::new(prices);
         let p = table.get("claude-opus-5-fast").unwrap();
         // $10/$50 against a $5/$25 base.
         assert!((p.input_cost_per_token - 0.000010).abs() < 1e-12);
         assert!((p.output_cost_per_token - 0.000050).abs() < 1e-12);
-        assert!(
-            (p.cache_creation_input_token_cost.unwrap() - 0.00000625 * 2.0).abs()
-                < 1e-12
-        );
-        assert!(
-            (p.cache_read_input_token_cost.unwrap() - 0.0000005 * 2.0).abs()
-                < 1e-12
-        );
+        assert!((p.cache_creation_input_token_cost.unwrap() - 0.00000625 * 2.0).abs() < 1e-12);
+        assert!((p.cache_read_input_token_cost.unwrap() - 0.0000005 * 2.0).abs() < 1e-12);
     }
 
     #[test]
     fn test_direct_match_is_borrowed() {
         // Hot-path guard: direct LiteLLM matches must not allocate.
         let mut prices = HashMap::new();
-        prices.insert("claude-opus-4-7".to_string(), ModelPricing {
-            input_cost_per_token: 0.000005,
-            output_cost_per_token: 0.000025,
-            cache_creation_input_token_cost: None,
-            cache_read_input_token_cost: None,
-        });
+        prices.insert(
+            "claude-opus-4-7".to_string(),
+            ModelPricing {
+                input_cost_per_token: 0.000005,
+                output_cost_per_token: 0.000025,
+                cache_creation_input_token_cost: None,
+                cache_read_input_token_cost: None,
+            },
+        );
         let table = PricingTable::new(prices);
         let cow = table.get("claude-opus-4-7").unwrap();
         assert!(matches!(cow, std::borrow::Cow::Borrowed(_)));
@@ -644,12 +686,15 @@ mod tests {
     #[test]
     fn test_fast_fallback_is_owned() {
         let mut prices = HashMap::new();
-        prices.insert("claude-opus-5".to_string(), ModelPricing {
-            input_cost_per_token: 0.000005,
-            output_cost_per_token: 0.000025,
-            cache_creation_input_token_cost: None,
-            cache_read_input_token_cost: None,
-        });
+        prices.insert(
+            "claude-opus-5".to_string(),
+            ModelPricing {
+                input_cost_per_token: 0.000005,
+                output_cost_per_token: 0.000025,
+                cache_creation_input_token_cost: None,
+                cache_read_input_token_cost: None,
+            },
+        );
         let table = PricingTable::new(prices);
         let cow = table.get("claude-opus-5-fast").unwrap();
         assert!(matches!(cow, std::borrow::Cow::Owned(_)));
@@ -673,12 +718,15 @@ mod tests {
     fn test_fast_suffix_unknown_base_returns_none() {
         // "-fast" suffix but base model not in multiplier table → no fallback.
         let mut prices = HashMap::new();
-        prices.insert("claude-sonnet-4-5".to_string(), ModelPricing {
-            input_cost_per_token: 0.000003,
-            output_cost_per_token: 0.000015,
-            cache_creation_input_token_cost: None,
-            cache_read_input_token_cost: None,
-        });
+        prices.insert(
+            "claude-sonnet-4-5".to_string(),
+            ModelPricing {
+                input_cost_per_token: 0.000003,
+                output_cost_per_token: 0.000015,
+                cache_creation_input_token_cost: None,
+                cache_read_input_token_cost: None,
+            },
+        );
         let table = PricingTable::new(prices);
         // Sonnet isn't in FAST_MULTIPLIER → no fallback, even though base exists.
         assert!(table.get("claude-sonnet-4-5-fast").is_none());

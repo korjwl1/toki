@@ -8,8 +8,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use crate::common::schema::ProviderSchema;
 use crate::common::types::{ModelUsageSummary, UsageEventWithTs};
 use crate::pricing::PricingTable;
-use crate::sink::Sink;
 use crate::sink::json::{event_to_json, events_batch_to_json, grouped_to_json, summaries_to_json};
+use crate::sink::Sink;
 
 /// Maximum local queue size per client. If exceeded, client is disconnected.
 const MAX_QUEUE_SIZE: usize = 1024;
@@ -93,7 +93,11 @@ impl BroadcastSink {
         // Atomic admit: fetch_add + check would transiently exceed the cap.
         if count
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |c| {
-                if c >= Self::MAX_CLIENTS { None } else { Some(c + 1) }
+                if c >= Self::MAX_CLIENTS {
+                    None
+                } else {
+                    Some(c + 1)
+                }
             })
             .is_err()
         {
@@ -128,7 +132,8 @@ impl BroadcastSink {
                         let message = {
                             let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
                             while s.seq == last_seq && !s.closed && alive.load(Ordering::Relaxed) {
-                                let (guard, _) = condvar.wait_timeout(s, timeout)
+                                let (guard, _) = condvar
+                                    .wait_timeout(s, timeout)
                                     .unwrap_or_else(|e| e.into_inner());
                                 s = guard;
                             }
@@ -192,7 +197,8 @@ impl BroadcastSink {
                                     .wait_timeout(q, std::time::Duration::from_secs(5))
                                     .unwrap_or_else(|e| e.into_inner());
                                 q = guard;
-                                if timeout.timed_out() && q.is_empty() && peer_disconnected(&stream) {
+                                if timeout.timed_out() && q.is_empty() && peer_disconnected(&stream)
+                                {
                                     alive.store(false, Ordering::Relaxed);
                                     broadcast_condvar.notify_all();
                                     break;
@@ -260,15 +266,31 @@ impl Drop for BroadcastSink {
 }
 
 impl Sink for BroadcastSink {
-    fn emit_event(&self, event: &UsageEventWithTs, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
+    fn emit_event(
+        &self,
+        event: &UsageEventWithTs,
+        pricing: Option<&PricingTable>,
+        schema: Option<&dyn ProviderSchema>,
+    ) {
         self.broadcast(&event_to_json(event, pricing, schema));
     }
 
-    fn emit_summary(&self, summaries: &HashMap<String, ModelUsageSummary>, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
+    fn emit_summary(
+        &self,
+        summaries: &HashMap<String, ModelUsageSummary>,
+        pricing: Option<&PricingTable>,
+        schema: Option<&dyn ProviderSchema>,
+    ) {
         self.broadcast(&summaries_to_json(summaries, pricing, schema));
     }
 
-    fn emit_grouped(&self, grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>, type_name: &str, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
+    fn emit_grouped(
+        &self,
+        grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>,
+        type_name: &str,
+        pricing: Option<&PricingTable>,
+        schema: Option<&dyn ProviderSchema>,
+    ) {
         self.broadcast(&grouped_to_json(grouped, type_name, pricing, schema));
     }
 
@@ -276,21 +298,42 @@ impl Sink for BroadcastSink {
         self.broadcast(&serde_json::json!({ "type": type_name, "items": items }));
     }
 
-    fn emit_events_batch(&self, events: &[crate::common::types::RawEvent], pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
+    fn emit_events_batch(
+        &self,
+        events: &[crate::common::types::RawEvent],
+        pricing: Option<&PricingTable>,
+        schema: Option<&dyn ProviderSchema>,
+    ) {
         self.broadcast(&events_batch_to_json(events, pricing, schema));
     }
 }
 
 impl Sink for Arc<BroadcastSink> {
-    fn emit_event(&self, event: &UsageEventWithTs, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
+    fn emit_event(
+        &self,
+        event: &UsageEventWithTs,
+        pricing: Option<&PricingTable>,
+        schema: Option<&dyn ProviderSchema>,
+    ) {
         (**self).emit_event(event, pricing, schema);
     }
 
-    fn emit_summary(&self, summaries: &HashMap<String, ModelUsageSummary>, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
+    fn emit_summary(
+        &self,
+        summaries: &HashMap<String, ModelUsageSummary>,
+        pricing: Option<&PricingTable>,
+        schema: Option<&dyn ProviderSchema>,
+    ) {
         (**self).emit_summary(summaries, pricing, schema);
     }
 
-    fn emit_grouped(&self, grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>, type_name: &str, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
+    fn emit_grouped(
+        &self,
+        grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>,
+        type_name: &str,
+        pricing: Option<&PricingTable>,
+        schema: Option<&dyn ProviderSchema>,
+    ) {
         (**self).emit_grouped(grouped, type_name, pricing, schema);
     }
 
@@ -298,7 +341,12 @@ impl Sink for Arc<BroadcastSink> {
         (**self).emit_list(items, type_name);
     }
 
-    fn emit_events_batch(&self, events: &[crate::common::types::RawEvent], pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
+    fn emit_events_batch(
+        &self,
+        events: &[crate::common::types::RawEvent],
+        pricing: Option<&PricingTable>,
+        schema: Option<&dyn ProviderSchema>,
+    ) {
         (**self).emit_events_batch(events, pricing, schema);
     }
 }
@@ -337,6 +385,9 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(start.elapsed() < Duration::from_secs(4), "teardown must beat the 5s timeout");
+        assert!(
+            start.elapsed() < Duration::from_secs(4),
+            "teardown must beat the 5s timeout"
+        );
     }
 }

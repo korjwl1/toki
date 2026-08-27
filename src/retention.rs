@@ -23,7 +23,10 @@ pub struct RetentionStats {
     pub elapsed: Duration,
 }
 
-pub fn run_retention(db: &Database, policy: &RetentionPolicy) -> Result<RetentionStats, fjall::Error> {
+pub fn run_retention(
+    db: &Database,
+    policy: &RetentionPolicy,
+) -> Result<RetentionStats, fjall::Error> {
     let t = Instant::now();
 
     // Window rows age out on their own horizon, before the event-retention
@@ -124,14 +127,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(&dir.path().join("test.fjall")).unwrap();
 
-        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
         let old_ts = now_ms - 100 * 86_400_000; // 100 days ago
         let recent_ts = now_ms - 10 * 86_400_000; // 10 days ago
 
         let event = StoredEvent {
-            model_id: 1, session_id: 1, source_file_id: 1, project_name_id: 0,
-            input_tokens: 10, output_tokens: 5,
-            cache_creation_input_tokens: 0, cache_read_input_tokens: 0,
+            model_id: 1,
+            session_id: 1,
+            source_file_id: 1,
+            project_name_id: 0,
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
         };
 
         db.insert_event(old_ts, "old", &event).unwrap();
@@ -155,7 +166,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(&dir.path().join("test.fjall")).unwrap();
 
-        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
         let old_ts = now_ms - 100 * 86_400_000; // aged out
         let recent_ts = now_ms - 10 * 86_400_000; // kept
 
@@ -169,14 +183,24 @@ mod tests {
         batch.commit().unwrap();
 
         let old_event = StoredEvent {
-            model_id: 1, session_id: 2, source_file_id: 0, project_name_id: 4,
-            input_tokens: 1, output_tokens: 0,
-            cache_creation_input_tokens: 0, cache_read_input_tokens: 0,
+            model_id: 1,
+            session_id: 2,
+            source_file_id: 0,
+            project_name_id: 4,
+            input_tokens: 1,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
         };
         let recent_event = StoredEvent {
-            model_id: 1, session_id: 3, source_file_id: 0, project_name_id: 5,
-            input_tokens: 1, output_tokens: 0,
-            cache_creation_input_tokens: 0, cache_read_input_tokens: 0,
+            model_id: 1,
+            session_id: 3,
+            source_file_id: 0,
+            project_name_id: 5,
+            input_tokens: 1,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
         };
         db.insert_event(old_ts, "old", &old_event).unwrap();
         db.insert_event(recent_ts, "recent", &recent_event).unwrap();
@@ -188,7 +212,10 @@ mod tests {
         db.insert_project_index(&mut idx, "proj-recent", recent_ts, "recent");
         idx.commit().unwrap();
 
-        let policy = RetentionPolicy { event_retention_days: 90, ..Default::default() };
+        let policy = RetentionPolicy {
+            event_retention_days: 90,
+            ..Default::default()
+        };
         let stats = run_retention(&db, &policy).unwrap();
 
         assert_eq!(stats.events_deleted, 1);
@@ -199,11 +226,11 @@ mod tests {
 
         // Dict: entries referenced by the surviving event remain; unreferenced go.
         let dict = db.load_dict_reverse().unwrap();
-        assert_eq!(dict.get(&1).map(|s| s.as_str()), Some("model"));       // shared
+        assert_eq!(dict.get(&1).map(|s| s.as_str()), Some("model")); // shared
         assert_eq!(dict.get(&3).map(|s| s.as_str()), Some("sess-recent")); // referenced
         assert_eq!(dict.get(&5).map(|s| s.as_str()), Some("proj-recent")); // referenced
-        assert!(dict.get(&2).is_none(), "sess-old dict entry must be GC'd");
-        assert!(dict.get(&4).is_none(), "proj-old dict entry must be GC'd");
+        assert!(!dict.contains_key(&2), "sess-old dict entry must be GC'd");
+        assert!(!dict.contains_key(&4), "proj-old dict entry must be GC'd");
         assert!(stats.dict_removed.contains(&"sess-old".to_string()));
         assert!(stats.dict_removed.contains(&"proj-old".to_string()));
     }
@@ -223,11 +250,17 @@ mod tests {
         assert!(db.events_is_empty());
         assert!(!db.dict_is_empty());
 
-        let policy = RetentionPolicy { event_retention_days: 90, ..Default::default() };
+        let policy = RetentionPolicy {
+            event_retention_days: 90,
+            ..Default::default()
+        };
         let stats = run_retention(&db, &policy).unwrap();
 
         assert_eq!(stats.events_deleted, 0);
-        assert!(db.load_dict_reverse().unwrap().is_empty(), "orphan dict entries must be GC'd in an empty events DB");
+        assert!(
+            db.load_dict_reverse().unwrap().is_empty(),
+            "orphan dict entries must be GC'd in an empty events DB"
+        );
         assert!(stats.dict_removed.contains(&"orphan-a".to_string()));
         assert!(stats.dict_removed.contains(&"orphan-b".to_string()));
     }
@@ -247,34 +280,58 @@ mod tests {
         batch.commit().unwrap();
 
         // A recent event keeps id 1 (and the sentinel 0) live; nothing ages out.
-        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
-        let recent_ts = now_ms - 1 * 86_400_000;
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let recent_ts = now_ms - 86_400_000;
         let ev = StoredEvent {
-            model_id: 1, session_id: 1, source_file_id: 0, project_name_id: 0,
-            input_tokens: 1, output_tokens: 0,
-            cache_creation_input_tokens: 0, cache_read_input_tokens: 0,
+            model_id: 1,
+            session_id: 1,
+            source_file_id: 0,
+            project_name_id: 0,
+            input_tokens: 1,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
         };
         db.insert_event(recent_ts, "m1", &ev).unwrap();
 
         db.set_pending_dict_gc(true).unwrap();
 
-        let policy = RetentionPolicy { event_retention_days: 90, ..Default::default() };
+        let policy = RetentionPolicy {
+            event_retention_days: 90,
+            ..Default::default()
+        };
         let stats = run_retention(&db, &policy).unwrap();
 
         assert_eq!(stats.events_deleted, 0, "recent event must survive");
-        assert!(stats.dict_removed.contains(&"orphan-2".to_string()), "pending marker must force the owed GC");
+        assert!(
+            stats.dict_removed.contains(&"orphan-2".to_string()),
+            "pending marker must force the owed GC"
+        );
         assert!(stats.dict_removed.contains(&"orphan-3".to_string()));
         let dict = db.load_dict_reverse().unwrap();
-        assert_eq!(dict.get(&1).map(|s| s.as_str()), Some("model"), "live entry must survive");
-        assert!(dict.get(&2).is_none());
-        assert!(!db.pending_dict_gc().unwrap(), "marker must be cleared after a successful GC");
+        assert_eq!(
+            dict.get(&1).map(|s| s.as_str()),
+            Some("model"),
+            "live entry must survive"
+        );
+        assert!(!dict.contains_key(&2));
+        assert!(
+            !db.pending_dict_gc().unwrap(),
+            "marker must be cleared after a successful GC"
+        );
     }
 
     #[test]
     fn test_retention_disabled_noop() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(&dir.path().join("test.fjall")).unwrap();
-        let policy = RetentionPolicy { event_retention_days: 0, ..Default::default() };
+        let policy = RetentionPolicy {
+            event_retention_days: 0,
+            ..Default::default()
+        };
         let stats = run_retention(&db, &policy).unwrap();
         assert_eq!(stats.events_deleted, 0);
         assert_eq!(stats.index_deleted, 0);

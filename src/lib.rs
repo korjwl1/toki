@@ -1,10 +1,10 @@
+pub mod checkpoint;
 pub mod claude_poll;
 pub mod common;
 pub mod config;
 pub mod daemon;
 pub mod db;
 pub mod engine;
-pub mod checkpoint;
 pub mod platform;
 pub mod pricing;
 pub mod providers;
@@ -18,7 +18,7 @@ pub mod update;
 pub mod windows;
 pub mod writer;
 
-pub use common::types::{UsageEvent, UsageEventWithTs, ModelUsageSummary, SessionGroup, TokiError};
+pub use common::types::{ModelUsageSummary, SessionGroup, TokiError, UsageEvent, UsageEventWithTs};
 pub use config::Config;
 
 use std::collections::HashMap;
@@ -96,7 +96,10 @@ impl Handle {
     /// All provider DBs for report queries that need to merge across providers.
     /// Returns (provider_name, db) pairs.
     pub fn dbs(&self) -> Vec<(&str, &Arc<Database>)> {
-        self.provider_dbs.iter().map(|(name, db)| (name.as_str(), db)).collect()
+        self.provider_dbs
+            .iter()
+            .map(|(name, db)| (name.as_str(), db))
+            .collect()
     }
 
     /// Window-tracking hub for the daemon listener (None when disabled).
@@ -195,8 +198,17 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
         let new_path = config.db_base_dir.join("claude_code.fjall");
         if legacy_path.exists() && !new_path.exists() {
             match std::fs::rename(&legacy_path, &new_path) {
-                Ok(()) => eprintln!("[toki] Migrated {} → {}", legacy_path.display(), new_path.display()),
-                Err(e) => eprintln!("[toki] Migration failed ({} → {}): {}", legacy_path.display(), new_path.display(), e),
+                Ok(()) => eprintln!(
+                    "[toki] Migrated {} → {}",
+                    legacy_path.display(),
+                    new_path.display()
+                ),
+                Err(e) => eprintln!(
+                    "[toki] Migration failed ({} → {}): {}",
+                    legacy_path.display(),
+                    new_path.display(),
+                    e
+                ),
             }
         }
     }
@@ -218,14 +230,18 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
     // Window-tracking hub: created up front so the Claude writer can carry the
     // token-flow wake from birth. Roots come from the configured providers.
     let windows_hub: Option<Arc<claude_poll::PollerHub>> = if config.window_tracking {
-        let claude_root = provider_list.iter()
+        let claude_root = provider_list
+            .iter()
             .find(|p| p.name() == "claude_code")
             .and_then(|p| p.root_dir());
-        let codex_root = provider_list.iter()
+        let codex_root = provider_list
+            .iter()
             .find(|p| p.name() == "codex")
             .and_then(|p| p.root_dir());
         Some(Arc::new(claude_poll::PollerHub::new(
-            claude_root, codex_root, config.window_polling,
+            claude_root,
+            codex_root,
+            config.window_polling,
         )))
     } else {
         None
@@ -241,7 +257,10 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
     for provider in provider_list {
         // Skip providers whose root directory doesn't exist (e.g., Codex not installed)
         if provider.root_dir().is_none() {
-            eprintln!("[toki] Skipping {}: data directory not found", provider.display_name());
+            eprintln!(
+                "[toki] Skipping {}: data directory not found",
+                provider.display_name()
+            );
             continue;
         }
 
@@ -249,8 +268,7 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
         let db = Arc::new(Database::open(&db_path).map_err(TokiError::Db)?);
 
         // Load checkpoints from this provider's DB
-        let provider_checkpoints = db.load_all_checkpoints()
-            .map_err(TokiError::Db)?;
+        let provider_checkpoints = db.load_all_checkpoints().map_err(TokiError::Db)?;
         for cp in provider_checkpoints {
             all_checkpoints.insert(cp.file_path.clone(), cp);
         }
@@ -285,7 +303,11 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
     let pricing = {
         let cache_path = pricing::default_cache_path();
         let p = pricing::fetch_pricing(&cache_path);
-        if p.is_empty() { None } else { Some(p) }
+        if p.is_empty() {
+            None
+        } else {
+            Some(p)
+        }
     };
 
     // Create engine with all channels
@@ -308,8 +330,11 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
     println!("[toki] Running initial scan...");
     for rt in &runtimes {
         if rt.provider.root_dir().is_some() {
-            eprintln!("[toki] Scanning {} ({})", rt.provider.display_name(),
-                rt.provider.root_dir().unwrap_or_default());
+            eprintln!(
+                "[toki] Scanning {} ({})",
+                rt.provider.display_name(),
+                rt.provider.root_dir().unwrap_or_default()
+            );
             if let Err(e) = engine.cold_start_provider(rt.provider.as_ref(), &rt.db_tx) {
                 eprintln!("[toki] Cold start error for {}: {}", rt.provider.name(), e);
             }
@@ -317,9 +342,16 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
 
         // Clean up old dedup index entries (> 24h)
         let cutoff = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64 - 24 * 3600 * 1000;
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            - 24 * 3600 * 1000;
         if let Err(e) = rt.db.cleanup_old_idx_msg(cutoff) {
-            eprintln!("[toki] idx_msg cleanup error for {}: {}", rt.provider.name(), e);
+            eprintln!(
+                "[toki] idx_msg cleanup error for {}: {}",
+                rt.provider.name(),
+                e
+            );
         }
     }
 
@@ -363,7 +395,10 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
         // itself gates on the hot-reloadable polling flag, so enabling
         // window_polling at runtime works without a restart.
         {
-            if let Some(rt) = runtimes.iter().find(|rt| rt.provider.name() == "claude_code") {
+            if let Some(rt) = runtimes
+                .iter()
+                .find(|rt| rt.provider.name() == "claude_code")
+            {
                 if let Some(root) = rt.provider.root_dir() {
                     let hub = hub.clone();
                     let db_tx = rt.db_tx.clone();
@@ -400,7 +435,8 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
     let (stop_tx, stop_rx) = crossbeam_channel::bounded::<()>(1);
 
     // Build provider+channel pairs for watch loop
-    let mut provider_channels: Vec<(Box<dyn Provider>, crossbeam_channel::Sender<DbOp>)> = Vec::new();
+    let mut provider_channels: Vec<(Box<dyn Provider>, crossbeam_channel::Sender<DbOp>)> =
+        Vec::new();
     for rt in &runtimes {
         // We need to create new provider instances for the worker thread since we can't move
         // them out of runtimes (we still need runtimes for shutdown).
@@ -419,11 +455,7 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
         .name("toki-worker".to_string())
         .spawn(move || {
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                engine.watch_loop_providers(
-                    event_rx,
-                    stop_rx,
-                    &provider_channels,
-                );
+                engine.watch_loop_providers(event_rx, stop_rx, &provider_channels);
             }));
 
             if let Err(e) = result {
@@ -442,12 +474,15 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
 
     // Use first provider's DB as primary for report queries.
     // runtimes is guaranteed non-empty here because provider_list.is_empty() returns early above.
-    let primary_db = runtimes.first()
+    let primary_db = runtimes
+        .first()
         .expect("runtimes guaranteed non-empty: provider_list emptiness checked above")
-        .db.clone();
+        .db
+        .clone();
 
     // Collect all provider DBs for multi-provider queries (with names)
-    let provider_dbs: Vec<(String, Arc<Database>)> = runtimes.iter()
+    let provider_dbs: Vec<(String, Arc<Database>)> = runtimes
+        .iter()
         .map(|rt| (rt.provider.name().to_string(), rt.db.clone()))
         .collect();
 
@@ -475,12 +510,14 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
     for (flush_notify, db, provider_name) in provider_sync_infos {
         flush_notifies.push(flush_notify.clone());
         let (sync_stop_tx, sync_stop_rx) = crossbeam_channel::bounded::<()>(1);
-        let sync_toggle: sync::SyncToggle = Arc::new((
-            Mutex::new(sync_initially_enabled),
-            Condvar::new(),
-        ));
+        let sync_toggle: sync::SyncToggle =
+            Arc::new((Mutex::new(sync_initially_enabled), Condvar::new()));
         let handle = sync::start_sync_thread(
-            db, flush_notify, sync_stop_rx, provider_name.clone(), sync_toggle.clone(),
+            db,
+            flush_notify,
+            sync_stop_rx,
+            provider_name.clone(),
+            sync_toggle.clone(),
         );
         sync_stops.push(sync_stop_tx);
         sync_threads.push(Some(handle));
@@ -500,7 +537,11 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
                 }
 
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_settings_watcher(settings_stop_rx.clone(), settings_toggles.clone(), settings_hub.clone());
+                    run_settings_watcher(
+                        settings_stop_rx.clone(),
+                        settings_toggles.clone(),
+                        settings_hub.clone(),
+                    );
                 }));
 
                 match result {
@@ -513,9 +554,15 @@ pub fn start(config: Config, sink: Box<dyn Sink>) -> Result<Handle, TokiError> {
                         } else {
                             "unknown panic".to_string()
                         };
-                        eprintln!("[toki:settings-watcher] thread panicked: {}, restarting in 5s...", msg);
+                        eprintln!(
+                            "[toki:settings-watcher] thread panicked: {}, restarting in 5s...",
+                            msg
+                        );
 
-                        if settings_stop_rx.recv_timeout(std::time::Duration::from_secs(5)).is_ok() {
+                        if settings_stop_rx
+                            .recv_timeout(std::time::Duration::from_secs(5))
+                            .is_ok()
+                        {
                             return;
                         }
                     }
@@ -570,7 +617,7 @@ fn run_settings_watcher(
     // Set up file watcher on the sentinel file
     let (watch_tx, watch_rx) = crossbeam_channel::unbounded::<()>();
     let _watcher = {
-        use notify::{RecursiveMode, Watcher, Event, EventKind};
+        use notify::{Event, EventKind, RecursiveMode, Watcher};
         let tx = watch_tx.clone();
         let mut w = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
             if let Ok(event) = res {
@@ -587,7 +634,10 @@ fn run_settings_watcher(
                 }
             }
             Err(ref e) => {
-                eprintln!("[toki:settings-watcher] failed to create watcher: {}, falling back to polling", e);
+                eprintln!(
+                    "[toki:settings-watcher] failed to create watcher: {}, falling back to polling",
+                    e
+                );
             }
         }
         w.ok()
@@ -651,7 +701,10 @@ fn handle_settings_change(
             eprintln!("[toki:settings-watcher] sync enabled for {}", provider_name);
             toggle.1.notify_one();
         } else if !sync_enabled && was_enabled {
-            eprintln!("[toki:settings-watcher] sync disabled for {}", provider_name);
+            eprintln!(
+                "[toki:settings-watcher] sync disabled for {}",
+                provider_name
+            );
             // Sync thread will notice on next toggle check
         }
     }
@@ -659,7 +712,10 @@ fn handle_settings_change(
 
 /// Create a provider instance by name (used to clone providers for worker thread).
 /// Returns Err if the provider name is unknown.
-fn create_provider_instance(name: &str, root_dir: Option<String>) -> Result<Box<dyn Provider>, String> {
+fn create_provider_instance(
+    name: &str,
+    root_dir: Option<String>,
+) -> Result<Box<dyn Provider>, String> {
     match name {
         "claude_code" => {
             let root = root_dir.unwrap_or_else(|| {
@@ -668,7 +724,9 @@ fn create_provider_instance(name: &str, root_dir: Option<String>) -> Result<Box<
                     .to_string_lossy()
                     .to_string()
             });
-            Ok(Box::new(providers::claude_code::ClaudeCodeProvider::new(root)))
+            Ok(Box::new(providers::claude_code::ClaudeCodeProvider::new(
+                root,
+            )))
         }
         "codex" => {
             let root = root_dir.unwrap_or_else(|| {

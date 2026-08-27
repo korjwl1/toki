@@ -31,17 +31,37 @@ pub trait ProviderSchema: Send + Sync {
 // ── Claude Code schema ──────────────────────────────────────────────────────
 
 static CLAUDE_CODE_COLUMNS: &[TokenColumn] = &[
-    TokenColumn { header: "Input",          json_key: "input_tokens",                  short: "in" },
-    TokenColumn { header: "Output",         json_key: "output_tokens",                 short: "out" },
-    TokenColumn { header: "Cache\nCreate",  json_key: "cache_creation_input_tokens",   short: "cc" },
-    TokenColumn { header: "Cache\nRead",    json_key: "cache_read_input_tokens",       short: "cr" },
+    TokenColumn {
+        header: "Input",
+        json_key: "input_tokens",
+        short: "in",
+    },
+    TokenColumn {
+        header: "Output",
+        json_key: "output_tokens",
+        short: "out",
+    },
+    TokenColumn {
+        header: "Cache\nCreate",
+        json_key: "cache_creation_input_tokens",
+        short: "cc",
+    },
+    TokenColumn {
+        header: "Cache\nRead",
+        json_key: "cache_read_input_tokens",
+        short: "cr",
+    },
 ];
 
 pub struct ClaudeCodeSchema;
 
 impl ProviderSchema for ClaudeCodeSchema {
-    fn columns(&self) -> &[TokenColumn] { CLAUDE_CODE_COLUMNS }
-    fn provider_name(&self) -> &str { "Claude Code" }
+    fn columns(&self) -> &[TokenColumn] {
+        CLAUDE_CODE_COLUMNS
+    }
+    fn provider_name(&self) -> &str {
+        "Claude Code"
+    }
 
     fn extract_tokens(&self, s: &ModelUsageSummary) -> Vec<u64> {
         vec![
@@ -63,17 +83,37 @@ impl ProviderSchema for ClaudeCodeSchema {
 // ── Codex schema ────────────────────────────────────────────────────────────
 
 static CODEX_COLUMNS: &[TokenColumn] = &[
-    TokenColumn { header: "Input",            json_key: "input_tokens",              short: "in" },
-    TokenColumn { header: "Output",           json_key: "output_tokens",             short: "out" },
-    TokenColumn { header: "Cached\nInput",    json_key: "cached_input_tokens",       short: "ci" },
-    TokenColumn { header: "Reasoning\nOutput", json_key: "reasoning_output_tokens",  short: "ro" },
+    TokenColumn {
+        header: "Input",
+        json_key: "input_tokens",
+        short: "in",
+    },
+    TokenColumn {
+        header: "Output",
+        json_key: "output_tokens",
+        short: "out",
+    },
+    TokenColumn {
+        header: "Cached\nInput",
+        json_key: "cached_input_tokens",
+        short: "ci",
+    },
+    TokenColumn {
+        header: "Reasoning\nOutput",
+        json_key: "reasoning_output_tokens",
+        short: "ro",
+    },
 ];
 
 pub struct CodexSchema;
 
 impl ProviderSchema for CodexSchema {
-    fn columns(&self) -> &[TokenColumn] { CODEX_COLUMNS }
-    fn provider_name(&self) -> &str { "Codex CLI" }
+    fn columns(&self) -> &[TokenColumn] {
+        CODEX_COLUMNS
+    }
+    fn provider_name(&self) -> &str {
+        "Codex CLI"
+    }
 
     fn extract_tokens(&self, s: &ModelUsageSummary) -> Vec<u64> {
         // slot 3 = cache_creation_input_tokens = reasoning_output_tokens
@@ -81,8 +121,8 @@ impl ProviderSchema for CodexSchema {
         vec![
             s.input_tokens,
             s.output_tokens,
-            s.cache_read_input_tokens,            // cached input
-            s.cache_creation_input_tokens,         // reasoning output
+            s.cache_read_input_tokens,     // cached input
+            s.cache_creation_input_tokens, // reasoning output
         ]
     }
 
@@ -226,8 +266,8 @@ mod tests {
             model: "test".to_string(),
             input_tokens: 100,
             output_tokens: 200,
-            cache_creation_input_tokens: 50,   // reasoning output in slot 3
-            cache_read_input_tokens: 400,       // cached input in slot 4
+            cache_creation_input_tokens: 50, // reasoning output in slot 3
+            cache_read_input_tokens: 400,    // cached input in slot 4
             event_count: 1,
             cost_usd: None,
         };
@@ -241,7 +281,13 @@ mod tests {
     #[test]
     fn test_schema_for_provider() {
         assert_eq!(schema_for_provider("codex").provider_name(), "Codex CLI");
-        assert_eq!(schema_for_provider("claude_code").provider_name(), "Claude Code");
-        assert_eq!(schema_for_provider("unknown").provider_name(), "Claude Code");
+        assert_eq!(
+            schema_for_provider("claude_code").provider_name(),
+            "Claude Code"
+        );
+        assert_eq!(
+            schema_for_provider("unknown").provider_name(),
+            "Claude Code"
+        );
     }
 }

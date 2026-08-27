@@ -71,8 +71,10 @@ fn get_latest_version(cache_path: &Path) -> Option<String> {
         // answers 403 (or 429); surface a warning instead of silently reporting
         // "no update", and fall back to the last cached value if we have one.
         Err(ureq::Error::Status(code, _)) if code == 403 || code == 429 => {
-            eprintln!("[toki] update check: GitHub API rate limit hit (HTTP {code}); \
-                       keeping last known version");
+            eprintln!(
+                "[toki] update check: GitHub API rate limit hit (HTTP {code}); \
+                       keeping last known version"
+            );
             return cached.map(|c| c.latest_version);
         }
         Err(_) => return cached.map(|c| c.latest_version),
@@ -99,7 +101,9 @@ fn load_cache(path: &Path) -> Option<UpdateCache> {
 }
 
 fn save_cache(path: &Path, cache: &UpdateCache) {
-    let Ok(json) = serde_json::to_string(cache) else { return };
+    let Ok(json) = serde_json::to_string(cache) else {
+        return;
+    };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -125,7 +129,10 @@ fn version_newer(latest: &str, current: &str) -> bool {
         let parts: Vec<&str> = v.split('.').collect();
         let major = parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
         let minor = parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-        let patch = parts.get(2).and_then(|s| s.split('-').next()?.parse().ok()).unwrap_or(0);
+        let patch = parts
+            .get(2)
+            .and_then(|s| s.split('-').next()?.parse().ok())
+            .unwrap_or(0);
         (major, minor, patch)
     };
     parse(latest) > parse(current)
@@ -163,11 +170,23 @@ mod tests {
         let path = dir.join("update_check.json");
 
         // A far-future version in cache → reported as available, no network.
-        save_cache(&path, &UpdateCache { latest_version: "999.0.0".into(), checked_at: 0 });
+        save_cache(
+            &path,
+            &UpdateCache {
+                latest_version: "999.0.0".into(),
+                checked_at: 0,
+            },
+        );
         assert_eq!(cached_update(&path).as_deref(), Some("999.0.0"));
 
         // An old version → no update.
-        save_cache(&path, &UpdateCache { latest_version: "0.0.1".into(), checked_at: 0 });
+        save_cache(
+            &path,
+            &UpdateCache {
+                latest_version: "0.0.1".into(),
+                checked_at: 0,
+            },
+        );
         assert_eq!(cached_update(&path), None);
 
         // Missing cache → no update (and never panics / never hits network).
@@ -183,7 +202,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         // Parent does not exist yet — save_cache must create it.
         let path = dir.join("nested").join("update_check.json");
-        save_cache(&path, &UpdateCache { latest_version: "1.2.3".into(), checked_at: 42 });
+        save_cache(
+            &path,
+            &UpdateCache {
+                latest_version: "1.2.3".into(),
+                checked_at: 42,
+            },
+        );
         let loaded = load_cache(&path).expect("cache should round-trip");
         assert_eq!(loaded.latest_version, "1.2.3");
         assert_eq!(loaded.checked_at, 42);

@@ -1,11 +1,11 @@
+mod http;
 pub mod json;
 mod print;
 mod uds;
-mod http;
 
-pub use print::{PrintSink, OutputFormat};
-pub use uds::UdsSink;
 pub use self::http::HttpSink;
+pub use print::{OutputFormat, PrintSink};
+pub use uds::UdsSink;
 
 use std::collections::HashMap;
 
@@ -16,14 +16,37 @@ use crate::pricing::PricingTable;
 /// Output sink for emitting usage data.
 /// All implementations must be thread-safe (used in watch mode worker thread).
 pub trait Sink: Send + Sync {
-    fn emit_summary(&self, summaries: &HashMap<String, ModelUsageSummary>, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>);
-    fn emit_grouped(&self, grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>, type_name: &str, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>);
-    fn emit_event(&self, event: &UsageEventWithTs, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>);
+    fn emit_summary(
+        &self,
+        summaries: &HashMap<String, ModelUsageSummary>,
+        pricing: Option<&PricingTable>,
+        schema: Option<&dyn ProviderSchema>,
+    );
+    fn emit_grouped(
+        &self,
+        grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>,
+        type_name: &str,
+        pricing: Option<&PricingTable>,
+        schema: Option<&dyn ProviderSchema>,
+    );
+    fn emit_event(
+        &self,
+        event: &UsageEventWithTs,
+        pricing: Option<&PricingTable>,
+        schema: Option<&dyn ProviderSchema>,
+    );
     fn emit_list(&self, items: &[String], type_name: &str);
     /// Emit a batch of raw events (from `events` metric query).
-    fn emit_events_batch(&self, events: &[RawEvent], pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>);
+    fn emit_events_batch(
+        &self,
+        events: &[RawEvent],
+        pricing: Option<&PricingTable>,
+        schema: Option<&dyn ProviderSchema>,
+    );
     /// Emit a pre-formatted JSONL line (used by trace passthrough).
-    fn emit_raw(&self, line: &str) { println!("{}", line); }
+    fn emit_raw(&self, line: &str) {
+        println!("{}", line);
+    }
     /// Emit rate-limit window rows (`windows` metric). Default: one JSON
     /// object per line through emit_raw; structured sinks override.
     fn emit_windows(&self, rows: &[crate::windows::WindowRow]) {
@@ -52,28 +75,61 @@ impl Sink for MultiSink {
             sink.emit_windows(rows);
         }
     }
-    fn emit_summary(&self, summaries: &HashMap<String, ModelUsageSummary>, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
-        for s in &self.sinks { s.emit_summary(summaries, pricing, schema); }
+    fn emit_summary(
+        &self,
+        summaries: &HashMap<String, ModelUsageSummary>,
+        pricing: Option<&PricingTable>,
+        schema: Option<&dyn ProviderSchema>,
+    ) {
+        for s in &self.sinks {
+            s.emit_summary(summaries, pricing, schema);
+        }
     }
 
-    fn emit_grouped(&self, grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>, type_name: &str, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
-        for s in &self.sinks { s.emit_grouped(grouped, type_name, pricing, schema); }
+    fn emit_grouped(
+        &self,
+        grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>,
+        type_name: &str,
+        pricing: Option<&PricingTable>,
+        schema: Option<&dyn ProviderSchema>,
+    ) {
+        for s in &self.sinks {
+            s.emit_grouped(grouped, type_name, pricing, schema);
+        }
     }
 
-    fn emit_event(&self, event: &UsageEventWithTs, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
-        for s in &self.sinks { s.emit_event(event, pricing, schema); }
+    fn emit_event(
+        &self,
+        event: &UsageEventWithTs,
+        pricing: Option<&PricingTable>,
+        schema: Option<&dyn ProviderSchema>,
+    ) {
+        for s in &self.sinks {
+            s.emit_event(event, pricing, schema);
+        }
     }
 
     fn emit_list(&self, items: &[String], type_name: &str) {
-        for s in &self.sinks { s.emit_list(items, type_name); }
+        for s in &self.sinks {
+            s.emit_list(items, type_name);
+        }
     }
 
-    fn emit_events_batch(&self, events: &[RawEvent], pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
-        for s in &self.sinks { s.emit_events_batch(events, pricing, schema); }
+    fn emit_events_batch(
+        &self,
+        events: &[RawEvent],
+        pricing: Option<&PricingTable>,
+        schema: Option<&dyn ProviderSchema>,
+    ) {
+        for s in &self.sinks {
+            s.emit_events_batch(events, pricing, schema);
+        }
     }
 
     fn emit_raw(&self, line: &str) {
-        for s in &self.sinks { s.emit_raw(line); }
+        for s in &self.sinks {
+            s.emit_raw(line);
+        }
     }
 }
 
@@ -89,7 +145,10 @@ pub fn create_sinks(specs: &[String], print_format: OutputFormat) -> Box<dyn Sin
         } else if spec.starts_with("http://") || spec.starts_with("https://") {
             sinks.push(Box::new(HttpSink::new(spec.to_string())));
         } else {
-            eprintln!("[toki] Unknown sink: {} (use: print, uds://<path>, http://<url>)", spec);
+            eprintln!(
+                "[toki] Unknown sink: {} (use: print, uds://<path>, http://<url>)",
+                spec
+            );
             std::process::exit(1);
         }
     }

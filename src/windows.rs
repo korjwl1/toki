@@ -221,7 +221,9 @@ impl WindowSnapshotV1 {
         if self.active_ms > cap {
             self.active_ms = cap;
         }
-        self.sampled_active_fraction = self.sampled_active_fraction.max(other.sampled_active_fraction);
+        self.sampled_active_fraction = self
+            .sampled_active_fraction
+            .max(other.sampled_active_fraction);
         self.n_samples = self.n_samples.max(other.n_samples);
     }
 }
@@ -229,7 +231,12 @@ impl WindowSnapshotV1 {
 /// Storage key: `[kind u8][limit_id_hash u64 BE][account_hash u64 BE][anchor_min_ms i64 BE]`.
 /// The provider is implicit (one DB per provider). Fixed-width hashes keep the
 /// key independent of the dictionary (see WindowSnapshotV1::limit_id).
-pub fn window_key(kind: WindowKind, limit_id_hash: u64, account_hash: u64, anchor_min_ms: i64) -> [u8; 25] {
+pub fn window_key(
+    kind: WindowKind,
+    limit_id_hash: u64,
+    account_hash: u64,
+    anchor_min_ms: i64,
+) -> [u8; 25] {
     let mut key = [0u8; 25];
     key[0] = kind as u8;
     key[1..9].copy_from_slice(&limit_id_hash.to_be_bytes());
@@ -318,8 +325,7 @@ impl WindowRow {
             // stored-flag-only local path meant the same window counted toward
             // statistics when read from the server and was silently dropped
             // when read from the local CLI.
-            finalized: snap.finalized
-                || snap.raw_resets_at_ms + FINALIZE_GRACE_MS < now_ms,
+            finalized: snap.finalized || snap.raw_resets_at_ms + FINALIZE_GRACE_MS < now_ms,
             maxed_out: snap.maxed_out,
             limit_reached_kind: snap.limit_reached_kind,
             time_to_100_ms: snap.time_to_100_ms,
@@ -415,7 +421,12 @@ impl OpenWindow {
     }
 
     fn key(&self) -> [u8; 25] {
-        window_key(self.kind, self.limit_id_hash, self.account_hash, self.anchor_min_ms)
+        window_key(
+            self.kind,
+            self.limit_id_hash,
+            self.account_hash,
+            self.anchor_min_ms,
+        )
     }
 }
 
@@ -431,6 +442,12 @@ pub struct WindowTracker {
     /// Account scope applied to new windows ("unknown" until resolved).
     account: String,
     account_hash: u64,
+}
+
+impl Default for WindowTracker {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl WindowTracker {
@@ -499,7 +516,9 @@ impl WindowTracker {
         // limit_id or plan from a corrupt//future-schema line is stored locally
         // and then PERMANENTLY rejected by the server as a stable-invalid item
         // — visible in local stats, silently absent from every other device.
-        if obs.limit_id.len() > MAX_LIMIT_ID_LEN || obs.plan_type.as_ref().map(|p| p.len()).unwrap_or(0) > MAX_PLAN_LEN {
+        if obs.limit_id.len() > MAX_LIMIT_ID_LEN
+            || obs.plan_type.as_ref().map(|p| p.len()).unwrap_or(0) > MAX_PLAN_LEN
+        {
             return None;
         }
         let kind = WindowKind::from_minutes(obs.window_minutes);
@@ -554,7 +573,11 @@ impl WindowTracker {
                     w.time_to_100_ms = (obs.ts_ms - window_start).max(0);
                 }
                 if obs.limit_reached {
-                    let kind_reached = if obs.has_credits { REACHED_ON_CREDITS } else { REACHED_HARD_STOP };
+                    let kind_reached = if obs.has_credits {
+                        REACHED_ON_CREDITS
+                    } else {
+                        REACHED_HARD_STOP
+                    };
                     w.limit_reached_kind = w.limit_reached_kind.max(kind_reached);
                 }
 
@@ -574,7 +597,10 @@ impl WindowTracker {
                     w.last_write_ts_ms = obs.ts_ms;
                     let snap = w.to_snapshot(false);
                     let key = w.key();
-                    Some(WindowWrite { key, snapshot: snap })
+                    Some(WindowWrite {
+                        key,
+                        snapshot: snap,
+                    })
                 } else {
                     None
                 }
@@ -591,9 +617,7 @@ impl WindowTracker {
                 // that: it would add an untouched row to the 5h duty-cycle and
                 // active-mean statistics, and it is the shape most at risk if
                 // a provider ever slides an unused window's resets_at.
-                if obs.used_percent <= 0.0
-                    && !(obs.anchor_stable && kind == WindowKind::Weekly)
-                {
+                if obs.used_percent <= 0.0 && !(obs.anchor_stable && kind == WindowKind::Weekly) {
                     return None;
                 }
                 // A resets_at already past is a stale replay: it may only
@@ -623,7 +647,11 @@ impl WindowTracker {
                     last_pct: obs.used_percent,
                     maxed_out: obs.used_percent >= 99.995,
                     limit_reached_kind: if obs.limit_reached {
-                        if obs.has_credits { REACHED_ON_CREDITS } else { REACHED_HARD_STOP }
+                        if obs.has_credits {
+                            REACHED_ON_CREDITS
+                        } else {
+                            REACHED_HARD_STOP
+                        }
                     } else {
                         REACHED_NONE
                     },
@@ -641,11 +669,17 @@ impl WindowTracker {
                     let window_start = w.anchor_min_ms - (w.window_minutes as i64) * 60_000;
                     let mut w = w;
                     w.time_to_100_ms = (obs.ts_ms - window_start).max(0);
-                    let write = WindowWrite { key: w.key(), snapshot: w.to_snapshot(false) };
+                    let write = WindowWrite {
+                        key: w.key(),
+                        snapshot: w.to_snapshot(false),
+                    };
                     self.open.push(w);
                     return Some(write);
                 }
-                let write = WindowWrite { key: w.key(), snapshot: w.to_snapshot(false) };
+                let write = WindowWrite {
+                    key: w.key(),
+                    snapshot: w.to_snapshot(false),
+                };
                 self.open.push(w);
                 Some(write)
             }
@@ -680,7 +714,10 @@ impl WindowTracker {
         let mut writes = Vec::new();
         self.open.retain(|w| {
             if now_ms > w.raw_resets_at_ms + FINALIZE_GRACE_MS {
-                writes.push(WindowWrite { key: w.key(), snapshot: w.to_snapshot(true) });
+                writes.push(WindowWrite {
+                    key: w.key(),
+                    snapshot: w.to_snapshot(true),
+                });
                 false
             } else {
                 true
@@ -717,7 +754,10 @@ impl WindowTracker {
         let writes: Vec<WindowWrite> = self
             .open
             .iter()
-            .map(|w| WindowWrite { key: w.key(), snapshot: w.to_snapshot(true) })
+            .map(|w| WindowWrite {
+                key: w.key(),
+                snapshot: w.to_snapshot(true),
+            })
             .collect();
         self.open.clear();
         writes
@@ -727,7 +767,10 @@ impl WindowTracker {
     pub fn flush_all(&mut self) -> Vec<WindowWrite> {
         self.open
             .iter()
-            .map(|w| WindowWrite { key: w.key(), snapshot: w.to_snapshot(false) })
+            .map(|w| WindowWrite {
+                key: w.key(),
+                snapshot: w.to_snapshot(false),
+            })
             .collect()
     }
 }
@@ -748,7 +791,11 @@ pub struct CachedAccountScope {
 
 impl CachedAccountScope {
     pub fn new(root: String) -> Self {
-        CachedAccountScope { root, mtime: None, scope: "unknown".to_string() }
+        CachedAccountScope {
+            root,
+            mtime: None,
+            scope: "unknown".to_string(),
+        }
     }
 
     pub fn resolve(&mut self) -> &str {
@@ -818,8 +865,7 @@ pub fn run_windows_backfill(
         FIRST_RUN_DAYS * 86_400_000
     } else {
         (now_ms - last_scan_ms + 86_400_000)
-            .max(CATCHUP_DAYS * 86_400_000)
-            .min(FIRST_RUN_DAYS * 86_400_000)
+            .clamp(CATCHUP_DAYS * 86_400_000, FIRST_RUN_DAYS * 86_400_000)
     };
     let cutoff_ms = now_ms - lookback_ms;
     // First run replays months of history that cannot be attributed to the
@@ -921,7 +967,10 @@ pub fn run_windows_backfill(
         files_scanned += 1;
         // Deliberate throttle: this is background work, never a startup burst.
         // Doubles as the stop check — shutdown must not wait out a 60-day scan.
-        if stop_rx.recv_timeout(std::time::Duration::from_millis(5)).is_ok() {
+        if stop_rx
+            .recv_timeout(std::time::Duration::from_millis(5))
+            .is_ok()
+        {
             eprintln!("[toki] windows backfill: stopping (shutdown)");
             return;
         }
@@ -952,7 +1001,10 @@ pub fn run_windows_backfill(
     let errors_before = db.window_write_errors();
     let n = writes.len();
     for w in writes {
-        if db_tx.send(crate::writer::DbOp::WriteWindow(Box::new(w))).is_err() {
+        if db_tx
+            .send(crate::writer::DbOp::WriteWindow(Box::new(w)))
+            .is_err()
+        {
             eprintln!("[toki] windows backfill: writer channel closed");
             return; // leave marker unset so the next start retries
         }
@@ -962,8 +1014,12 @@ pub fn run_windows_backfill(
     // Processed is not stored — writes are fire-and-forget — so the error
     // counter is checked below.
     let (ack_tx, ack_rx) = crossbeam_channel::bounded::<()>(1);
-    if db_tx.send(crate::writer::DbOp::FlushBulkEvents(ack_tx)).is_err()
-        || ack_rx.recv_timeout(std::time::Duration::from_secs(60)).is_err()
+    if db_tx
+        .send(crate::writer::DbOp::FlushBulkEvents(ack_tx))
+        .is_err()
+        || ack_rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .is_err()
     {
         eprintln!("[toki] windows backfill: flush barrier failed; marker not set");
         return;
@@ -1023,7 +1079,11 @@ mod tests {
 
         // The guard the backfill applies before setting its marker.
         assert_ne!(db.window_write_errors(), before);
-        assert_eq!(db.window_write_errors(), 1, "counter is monotonic, not a flag");
+        assert_eq!(
+            db.window_write_errors(),
+            1,
+            "counter is monotonic, not a flag"
+        );
         db.note_window_write_error();
         assert_eq!(db.window_write_errors(), 2);
     }
@@ -1048,18 +1108,26 @@ mod tests {
             anchor_stable: true,
             ts_ms: now,
         };
-        assert!(t.observe(&obs).is_none(), "over-long limit_id must not open a window");
+        assert!(
+            t.observe(&obs).is_none(),
+            "over-long limit_id must not open a window"
+        );
 
         obs.limit_id = "ok".into();
         obs.plan_type = Some("p".repeat(MAX_PLAN_LEN + 1));
-        assert!(t.observe(&obs).is_none(), "over-long plan must not open a window");
+        assert!(
+            t.observe(&obs).is_none(),
+            "over-long plan must not open a window"
+        );
 
         obs.plan_type = Some("max_5x".into());
         t.observe(&obs);
-        assert_eq!(t.open_reset_times().len(), 1, "a valid observation still opens one");
+        assert_eq!(
+            t.open_reset_times().len(),
+            1,
+            "a valid observation still opens one"
+        );
     }
-
-
 
     /// Backfilled history is attributed to the CURRENT account. Rollout files
     /// carry no account of their own, and keying months of real history as
@@ -1113,7 +1181,11 @@ mod tests {
         for i in 0..MAX_OPEN_WINDOWS {
             t.observe(&mk(i, 10.0));
         }
-        assert_eq!(t.open_reset_times().len(), MAX_OPEN_WINDOWS, "at the ceiling");
+        assert_eq!(
+            t.open_reset_times().len(),
+            MAX_OPEN_WINDOWS,
+            "at the ceiling"
+        );
 
         // A NEW identity is refused...
         assert!(t.observe(&mk(MAX_OPEN_WINDOWS + 1, 10.0)).is_none());
@@ -1121,7 +1193,11 @@ mod tests {
 
         // ...but an existing one still takes the higher peak.
         t.observe(&mk(0, 90.0));
-        let peaks: Vec<f64> = t.flush_all().iter().map(|w| w.snapshot.peak_pct_x100 as f64 / 100.0).collect();
+        let peaks: Vec<f64> = t
+            .flush_all()
+            .iter()
+            .map(|w| w.snapshot.peak_pct_x100 as f64 / 100.0)
+            .collect();
         assert!(
             peaks.iter().any(|p| (*p - 90.0).abs() < 0.01),
             "an already-open window must keep updating at the cap, got {peaks:?}"
@@ -1151,7 +1227,13 @@ mod tests {
         assert_eq!(t.open_reset_times().len(), MAX_OPEN_WINDOWS);
     }
 
-    fn obs(limit: &str, minutes: u32, pct: f64, resets_at_ms: i64, ts_ms: i64) -> WindowObservation {
+    fn obs(
+        limit: &str,
+        minutes: u32,
+        pct: f64,
+        resets_at_ms: i64,
+        ts_ms: i64,
+    ) -> WindowObservation {
         WindowObservation {
             limit_id: limit.to_string(),
             window_minutes: minutes,
@@ -1216,7 +1298,10 @@ mod tests {
             }
             v
         };
-        assert_eq!(bytes, expected, "v1 byte layout changed — bump WINDOW_VALUE_VERSION");
+        assert_eq!(
+            bytes, expected,
+            "v1 byte layout changed — bump WINDOW_VALUE_VERSION"
+        );
         assert_eq!(WindowSnapshotV1::decode(&expected).unwrap(), snap);
     }
 
@@ -1257,8 +1342,24 @@ mod tests {
     fn zero_percent_never_opens_window() {
         let mut t = WindowTracker::new();
         // Sliding anchors of an unused limit (observed: ~130s steps).
-        assert!(t.observe(&obs("codex_bengalfox", 10080, 0.0, 1_784_684_645_000, 1_784_080_000_000)).is_none());
-        assert!(t.observe(&obs("codex_bengalfox", 10080, 0.0, 1_784_684_773_000, 1_784_080_130_000)).is_none());
+        assert!(t
+            .observe(&obs(
+                "codex_bengalfox",
+                10080,
+                0.0,
+                1_784_684_645_000,
+                1_784_080_000_000
+            ))
+            .is_none());
+        assert!(t
+            .observe(&obs(
+                "codex_bengalfox",
+                10080,
+                0.0,
+                1_784_684_773_000,
+                1_784_080_130_000
+            ))
+            .is_none());
         assert!(t.open.is_empty());
     }
 
@@ -1269,8 +1370,20 @@ mod tests {
         let w1 = t.observe(&obs("codex", 10080, 3.0, base_reset, 1_784_000_000_000));
         assert!(w1.is_some());
         // +1s jitter (observed in real data) merges; anchor unchanged.
-        let _ = t.observe(&obs("codex", 10080, 5.0, base_reset + 1_000, 1_784_000_600_000));
-        let _ = t.observe(&obs("codex", 10080, 7.0, base_reset - 15_000, 1_784_001_200_000));
+        let _ = t.observe(&obs(
+            "codex",
+            10080,
+            5.0,
+            base_reset + 1_000,
+            1_784_000_600_000,
+        ));
+        let _ = t.observe(&obs(
+            "codex",
+            10080,
+            7.0,
+            base_reset - 15_000,
+            1_784_001_200_000,
+        ));
         assert_eq!(t.open.len(), 1);
         assert_eq!(t.open[0].anchor_min_ms, floor_to_minute(base_reset));
         assert_eq!(t.open[0].peak_pct, 7.0);
@@ -1279,8 +1392,20 @@ mod tests {
     #[test]
     fn separate_limit_ids_are_separate_windows() {
         let mut t = WindowTracker::new();
-        let _ = t.observe(&obs("codex", 10080, 17.0, 1_782_717_082_000, 1_782_100_000_000));
-        let _ = t.observe(&obs("codex_gpt5", 10080, 1.0, 1_782_717_082_000, 1_782_100_001_000));
+        let _ = t.observe(&obs(
+            "codex",
+            10080,
+            17.0,
+            1_782_717_082_000,
+            1_782_100_000_000,
+        ));
+        let _ = t.observe(&obs(
+            "codex_gpt5",
+            10080,
+            1.0,
+            1_782_717_082_000,
+            1_782_100_001_000,
+        ));
         assert_eq!(t.open.len(), 2);
     }
 
@@ -1301,12 +1426,24 @@ mod tests {
         let reset = 1_786_000_000_000;
         let t0 = reset - 4 * 3_600_000; // inside the 5h window
         assert!(t.observe(&obs("codex", 300, 10.0, reset, t0)).is_some()); // new window
-        // Sub-integer wiggle within the interval: suppressed.
-        assert!(t.observe(&obs("codex", 300, 10.4, reset, t0 + 10_000)).is_none());
+                                                                           // Sub-integer wiggle within the interval: suppressed.
+        assert!(t
+            .observe(&obs("codex", 300, 10.4, reset, t0 + 10_000))
+            .is_none());
         // Integer boundary crossed: written.
-        assert!(t.observe(&obs("codex", 300, 11.0, reset, t0 + 20_000)).is_some());
+        assert!(t
+            .observe(&obs("codex", 300, 11.0, reset, t0 + 20_000))
+            .is_some());
         // No change, but MIN_WRITE_INTERVAL elapsed: heartbeat write.
-        assert!(t.observe(&obs("codex", 300, 11.2, reset, t0 + 20_000 + MIN_WRITE_INTERVAL_MS)).is_some());
+        assert!(t
+            .observe(&obs(
+                "codex",
+                300,
+                11.2,
+                reset,
+                t0 + 20_000 + MIN_WRITE_INTERVAL_MS
+            ))
+            .is_some());
     }
 
     #[test]
@@ -1354,15 +1491,13 @@ mod tests {
 
         // A later stale line must not resurrect the high-water mark. A fresh
         // window opened after the jump stays open.
-        let _ = t.observe(&obs(
-            "codex",
-            300,
-            10.0,
-            reset + 100_000_000,
-            reset + 1_000,
-        ));
+        let _ = t.observe(&obs("codex", 300, 10.0, reset + 100_000_000, reset + 1_000));
         assert!(t.finalize_expired(reset - 10_000_000).is_empty());
-        assert_eq!(t.open.len(), 1, "a backward step must not close the new window");
+        assert_eq!(
+            t.open.len(),
+            1,
+            "a backward step must not close the new window"
+        );
     }
 
     #[test]
@@ -1416,7 +1551,13 @@ mod tests {
         let closed = t.finalize_expired(reset + FINALIZE_GRACE_MS + 1);
         assert_eq!(closed.len(), 1);
         // ts is past reset+grace; a +90s jittered reset must NOT reopen.
-        let late = obs("codex", 300, 41.0, reset + 90_000, reset + FINALIZE_GRACE_MS + 30_000);
+        let late = obs(
+            "codex",
+            300,
+            41.0,
+            reset + 90_000,
+            reset + FINALIZE_GRACE_MS + 30_000,
+        );
         assert!(t.observe(&late).is_none());
         assert!(t.open.is_empty());
     }
@@ -1427,7 +1568,13 @@ mod tests {
         // weekly window must exist (weekly overall mean would otherwise bias
         // toward active weeks).
         let mut t = WindowTracker::new();
-        let mut o = obs("seven_day", 10_080, 0.0, 1_786_000_000_000, 1_785_500_000_000);
+        let mut o = obs(
+            "seven_day",
+            10_080,
+            0.0,
+            1_786_000_000_000,
+            1_785_500_000_000,
+        );
         o.anchor_stable = true; // weekly: the documented exception
         assert!(t.observe(&o).is_some());
         assert_eq!(t.open.len(), 1);
@@ -1449,11 +1596,27 @@ mod tests {
     fn implausible_observations_are_rejected() {
         let mut t = WindowTracker::new();
         // Reset farther in the future than the window's own length: corrupt.
-        let far = obs("codex", 300, 10.0, 1_786_000_000_000 + 3 * 86_400_000, 1_786_000_000_000);
+        let far = obs(
+            "codex",
+            300,
+            10.0,
+            1_786_000_000_000 + 3 * 86_400_000,
+            1_786_000_000_000,
+        );
         assert!(t.observe(&far).is_none());
         // Zero / absurd durations.
-        assert!(t.observe(&obs("codex", 0, 10.0, 1_786_000_000_000, 1_785_999_000_000)).is_none());
-        assert!(t.observe(&obs("codex", 60 * 24 * 366, 10.0, 1_786_000_000_000, 1_785_999_000_000)).is_none());
+        assert!(t
+            .observe(&obs("codex", 0, 10.0, 1_786_000_000_000, 1_785_999_000_000))
+            .is_none());
+        assert!(t
+            .observe(&obs(
+                "codex",
+                60 * 24 * 366,
+                10.0,
+                1_786_000_000_000,
+                1_785_999_000_000
+            ))
+            .is_none());
         assert!(t.open.is_empty());
     }
 
@@ -1461,7 +1624,15 @@ mod tests {
     fn stale_past_resets_never_open_windows() {
         let mut t = WindowTracker::new();
         // Observation timestamped long after its own reset time (log replay).
-        assert!(t.observe(&obs("codex", 300, 40.0, 1_780_000_000_000, 1_780_010_000_000)).is_none());
+        assert!(t
+            .observe(&obs(
+                "codex",
+                300,
+                40.0,
+                1_780_000_000_000,
+                1_780_010_000_000
+            ))
+            .is_none());
         assert!(t.open.is_empty());
     }
 
@@ -1476,7 +1647,10 @@ mod tests {
         t.observe_activity(t0 + 120_000); // +60s gap
         t.observe_activity(t0 + 120_000 + ACTIVE_GAP_MS + 1); // over gap: pad
         let w = &t.open[0];
-        assert_eq!(w.active_ms, ISOLATED_EVENT_PAD_MS + 60_000 + 60_000 + ISOLATED_EVENT_PAD_MS);
+        assert_eq!(
+            w.active_ms,
+            ISOLATED_EVENT_PAD_MS + 60_000 + 60_000 + ISOLATED_EVENT_PAD_MS
+        );
     }
 
     /// The `>=` in `merge_from`'s LWW branch, pinned.

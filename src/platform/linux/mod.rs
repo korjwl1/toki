@@ -22,7 +22,7 @@ pub fn enable_autostart() -> Result<(), String> {
 
     let binary = toki_binary_path();
     let unit = format!(
-"[Unit]\n\
+        "[Unit]\n\
 Description=toki token usage tracker daemon\n\
 After=default.target\n\
 \n\
@@ -34,7 +34,9 @@ Restart=on-failure\n\
 RestartSec=5\n\
 \n\
 [Install]\n\
-WantedBy=default.target\n", binary, binary);
+WantedBy=default.target\n",
+        binary, binary
+    );
 
     std::fs::write(&path, &unit).map_err(|e| e.to_string())?;
 

@@ -1,8 +1,8 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use super::BroadcastSink;
 use crate::common::schema::ProviderSchema;
@@ -31,7 +31,11 @@ impl ConnPermit {
                 return None;
             }
             match count.compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => return Some(ConnPermit { count: Arc::clone(count) }),
+                Ok(_) => {
+                    return Some(ConnPermit {
+                        count: Arc::clone(count),
+                    })
+                }
                 Err(actual) => cur = actual,
             }
         }
@@ -80,8 +84,13 @@ pub fn run_listener(
             .map(|p| p == parent)
             .unwrap_or(false);
         if own_dir {
-            if let Err(e) = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)) {
-                eprintln!("[toki:daemon] could not restrict {}: {}", parent.display(), e);
+            if let Err(e) = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            {
+                eprintln!(
+                    "[toki:daemon] could not restrict {}: {}",
+                    parent.display(),
+                    e
+                );
             }
         }
     }
@@ -89,7 +98,11 @@ pub fn run_listener(
     let listener = match bind_result {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("[toki:daemon] Failed to bind {}: {}", sock_path.display(), e);
+            eprintln!(
+                "[toki:daemon] Failed to bind {}: {}",
+                sock_path.display(),
+                e
+            );
             return;
         }
     };
@@ -101,8 +114,12 @@ pub fn run_listener(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(0o600)) {
-            eprintln!("[toki:daemon] socket chmod failed ({}), refusing to listen", e);
+        if let Err(e) = std::fs::set_permissions(sock_path, std::fs::Permissions::from_mode(0o600))
+        {
+            eprintln!(
+                "[toki:daemon] socket chmod failed ({}), refusing to listen",
+                e
+            );
             let _ = std::fs::remove_file(sock_path);
             return;
         }
@@ -148,7 +165,11 @@ pub fn run_listener(
                             "ok": false,
                             "error": "server busy, too many concurrent connections"
                         });
-                        let _ = writeln!(&stream, "{}", serde_json::to_string(&busy).unwrap_or_default());
+                        let _ = writeln!(
+                            &stream,
+                            "{}",
+                            serde_json::to_string(&busy).unwrap_or_default()
+                        );
                         continue;
                     }
                 };
@@ -191,7 +212,13 @@ pub fn run_listener(
 /// break the socket (mode 0600 remains the primary control).
 #[cfg(unix)]
 fn peer_is_owner(stream: &UnixStream) -> bool {
-    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd"
+    ))]
     {
         use std::os::unix::io::AsRawFd;
         let mut euid: libc::uid_t = 0;
@@ -210,7 +237,11 @@ fn peer_is_owner(stream: &UnixStream) -> bool {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::io::AsRawFd;
-        let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+        let mut cred = libc::ucred {
+            pid: 0,
+            uid: 0,
+            gid: 0,
+        };
         let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
         let rc = unsafe {
             libc::getsockopt(
@@ -247,10 +278,7 @@ fn peer_is_owner(stream: &UnixStream) -> bool {
 /// grows its String until the peer sends a newline — a hostile or broken
 /// local client could feed an endless unterminated stream and balloon the
 /// daemon's memory. Returns None on EOF, error, or cap overflow.
-fn read_line_limited(
-    reader: &mut BufReader<&UnixStream>,
-    max_bytes: u64,
-) -> Option<String> {
+fn read_line_limited(reader: &mut BufReader<&UnixStream>, max_bytes: u64) -> Option<String> {
     use std::io::Read;
     let mut line = String::new();
     let mut limited = reader.take(max_bytes);
@@ -276,7 +304,9 @@ fn handle_connection(
     windows_hub: Option<&Arc<crate::claude_poll::PollerHub>>,
 ) {
     // 5 second timeout to read the command line
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).ok();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .ok();
 
     let mut reader = BufReader::new(&stream);
     let Some(command_line) = read_line_limited(&mut reader, 4 * 1024) else {
@@ -309,18 +339,25 @@ fn handle_connection(
                 }
                 return;
             }
-            eprintln!("[toki:daemon] Trace client connected ({} total)", broadcast.client_count());
+            eprintln!(
+                "[toki:daemon] Trace client connected ({} total)",
+                broadcast.client_count()
+            );
         }
         "REPORT" => {
             // Read the next line as JSON payload, then serve inline. This worker
             // already holds a ConnPermit (acquired in the accept loop), so the
             // report runs under the single connection-worker cap — no separate
             // thread and no racy per-report counter.
-            stream.set_read_timeout(Some(std::time::Duration::from_secs(60))).ok();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(60)))
+                .ok();
             // Bound the RESPONSE too: a peer that stops reading would
             // otherwise pin this connection worker forever (responses exceed
             // the socket buffer).
-            stream.set_write_timeout(Some(std::time::Duration::from_secs(30))).ok();
+            stream
+                .set_write_timeout(Some(std::time::Duration::from_secs(30)))
+                .ok();
             let Some(payload_line) = read_line_limited(&mut reader, 1024 * 1024) else {
                 return;
             };
@@ -332,8 +369,12 @@ fn handle_connection(
             // The payload line is OPTIONAL, so this read is expected to time
             // out for clients that omit it — keep it short or every such
             // request would pin a connection worker for 5s.
-            stream.set_read_timeout(Some(std::time::Duration::from_millis(300))).ok();
-            stream.set_write_timeout(Some(std::time::Duration::from_secs(10))).ok();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_millis(300)))
+                .ok();
+            stream
+                .set_write_timeout(Some(std::time::Duration::from_secs(10)))
+                .ok();
             let payload_line = read_line_limited(&mut reader, 4 * 1024).unwrap_or_default();
             handle_windows_client(stream, &payload_line, dbs, windows_hub);
         }
@@ -342,7 +383,11 @@ fn handle_connection(
                 "ok": false,
                 "error": format!("unknown command: {}", command)
             });
-            let _ = writeln!(&stream, "{}", serde_json::to_string(&error_resp).unwrap_or_default());
+            let _ = writeln!(
+                &stream,
+                "{}",
+                serde_json::to_string(&error_resp).unwrap_or_default()
+            );
         }
     }
 }
@@ -374,7 +419,11 @@ fn handle_windows_client(
             "ok": false,
             "error": "window tracking is disabled (settings set window_tracking true)"
         });
-        let _ = writeln!(&stream, "{}", serde_json::to_string(&resp).unwrap_or_default());
+        let _ = writeln!(
+            &stream,
+            "{}",
+            serde_json::to_string(&resp).unwrap_or_default()
+        );
         return;
     };
 
@@ -385,8 +434,7 @@ fn handle_windows_client(
     if hub.polling_enabled() && hub.poller_running() {
         if let Some(max_age) = req.max_age_ms {
             if now_ms - claude_state.last_success_ms > max_age.max(0) {
-                let (st, timed_out) =
-                    hub.request_refresh(std::time::Duration::from_secs(2));
+                let (st, timed_out) = hub.request_refresh(std::time::Duration::from_secs(2));
                 claude_state = st;
                 refreshing = timed_out;
             }
@@ -445,9 +493,7 @@ fn handle_windows_client(
             // current one's for Claude either. A daemon restarted on an idle
             // machine never polls (activity gate), so fall back to the newest
             // stored row's account (already in hand — no extra I/O).
-            "claude_code" if !claude_state.account.is_empty() => {
-                Some(claude_state.account.clone())
-            }
+            "claude_code" if !claude_state.account.is_empty() => Some(claude_state.account.clone()),
             "claude_code" => rows
                 .iter()
                 .max_by_key(|r| r.observed_ts_ms)
@@ -523,11 +569,19 @@ fn handle_windows_client(
         "refreshing": refreshing,
         "providers": providers,
     });
-    let _ = writeln!(&stream, "{}", serde_json::to_string(&resp).unwrap_or_default());
+    let _ = writeln!(
+        &stream,
+        "{}",
+        serde_json::to_string(&resp).unwrap_or_default()
+    );
 }
 
 /// Handle a report query: parse request, execute query, send response.
-fn handle_report_client(mut stream: UnixStream, request_line: &str, dbs: &[(String, Arc<Database>)]) {
+fn handle_report_client(
+    mut stream: UnixStream,
+    request_line: &str,
+    dbs: &[(String, Arc<Database>)],
+) {
     stream.set_read_timeout(None).ok();
 
     let response = match execute_report_request(request_line, dbs) {
@@ -569,14 +623,20 @@ fn execute_report_request(
         crate::query_parser::parse(&req.query).map_err(|e| format!("query parse error: {}", e))?;
 
     // Resolve time range from request start/end fields.
-    let since_ms = req.start.as_deref()
-        .map(|s| crate::query::parse_range_time(s, false, tz)
-            .map(|d| d.and_utc().timestamp_millis()))
+    let since_ms = req
+        .start
+        .as_deref()
+        .map(|s| {
+            crate::query::parse_range_time(s, false, tz).map(|d| d.and_utc().timestamp_millis())
+        })
         .transpose()?
         .unwrap_or(0);
-    let until_ms = req.end.as_deref()
-        .map(|s| crate::query::parse_range_time(s, true, tz)
-            .map(|d| d.and_utc().timestamp_millis()))
+    let until_ms = req
+        .end
+        .as_deref()
+        .map(|s| {
+            crate::query::parse_range_time(s, true, tz).map(|d| d.and_utc().timestamp_millis())
+        })
         .transpose()?
         .unwrap_or(i64::MAX);
 
@@ -617,7 +677,16 @@ fn execute_report_request(
 
     for (provider_name, db) in &target_dbs {
         let collector = CollectorSink::new();
-        crate::query::execute_parsed_query(db, &parsed, tz, start_of_week, None, &collector, since_ms, until_ms)?;
+        crate::query::execute_parsed_query(
+            db,
+            &parsed,
+            tz,
+            start_of_week,
+            None,
+            &collector,
+            since_ms,
+            until_ms,
+        )?;
 
         let mut provider_results = collector.take();
         for item in &mut provider_results {
@@ -768,12 +837,22 @@ mod tests {
             .collect();
         assert_eq!(count.load(Ordering::SeqCst), MAX_CONN_WORKERS);
         // At cap: further acquisition is refused (no check-then-increment slip).
-        assert!(ConnPermit::try_acquire(&count).is_none(), "must refuse beyond cap");
-        assert_eq!(count.load(Ordering::SeqCst), MAX_CONN_WORKERS, "refusal must not bump the counter");
+        assert!(
+            ConnPermit::try_acquire(&count).is_none(),
+            "must refuse beyond cap"
+        );
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            MAX_CONN_WORKERS,
+            "refusal must not bump the counter"
+        );
         // Releasing one frees exactly one slot.
         held.pop();
         assert_eq!(count.load(Ordering::SeqCst), MAX_CONN_WORKERS - 1);
-        assert!(ConnPermit::try_acquire(&count).is_some(), "freed slot must be reusable");
+        assert!(
+            ConnPermit::try_acquire(&count).is_some(),
+            "freed slot must be reusable"
+        );
         drop(held);
     }
 
@@ -798,7 +877,9 @@ mod tests {
                 }
             }));
         }
-        for h in handles { h.join().unwrap(); }
+        for h in handles {
+            h.join().unwrap();
+        }
         assert!(max_seen.load(Ordering::SeqCst) <= MAX_CONN_WORKERS);
         assert_eq!(count.load(Ordering::SeqCst), 0, "all permits released");
     }
@@ -811,7 +892,10 @@ mod tests {
     #[test]
     fn report_request_start_of_week_absent_defaults_monday() {
         let r = execute_report_request(r#"{"query":"usage[1w]"}"#, &[]);
-        assert!(r.is_ok(), "absent start_of_week must be accepted (older clients)");
+        assert!(
+            r.is_ok(),
+            "absent start_of_week must be accepted (older clients)"
+        );
     }
 
     #[test]
@@ -829,7 +913,10 @@ mod tests {
     #[test]
     fn report_request_start_of_week_invalid_rejected() {
         let r = execute_report_request(r#"{"query":"usage[1w]","start_of_week":"funday"}"#, &[]);
-        assert!(r.is_err(), "invalid start_of_week must be a protocol error, not a silent Monday");
+        assert!(
+            r.is_err(),
+            "invalid start_of_week must be a protocol error, not a silent Monday"
+        );
         assert!(r.unwrap_err().contains("start_of_week"));
     }
 }

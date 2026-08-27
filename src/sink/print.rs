@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
-use comfy_table::{Table, ContentArrangement, Cell, Attribute, presets::UTF8_FULL};
+use comfy_table::{presets::UTF8_FULL, Attribute, Cell, ContentArrangement, Table};
 
+use super::{format_source_label, json, shorten_id, Sink};
 use crate::common::schema::{ClaudeCodeSchema, ProviderSchema};
 use crate::common::types::{ModelUsageSummary, RawEvent, UsageEventWithTs};
-use crate::pricing::{PricingTable, format_cost};
-use super::{Sink, json, format_source_label, shorten_id};
+use crate::pricing::{format_cost, PricingTable};
 
 /// Output format for the print sink.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -33,7 +33,7 @@ fn format_number(n: u64) -> String {
     let commas = if len > 0 { (len - 1) / 3 } else { 0 };
     let mut result = String::with_capacity(len + commas);
     for (i, &b) in bytes.iter().enumerate() {
-        if i > 0 && (len - i) % 3 == 0 {
+        if i > 0 && (len - i).is_multiple_of(3) {
             result.push(',');
         }
         result.push(b as char);
@@ -47,7 +47,6 @@ fn effective_schema(schema: Option<&dyn ProviderSchema>) -> &dyn ProviderSchema 
 }
 
 impl Sink for PrintSink {
-
     /// Recorded window rows as a table. The trait's default emits raw JSON,
     /// which made `--output-format table` print one JSON object per line —
     /// technically non-empty, but not a table.
@@ -90,7 +89,11 @@ impl Sink for PrintSink {
             };
             let active_min = r.active_ms / 60_000;
             table.add_row(vec![
-                Cell::new(if r.limit_id.is_empty() { "(unnamed)" } else { &r.limit_id }),
+                Cell::new(if r.limit_id.is_empty() {
+                    "(unnamed)"
+                } else {
+                    &r.limit_id
+                }),
                 Cell::new(window),
                 Cell::new(format!("{:.1}%", r.peak_pct)),
                 Cell::new(reset),
@@ -101,10 +104,21 @@ impl Sink for PrintSink {
         }
         println!("{}", table);
     }
-    fn emit_summary(&self, summaries: &HashMap<String, ModelUsageSummary>, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
+    fn emit_summary(
+        &self,
+        summaries: &HashMap<String, ModelUsageSummary>,
+        pricing: Option<&PricingTable>,
+        schema: Option<&dyn ProviderSchema>,
+    ) {
         if summaries.is_empty() {
             if self.format == OutputFormat::Json {
-                println!("{}", serde_json::to_string_pretty(&json::summaries_to_json(summaries, pricing, schema)).unwrap_or_default());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json::summaries_to_json(
+                        summaries, pricing, schema
+                    ))
+                    .unwrap_or_default()
+                );
             } else {
                 println!("[toki] No usage data found.");
             }
@@ -112,7 +126,11 @@ impl Sink for PrintSink {
         }
 
         if self.format == OutputFormat::Json {
-            println!("{}", serde_json::to_string_pretty(&json::summaries_to_json(summaries, pricing, schema)).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json::summaries_to_json(summaries, pricing, schema))
+                    .unwrap_or_default()
+            );
             return;
         }
 
@@ -160,7 +178,9 @@ impl Sink for PrintSink {
             row.push(Cell::new(format_number(s.event_count)));
             if show_cost {
                 row.push(Cell::new(format_cost(cost)));
-                if let Some(c) = cost { total_cost += c; }
+                if let Some(c) = cost {
+                    total_cost += c;
+                }
             }
             table.add_row(row);
 
@@ -190,10 +210,22 @@ impl Sink for PrintSink {
         println!("{table}");
     }
 
-    fn emit_grouped(&self, grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>, type_name: &str, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
+    fn emit_grouped(
+        &self,
+        grouped: &HashMap<String, HashMap<String, ModelUsageSummary>>,
+        type_name: &str,
+        pricing: Option<&PricingTable>,
+        schema: Option<&dyn ProviderSchema>,
+    ) {
         if grouped.is_empty() {
             if self.format == OutputFormat::Json {
-                println!("{}", serde_json::to_string_pretty(&json::grouped_to_json(grouped, type_name, pricing, schema)).unwrap_or_default());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json::grouped_to_json(
+                        grouped, type_name, pricing, schema
+                    ))
+                    .unwrap_or_default()
+                );
             } else {
                 println!("[toki] No usage data found.");
             }
@@ -201,7 +233,13 @@ impl Sink for PrintSink {
         }
 
         if self.format == OutputFormat::Json {
-            println!("{}", serde_json::to_string_pretty(&json::grouped_to_json(grouped, type_name, pricing, schema)).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json::grouped_to_json(
+                    grouped, type_name, pricing, schema
+                ))
+                .unwrap_or_default()
+            );
             return;
         }
 
@@ -211,12 +249,20 @@ impl Sink for PrintSink {
         let is_session = type_name == "session";
         let is_provider = type_name == "provider";
         let has_pricing = pricing.is_some_and(|p| !p.is_empty());
-        let has_precalc_cost = grouped.values().any(|m| m.values().any(|s| s.cost_usd.is_some()));
+        let has_precalc_cost = grouped
+            .values()
+            .any(|m| m.values().any(|s| s.cost_usd.is_some()));
         let show_cost = has_pricing || has_precalc_cost;
         let mut buckets: Vec<&String> = grouped.keys().collect();
         buckets.sort();
 
-        let header_label = if is_session { "Session" } else if is_provider { "Provider" } else { "Period" };
+        let header_label = if is_session {
+            "Session"
+        } else if is_provider {
+            "Provider"
+        } else {
+            "Period"
+        };
         let mut table = Table::new();
         table.load_preset(UTF8_FULL);
         table.set_content_arrangement(ContentArrangement::Dynamic);
@@ -251,7 +297,11 @@ impl Sink for PrintSink {
                     let cost = pricing
                         .and_then(|p| p.summary_cost_for_schema(s, schema))
                         .or(s.cost_usd);
-                    let display_key = if is_session { shorten_id(bucket).to_string() } else { bucket.to_string() };
+                    let display_key = if is_session {
+                        shorten_id(bucket).to_string()
+                    } else {
+                        bucket.to_string()
+                    };
                     let period_cell = if i == 0 {
                         Cell::new(&display_key)
                     } else {
@@ -266,7 +316,9 @@ impl Sink for PrintSink {
                     row.push(Cell::new(format_number(s.event_count)));
                     if show_cost {
                         row.push(Cell::new(format_cost(cost)));
-                        if let Some(c) = cost { grand_cost += c; }
+                        if let Some(c) = cost {
+                            grand_cost += c;
+                        }
                     }
                     table.add_row(row);
 
@@ -305,7 +357,10 @@ impl Sink for PrintSink {
                 "type": type_name,
                 "items": items,
             });
-            println!("{}", serde_json::to_string_pretty(&json).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json).unwrap_or_default()
+            );
             return;
         }
 
@@ -314,7 +369,11 @@ impl Sink for PrintSink {
             return;
         }
 
-        let col_name = if type_name == "sessions" { "Session ID" } else { "Project" };
+        let col_name = if type_name == "sessions" {
+            "Session ID"
+        } else {
+            "Project"
+        };
         let mut table = Table::new();
         table.load_preset(UTF8_FULL);
         table.set_content_arrangement(ContentArrangement::Dynamic);
@@ -328,7 +387,12 @@ impl Sink for PrintSink {
         println!("{table}");
     }
 
-    fn emit_event(&self, event: &UsageEventWithTs, pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
+    fn emit_event(
+        &self,
+        event: &UsageEventWithTs,
+        pricing: Option<&PricingTable>,
+        schema: Option<&dyn ProviderSchema>,
+    ) {
         if self.format == OutputFormat::Json {
             let json = json::event_to_json(event, pricing, schema);
             println!("{}", serde_json::to_string(&json).unwrap_or_default());
@@ -351,17 +415,30 @@ impl Sink for PrintSink {
             cost_usd: None,
         };
         let tokens = schema.extract_tokens(&summary);
-        let parts: Vec<String> = columns.iter().zip(tokens.iter())
+        let parts: Vec<String> = columns
+            .iter()
+            .zip(tokens.iter())
             .map(|(col, &val)| format!("{}:{}", col.short, val))
             .collect();
 
         match cost {
-            Some(c) => println!("[toki] {} | {} | {} | {}", event.model, label, parts.join(" "), format_cost(Some(c))),
+            Some(c) => println!(
+                "[toki] {} | {} | {} | {}",
+                event.model,
+                label,
+                parts.join(" "),
+                format_cost(Some(c))
+            ),
             None => println!("[toki] {} | {} | {}", event.model, label, parts.join(" ")),
         }
     }
 
-    fn emit_events_batch(&self, events: &[RawEvent], pricing: Option<&PricingTable>, schema: Option<&dyn ProviderSchema>) {
+    fn emit_events_batch(
+        &self,
+        events: &[RawEvent],
+        pricing: Option<&PricingTable>,
+        schema: Option<&dyn ProviderSchema>,
+    ) {
         if self.format == OutputFormat::Json {
             let json = json::events_batch_to_json(events, pricing, schema);
             println!("{}", serde_json::to_string(&json).unwrap_or_default());
@@ -404,9 +481,9 @@ impl Sink for PrintSink {
             };
             let tokens = schema.extract_tokens(&summary);
             let total = schema.total_tokens(&summary);
-            let cost = e.cost_usd.or_else(|| {
-                pricing.and_then(|p| p.summary_cost_for_schema(&summary, schema))
-            });
+            let cost = e
+                .cost_usd
+                .or_else(|| pricing.and_then(|p| p.summary_cost_for_schema(&summary, schema)));
 
             let mut row = vec![
                 Cell::new(&e.timestamp),

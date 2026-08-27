@@ -6,7 +6,7 @@ use crossbeam_channel::Receiver;
 
 use crate::common::types::{FileCheckpoint, StoredEvent, TokenFields};
 use crate::db::Database;
-use crate::retention::{RetentionPolicy, run_retention};
+use crate::retention::{run_retention, RetentionPolicy};
 
 /// Event data for cold start bulk write.
 /// Uses Arc<str> for session_id/source_file to avoid per-event String clones.
@@ -241,7 +241,11 @@ impl DbWriter {
             if last_idx.len() < events.len() {
                 let keep: std::collections::HashSet<usize> = last_idx.values().copied().collect();
                 let mut i = 0;
-                events.retain(|_| { let k = keep.contains(&i); i += 1; k });
+                events.retain(|_| {
+                    let k = keep.contains(&i);
+                    i += 1;
+                    k
+                });
             }
         }
 
@@ -272,14 +276,21 @@ impl DbWriter {
 
             // Dedup insert: delete previous event with same msg_id.
             // Server-side EventStore handles dedup via upsert, so no corrections needed.
-            self.db.insert_event_dedup(&mut batch, event.ts_ms, &event.message_id, &stored);
+            self.db
+                .insert_event_dedup(&mut batch, event.ts_ms, &event.message_id, &stored);
 
             // Session index
-            self.db.insert_session_index(&mut batch, &event.session_id, event.ts_ms, &event.message_id);
+            self.db.insert_session_index(
+                &mut batch,
+                &event.session_id,
+                event.ts_ms,
+                &event.message_id,
+            );
 
             // Project index
             if let Some(ref project) = event.project_name {
-                self.db.insert_project_index(&mut batch, project, event.ts_ms, &event.message_id);
+                self.db
+                    .insert_project_index(&mut batch, project, event.ts_ms, &event.message_id);
             }
         }
 
@@ -288,8 +299,11 @@ impl DbWriter {
         }
 
         if crate::engine::debug_level() >= 1 {
-            eprintln!("[toki:writer] flushed {} events in {}µs",
-                count, t.elapsed().as_micros());
+            eprintln!(
+                "[toki:writer] flushed {} events in {}µs",
+                count,
+                t.elapsed().as_micros()
+            );
         }
 
         // Notify sync thread that new data is available
@@ -349,11 +363,18 @@ impl DbWriter {
 
             // Use dedup insert: engine already deduped by msg_id, but idx_msg
             // still needs to be populated for watch-mode dedup after cold start.
-            self.db.insert_event_dedup(&mut batch, event.ts_ms, &event.message_id, &stored);
-            self.db.insert_session_index(&mut batch, &event.session_id, event.ts_ms, &event.message_id);
+            self.db
+                .insert_event_dedup(&mut batch, event.ts_ms, &event.message_id, &stored);
+            self.db.insert_session_index(
+                &mut batch,
+                &event.session_id,
+                event.ts_ms,
+                &event.message_id,
+            );
 
             if let Some(ref project) = event.project_name {
-                self.db.insert_project_index(&mut batch, project, event.ts_ms, &event.message_id);
+                self.db
+                    .insert_project_index(&mut batch, project, event.ts_ms, &event.message_id);
             }
         }
 

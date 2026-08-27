@@ -9,7 +9,8 @@ const PLIST_LABEL: &str = "com.toki.daemon";
 
 fn plist_path() -> std::path::PathBuf {
     let home = crate::config::home_dir();
-    home.join("Library/LaunchAgents").join(format!("{}.plist", PLIST_LABEL))
+    home.join("Library/LaunchAgents")
+        .join(format!("{}.plist", PLIST_LABEL))
 }
 
 fn toki_binary_path() -> String {
@@ -32,7 +33,7 @@ pub fn enable_autostart() -> Result<(), String> {
     // KeepAlive is restart-on-crash-only: a clean `toki daemon stop` exits 0 and
     // stays stopped, while a crash (non-zero) is relaunched.
     let plist = format!(
-r#"<?xml version="1.0" encoding="UTF-8"?>
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -53,7 +54,9 @@ r#"<?xml version="1.0" encoding="UTF-8"?>
         <false/>
     </dict>
 </dict>
-</plist>"#, PLIST_LABEL, binary);
+</plist>"#,
+        PLIST_LABEL, binary
+    );
 
     std::fs::write(&path, &plist).map_err(|e| e.to_string())?;
 

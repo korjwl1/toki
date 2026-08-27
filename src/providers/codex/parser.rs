@@ -5,7 +5,9 @@ use std::sync::Mutex;
 use serde::Deserialize;
 use xxhash_rust::xxh3::xxh3_64;
 
-use crate::common::types::{LogParser, LogParserWithTs, SessionGroup, UsageEvent, UsageEventWithTs};
+use crate::common::types::{
+    LogParser, LogParserWithTs, SessionGroup, UsageEvent, UsageEventWithTs,
+};
 use crate::providers::{ColdStartParsed, FileParser};
 
 /// Build a Codex `event_key` whose first `:`-segment is unique per token_count
@@ -116,6 +118,12 @@ pub struct CodexFileParser {
     last_model: String,
     session_id: Option<String>,
     cwd: Option<String>,
+}
+
+impl Default for CodexFileParser {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CodexFileParser {
@@ -241,10 +249,7 @@ impl FileParser for CodexFileParser {
                 let ts_ms = crate::common::time::parse_ts_to_ms(ts)?;
 
                 // Build a per-event-unique event key (see codex_event_key).
-                let session_part = self
-                    .session_id
-                    .as_deref()
-                    .unwrap_or("unknown");
+                let session_part = self.session_id.as_deref().unwrap_or("unknown");
                 let event_key = codex_event_key(
                     session_part,
                     ts,
@@ -342,6 +347,7 @@ struct EventMsgPayload<'a> {
 /// - rust-v0.41+: nested `primary`/`secondary` with `resets_in_seconds`
 /// - rust-v0.48+: `resets_at` (epoch seconds) replaces `resets_in_seconds`
 /// - current:     adds `limit_id`, `plan_type`, `credits`, `rate_limit_reached_type`
+///
 /// The flat v0.40 shape (no reset info) has no window identity and is ignored.
 #[derive(Deserialize)]
 struct RateLimitsRaw {
@@ -382,7 +388,10 @@ struct RateLimitCreditsRaw {
 /// Parse a captured `rate_limits` JSON span into window observations.
 /// `ts_ms` is the containing line's timestamp (needed for the relative
 /// `resets_in_seconds` form). Returns None when nothing usable is present.
-fn parse_rate_limits_json(raw: &str, ts_ms: i64) -> Option<crate::common::types::WindowObservations> {
+fn parse_rate_limits_json(
+    raw: &str,
+    ts_ms: i64,
+) -> Option<crate::common::types::WindowObservations> {
     let rl: RateLimitsRaw = serde_json::from_str(raw).ok()?;
     let limit_id = rl.limit_id.unwrap_or_default();
     let plan_type = rl.plan_type;
@@ -394,7 +403,9 @@ fn parse_rate_limits_json(raw: &str, ts_ms: i64) -> Option<crate::common::types:
     let secondary_reached = reached == Some("secondary");
     let has_credits = rl.credits.and_then(|c| c.has_credits).unwrap_or(false);
 
-    let mk = |w: RateLimitWindowRaw, limit_reached: bool| -> Option<crate::common::types::WindowObservation> {
+    let mk = |w: RateLimitWindowRaw,
+              limit_reached: bool|
+     -> Option<crate::common::types::WindowObservation> {
         let used_percent = w.used_percent?;
         let window_minutes = w.window_minutes?;
         let resets_at_ms = match (w.resets_at, w.resets_in_seconds) {
@@ -433,7 +444,9 @@ fn parse_rate_limits_json(raw: &str, ts_ms: i64) -> Option<crate::common::types:
 
 /// Backfill entry point: parse a raw rollout line for rate-limit observations
 /// only (used by the startup windows backfill scan; see `windows.rs`).
-pub(crate) fn parse_rate_limits_line(line: &str) -> Option<crate::common::types::WindowObservations> {
+pub(crate) fn parse_rate_limits_line(
+    line: &str,
+) -> Option<crate::common::types::WindowObservations> {
     let header: CodexLineHeader = serde_json::from_str(line).ok()?;
     if header.line_type != "event_msg" {
         return None;
@@ -489,6 +502,12 @@ pub struct CodexParser {
 /// Upper bound on how long identical rate_limits spans may be skipped.
 const RATE_LIMITS_SKIP_MAX_MS: i64 = 60_000;
 
+impl Default for CodexParser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl CodexParser {
     pub fn new() -> Self {
         CodexParser {
@@ -502,7 +521,8 @@ impl CodexParser {
     /// this file (see `rate_limits_seen`). Updates the seen-state when parsing
     /// should proceed.
     fn rate_limits_should_skip(&self, source_file: &str, span_hash: u64, ts_ms: i64) -> bool {
-        let mut map = self.rate_limits_seen
+        let mut map = self
+            .rate_limits_seen
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         // In-place update for the common case: no per-line String allocation.
@@ -545,16 +565,14 @@ impl CodexParser {
             return model;
         }
         // Read outside the lock: this touches the disk.
-        let recovered = last_turn_context_model(source_file)
-            .unwrap_or_else(|| "unknown".to_string());
+        let recovered =
+            last_turn_context_model(source_file).unwrap_or_else(|| "unknown".to_string());
         self.set_model(source_file, &recovered);
         recovered
     }
 
     fn set_model(&self, source_file: &str, model: &str) {
-        let mut map = self.file_models
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut map = self.file_models.lock().unwrap_or_else(|e| e.into_inner());
         // Cap size to prevent unbounded growth. Evict roughly half of entries
         // (arbitrary iteration order, but preserves some model tracking rather than
         // losing all of it via clear()).
@@ -594,9 +612,7 @@ impl CodexParser {
     }
 
     fn set_cwd(&self, source_file: &str, cwd: &str) {
-        let mut map = self.file_cwds
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut map = self.file_cwds.lock().unwrap_or_else(|e| e.into_inner());
         // Same bounded-growth eviction policy as set_model.
         if map.len() > 500 {
             let keys_to_remove: Vec<String> = map.keys().take(250).cloned().collect();
@@ -702,8 +718,8 @@ impl LogParser for CodexParser {
                 None => continue,
             };
 
-            let session_id = super::extract_uuid_from_filename(stem)
-                .unwrap_or_else(|| stem.to_string());
+            let session_id =
+                super::extract_uuid_from_filename(stem).unwrap_or_else(|| stem.to_string());
 
             sessions.push(SessionGroup {
                 session_id,
@@ -732,7 +748,10 @@ impl LogParserWithTs for CodexParser {
         &self,
         line: &str,
         source_file: &str,
-    ) -> (Option<UsageEventWithTs>, Option<crate::common::types::WindowObservations>) {
+    ) -> (
+        Option<UsageEventWithTs>,
+        Option<crate::common::types::WindowObservations>,
+    ) {
         // Pre-filter (session_meta is cheap: one line per file, carries cwd)
         if !line.contains("\"token_count\"")
             && !line.contains("\"turn_context\"")
@@ -858,7 +877,10 @@ mod tests {
         let path = path.to_str().unwrap();
 
         // The most recent turn_context wins, not the first.
-        assert_eq!(last_turn_context_model(path).as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(
+            last_turn_context_model(path).as_deref(),
+            Some("gpt-5.6-terra")
+        );
 
         // A parser that never saw those lines still answers correctly.
         let parser = CodexParser::new();
@@ -906,7 +928,10 @@ mod tests {
         let line = r#"{"timestamp":"2026-03-11T15:35:35.678Z","type":"session_meta","payload":{"id":"019cdd89-9fd9-7f11-b555-459c0ec30834","cwd":"/Users/test/project"}}"#;
         let result = parser.parse_line(line);
         assert!(result.is_none());
-        assert_eq!(parser.session_id.as_deref(), Some("019cdd89-9fd9-7f11-b555-459c0ec30834"));
+        assert_eq!(
+            parser.session_id.as_deref(),
+            Some("019cdd89-9fd9-7f11-b555-459c0ec30834")
+        );
         assert_eq!(parser.cwd.as_deref(), Some("/Users/test/project"));
     }
 
@@ -986,8 +1011,12 @@ mod tests {
     fn test_watch_event_keys_do_not_collapse() {
         let parser = CodexParser::new();
         let sf = "/test/rollout-abc.jsonl";
-        let e1 = parser.parse_line(&tc_line("2026-06-19T11:38:31.718Z", 100, 10), sf).unwrap();
-        let e2 = parser.parse_line(&tc_line("2026-06-19T11:39:01.000Z", 200, 20), sf).unwrap();
+        let e1 = parser
+            .parse_line(&tc_line("2026-06-19T11:38:31.718Z", 100, 10), sf)
+            .unwrap();
+        let e2 = parser
+            .parse_line(&tc_line("2026-06-19T11:39:01.000Z", 200, 20), sf)
+            .unwrap();
         // Pre-fix both bare ids were the literal "codex" -> global collapse.
         assert_ne!(bare(&e1.event_key), bare(&e2.event_key));
         assert_ne!(e1.event_key, e2.event_key);
@@ -997,8 +1026,12 @@ mod tests {
     fn test_coldstart_event_keys_do_not_collapse() {
         let mut parser = CodexFileParser::new();
         parser.session_id = Some("019ed863-b315-76f1-891a-e8d55fe53f0d".to_string());
-        let e1 = parser.parse_line(&tc_line("2026-06-18T10:41:13.000Z", 100, 10)).unwrap();
-        let e2 = parser.parse_line(&tc_line("2026-06-18T10:41:59.000Z", 200, 20)).unwrap();
+        let e1 = parser
+            .parse_line(&tc_line("2026-06-18T10:41:13.000Z", 100, 10))
+            .unwrap();
+        let e2 = parser
+            .parse_line(&tc_line("2026-06-18T10:41:59.000Z", 200, 20))
+            .unwrap();
         // Pre-fix both bare ids were the session UUID -> per-session collapse.
         assert_ne!(bare(&e1.event_key), bare(&e2.event_key));
     }
@@ -1024,8 +1057,12 @@ mod tests {
         let parser = CodexParser::new();
         let line = tc_line("2026-06-30T20:00:05.000Z", 1000, 100);
         let name = "rollout-2026-06-30T20-00-00-019f1abc-0000-7000-8000-live00000001.jsonl";
-        let a = parser.parse_line(&line, &format!("/tmp/sessions/{name}")).unwrap();
-        let b = parser.parse_line(&line, &format!("/private/tmp/sessions/{name}")).unwrap();
+        let a = parser
+            .parse_line(&line, &format!("/tmp/sessions/{name}"))
+            .unwrap();
+        let b = parser
+            .parse_line(&line, &format!("/private/tmp/sessions/{name}"))
+            .unwrap();
         assert_eq!(a.event_key, b.event_key);
     }
 
@@ -1126,10 +1163,12 @@ mod tests {
     fn test_identical_rate_limits_span_skipped_within_bound() {
         let parser = CodexParser::new();
         let sf = "/test/rollout-rlskip.jsonl";
-        let mk = |ts: &str| format!(
-            r#"{{"timestamp":"{}","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":100,"output_tokens":10}}}},"rate_limits":{{"limit_id":"codex","primary":{{"used_percent":20.0,"window_minutes":10080,"resets_at":1786160691}}}}}}}}"#,
-            ts
-        );
+        let mk = |ts: &str| {
+            format!(
+                r#"{{"timestamp":"{}","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":100,"output_tokens":10}}}},"rate_limits":{{"limit_id":"codex","primary":{{"used_percent":20.0,"window_minutes":10080,"resets_at":1786160691}}}}}}}}"#,
+                ts
+            )
+        };
         let (_, w1) = parser.parse_line_full(&mk("2026-08-02T10:00:00.000Z"), sf);
         assert!(w1.is_some());
         // Identical span 10s later: skipped.
@@ -1162,10 +1201,17 @@ mod tests {
     fn codex_parser_throughput() {
         let parser = CodexParser::new();
         let sf = "/test/rollout-2026-08-02T00-00-00-019f9f31-585b-7d03-aa95-1ab70e4bf080.jsonl";
-        let mk = |i: u64| format!(
-            r#"{{"timestamp":"2026-08-02T10:{:02}:{:02}.{:03}Z","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":{},"cached_input_tokens":512,"output_tokens":{},"reasoning_output_tokens":64,"total_tokens":0}},"total_token_usage":{{"input_tokens":30395,"cached_input_tokens":24192,"output_tokens":165,"reasoning_output_tokens":0,"total_tokens":30560}},"model_context_window":258400}},"rate_limits":{{"limit_id":"codex","limit_name":null,"primary":{{"used_percent":{}.0,"window_minutes":10080,"resets_at":1786160691}},"secondary":null,"credits":{{"has_credits":false,"unlimited":false,"balance":"0"}},"individual_limit":null,"plan_type":"prolite","rate_limit_reached_type":null}}}}}}"#,
-            (i / 60) % 60, i % 60, i % 1000, 1000 + i, 10 + i % 90, i % 100
-        );
+        let mk = |i: u64| {
+            format!(
+                r#"{{"timestamp":"2026-08-02T10:{:02}:{:02}.{:03}Z","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":{},"cached_input_tokens":512,"output_tokens":{},"reasoning_output_tokens":64,"total_tokens":0}},"total_token_usage":{{"input_tokens":30395,"cached_input_tokens":24192,"output_tokens":165,"reasoning_output_tokens":0,"total_tokens":30560}},"model_context_window":258400}},"rate_limits":{{"limit_id":"codex","limit_name":null,"primary":{{"used_percent":{}.0,"window_minutes":10080,"resets_at":1786160691}},"secondary":null,"credits":{{"has_credits":false,"unlimited":false,"balance":"0"}},"individual_limit":null,"plan_type":"prolite","rate_limit_reached_type":null}}}}}}"#,
+                (i / 60) % 60,
+                i % 60,
+                i % 1000,
+                1000 + i,
+                10 + i % 90,
+                i % 100
+            )
+        };
         let lines: Vec<String> = (0..200_000u64).map(mk).collect();
         // Warmup
         for line in lines.iter().take(10_000) {
@@ -1181,7 +1227,10 @@ mod tests {
         let el = t0.elapsed();
         eprintln!(
             "codex_parser_throughput: {} lines in {:?} ({} ns/line, {} events)",
-            lines.len(), el, el.as_nanos() as u64 / lines.len() as u64, n
+            lines.len(),
+            el,
+            el.as_nanos() as u64 / lines.len() as u64,
+            n
         );
         assert_eq!(n as usize, lines.len());
 
@@ -1201,7 +1250,8 @@ mod tests {
         let el1 = t1.elapsed();
         eprintln!(
             "codex_parser_throughput(steady rate_limits): {} ns/line ({} events)",
-            el1.as_nanos() as u64 / steady.len() as u64, m
+            el1.as_nanos() as u64 / steady.len() as u64,
+            m
         );
     }
 
@@ -1212,7 +1262,10 @@ mod tests {
         assert_eq!(parser.cwd_for(sf), None);
         let meta = r#"{"timestamp":"2026-06-19T11:38:00.000Z","type":"session_meta","payload":{"id":"019ed863-b315-76f1-891a-e8d55fe53f0d","cwd":"/Users/test/sveltos-infra-apps"}}"#;
         assert!(parser.parse_line(meta, sf).is_none());
-        assert_eq!(parser.cwd_for(sf).as_deref(), Some("/Users/test/sveltos-infra-apps"));
+        assert_eq!(
+            parser.cwd_for(sf).as_deref(),
+            Some("/Users/test/sveltos-infra-apps")
+        );
         // Unrelated files remain unknown.
         assert_eq!(parser.cwd_for("/test/other.jsonl"), None);
     }

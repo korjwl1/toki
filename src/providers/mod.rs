@@ -52,9 +52,12 @@ pub trait Provider: Send + Sync {
     /// Returns checkpoint data (bytes_consumed, last_line_len, last_line_hash) if lines were processed.
     /// Default implementation uses `create_file_parser()` (dyn dispatch).
     /// Providers can override this with a concrete type for inlining.
-    fn scan_file_cold_start(&self, path: &str, offset: u64, emit: &mut dyn FnMut(ColdStartParsed))
-        -> std::io::Result<Option<(u64, u64, u64)>>
-    {
+    fn scan_file_cold_start(
+        &self,
+        path: &str,
+        offset: u64,
+        emit: &mut dyn FnMut(ColdStartParsed),
+    ) -> std::io::Result<Option<(u64, u64, u64)>> {
         let mut parser = self.create_file_parser(path, offset);
         crate::checkpoint::process_lines_streaming(path, offset, |line| {
             if let Some(parsed) = parser.parse_line(line) {
@@ -120,8 +123,12 @@ impl ColdStartParsed {
         source_file: Arc<str>,
         project_name: Option<Arc<str>>,
     ) -> ColdStartEvent {
-        summary.input_tokens = summary.input_tokens.saturating_add(self.tokens.input_tokens);
-        summary.output_tokens = summary.output_tokens.saturating_add(self.tokens.output_tokens);
+        summary.input_tokens = summary
+            .input_tokens
+            .saturating_add(self.tokens.input_tokens);
+        summary.output_tokens = summary
+            .output_tokens
+            .saturating_add(self.tokens.output_tokens);
         summary.cache_creation_input_tokens = summary
             .cache_creation_input_tokens
             .saturating_add(self.tokens.cache_creation_input_tokens);
@@ -147,14 +154,12 @@ pub fn create_providers(names: &[String], config: &crate::Config) -> Vec<Box<dyn
     names
         .iter()
         .filter_map(|name| match name.as_str() {
-            "claude_code" => Some(
-                Box::new(claude_code::ClaudeCodeProvider::new(
-                    config.claude_code_root.clone(),
-                )) as Box<dyn Provider>,
-            ),
-            "codex" => Some(Box::new(codex::CodexProvider::new(
-                config.codex_root.clone(),
+            "claude_code" => Some(Box::new(claude_code::ClaudeCodeProvider::new(
+                config.claude_code_root.clone(),
             )) as Box<dyn Provider>),
+            "codex" => Some(
+                Box::new(codex::CodexProvider::new(config.codex_root.clone())) as Box<dyn Provider>,
+            ),
             _ => {
                 eprintln!("[toki] Unknown provider: {}", name);
                 None
