@@ -512,7 +512,14 @@ fn main() {
 
             let response = if remote {
                 // Remote instant query: no start/end (instant at current time)
-                send_remote_query(&query, start.as_deref(), end.as_deref(), &sow_str)
+                send_remote_query(
+                    &query,
+                    start.as_deref(),
+                    end.as_deref(),
+                    &sow_str,
+                    config.tz,
+                    config.no_cost,
+                )
             } else {
                 // Local: full range scan, PromQL handles aggregation window
                 let sock_path = config.daemon_sock.clone();
@@ -1625,10 +1632,14 @@ fn remote_query_params<'a>(
     start: Option<&'a str>,
     end: Option<&'a str>,
     start_of_week: &'a str,
+    timezone: Option<&'a str>,
+    no_cost: bool,
 ) -> Vec<(&'a str, &'a str)> {
     let mut params = vec![("query", query), ("start_of_week", start_of_week)];
     if let Some(s) = start { params.push(("start", s)); }
     if let Some(e) = end { params.push(("end", e)); }
+    if let Some(tz) = timezone { params.push(("tz", tz)); }
+    if no_cost { params.push(("no_cost", "true")); }
     params
 }
 
@@ -1665,6 +1676,8 @@ fn send_remote_query(
     start: Option<&str>,
     end: Option<&str>,
     start_of_week: &str,
+    timezone: Option<chrono_tz::Tz>,
+    no_cost: bool,
 ) -> Result<ReportResponse, String> {
     let creds = toki::sync::credentials::load()
         .ok_or_else(|| "Not configured for remote query. Run: toki settings sync enable --server <host>".to_string())?;
@@ -1680,11 +1693,14 @@ fn send_remote_query(
         .unwrap_or(0);
     let (derived_start, derived_end) =
         derived_remote_query_bounds(query, start, end, now_secs);
+    let timezone_name = timezone.map(|tz| tz.to_string());
     let params = remote_query_params(
         query,
         derived_start.as_deref(),
         derived_end.as_deref(),
         start_of_week,
+        timezone_name.as_deref(),
+        no_cost,
     );
 
     let do_request = |token: &str| -> Result<ureq::Response, ureq::Error> {
@@ -1757,7 +1773,7 @@ fn send_remote_query(
     // shape as a VictoriaMetrics response and silently converted it to an
     // empty claude_code summary. Keep the Prometheus converter below only as
     // backwards compatibility for endpoints that actually return that shape.
-    if let Some(data) = native_toki_response_to_data(&body, query) {
+    if let Some(data) = native_toki_response_to_data(&body, query, no_cost) {
         return Ok(ReportResponse {
             data,
             meta: serde_json::json!({}),
@@ -1767,7 +1783,10 @@ fn send_remote_query(
     // The toki-sync /api/v1/query_range proxies to VictoriaMetrics and returns
     // Prometheus-compatible JSON. Convert it into toki's ReportResponse format
     // so the existing display pipeline (dispatch_result_to_sink) can render it.
-    let data = prometheus_response_to_toki_data(&body);
+    let mut data = prometheus_response_to_toki_data(&body);
+    if no_cost {
+        remove_cost_fields(&mut data);
+    }
     Ok(ReportResponse {
         data,
         meta: serde_json::json!({}),
@@ -1779,10 +1798,19 @@ fn send_remote_query(
 fn native_toki_response_to_data(
     body: &serde_json::Value,
     query: &str,
+    no_cost: bool,
 ) -> Option<serde_json::Value> {
     let providers = body.get("providers")?.as_object()?;
     let parsed = toki::query_parser::parse(query).ok();
     let type_name = match parsed.as_ref() {
+        Some(parsed)
+            if parsed.metric == toki::query_parser::Metric::Events
+                && parsed.bucket.is_none()
+                && parsed.group_by.is_empty()
+                && parsed.aggregation.is_none() =>
+        {
+            "events".to_string()
+        }
         Some(parsed) if parsed.bucket.is_some() => {
             format!("every {}", parsed.bucket.unwrap())
         }
@@ -1798,10 +1826,14 @@ fn native_toki_response_to_data(
     let items: Vec<serde_json::Value> = providers
         .iter()
         .map(|(provider, rows)| {
+            let mut rows = rows.clone();
+            if no_cost {
+                remove_cost_fields(&mut rows);
+            }
             let data = if type_name == "summary" {
-                flatten_native_periods(rows)
+                flatten_native_periods(&rows)
             } else {
-                rows.clone()
+                rows
             };
             serde_json::json!({
                 "type": type_name,
@@ -1811,6 +1843,23 @@ fn native_toki_response_to_data(
         })
         .collect();
     Some(serde_json::Value::Array(items))
+}
+
+fn remove_cost_fields(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            object.remove("cost_usd");
+            for child in object.values_mut() {
+                remove_cost_fields(child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                remove_cost_fields(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// An instant server response still wraps models in a synthetic period. Fold
@@ -2781,9 +2830,18 @@ mod tests {
     fn test_remote_query_params_includes_start_of_week() {
         // start_of_week is always present so the server does not silently fall
         // back to its Monday default when the caller configured another day.
-        let p = remote_query_params("usage[1w]", None, None, "sun");
+        let p = remote_query_params(
+            "usage[1w]",
+            None,
+            None,
+            "sun",
+            Some("Asia/Seoul"),
+            true,
+        );
         assert!(p.contains(&("query", "usage[1w]")));
         assert!(p.contains(&("start_of_week", "sun")));
+        assert!(p.contains(&("tz", "Asia/Seoul")));
+        assert!(p.contains(&("no_cost", "true")));
         // start/end omitted when absent.
         assert!(!p.iter().any(|(k, _)| *k == "start"));
         assert!(!p.iter().any(|(k, _)| *k == "end"));
@@ -2791,7 +2849,14 @@ mod tests {
 
     #[test]
     fn test_remote_query_params_with_range() {
-        let p = remote_query_params("usage[1d]", Some("20240301"), Some("20240315"), "mon");
+        let p = remote_query_params(
+            "usage[1d]",
+            Some("20240301"),
+            Some("20240315"),
+            "mon",
+            None,
+            false,
+        );
         assert!(p.contains(&("query", "usage[1d]")));
         assert!(p.contains(&("start", "20240301")));
         assert!(p.contains(&("end", "20240315")));
@@ -2832,7 +2897,7 @@ mod tests {
                 }]
             }
         });
-        let data = native_toki_response_to_data(&body, "usage").unwrap();
+        let data = native_toki_response_to_data(&body, "usage", false).unwrap();
         let item = &data.as_array().unwrap()[0];
         assert_eq!(item["schema"], "codex");
         assert_eq!(item["type"], "summary");
@@ -2842,6 +2907,71 @@ mod tests {
         assert_eq!(summaries[0].cache_read_input_tokens, 4);
         assert_eq!(summaries[0].cache_creation_input_tokens, 2);
         assert_eq!(summaries[0].event_count, 1);
+    }
+
+    #[test]
+    fn native_bare_events_response_stays_raw() {
+        let body = serde_json::json!({
+            "providers": {
+                "codex": [{
+                    "timestamp": "2026-08-27T23:30:00",
+                    "model": "gpt-test",
+                    "session": "session-1",
+                    "project": "/tmp/project",
+                    "input_tokens": 12,
+                    "output_tokens": 3,
+                    "cache_creation_input_tokens": 2,
+                    "cache_read_input_tokens": 4,
+                    "cost_usd": 1.25
+                }]
+            }
+        });
+
+        let data = native_toki_response_to_data(&body, "events", false).unwrap();
+        let item = &data.as_array().unwrap()[0];
+        assert_eq!(item["schema"], "codex");
+        assert_eq!(item["type"], "events");
+        let events: Vec<toki::common::types::RawEvent> =
+            serde_json::from_value(item["data"].clone()).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].session, "session-1");
+        assert_eq!(events[0].cache_read_input_tokens, 4);
+        assert_eq!(events[0].cost_usd, Some(1.25));
+        let rendered = reprocess_item_data(
+            item,
+            None,
+            Some(toki::common::schema::schema_for_provider("codex")),
+        );
+        assert_eq!(rendered[0]["cost_usd"], 1.25);
+    }
+
+    #[test]
+    fn remote_no_cost_removes_server_prices_from_every_shape() {
+        let body = serde_json::json!({
+            "providers": {
+                "codex": [{
+                    "timestamp": "2026-08-27T23:30:00",
+                    "model": "gpt-test",
+                    "session": "session-1",
+                    "project": "/tmp/project",
+                    "input_tokens": 12,
+                    "output_tokens": 3,
+                    "cache_creation_input_tokens": 2,
+                    "cache_read_input_tokens": 4,
+                    "cost_usd": 1.25
+                }]
+            }
+        });
+        let data = native_toki_response_to_data(&body, "events", true).unwrap();
+        let event: toki::common::types::RawEvent =
+            serde_json::from_value(data[0]["data"][0].clone()).unwrap();
+        assert_eq!(event.cost_usd, None);
+        let rendered = reprocess_item_data(
+            &data[0],
+            None,
+            Some(toki::common::schema::schema_for_provider("codex")),
+        );
+        assert!(rendered[0].get("cost_usd").is_none());
     }
 
     #[test]

@@ -111,10 +111,15 @@ fn windows_reach_a_real_server_over_tcp() {
 #[ignore = "requires a live toki-sync server and TOKI_E2E_ADDR/TOKI_E2E_JWT"]
 fn event_sync_and_window_sync_share_one_connection() {
     let (addr, jwt) = env2();
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
+    let now_ms = std::env::var("TOKI_E2E_EVENT_TS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64
+        });
 
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open(&dir.path().join("mixed.fjall")).unwrap();
@@ -127,7 +132,10 @@ fn event_sync_and_window_sync_share_one_connection() {
 
     let mut dict = std::collections::HashMap::new();
     dict.insert(1u32, "claude-opus-5".to_string());
-    dict.insert(2u32, "sess-mixed".to_string());
+    dict.insert(
+        2u32,
+        std::env::var("TOKI_E2E_SESSION").unwrap_or_else(|_| "sess-mixed".to_string()),
+    );
     dict.insert(3u32, "file-mixed".to_string());
     dict.insert(4u32, "proj-mixed".to_string());
     let item = toki_sync_protocol::SyncItem {
@@ -139,16 +147,16 @@ fn event_sync_and_window_sync_share_one_connection() {
             source_file_id: 3,
             project_name_id: 4,
             // Order matches `cols` below (the wire's token_columns).
-            tokens: vec![11, 22, 0, 0],
+            tokens: vec![11, 22, 3, 4],
         },
         usage_total: 33,
         is_correction: false,
     };
     let cols = vec![
-        "input_tokens".to_string(),
-        "output_tokens".to_string(),
-        "cache_creation_input_tokens".to_string(),
-        "cache_read_input_tokens".to_string(),
+        "input".to_string(),
+        "output".to_string(),
+        "reasoning_output".to_string(),
+        "cached_input".to_string(),
     ];
 
     let mut client = toki::sync::client::SyncClient::connect(&addr, false, false)

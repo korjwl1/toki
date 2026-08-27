@@ -322,6 +322,7 @@ pub fn execute_parsed_query(
                     output_tokens: event.output_tokens,
                     cache_creation_input_tokens: event.cache_creation_input_tokens,
                     cache_read_input_tokens: event.cache_read_input_tokens,
+                    cost_usd: None,
                 });
             }).map_err(|e| e.to_string())?;
 

@@ -120,6 +120,10 @@ pub struct RawEvent {
     pub output_tokens: u64,
     pub cache_creation_input_tokens: u64,
     pub cache_read_input_tokens: u64,
+    /// Remote queries may carry the server's authoritative price. Local raw
+    /// events leave this empty and are priced by the selected sink as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
 }
 
 /// Token fields for DbOp::WriteEvent.

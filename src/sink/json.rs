@@ -131,7 +131,7 @@ pub fn events_batch_to_json(
         }
         entry["total_tokens"] = serde_json::json!(total);
 
-        if let Some(cost) = pricing.and_then(|p| p.summary_cost(&summary)) {
+        if let Some(cost) = e.cost_usd.or_else(|| pricing.and_then(|p| p.summary_cost(&summary))) {
             entry["cost_usd"] = serde_json::json!(cost);
         }
         entry

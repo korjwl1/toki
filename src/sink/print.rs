@@ -382,7 +382,8 @@ impl Sink for PrintSink {
             header.push(Cell::new(col.header).add_attribute(Attribute::Bold));
         }
         header.push(Cell::new("Total").add_attribute(Attribute::Bold));
-        if pricing.is_some() {
+        let has_cost = pricing.is_some() || events.iter().any(|event| event.cost_usd.is_some());
+        if has_cost {
             header.push(Cell::new("Cost").add_attribute(Attribute::Bold));
         }
         table.set_header(header);
@@ -399,7 +400,7 @@ impl Sink for PrintSink {
             };
             let tokens = schema.extract_tokens(&summary);
             let total = schema.total_tokens(&summary);
-            let cost = pricing.and_then(|p| p.summary_cost(&summary));
+            let cost = e.cost_usd.or_else(|| pricing.and_then(|p| p.summary_cost(&summary)));
 
             let mut row = vec![
                 Cell::new(&e.timestamp),
@@ -411,7 +412,7 @@ impl Sink for PrintSink {
                 row.push(Cell::new(format_number(val)));
             }
             row.push(Cell::new(format_number(total)));
-            if pricing.is_some() {
+            if has_cost {
                 row.push(Cell::new(format_cost(cost)));
             }
             table.add_row(row);
