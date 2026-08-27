@@ -625,8 +625,18 @@ pub fn parse_range_time(value: &str, is_until: bool, tz: Option<Tz>) -> Result<N
     for fmt in &["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"] {
         if let Ok(naive) = NaiveDateTime::parse_from_str(value, fmt)
             .or_else(|_| {
-                chrono::NaiveDate::parse_from_str(value, fmt)
-                    .map(|d| NaiveDateTime::new(d, chrono::NaiveTime::from_hms_opt(0,0,0).unwrap()))
+                chrono::NaiveDate::parse_from_str(value, fmt).map(|d| {
+                    // A dashed date-only bound denotes the whole day, exactly
+                    // as YYYYMMDD does above. Anchoring an end bound at
+                    // midnight dropped the entire end day — the same bug the
+                    // compact format was fixed for, in a documented format.
+                    let time = if is_until {
+                        chrono::NaiveTime::from_hms_milli_opt(23, 59, 59, 999).unwrap()
+                    } else {
+                        chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap()
+                    };
+                    NaiveDateTime::new(d, time)
+                })
             })
         {
             return match tz {
@@ -858,6 +868,25 @@ mod tests {
     }
 
     // ── parse_range_time format coverage ────────────────────────────────────
+
+    #[test]
+    fn dashed_date_only_end_covers_the_whole_day() {
+        // `--end 2026-03-01` denotes the whole date, exactly as `20260301`
+        // does. Anchoring it at midnight dropped the entire end day.
+        let dt = parse_range_time("2026-03-01", false, None).unwrap();
+        assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2026-03-01 00:00:00");
+
+        let dt_until = parse_range_time("2026-03-01", true, None).unwrap();
+        assert_eq!(dt_until.format("%H:%M:%S").to_string(), "23:59:59");
+        assert_eq!(dt_until.and_utc().timestamp_subsec_millis(), 999);
+
+        // The two spellings of the same date must resolve identically.
+        assert_eq!(dt_until, parse_range_time("20260301", true, None).unwrap());
+
+        // An explicit time is still honoured verbatim in either direction.
+        let explicit = parse_range_time("2026-03-01 08:00:00", true, None).unwrap();
+        assert_eq!(explicit.format("%H:%M:%S").to_string(), "08:00:00");
+    }
 
     #[test]
     fn test_parse_range_time_yyyymmdd() {

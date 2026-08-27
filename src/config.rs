@@ -149,8 +149,17 @@ impl Config {
         }
         if let Some(v) = settings.get("timezone").and_then(|v| v.as_str()) {
             if !v.is_empty() {
-                if let Ok(tz) = v.parse::<Tz>() {
-                    self.tz = Some(tz);
+                match v.parse::<Tz>() {
+                    Ok(tz) => self.tz = Some(tz),
+                    // Leaving tz unset makes every date bound resolve against
+                    // UTC. `settings set` now refuses to write a bad value, but
+                    // a hand-edited or older config can still carry one, and
+                    // silently falling back to UTC is exactly the kind of
+                    // plausible wrong answer that never gets noticed.
+                    Err(_) => eprintln!(
+                        "[toki] Ignoring invalid timezone setting '{}';                          dates will be interpreted as UTC.                          Fix it with: toki settings set timezone <IANA name>",
+                        v
+                    ),
                 }
             }
         }

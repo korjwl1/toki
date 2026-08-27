@@ -492,6 +492,15 @@ fn main() {
             }
 
             let config = build_config(cli_tz, cli_no_cost, cli_output_format);
+
+            // A reversed range is a mistake, not an empty result. Locally this
+            // used to scan to completion and print an empty table with exit 0;
+            // only the remote path caught it, and only because the server did.
+            validate_range(
+                parse_opt_range(&start, false, config.tz),
+                parse_opt_range(&end, true, config.tz),
+            );
+
             let output_format = resolve_output_format(&config);
             let sink = toki::sink::create_sinks(&["print".to_string()], output_format);
 
@@ -631,6 +640,16 @@ fn handle_settings_set(key: &str, value: &str) {
     if !VALID_SETTINGS.contains(&key) {
         eprintln!("[toki] Unknown setting: {}", key);
         eprintln!("[toki] Valid keys: {}", VALID_SETTINGS.join(", "));
+        std::process::exit(1);
+    }
+
+    // Validate the timezone on write. The loader discards an unparseable value
+    // and leaves `tz` unset, which makes every date bound resolve against UTC
+    // — silently, and off by a whole working day in Asia/Seoul. The
+    // `--timezone` flag and the settings TUI already validate; only this path
+    // did not.
+    if key == "timezone" && !value.is_empty() && value.parse::<chrono_tz::Tz>().is_err() {
+        eprintln!("[toki] Invalid timezone: {} (use an IANA name like Asia/Seoul)", value);
         std::process::exit(1);
     }
 
@@ -1388,11 +1407,6 @@ fn handle_report(
                 }
             }
 
-            validate_range(
-                parse_opt_range(&eff_since, false, tz),
-                parse_opt_range(&eff_until, true, tz),
-            );
-
             // Capture the resolved week start (honours --start-of-week) before
             // group_by is consumed; to_query_string_with_bucket drops it.
             let sow = if let toki::engine::ReportGroupBy::Week { start_of_week } = &group_by {
@@ -1415,6 +1429,14 @@ fn handle_report(
             ).to_query_string();
             (q, since.clone(), until.clone(), config.start_of_week)
         };
+
+    // Validate the resolved bounds for BOTH arms. Living inside the
+    // subcommand arm, this check let `toki report --start B --end A` through
+    // to an empty table and exit 0.
+    validate_range(
+        parse_opt_range(&req_start, false, tz),
+        parse_opt_range(&req_end, true, tz),
+    );
 
     // Load pricing client-side (file cache, no DB)
     let pricing = if no_cost {

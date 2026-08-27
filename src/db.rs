@@ -900,6 +900,51 @@ mod tests {
     }
 
     #[test]
+    fn an_end_date_includes_its_final_millisecond_and_stops_at_midnight() {
+        // The `--end YYYYMMDD` fix had no end-to-end coverage: the only
+        // assertion was on the parsed NaiveDateTime, nothing exercised the
+        // scan at the boundary. These are the two events that actually decide
+        // whether a day's last second is reported or silently dropped.
+        let (db, _dir) = temp_db();
+
+        let ev = |input: u64| StoredEvent {
+            model_id: 1,
+            session_id: 1,
+            source_file_id: 1,
+            project_name_id: 1,
+            input_tokens: input,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        };
+
+        // 2026-08-27 in UTC.
+        let day_start_ms = 1_787_788_800_000i64;
+        let until_ms = crate::query::parse_range_time("20260827", true, None)
+            .unwrap()
+            .and_utc()
+            .timestamp_millis();
+
+        // The last representable millisecond of the end date.
+        db.insert_event(until_ms, "last-ms", &ev(1)).unwrap();
+        // The first millisecond of the following day.
+        db.insert_event(until_ms + 1, "next-midnight", &ev(2)).unwrap();
+
+        let mut seen = Vec::new();
+        db.for_each_event(day_start_ms, until_ms, |ts, e| {
+            seen.push((ts, e.input_tokens));
+        })
+        .unwrap();
+
+        assert_eq!(
+            seen,
+            vec![(until_ms, 1)],
+            "the end date's final millisecond must be included and the next \
+             day's first millisecond must not"
+        );
+    }
+
+    #[test]
     fn test_window_upsert_merge_and_retention() {
         use crate::windows::{window_key, WindowKind, WindowSnapshotV1, REACHED_NONE};
         let (db, _dir) = temp_db();

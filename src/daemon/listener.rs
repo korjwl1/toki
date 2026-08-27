@@ -580,6 +580,13 @@ fn execute_report_request(
         .transpose()?
         .unwrap_or(i64::MAX);
 
+    // A reversed range is a client bug, not a request for nothing. The tz and
+    // start_of_week checks above already refuse to guess; this one was simply
+    // missing, so the daemon answered `ok:true` with empty data.
+    if since_ms > until_ms {
+        return Err("invalid range: end is earlier than start".to_string());
+    }
+
     // Strip "provider" from group_by (handled at DB routing level)
     parsed.group_by.retain(|k| k != "provider");
 
