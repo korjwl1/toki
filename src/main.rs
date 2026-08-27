@@ -472,7 +472,7 @@ fn main() {
             let config = build_config(None, false, None);
             handle_windows(&config, command.unwrap_or(WindowsCommands::Status { fresh: false, json: false }));
         }
-        Commands::Query { query, remote, timezone, start_of_week: cli_start_of_week, output_format: cli_fmt, start, end, step: _step, no_cost: cli_no_cost } => {
+        Commands::Query { query, remote, timezone, start_of_week: cli_start_of_week, output_format: cli_fmt, start, end, step, no_cost: cli_no_cost } => {
             let cli_tz: Option<Tz> = match timezone.as_deref() {
                 Some(name) => match name.parse::<Tz>() {
                     Ok(tz) => Some(tz),
@@ -525,6 +525,7 @@ fn main() {
                     &query,
                     start.as_deref(),
                     end.as_deref(),
+                    step.as_deref(),
                     &sow_str,
                     config.tz,
                     config.no_cost,
@@ -1653,6 +1654,7 @@ fn remote_query_params<'a>(
     query: &'a str,
     start: Option<&'a str>,
     end: Option<&'a str>,
+    step: Option<&'a str>,
     start_of_week: &'a str,
     timezone: Option<&'a str>,
     no_cost: bool,
@@ -1660,9 +1662,31 @@ fn remote_query_params<'a>(
     let mut params = vec![("query", query), ("start_of_week", start_of_week)];
     if let Some(s) = start { params.push(("start", s)); }
     if let Some(e) = end { params.push(("end", e)); }
+    if let Some(st) = step { params.push(("step", st)); }
     if let Some(tz) = timezone { params.push(("tz", tz)); }
     if no_cost { params.push(("no_cost", "true")); }
     params
+}
+
+/// Resolve the step the sync backend should bucket by.
+///
+/// The server buckets by the `step` parameter and by nothing else: it parses
+/// the query text but does not keep the range selector, so `usage[1d]` arrived
+/// as a bucket-less request and collapsed the whole range into one bucket,
+/// labelled with a date that need not contain any data. The local engine
+/// buckets by the selector. Same query, two different answers.
+///
+/// An explicit --step wins; otherwise derive it from the selector so remote
+/// matches local. Returning None leaves the old whole-range behaviour for
+/// queries that carry no selector at all.
+fn resolved_remote_step(query: &str, step: Option<&str>) -> Option<String> {
+    if let Some(explicit) = step {
+        return Some(explicit.to_string());
+    }
+    toki::query_parser::parse(query)
+        .ok()
+        .and_then(|parsed| parsed.bucket)
+        .map(|bucket| format!("{}s", bucket.as_secs()))
 }
 
 /// The sync backend receives the scan range as separate HTTP parameters; the
@@ -1697,6 +1721,7 @@ fn send_remote_query(
     query: &str,
     start: Option<&str>,
     end: Option<&str>,
+    step: Option<&str>,
     start_of_week: &str,
     timezone: Option<chrono_tz::Tz>,
     no_cost: bool,
@@ -1716,10 +1741,12 @@ fn send_remote_query(
     let (derived_start, derived_end) =
         derived_remote_query_bounds(query, start, end, now_secs);
     let timezone_name = timezone.map(|tz| tz.to_string());
+    let resolved_step = resolved_remote_step(query, step);
     let params = remote_query_params(
         query,
         derived_start.as_deref(),
         derived_end.as_deref(),
+        resolved_step.as_deref(),
         start_of_week,
         timezone_name.as_deref(),
         no_cost,
@@ -2856,6 +2883,7 @@ mod tests {
             "usage[1w]",
             None,
             None,
+            None,
             "sun",
             Some("Asia/Seoul"),
             true,
@@ -2875,6 +2903,7 @@ mod tests {
             "usage[1d]",
             Some("20240301"),
             Some("20240315"),
+            None,
             "mon",
             None,
             false,
@@ -2883,6 +2912,44 @@ mod tests {
         assert!(p.contains(&("start", "20240301")));
         assert!(p.contains(&("end", "20240315")));
         assert!(p.contains(&("start_of_week", "mon")));
+    }
+
+    #[test]
+    fn a_range_selector_becomes_the_remote_step() {
+        // The server buckets by the `step` parameter and nothing else -- it
+        // does not keep the range selector it parses. The client dropped
+        // --step on the floor and never derived one, so `usage[1d]` over a
+        // week collapsed remotely into a single bucket carrying a date that
+        // held no data, while the same query locally produced one bucket per
+        // day. Same question, two answers.
+        assert_eq!(resolved_remote_step("usage[1d]", None).as_deref(), Some("86400s"));
+        assert_eq!(resolved_remote_step("usage[1w]", None).as_deref(), Some("604800s"));
+        assert_eq!(resolved_remote_step("usage[24h]", None).as_deref(), Some("86400s"));
+
+        // An explicit --step wins over the selector.
+        assert_eq!(
+            resolved_remote_step("usage[1d]", Some("1h")).as_deref(),
+            Some("1h")
+        );
+
+        // A query with no selector keeps the whole-range behaviour.
+        assert_eq!(resolved_remote_step("events", None), None);
+
+        // And the derived step actually reaches the wire.
+        let derived = resolved_remote_step("usage[1d]", None);
+        let params = remote_query_params(
+            "usage[1d]",
+            Some("20260820"),
+            Some("20260826"),
+            derived.as_deref(),
+            "sun",
+            Some("Asia/Seoul"),
+            false,
+        );
+        assert!(
+            params.iter().any(|(k, v)| *k == "step" && *v == "86400s"),
+            "step must be sent, got {params:?}"
+        );
     }
 
     #[test]
