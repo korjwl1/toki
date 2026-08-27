@@ -9,7 +9,7 @@
 ## 토픽
 
 - **데몬 실행 및 provider 처리** — `daemon`, `provider 관리`
-- **데이터 조회** — `report`, `query`, `trace`
+- **데이터 조회** — `report`, `query`, `trace`, `windows`
 - **toki 설정** — `settings`, `sync`, 클라이언트 옵션, 출력 형식
 - **동작 이해** — retention, 디버그 로깅, JSONL 구조, 라이브러리 사용
 
@@ -19,20 +19,30 @@ toki는 데몬/클라이언트 구조로 동작한다:
 
 - **`daemon start`**: 서버 프로세스. cold start 후 파일 감시 + TSDB 저장
 - **`daemon stop/restart/status`**: 데몬 관리
-- **`daemon reset`**: DB 전체 삭제 및 초기화
+- **`daemon enable/disable`**: 로그인 자동 시작 설치/제거
+- **`daemon reset`**: 재구축 가능한 이벤트 DB 삭제; 설정과 window 이력은 보존
 - **`settings set providers --add/--remove`**: provider 관리 (Claude Code, Codex CLI 등)
 - **`trace`**: 데몬에 연결하여 실시간 이벤트 스트림 수신
-- **`query`**: 최상위 PromQL instant 쿼리 (순수 PromQL, `--start`/`--end` 없음)
+- **`query`**: 최상위 PromQL instant/range 쿼리; 로컬·원격 실행 지원
 - **`report`**: one-shot TSDB 조회. 데몬이 수집한 데이터를 조회
-- **`report query`**: `--start`/`--end` 시간 윈도우를 사용하는 범위 PromQL 쿼리 (하위 호환)
+- **`windows`**: 현재 rate-limit gauge와 저장된 window 이력
 
 ## 소스에서 빌드
 
+현재 개발 branch는 v1.1.0 tag 전까지 protocol repository의 sibling checkout이
+필요하다:
+
 ```bash
+git clone https://github.com/korjwl1/toki-sync-protocol.git toki_sync_protocol
+git clone https://github.com/korjwl1/toki.git toki
+cd toki
 cargo build --release
 # 바이너리: target/release/toki
 # PATH에 추가하거나 직접 실행
 ```
+
+릴리즈 바이너리는 macOS 또는 Linux에서
+`brew tap korjwl1/tap && brew install toki`로 설치할 수 있다.
 
 ## Common tasks: daemon
 
@@ -47,9 +57,8 @@ toki daemon start --foreground # 포그라운드 실행 (디버그용)
 
 1. 설정된 provider의 세션 파일을 스캔 (cold start)
 2. 파싱된 이벤트를 provider별 TSDB에 저장
-3. 전체 토큰 사용량 요약 출력
-4. FSEvents 감시 모드 진입
-5. UDS 리스너 시작 (trace 클라이언트 수신 대기)
+3. 파일 감시기와 설정된 window/sync worker 시작
+4. trace, report, query, window 클라이언트용 UDS listener 시작
 
 데몬 설정(소켓 경로, Claude Code root 등)은 `toki settings`에서 관리한다.
 
@@ -71,8 +80,10 @@ PID 파일과 소켓 파일을 정리한다.
 toki daemon restart
 ```
 
-실행 중인 데몬을 중지하고 다시 시작한다.
-설정(`toki settings`)을 변경한 뒤 데몬에 즉시 반영하려면 이 명령을 사용한다.
+실행 중인 데몬을 중지하고 다시 시작한다. provider root/선택, socket 경로,
+`window_tracking`, `retention_days`, `window_retention_days`는 재시작이
+필요하다. Sync와 `window_polling`은 hot reload되고 표시 설정은 새 CLI process가
+매번 읽는다.
 
 ### daemon status
 
@@ -88,9 +99,21 @@ toki daemon status
 toki daemon reset
 ```
 
-데몬이 실행 중이면 먼저 중지한 뒤, TSDB 데이터베이스를 전체 삭제한다.
-모든 이벤트, rollup, 체크포인트, 설정이 초기화된다.
-삭제 후 `toki daemon start`로 처음부터 다시 데이터를 수집할 수 있다.
+데몬이 실행 중이면 먼저 중지한 뒤 legacy 이벤트 DB와 provider별 재구축 가능한
+`<provider>.fjall`을 삭제한다. 다음 시작 시 provider 로그에서 이벤트, 인덱스,
+dictionary, checkpoint를 다시 만든다.
+
+`settings.json`, 인증 정보, `<provider>.windows.fjall`은 의도적으로 보존한다.
+Window peak는 항상 재구축 가능한 데이터가 아니기 때문이다.
+
+### daemon enable / disable
+
+```bash
+toki daemon enable   # 로그인 자동 시작 설치
+toki daemon disable  # 로그인 자동 시작 제거
+```
+
+macOS에서는 launchd, Linux에서는 사용자 systemd unit을 사용한다.
 
 ## Common tasks: provider 관리
 
@@ -111,7 +134,8 @@ toki settings set providers --remove codex
 toki settings get providers
 ```
 
-각 provider는 독립된 데이터베이스(`~/.config/toki/<provider>.fjall`)를 가진다.
+각 provider는 이벤트 DB(`~/.config/toki/<provider>.fjall`)와 별도 window 이력
+DB(`~/.config/toki/<provider>.windows.fjall`)를 가진다.
 provider를 추가하거나 제거한 뒤 데몬이 실행 중이면 재시작이 필요하다.
 
 ## Common tasks: trace
@@ -134,7 +158,7 @@ toki trace --sink print --sink http://localhost:8080/events
 toki trace --no-cost
 ```
 
-- 항상 JSONL 형식 (`--output-format`은 report에만 적용)
+- 항상 JSONL 형식 (`--output-format`은 query/report에서 사용)
 - `--sink`로 UDS, HTTP 등으로 중계 가능
 - 기본적으로 `cost_usd` 필드 포함 (daemon이 pricing 로드); `--no-cost`로 제외
 - 데몬이 실행 중이어야 한다 (`toki daemon start` 먼저)
@@ -160,7 +184,8 @@ toki report --start 20260301 --end 20260331
 ```
 
 전체 기간 또는 지정 범위의 모델별 토큰 사용량 합계를 출력한다.
-기본적으로 모든 활성 provider의 결과를 병합한다. `--provider`로 단일 provider만 필터링할 수 있다.
+기본 응답은 활성 provider별 결과 set을 분리한다. 서로 다른 token column 의미를
+provider 사이에서 합치지 않는다. `--provider`로 하나를 선택할 수 있다.
 
 ### 시간별 그룹핑
 
@@ -173,32 +198,29 @@ toki report yearly
 toki report hourly --start 20260301
 ```
 
-| 서브커맨드 | `--start` 필수 | 비고 |
-|-----------|----------------|------|
-| `hourly` | 필수 | - |
-| `daily` | 필수 | - |
-| `weekly` | 필수 | `--start-of-week` 사용 가능 |
-| `monthly` | - | - |
-| `yearly` | - | - |
-
-`hourly`, `daily`, `weekly`는 데이터 양이 많을 수 있으므로 `--start`를 필수로 요구한다.
+모든 grouping 서브커맨드는 선택적 범위를 받는다. 특히 `hourly`, `daily`,
+`weekly`에서는 `--start`로 출력 범위를 제한하는 것이 좋다.
 
 ### --start / --end 형식
 
 | 형식 | 예시 | 해석 |
 |------|------|------|
-| `YYYYMMDD` | `20260301` | `--start`: 00:00:00, `--end`: 23:59:59 |
+| `YYYYMMDD` / `YYYY-MM-DD` | `20260301` / `2026-03-01` | `--start`: 00:00:00.000, `--end`: 23:59:59.999 |
 | `YYYYMMDDhhmmss` | `20260301143000` | 정확한 시각 |
+| Unix seconds | `1772323200` | 정확한 UTC 초 |
+| Unix milliseconds | `1772323200123` | 정확한 UTC 밀리초 |
+| RFC 3339 / ISO 8601 | `2026-03-01T14:30:00+09:00` | offset-aware; naive 값은 선택한 timezone 사용 |
 
 - `--timezone`이 지정되면 입력값을 해당 타임존의 로컬 시간으로 해석하여 UTC로 변환
-- `--timezone`이 없으면 UTC로 해석
+- `--timezone`이 없으면 timezone 없는 값을 UTC로 해석
+- 날짜만 쓴 `--end`는 마지막 날 전체를 포함하며, 역전 범위는 거부
 
 ```bash
 # UTC 기준
 toki report daily --start 20260301
 
 # KST 기준 (2026-03-01 00:00:00 KST = 2026-02-28 15:00:00 UTC)
-toki -z Asia/Seoul report daily --start 20260301
+toki report -z Asia/Seoul daily --start 20260301
 ```
 
 ### 세션별 그룹핑
@@ -233,11 +255,12 @@ toki report --session-id abc --project myapp
 toki report daily --start 20260301 --session-id abc
 ```
 
-필터가 지정되면 rollup 대신 이벤트 레벨 스캔을 사용한다 (rollup에는 세션/프로젝트 정보가 없으므로).
+요약과 grouping report는 모두 시간순 이벤트 keyspace를 스캔한다. 시간 필터가
+없는 session/project 목록은 해당 인덱스를 사용할 수 있다.
 
 ### PromQL 스타일 쿼리
 
-`report query` 서브커맨드로 PromQL에서 영감을 받은 자유 쿼리를 실행할 수 있다.
+최상위 `query` 명령으로 PromQL에서 영감을 받은 자유 쿼리를 실행한다.
 
 #### 문법
 
@@ -247,61 +270,62 @@ toki report daily --start 20260301 --session-id abc
 
 | 요소 | 필수 | 설명 |
 |------|------|------|
-| `metric` | 필수 | `usage`, `sessions`, `projects`, `events` |
+| `metric` | 필수 | `toki_tokens_total` (`usage` alias), `cost`, `events`, `windows`, `sessions`, `projects` |
 | `{filters}` | - | `key="value"` 쌍, `,`로 구분 |
 | `[bucket]` | - | 시간 버킷: `s`, `m`, `h`, `d`, `w` — 복합 가능: `2h30m` (usage 전용). 데이터가 있는 버킷만 반환하며, 빈 구간은 zero-fill하지 않음. |
 | `offset <dur>` | - | 시간 윈도우를 과거로 이동 (예: `offset 7d`) |
 | `sum\|avg\|count()` | - | 집계: 모델 차원 collapse (usage 전용) |
 | `by (dims)` | - | 그룹 기준: `model`, `session`, `project` (usage 전용) |
 
-필터 키: `model`, `session`, `project`, `provider`, `since`, `until`
+필터 키: `model`, `session`, `project`, `provider`, `type`. 시간 범위는 label
+filter가 아니라 CLI flag로 지정한다.
 
 #### 예시
 
 ```bash
 # 전체 사용량 요약
-toki report query 'usage'
+toki query 'usage'
 
 # 모델 필터
-toki report query 'usage{model="claude-opus-4-6"}'
+toki query 'usage{model="claude-opus-4-6"}'
 
 # 1시간 버킷 + 모델별 그룹핑
-toki report --start 20260301 query 'usage[1h] by (model)'
+toki query --start 20260301 'usage[1h] by (model)'
 
 # Provider 필터 + 모델별 그룹핑
-toki report query 'usage{provider="codex"} by (model)'
+toki query 'usage{provider="codex"} by (model)'
 
 # 세션별 그룹핑 + 시간 범위
-toki report --start 20260301 --end 20260331 query 'usage by (session)'
+toki query --start 20260301 --end 20260331 'usage by (session)'
 
 # 프로젝트별 그룹핑
-toki report query 'usage{project="myapp"} by (project)'
+toki query 'usage{project="myapp"} by (project)'
 
 # 복합 그룹핑
-toki report query 'usage[1d] by (model, session)'
+toki query 'usage[1d] by (model, session)'
 
 # offset 수정자 — 이전 기간과 비교
-toki report query 'usage[1d] offset 7d'
+toki query 'usage[1d] offset 7d'
 
 # 집계 함수 — 모델 차원 collapse
-toki report query 'sum(usage[1d])'                                    # 일별 전체 합산
-toki report query 'avg(usage[1d])'                                    # 이벤트당 평균
-toki report query 'count(usage[1d])'                                  # 이벤트 수만
-toki report --start 20260301 query 'sum(usage[1d]) by (project)'      # 프로젝트별 일별 합산
+toki query 'sum(usage[1d])'                                    # 일별 전체 합산
+toki query 'avg(usage[1d])'                                    # 이벤트당 평균
+toki query 'count(usage[1d])'                                  # 이벤트 수만
+toki query --start 20260301 'sum(usage[1d]) by (project)'      # 프로젝트별 일별 합산
 
 # raw 이벤트
-toki report --start 20260320 query 'events'
-toki report --start 20260301 query 'events{model="claude-opus-4-6"}'
-toki report query 'events{session="abc123"}'
+toki query --start 20260320 'events'
+toki query --start 20260301 'events{model="claude-opus-4-6"}'
+toki query 'events{session="abc123"}'
 
 # 세션 리스팅
-toki report query 'sessions'
-toki report query 'sessions{project="myapp"}'
-toki report --start 20260301 query 'sessions'
+toki query 'sessions'
+toki query 'sessions{project="myapp"}'
+toki query --start 20260301 'sessions'
 
 # 프로젝트 리스팅
-toki report query 'projects'
-toki report query 'projects{project="myapp"}'
+toki query 'projects'
+toki query 'projects{project="myapp"}'
 ```
 
 #### 집계 함수 의미
@@ -339,16 +363,21 @@ toki report query 'projects{project="myapp"}'
 
 ## Common tasks: query
 
-`toki query`는 instant PromQL 쿼리를 위한 최상위 명령어다. 순수 PromQL 문법을 사용하며 `--start`/`--end` 플래그가 없다 — 시간 범위는 PromQL 표현식 내부에서 지정한다 (예: `[1h]`, `[1d]`).
+`toki query`는 PromQL 진입점이다. 명시적 범위가 없으면 instant/rolling
+쿼리로, `--start` 또는 `--end`가 있으면 해당 범위를 스캔한다. `[1h]`,
+`[1d]` 같은 selector는 출력 bucket을 정하고, 원격 쿼리에서는 `--step`
+미지정 시 기본 step도 제공한다.
 
 ### 플래그
 
 | 플래그 | 설명 |
 |--------|------|
 | `-z <IANA>` | 시간 해석용 타임존 |
-| `-w` | 넓은 테이블 출력 |
+| `-w`, `--start-of-week <요일>` | `[1w]` bucket의 주 시작 경계 |
 | `--remote` | 로컬 데몬 대신 toki-sync 서버로 쿼리 전송 |
 | `--output-format table\|json` | 출력 형식 |
+| `--start`, `--end` | 명시적 스캔 범위 |
+| `--step <duration>` | 원격 range-query step; selector 유도값보다 우선 |
 | `--no-cost` | 비용 계산 비활성화 |
 
 ### 예시
@@ -364,8 +393,12 @@ toki query 'sum(toki_tokens_total{type=~"input|output"}[1h])'
 # 원격 쿼리 (sync 서버 경유)
 toki query --remote "sum by (model)(toki_tokens_total[1h])"
 
-# 넓은 테이블
-toki query -w "sum by (model)(toki_tokens_total[1d])"
+# 화요일 주 경계
+toki query -w tue "sum by (model)(toki_tokens_total[1w])"
+
+# 명시적 범위
+toki query --start 2026-03-01 --end 2026-03-31 --step 1d \
+  "sum by (model)(toki_tokens_total[1d])"
 
 # JSON 출력
 toki query --output-format json "toki_tokens_total[1h]"
@@ -374,22 +407,38 @@ toki query --output-format json "toki_tokens_total[1h]"
 toki query --no-cost "toki_tokens_total[1h]"
 ```
 
-### toki query vs toki report query
-
-| | `toki query` | `toki report query` |
-|---|---|---|
-| 범위 | Instant 쿼리 (순수 PromQL) | 범위 쿼리 (`--start`/`--end` 시간 윈도우) |
-| 시간 범위 | PromQL 표현식 내부: `[1h]`, `[1d]` | `--start`/`--end` 플래그 |
-| `--remote` | 지원 | 미지원 (`toki query --remote` 사용) |
-| 상태 | 신규 사용 시 권장 | 하위 호환, 계속 동작 |
+`toki report query`는 제거되었다. 표현식을 `toki query`로 옮기고 범위
+flag는 그대로 사용한다:
 
 ```bash
-# 권장: instant 쿼리
-toki query "sum by (model)(toki_tokens_total[1h])"
-
-# 계속 동작: 시간 윈도우를 사용하는 범위 쿼리
-toki report --start 20260301 --end 20260331 query "sum by (model)(toki_tokens_total[1d])"
+toki query --start 20260301 --end 20260331 \
+  "sum by (model)(toki_tokens_total[1d])"
 ```
+
+현재 원격 제한: sync server는 로컬 parser가 지원하는 모든 RFC 3339 bound를
+받지 않으며, server query에는 pagination 없는 상한이 있다. 매우 큰 원격
+범위는 CLI truncation 경고 없이 부분 결과가 될 수 있으므로 bounded query를 권장한다.
+
+## Common tasks: rate-limit windows
+
+Window tracking은 기본 활성화된다. Codex limit은 rollout JSONL에서 수동적으로
+추출하고 Claude limit은 활동 기반 usage/profile poller로 가져온다. Window row는
+provider별 별도 DB에 저장되며 sync 활성화 시 동기화된다.
+
+```bash
+toki windows                         # `windows status`와 동일
+toki windows status --fresh          # 제한 시간 내 live 재검증
+toki windows status --json
+toki windows list                    # 기본 -28d부터 +8d anchor까지
+toki windows list --start 20260801 --end 20260831
+toki windows list --start 2026-08-01 --end 2026-08-31 --json
+toki query windows                   # 저장된 로컬 이력
+toki query --remote windows          # 병합된 server 이력
+```
+
+`window_tracking=false`는 수집을 끄며 재시작이 필요하다.
+`window_polling=false`는 Claude network polling만 끄고 hot reload된다.
+이력은 기본 730일인 `window_retention_days`를 따른다.
 
 ## Common tasks: settings
 
@@ -406,29 +455,37 @@ toki settings get timezone
 toki settings list
 ```
 
-데몬 영향 설정(`claude_code_root`, `codex_root`, `daemon_sock`, `retention_days`, `rollup_retention_days`) 변경 시
-데몬이 실행 중이면 재시작 여부를 묻는다.
+Boolean 설정은 `true/false`, `on/off`, `yes/no`, `1/0`을 받는다. 잘못된
+IANA timezone은 UTC로 조용히 바뀌지 않고 거부된다.
 
 | 설정 항목 | key | 기본값 | 데몬 영향 |
 |-----------|-----|--------|-----------|
-| Providers | `providers` | `[]` | 있음 |
-| Claude Code Root | `claude_code_root` | `~/.claude` | 있음 |
-| Codex CLI Root | `codex_root` | `~/.codex` | 있음 |
-| Daemon Socket | `daemon_sock` | `~/.config/toki/daemon.sock` | 있음 |
-| Timezone | `timezone` | (빈값 = UTC) | 없음 |
-| Output Format | `output_format` | `table` | 없음 |
-| Start of Week | `start_of_week` | `mon` | 없음 |
-| No Cost | `no_cost` | `false` | 없음 |
-| Retention Days | `retention_days` | `0` (무제한) | 있음 |
-| Rollup Retention Days | `rollup_retention_days` | `0` (무제한) | 있음 |
+| Providers | `providers` | 미설정 시 자동 감지 | 재시작 |
+| Claude Code Root | `claude_code_root` | `~/.claude` | 재시작 |
+| Codex CLI Root | `codex_root` | `~/.codex` | 재시작 |
+| Daemon Socket | `daemon_sock` | `~/.config/toki/daemon.sock` | 재시작 |
+| Timezone | `timezone` | 빈값(UTC) | hot reload/client |
+| Output Format | `output_format` | `table` | hot reload/client |
+| Start of Week | `start_of_week` | `mon` | hot reload/client |
+| No Cost | `no_cost` | `false` | client 설정; daemon startup 가격 fetch에는 현재 미적용 |
+| Event retention | `retention_days` | `0` (무제한) | 재시작 |
+| Window tracking | `window_tracking` | `true` | 재시작 |
+| Claude window polling | `window_polling` | `true` | hot reload |
+| Window retention | `window_retention_days` | `730` | 재시작 |
+| 로그인 자동 시작 | `daemon_autostart` | platform 상태 | CLI 관리 |
 
 설정 우선순위: **CLI 인자 > 설정 파일 (settings.json) > 기본값**
 
-환경변수는 사용하지 않는다 (`TOKI_DEBUG` 제외).
+알려진 CLI 불일치: `settings set retention_days ...`는 현재 hot reload된다고
+출력하지만 writer는 daemon 시작 때 retention policy를 capture한다. 이 key를
+바꾼 뒤 daemon을 재시작해야 한다.
+
+`TOKI_HOME`은 격리 실행에서 provider root와 toki 상태가 사용할 home을
+오버라이드한다. `TOKI_DEBUG`는 진단 로그를 활성화한다.
 
 ## Common tasks: sync
 
-여러 디바이스의 토큰 사용량을 중앙 [toki-sync](https://github.com/korjwl1/toki-sync) 서버로 동기화한다. 모든 서브커맨드는 `toki settings sync`로도 사용할 수 있다.
+여러 디바이스의 토큰 사용량을 중앙 [toki-sync](https://github.com/korjwl1/toki-sync) 서버로 동기화한다. Sync 관리는 `toki settings sync` 아래에 있다.
 
 ### sync enable
 
@@ -494,9 +551,18 @@ toki settings sync devices
 
 동기화 서버에 등록된 모든 디바이스 목록을 표시한다.
 
-### settings sync
+### sync remove
 
-모든 sync 명령은 `toki settings sync` 서브커맨드로도 사용할 수 있다:
+```bash
+toki settings sync remove <device-id>
+```
+
+선택한 디바이스를 서버에서 제거한다. 제거된 디바이스는 다음 연결에서
+거부된다. ID는 먼저 `devices`로 확인한다.
+
+### sync 명령 요약
+
+전체 sync 명령은 다음과 같다:
 
 ```bash
 toki settings sync enable --server <host>
@@ -506,6 +572,7 @@ toki settings sync disable --keep       # 원격 데이터 유지
 toki settings sync status
 toki settings sync devices
 toki settings sync rename <new-name>
+toki settings sync remove <device-id>
 ```
 
 ### query --remote
@@ -526,18 +593,20 @@ toki query --remote 'toki_tokens_total{device="macbook-pro"}'
 | `--output-format table\|json` | query, report | 출력 형식 오버라이드 |
 | `--sink <SPEC>` | trace | 출력 대상: `print`, `uds://<path>`, `http://<url>` (복수 지정 가능) |
 | `--timezone <IANA>` / `-z` | query, report | 타임존 오버라이드 |
-| `-w` | query | 넓은 테이블 출력 |
+| `-w`, `--start-of-week <요일>` | query | `[1w]` bucket의 주 시작 경계 |
+| `--start`, `--end` | query, report, windows list | 시간 범위 |
+| `--step <duration>` | query | 원격 range-query step |
 | `--remote` | query | toki-sync 서버로 쿼리 전송 |
 | `--no-cost` | trace, query, report | 비용 계산 비활성화 |
 
-### --output-format (report 전용)
+### --output-format
 
 ```bash
 toki report --output-format table          # 기본값
 toki report --output-format json
 ```
 
-report의 `print` 출력에만 적용된다.
+report와 query에 적용된다. Window 명령은 별도 `--json` flag를 사용한다.
 
 ### --timezone / -z
 
@@ -559,6 +628,12 @@ toki trace --no-cost
 
 report: 가격 데이터 fetch를 스킵하고 Cost 컬럼을 표시하지 않는다.
 trace: JSONL 출력에서 `cost_usd` 필드를 제거한다.
+
+가격은 `~/.config/toki/pricing.json`의 LiteLLM cache를 사용한다. 정확한 모델
+매치가 우선이며, 정확한 Claude `-fast` 행이 없으면 알려진 Opus fast variant에
+provider 2배 배수를 적용한다. 공개 cache-read 가격이 없으면 cached input을
+무료로 가정하지 않고 일반 input 가격을 보수적으로 쓴다. 사용할 온라인/캐시
+가격이 없으면 값을 추정하지 않고 cost를 생략한다.
 
 ## Quick reference: 출력 형식
 
@@ -619,7 +694,7 @@ trace: JSONL 출력에서 `cost_usd` 필드를 제거한다.
 
 | 필드 | 설명 |
 |------|------|
-| `since` / `until` | TSDB에 있는 실제 데이터 범위 (rollup 첫/마지막 타임스탬프, O(1)) |
+| `since` / `until` | 이벤트 DB가 보고한 실제 데이터 범위 |
 | `query_since` / `query_until` | 사용자가 `--start`/`--end`로 지정한 필터 (미지정 시 null) |
 | `timezone` | 시간 해석에 사용된 타임존 (null = UTC) |
 | `start_of_week` | 주간 그룹핑 시 주의 시작 요일 |
@@ -743,16 +818,18 @@ UDS와 HTTP sink은 JSON과 동일한 구조를 사용한다. `--output-format`�
 
 ## How it works: retention (데이터 보존)
 
-기본적으로 비활성화되어 있다. `toki settings`에서 보존 기간을 설정하면 활성화된다.
+이벤트 retention은 기본 비활성화다. Window 이력은 provider 로그에서 항상
+재구축할 수 없으므로 독립된 기본 730일을 사용한다.
 
 | 대상 | 기본 보존 | 설정 키 |
 |------|----------|---------|
 | events (개별 이벤트) | 0 (무제한) | `retention_days` |
-| rollups (시간별 집계) | 0 (무제한) | `rollup_retention_days` |
+| rate-limit windows | 730일 | `window_retention_days` |
 
 - 0 = 비활성화 (데이터를 삭제하지 않음)
 - 활성화 시: daemon start 시 1회 실행 + 이후 24시간 간격
-- rollup은 events보다 오래 보존하는 것을 권장: events 삭제 후에도 report 가능
+- 이벤트 정리는 시간 인덱스와 미사용 dictionary entry도 회수
+- window 정리는 event retention이 꺼져도 독립 실행
 
 ## How it works: debug logging
 
@@ -769,8 +846,8 @@ TOKI_DEBUG=2 toki daemon start
 ```text
 [toki:debug] process_file /path/to/session.jsonl — 3 lines, 1024 bytes, 2 events, Active | find_resume: 50µs, read: 120µs, total: 180µs
 [toki:debug] flush_dirty — 5 checkpoints sent to writer
-[toki:writer] flushed 64 events, 3 rollups in 450µs
-[toki:writer] retention cleanup: 150 events, 12 rollups deleted (35ms)
+[toki:writer] flushed 64 events in 450µs
+[toki:writer] daily retention: 150 events, 24 index, 2 windows, 12 dict entries removed (35ms)
 ```
 
 ## Common tasks: 라이브러리 사용
@@ -786,7 +863,7 @@ use toki::daemon::BroadcastSink;
 use std::sync::Arc;
 
 fn main() {
-    let config = Config::new(); // loads defaults, then DB settings
+    let config = Config::new(); // 기본값 다음 settings.json 로드
 
     let broadcast = Arc::new(BroadcastSink::new());
     let handle = start(config, Box::new(broadcast.clone()))

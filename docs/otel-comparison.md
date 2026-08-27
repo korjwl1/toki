@@ -207,7 +207,7 @@ For the specific purpose of token usage monitoring:
 | **Data source** | Same (assistant message tokens) | Same |
 | **Data granularity** | Individual events (Log Records) | Individual events (JSONL lines) |
 | **Transport** | Network (OTLP over HTTP/gRPC) | Local file I/O |
-| **Latency** | 5-10s batch delay | 150ms-500ms polling |
+| **Latency** | 5-10s batch delay | Filesystem-event driven; macOS Codex has a 1s polling fallback |
 | **Infrastructure** | Collector + backend required | None (standalone binary) |
 | **Failure recovery** | File queue + exponential backoff | Checkpoint-based resume |
 | **Subagent separation** | Aggregated (no separation) | Per-file separation |

@@ -14,7 +14,8 @@ The fastest path in:
 
 - Rust toolchain (latest stable). `Cargo.toml` does not pin an MSRV, so the latest stable from [rustup](https://rustup.rs/) is the safest choice. If you hit a build error on an older toolchain, upgrade before filing a bug.
 - `cargo` (bundled with rustup).
-- macOS, Linux, or Windows. macOS uses FSEvents, Linux uses inotify, Windows falls back to polling — all handled by the `notify` crate.
+- macOS or Linux. The current CLI/daemon IPC uses Unix domain sockets; Windows is not a supported build yet.
+- A sibling checkout of `toki_sync_protocol` at `../toki_sync_protocol`. Until protocol v1.1.0 is tagged, `Cargo.toml` deliberately patches the git dependency to that path because the client uses `SyncWindows` and `WireWindow`.
 
 ### Build and run
 
@@ -37,7 +38,10 @@ Keep PRs focused — one fix or feature per PR. Reviewers can ship a small, self
 
 ### Commit messages
 
-Existing history uses short, lowercase, type-prefixed subjects: `fix: ...`, `feat: ...`, `chore: ...`, `refactor: ...`, `docs: ...`. Follow that pattern so `git log --oneline` stays scannable.
+Use a short, lowercase, scoped subject that explains the invariant or behavior,
+for example `windows: preserve observations across event schema resets`. Recent
+history uses both scoped prose and conventional `fix:`/`chore:` prefixes; match
+the nearby history and keep the first line scannable.
 
 ## Issues
 
@@ -46,7 +50,10 @@ Found a bug or have a feature idea? Open an issue using the templates provided. 
 ## Code style
 
 - Run `cargo fmt` before committing. This keeps diffs free of formatting noise so reviewers can focus on intent.
-- `cargo clippy` must pass with no warnings. Clippy catches a lot of subtle correctness issues; silencing it locally hides them from review.
+- Run `cargo clippy --all-targets --all-features` and do not add new warnings.
+  The current development branch still has a warning baseline, so a plain
+  successful exit is not the same as a warning-free run; include newly
+  introduced warnings in the change rather than hiding them.
 - Match the structure of nearby files. Provider parsers live under `src/providers/<name>/`, sink implementations under `src/sink/`, and shared types under `src/common/`. New parsers should implement the `Provider` trait in `src/providers/mod.rs` rather than introducing a parallel abstraction.
 
 ## Tests

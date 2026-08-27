@@ -9,7 +9,7 @@ This document is task-oriented: it shows how to do things with toki. Each H2 bel
 ## Topics
 
 - **Run the daemon and parse providers** — `daemon`, `provider management`
-- **Read your data** — `report`, `query`, `trace`
+- **Read your data** — `report`, `query`, `trace`, `windows`
 - **Configure toki** — `settings`, `sync`, client options, output formats
 - **Understand behavior** — retention, debug logging, JSONL structure, library usage
 
@@ -19,20 +19,30 @@ toki operates with a daemon/client architecture:
 
 - **`daemon start`**: Server process. Cold start followed by file watching + TSDB storage
 - **`daemon stop/restart/status`**: Daemon management
-- **`daemon reset`**: Full DB wipe and reinitialization
+- **`daemon enable/disable`**: Install or remove login auto-start
+- **`daemon reset`**: Rebuildable event DB wipe; settings and window history are preserved
 - **`settings set providers --add/--remove`**: Provider management (Claude Code, Codex CLI, etc.)
 - **`trace`**: Connect to daemon for real-time event streaming
-- **`query`**: Top-level PromQL instant query (pure PromQL, no `--start`/`--end`)
+- **`query`**: Top-level PromQL instant/range query; supports local and remote execution
 - **`report`**: One-shot TSDB query. Retrieves data collected by the daemon
-- **`report query`**: Range PromQL query with `--start`/`--end` time window (backward compat)
+- **`windows`**: Current rate-limit gauges and persisted window history
 
 ## Build from source
 
+The current development branch needs the protocol repository as a sibling
+checkout until v1.1.0 is tagged:
+
 ```bash
+git clone https://github.com/korjwl1/toki-sync-protocol.git toki_sync_protocol
+git clone https://github.com/korjwl1/toki.git toki
+cd toki
 cargo build --release
 # Binary: target/release/toki
 # Add to PATH or run directly
 ```
+
+Released binaries can instead be installed on macOS or Linux with
+`brew tap korjwl1/tap && brew install toki`.
 
 ## Common tasks: daemon
 
@@ -47,9 +57,8 @@ Detaches to the background by default. Use `--foreground` to keep the process in
 
 1. Scans configured providers' session files (cold start)
 2. Stores parsed events in per-provider TSDB
-3. Outputs total token usage summary
-4. Enters FSEvents watch mode
-5. Starts UDS listener (awaits trace client connections)
+3. Starts filesystem watchers and configured window/sync workers
+4. Starts the UDS listener for trace, report, query, and window clients
 
 Daemon settings (socket path, Claude Code root, etc.) are managed via `toki settings`.
 
@@ -71,8 +80,10 @@ Cleans up PID file and socket file.
 toki daemon restart
 ```
 
-Stops the running daemon and restarts it.
-Use this command to apply settings changes from `toki settings`.
+Stops the running daemon and restarts it. Provider roots/selection, socket path,
+`window_tracking`, `retention_days`, and `window_retention_days` require a
+restart. Sync and `window_polling` are hot-reloaded; display settings are read
+by each new CLI process.
 
 ### daemon status
 
@@ -88,9 +99,21 @@ Shows daemon running status and PID.
 toki daemon reset
 ```
 
-If the daemon is running, stops it first, then completely deletes the TSDB database.
-All events, rollups, checkpoints, and settings are reset.
-After deletion, use `toki daemon start` to collect data from scratch.
+If the daemon is running, stops it first, then deletes the legacy event DB and
+each provider's rebuildable `<provider>.fjall` event DB. Events, indexes,
+dictionaries, and checkpoints are rebuilt from provider logs on the next start.
+
+`settings.json`, credentials, and `<provider>.windows.fjall` are deliberately
+preserved. Window peaks are observations that cannot necessarily be rebuilt.
+
+### daemon enable / disable
+
+```bash
+toki daemon enable   # install login auto-start
+toki daemon disable  # remove login auto-start
+```
+
+On macOS this uses launchd; on Linux it uses a user systemd unit.
 
 ## Common tasks: provider management
 
@@ -111,7 +134,8 @@ toki settings set providers --remove codex
 toki settings get providers
 ```
 
-Each provider has an independent database (`~/.config/toki/<provider>.fjall`).
+Each provider has an event database (`~/.config/toki/<provider>.fjall`) and a
+separate window-history database (`~/.config/toki/<provider>.windows.fjall`).
 After adding or removing a provider, restart the daemon if it is running.
 
 ## Common tasks: trace
@@ -133,7 +157,7 @@ toki trace --sink print --sink http://localhost:8080/events
 toki trace --no-cost
 ```
 
-- Always outputs JSONL (no `--output-format` option — that applies to report only)
+- Always outputs JSONL (no `--output-format` option; query/report use that option)
 - Supports `--sink` for relaying to UDS or HTTP targets
 - Includes `cost_usd` field by default (daemon loads pricing); use `--no-cost` to exclude
 - Daemon must be running (`toki daemon start` first)
@@ -157,7 +181,9 @@ toki report --start 20260301 --end 20260331
 ```
 
 Outputs per-model token usage totals for the entire period or specified range.
-By default, results from all active providers are merged. Use `--provider` to filter to a single provider.
+By default, the response contains a separate result set for every active
+provider. Token-column semantics are not merged across providers. Use
+`--provider` to select one.
 
 ### Time-based grouping
 
@@ -170,32 +196,29 @@ toki report yearly
 toki report hourly --start 20260301
 ```
 
-| Subcommand | `--start` required | Note |
-|------------|-------------------|------|
-| `hourly` | Yes | - |
-| `daily` | Yes | - |
-| `weekly` | Yes | `--start-of-week` available |
-| `monthly` | No | - |
-| `yearly` | No | - |
-
-`hourly`, `daily`, `weekly` may produce large output, so `--start` is required.
+All grouping subcommands accept an optional range. Use `--start` for bounded
+output, especially with `hourly`, `daily`, or `weekly`.
 
 ### --start / --end format
 
 | Format | Example | Interpretation |
 |--------|---------|---------------|
-| `YYYYMMDD` | `20260301` | `--start`: 00:00:00, `--end`: 23:59:59 |
+| `YYYYMMDD` / `YYYY-MM-DD` | `20260301` / `2026-03-01` | `--start`: 00:00:00.000, `--end`: 23:59:59.999 |
 | `YYYYMMDDhhmmss` | `20260301143000` | Exact time |
+| Unix seconds | `1772323200` | Exact UTC second |
+| Unix milliseconds | `1772323200123` | Exact UTC millisecond |
+| RFC 3339 / ISO 8601 | `2026-03-01T14:30:00+09:00` | Offset-aware; naive values use the selected timezone |
 
 - If `--timezone` is set, input values are interpreted as local time in that timezone and converted to UTC
-- Without `--timezone`, values are interpreted as UTC
+- Without `--timezone`, timezone-less values are interpreted as UTC
+- A date-only `--end` includes the complete final day; reversed ranges are rejected
 
 ```bash
 # UTC-based
 toki report daily --start 20260301
 
 # KST-based (2026-03-01 00:00:00 KST = 2026-02-28 15:00:00 UTC)
-toki -z Asia/Seoul report daily --start 20260301
+toki report -z Asia/Seoul daily --start 20260301
 ```
 
 ### Session grouping
@@ -230,11 +253,12 @@ toki report --session-id abc --project myapp
 toki report daily --start 20260301 --session-id abc
 ```
 
-When filters are specified, event-level scanning is used instead of rollups (rollups lack session/project information).
+All summaries and grouped reports scan the time-ordered event keyspace. Session
+and project listing can use their indexes when no time filter is present.
 
 ### PromQL-style queries
 
-Use the `report query` subcommand for PromQL-inspired free queries.
+Use the top-level `query` command for PromQL-inspired free queries.
 
 #### Syntax
 
@@ -244,61 +268,62 @@ Use the `report query` subcommand for PromQL-inspired free queries.
 
 | Element | Required | Description |
 |---------|----------|-------------|
-| `metric` | Yes | `usage`, `sessions`, `projects`, `events` |
+| `metric` | Yes | `toki_tokens_total` (`usage` alias), `cost`, `events`, `windows`, `sessions`, `projects` |
 | `{filters}` | No | `key="value"` pairs, comma-separated |
 | `[bucket]` | No | Time bucket: `s`, `m`, `h`, `d`, `w` — compound ok: `2h30m` (usage only). Returns only buckets with data; empty intervals are not zero-filled. |
 | `offset <dur>` | No | Shift time window back (e.g. `offset 7d`) |
 | `sum\|avg\|count()` | No | Aggregation: collapse model dimension (usage only) |
 | `by (dims)` | No | Group by: `model`, `session`, `project` (usage only) |
 
-Filter keys: `model`, `session`, `project`, `provider`, `since`, `until`
+Filter keys: `model`, `session`, `project`, `provider`, `type`. Time bounds are
+CLI flags, not label filters.
 
 #### Examples
 
 ```bash
 # Full usage summary
-toki report query 'usage'
+toki query 'usage'
 
 # Model filter
-toki report query 'usage{model="claude-opus-4-6"}'
+toki query 'usage{model="claude-opus-4-6"}'
 
 # 1-hour bucket + model grouping
-toki report --start 20260301 query 'usage[1h] by (model)'
+toki query --start 20260301 'usage[1h] by (model)'
 
 # Provider filter + model grouping
-toki report query 'usage{provider="codex"} by (model)'
+toki query 'usage{provider="codex"} by (model)'
 
 # Session grouping + time range
-toki report --start 20260301 --end 20260331 query 'usage by (session)'
+toki query --start 20260301 --end 20260331 'usage by (session)'
 
 # Project grouping
-toki report query 'usage{project="myapp"} by (project)'
+toki query 'usage{project="myapp"} by (project)'
 
 # Multi-dimension grouping
-toki report query 'usage[1d] by (model, session)'
+toki query 'usage[1d] by (model, session)'
 
 # Offset modifier — compare with previous period
-toki report query 'usage[1d] offset 7d'
+toki query 'usage[1d] offset 7d'
 
 # Aggregation functions — collapse model dimension
-toki report query 'sum(usage[1d])'                                    # daily total
-toki report query 'avg(usage[1d])'                                    # per-event average
-toki report query 'count(usage[1d])'                                  # event count only
-toki report --start 20260301 query 'sum(usage[1d]) by (project)'      # per-project daily sum
+toki query 'sum(usage[1d])'                                    # daily total
+toki query 'avg(usage[1d])'                                    # per-event average
+toki query 'count(usage[1d])'                                  # event count only
+toki query --start 20260301 'sum(usage[1d]) by (project)'      # per-project daily sum
 
 # Raw events
-toki report --start 20260320 query 'events'
-toki report --start 20260301 query 'events{model="claude-opus-4-6"}'
-toki report query 'events{session="abc123"}'
+toki query --start 20260320 'events'
+toki query --start 20260301 'events{model="claude-opus-4-6"}'
+toki query 'events{session="abc123"}'
 
 # Session listing
-toki report query 'sessions'
-toki report query 'sessions{project="myapp"}'
-toki report --start 20260301 query 'sessions'
+toki query 'sessions'
+toki query 'sessions{project="myapp"}'
+toki query --start 20260301 'sessions'
 
 # Project listing
-toki report query 'projects'
-toki report query 'projects{project="myapp"}'
+toki query 'projects'
+toki query 'projects{project="myapp"}'
 ```
 
 #### Aggregation semantics
@@ -336,16 +361,21 @@ The `events` metric returns individual API call records:
 
 ## Common tasks: query
 
-`toki query` is a top-level command for instant PromQL queries. It uses pure PromQL syntax with no `--start`/`--end` flags — time ranges are expressed inside the PromQL expression itself (e.g. `[1h]`, `[1d]`).
+`toki query` is the PromQL entry point. Without explicit bounds it acts as an
+instant/rolling query; with `--start` or `--end` it scans that range. A selector
+such as `[1h]` or `[1d]` defines output buckets. For remote queries it also
+supplies the default step when `--step` is omitted.
 
 ### Flags
 
 | Flag | Description |
 |------|-------------|
 | `-z <IANA>` | Timezone for time interpretation |
-| `-w` | Wide table output |
+| `-w`, `--start-of-week <day>` | Week boundary for `[1w]` buckets |
 | `--remote` | Send query to toki-sync server instead of local daemon |
 | `--output-format table\|json` | Output format |
+| `--start`, `--end` | Explicit scan bounds |
+| `--step <duration>` | Remote range-query step; overrides selector-derived step |
 | `--no-cost` | Disable cost calculation |
 
 ### Examples
@@ -361,8 +391,12 @@ toki query 'sum(toki_tokens_total{type=~"input|output"}[1h])'
 # Remote (via sync server)
 toki query --remote "sum by (model)(toki_tokens_total[1h])"
 
-# Wide table
-toki query -w "sum by (model)(toki_tokens_total[1d])"
+# Tuesday week boundary
+toki query -w tue "sum by (model)(toki_tokens_total[1w])"
+
+# Explicit range
+toki query --start 2026-03-01 --end 2026-03-31 --step 1d \
+  "sum by (model)(toki_tokens_total[1d])"
 
 # JSON output
 toki query --output-format json "toki_tokens_total[1h]"
@@ -371,22 +405,39 @@ toki query --output-format json "toki_tokens_total[1h]"
 toki query --no-cost "toki_tokens_total[1h]"
 ```
 
-### toki query vs toki report query
-
-| | `toki query` | `toki report query` |
-|---|---|---|
-| Scope | Instant query (pure PromQL) | Range query (with `--start`/`--end` time window) |
-| Time range | Inside PromQL expression: `[1h]`, `[1d]` | Via `--start`/`--end` flags |
-| `--remote` | Supported | Not supported (use `toki query --remote`) |
-| Status | Preferred for new usage | Backward compatible, still works |
+`toki report query` has been removed. Move its expression to `toki query` and
+keep the range flags:
 
 ```bash
-# Preferred: instant query
-toki query "sum by (model)(toki_tokens_total[1h])"
-
-# Still works: range query with time window
-toki report --start 20260301 --end 20260331 query "sum by (model)(toki_tokens_total[1d])"
+toki query --start 20260301 --end 20260331 \
+  "sum by (model)(toki_tokens_total[1d])"
 ```
+
+Current remote limitations: the sync server does not accept every RFC 3339
+bound supported by the local parser, and server queries are capped without
+pagination. Very large remote ranges can therefore be partial without a CLI
+truncation warning; prefer bounded queries.
+
+## Common tasks: rate-limit windows
+
+Window tracking is enabled by default. Codex limits are extracted passively
+from rollout JSONL; Claude limits come from an activity-gated usage/profile
+poller. Window rows use a separate per-provider DB and sync when enabled.
+
+```bash
+toki windows                         # same as `windows status`
+toki windows status --fresh          # bounded live revalidation
+toki windows status --json
+toki windows list                    # -28d through +8d anchors by default
+toki windows list --start 20260801 --end 20260831
+toki windows list --start 2026-08-01 --end 2026-08-31 --json
+toki query windows                   # stored local history
+toki query --remote windows          # merged server history
+```
+
+`window_tracking=false` disables collection and requires a restart.
+`window_polling=false` only disables Claude network polling and hot-reloads.
+History follows `window_retention_days` (730 days by default).
 
 ## Common tasks: settings
 
@@ -403,28 +454,37 @@ toki settings get timezone
 toki settings list
 ```
 
-When daemon-affecting settings (`claude_code_root`, `codex_root`, `daemon_sock`, `retention_days`, `rollup_retention_days`) are changed and the daemon is running, you'll be prompted to restart.
+Boolean settings accept `true/false`, `on/off`, `yes/no`, and `1/0`. Invalid
+IANA timezone names are rejected instead of silently becoming UTC.
 
 | Setting | Key | Default | Daemon effect |
 |---------|-----|---------|---------------|
-| Providers | `providers` | `[]` | Yes |
-| Claude Code root | `claude_code_root` | `~/.claude` | Yes |
-| Codex CLI root | `codex_root` | `~/.codex` | Yes |
-| Daemon socket | `daemon_sock` | `~/.config/toki/daemon.sock` | Yes |
-| Timezone | `timezone` | (empty = UTC) | No |
-| Output format | `output_format` | `table` | No |
-| Start of week | `start_of_week` | `mon` | No |
-| No cost | `no_cost` | `false` | No |
-| Retention days | `retention_days` | `0` (unlimited) | Yes |
-| Rollup retention days | `rollup_retention_days` | `0` (unlimited) | Yes |
+| Providers | `providers` | auto-detected if unset | Restart |
+| Claude Code root | `claude_code_root` | `~/.claude` | Restart |
+| Codex CLI root | `codex_root` | `~/.codex` | Restart |
+| Daemon socket | `daemon_sock` | `~/.config/toki/daemon.sock` | Restart |
+| Timezone | `timezone` | empty (UTC) | Hot reload/client |
+| Output format | `output_format` | `table` | Hot reload/client |
+| Start of week | `start_of_week` | `mon` | Hot reload/client |
+| No cost | `no_cost` | `false` | Client setting; daemon startup pricing currently unaffected |
+| Event retention | `retention_days` | `0` (unlimited) | Restart |
+| Window tracking | `window_tracking` | `true` | Restart |
+| Claude window polling | `window_polling` | `true` | Hot reload |
+| Window retention | `window_retention_days` | `730` | Restart |
+| Login auto-start | `daemon_autostart` | platform state | CLI-managed |
 
 Settings priority: **CLI args > Settings file (settings.json) > Defaults**
 
-Environment variables are not used (except `TOKI_DEBUG`).
+Known CLI mismatch: `settings set retention_days ...` currently prints that it
+will hot-reload, but the writer captures its retention policy at daemon start.
+Restart the daemon after changing this key.
+
+`TOKI_HOME` overrides the home directory used for provider roots and toki state
+in isolated runs. `TOKI_DEBUG` enables diagnostic logging.
 
 ## Common tasks: sync
 
-Sync token usage across multiple devices to a central [toki-sync](https://github.com/korjwl1/toki-sync) server. All subcommands are also available under `toki settings sync`.
+Sync token usage across multiple devices to a central [toki-sync](https://github.com/korjwl1/toki-sync) server. Sync management lives under `toki settings sync`.
 
 ### sync enable
 
@@ -490,9 +550,18 @@ toki settings sync devices
 
 Lists all devices registered under your account on the sync server.
 
-### settings sync
+### sync remove
 
-All sync commands are also available as `toki settings sync` subcommands:
+```bash
+toki settings sync remove <device-id>
+```
+
+Removes the selected device from the server. It will be rejected on its next
+connection. Use `devices` first to obtain the ID.
+
+### sync command summary
+
+The complete sync command set is:
 
 ```bash
 toki settings sync enable --server <host>
@@ -502,6 +571,7 @@ toki settings sync disable --keep       # Keep remote data
 toki settings sync status
 toki settings sync devices
 toki settings sync rename <new-name>
+toki settings sync remove <device-id>
 ```
 
 ### query --remote
@@ -522,18 +592,20 @@ The `--remote` flag sends the PromQL query to the toki-sync server instead of th
 | `--output-format table\|json` | query, report | Override output format |
 | `--sink <SPEC>` | trace | Output target: `print`, `uds://<path>`, `http://<url>` (repeatable) |
 | `--timezone <IANA>` / `-z` | query, report | Override timezone |
-| `-w` | query | Wide table output |
+| `-w`, `--start-of-week <day>` | query | Week boundary for `[1w]` buckets |
+| `--start`, `--end` | query, report, windows list | Time bounds |
+| `--step <duration>` | query | Remote range-query step |
 | `--remote` | query | Send query to toki-sync server |
 | `--no-cost` | trace, query, report | Disable cost calculation |
 
-### --output-format (report only)
+### --output-format
 
 ```bash
 toki report --output-format table          # default
 toki report --output-format json
 ```
 
-Applies only to report's `print` output.
+Applies to query and report; window commands use their own `--json` flag.
 
 ### --timezone / -z
 
@@ -555,6 +627,13 @@ toki trace --no-cost
 
 For report: skips pricing data fetch and hides the Cost column.
 For trace: strips `cost_usd` field from JSONL output.
+
+Pricing comes from the LiteLLM cache at `~/.config/toki/pricing.json`. Exact
+model matches win. When an exact Claude `-fast` row is missing, known Opus fast
+variants use the configured 2x provider multiplier. If a model has no published
+cache-read rate, toki conservatively uses its normal input rate rather than
+assuming cached input is free. With no usable cached/online price, cost is
+omitted instead of guessed.
 
 ## Quick reference: output formats
 
@@ -615,7 +694,7 @@ All JSON report output is wrapped with `information` (query metadata) and `provi
 
 | Field | Description |
 |-------|-------------|
-| `since` / `until` | Actual data range in TSDB (earliest/latest rollup timestamp, O(1)) |
+| `since` / `until` | Actual data range reported by the event DB |
 | `query_since` / `query_until` | User-specified `--start`/`--end` filter (null if not set) |
 | `timezone` | Timezone used for interpretation (null = UTC) |
 | `start_of_week` | Week start day for weekly grouping |
@@ -739,16 +818,18 @@ UDS and HTTP sinks use the same JSON structure. Always JSON regardless of `--out
 
 ## How it works: retention
 
-Disabled by default. Configure retention periods via `toki settings` to enable.
+Event retention is disabled by default. Window history has an independent
+730-day default because it is not always reconstructable from provider logs.
 
 | Target | Default Retention | Settings Key |
 |--------|-------------------|-------------|
 | events (individual events) | 0 (unlimited) | `retention_days` |
-| rollups (hourly aggregation) | 0 (unlimited) | `rollup_retention_days` |
+| rate-limit windows | 730 days | `window_retention_days` |
 
 - 0 = disabled (data is not deleted)
 - When enabled: runs once on daemon start + every 24 hours thereafter
-- Recommend keeping rollups longer than events: reports remain available after events are deleted
+- Event cleanup also reclaims time indexes and unused dictionary entries
+- Window cleanup runs independently even when event retention is disabled
 
 ## How it works: debug logging
 
@@ -765,8 +846,8 @@ Example output:
 ```text
 [toki:debug] process_file /path/to/session.jsonl — 3 lines, 1024 bytes, 2 events, Active | find_resume: 50µs, read: 120µs, total: 180µs
 [toki:debug] flush_dirty — 5 checkpoints sent to writer
-[toki:writer] flushed 64 events, 3 rollups in 450µs
-[toki:writer] retention cleanup: 150 events, 12 rollups deleted (35ms)
+[toki:writer] flushed 64 events in 450µs
+[toki:writer] daily retention: 150 events, 24 index, 2 windows, 12 dict entries removed (35ms)
 ```
 
 ## Common tasks: library usage
@@ -782,7 +863,7 @@ use toki::daemon::BroadcastSink;
 use std::sync::Arc;
 
 fn main() {
-    let config = Config::new(); // loads defaults, then DB settings
+    let config = Config::new(); // loads defaults, then settings.json
 
     let broadcast = Arc::new(BroadcastSink::new());
     let handle = start(config, Box::new(broadcast.clone()))

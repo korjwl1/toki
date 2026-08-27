@@ -6,7 +6,7 @@
 
 <p align="center">
   <b>Token usage tracker for Claude Code and Codex CLI</b><br>
-  Built in Rust. Daemon-powered. 5 MB idle. Reports in 7 ms. Your workflow never notices.
+  Built in Rust. Daemon-powered. Incremental by design. Your workflow stays responsive.
 </p>
 
 <p align="center">
@@ -53,7 +53,7 @@
 Get from install to first report in 30 seconds:
 
 ```bash
-# 1. Install (macOS)
+# 1. Install (macOS or Linux with Homebrew)
 brew tap korjwl1/tap
 brew install toki
 
@@ -89,15 +89,15 @@ toki trace            # real-time stream    (≈ docker logs -f)
 toki report           # instant TSDB query  (≈ docker ps)
 ```
 
-- **daemon** — watches session logs from configured providers (Claude Code, Codex CLI), parses events, writes to per-provider embedded TSDBs (fjall). 4 base threads + 2 per connected trace client. Zero overhead when no trace clients are connected.
+- **daemon** — watches session logs from configured providers (Claude Code, Codex CLI), parses events, writes to per-provider embedded TSDBs (fjall), tracks rate-limit windows, and optionally syncs data. Writer and sync workers are created per enabled provider; optional poller/backfill workers run only when their features are enabled.
 - **trace** — connects to the daemon over UDS for real-time JSONL event streaming. Supports multiple sinks (`--sink uds://`, `--sink http://`) for relaying to other services.
-- **report** — sends a query to the daemon, gets merged results from all provider TSDBs. Always fast, always indexed. Filter by `--provider` to query a single provider.
+- **report** — sends a query to the daemon and receives one result set per provider DB. Provider-specific token columns stay separate; use `--provider` to query only one.
 
 ---
 
 ## Performance
 
-toki sits at 5 MB idle, near-zero CPU, and answers any report in 7 ms. Most alternatives re-read everything from scratch on every invocation — toki indexes once, then gets out of your way.
+In the benchmark snapshot below, toki sat at 5 MB idle with near-zero CPU and answered the measured report workload in about 7 ms. Most alternatives re-read source JSONL from scratch on every invocation; toki reads its indexed event database instead.
 
 Benchmarked against [ccusage](https://github.com/ryoppippi/ccusage) (Node.js) and [zzusage](https://github.com/joelreymont/zzusage) (Zig) on the same dataset, disk cache purged before each run.
 
@@ -138,13 +138,15 @@ Benchmarked against [ccusage](https://github.com/ryoppippi/ccusage) (Node.js) an
 | 1 GB | 119 MB | 127 MB | 1,209 MB |
 | 2 GB | 166 MB | 126 MB | **2,311 MB** |
 
-> Why does matching zzusage matter? toki does strictly more work per line — TSDB writes, rollup aggregation, checkpoint persistence, and schema validation. zzusage skips all of this. Despite the extra workload, toki matches zzusage in wall-clock time.
+> Why does matching zzusage matter? toki does strictly more work per line — event/index writes, checkpoint persistence, deduplication, and schema validation. zzusage skips all of this. Despite the extra workload, toki matches zzusage in this benchmark.
 
 </details>
 
-### Report speed (indexed TSDB query vs full re-scan)
+### Report speed in the recorded benchmark (indexed event DB vs source re-scan)
 
-~7 ms regardless of data size — **1,742x faster** than ccusage at 2 GB.
+About 7 ms on these datasets — **1,742x faster** than ccusage at 2 GB. Current
+reports scan matching stored usage events, so this table is a measured snapshot,
+not a guarantee of constant-time reports.
 
 <p align="center">
   <img src="docs/bench_report.png" alt="Report benchmark" width="900" />
@@ -204,8 +206,8 @@ toki is the only tool here with a persistent idle state. The others pay full res
 
 toki is privacy-safe by architecture, not by policy.
 
-- **No prompt access**: the JSONL parser only deserializes token counts and model name from `"assistant"` lines. Prompts, responses, file contents, and thinking blocks are never loaded into memory — serde skips them without allocation.
-- **No network transmission of your data**: all processing is local. The only outbound request is an optional pricing fetch from the public LiteLLM repo (`--no-cost` to disable).
+- **No prompt/body storage**: provider parsers deserialize targeted usage and routing metadata (for example Claude `assistant` usage and Codex `token_count`/turn metadata). Prompt text, response bodies, edited files, and thinking blocks are ignored and never written to toki's databases.
+- **Local by default**: parsing and local reports stay on your machine. The daemon may check GitHub for new releases and fetch LiteLLM pricing. Report/query `--no-cost` skips their pricing request, but trace `--no-cost` only strips the field and the daemon still fetches pricing at startup. Opt-in sync transmits token events and window metadata to your configured toki-sync server. Claude window polling, enabled by default while window tracking is on, calls Claude's usage/profile endpoints only after local Claude activity; set `window_polling` to `false` to disable it.
 - **No conversation logging**: the TSDB stores only timestamp, model name, session ID, source file path, project name, and token count integers.
 - **Read-only access**: toki only reads session files. It never writes to or modifies any CLI tool's data.
 
@@ -235,7 +237,9 @@ toki daemon start --foreground   # Foreground (for debug)
 toki daemon stop                 # Stop
 toki daemon restart              # Restart (reload settings)
 toki daemon status               # Check status
-toki daemon reset                # Wipe DB + reinitialize
+toki daemon reset                # Rebuild event DBs; preserve settings/window history
+toki daemon enable               # Start automatically on login
+toki daemon disable              # Disable login auto-start
 ```
 
 ### Report
@@ -255,18 +259,21 @@ toki report monthly
 toki report --group-by-session
 toki report --project toki
 
-# Range queries (with --start/--end time window)
-toki report --start 20260301 --end 20260331 query 'sum(usage[1d]) by (project)'
-toki report --start 20260320 query 'events'
-toki report query 'usage[1d] offset 7d'
+# PromQL queries use the top-level `query` command
+toki query --start 20260301 --end 20260331 'sum(usage[1d]) by (project)'
+toki query --start 20260320 'events'
+toki query 'usage[1d] offset 7d'
 ```
 
 ### Query
 
 ```bash
-# Instant PromQL query (top-level command, no --start/--end)
+# Instant PromQL query
 toki query 'sum by (model)(toki_tokens_total[1h])'
 toki query -z Asia/Seoul 'sum by (model)(toki_tokens_total[1d])'
+
+# Explicit range; --step controls remote range-query bucketing
+toki query --start 2026-03-01 --end 2026-03-31 --step 1d 'sum by (model)(toki_tokens_total[1d])'
 
 # type filter and regex operator
 toki query 'sum(toki_tokens_total{type=~"input|output"}[1h])'
@@ -275,12 +282,23 @@ toki query 'sum(toki_tokens_total{type=~"input|output"}[1h])'
 toki query --remote 'sum by (model)(toki_tokens_total[1h])'
 
 # Output format and options
-toki query -w 'sum by (model)(toki_tokens_total[1d])'   # wide table
+toki query -w tue 'sum by (model)(toki_tokens_total[1w])' # Tuesday week boundary
 toki query --output-format json 'toki_tokens_total[1h]'
 toki query --no-cost 'toki_tokens_total[1h]'
 ```
 
-> `toki report query` still works for range queries with `--start`/`--end` time windows.
+> `toki report query` has been removed. Use the top-level `toki query`, which supports `--start` and `--end` directly.
+
+### Rate-limit windows
+
+```bash
+toki windows                         # Same as `windows status`
+toki windows status --fresh          # Request a bounded live refresh
+toki windows status --json
+toki windows list                    # History: last 28 days by default
+toki windows list --start 2026-08-01 --end 2026-08-31 --json
+toki query windows                   # Same stored history through the query path
+```
 
 ### Trace
 
@@ -308,6 +326,7 @@ toki settings sync disable --keep       # Keep remote data, only disable locally
 toki settings sync status                                          # Connection info
 toki settings sync devices                                         # Registered devices
 toki settings sync rename <new-name>                               # Rename this device
+toki settings sync remove <device-id>                              # Remove another device
 ```
 
 </details>
@@ -333,6 +352,9 @@ toki settings sync status
 # List registered devices
 toki settings sync devices
 
+# Remove a registered device by ID
+toki settings sync remove <device-id>
+
 # Query server data from CLI
 toki query --remote 'sum by (model)(toki_tokens_total)'
 
@@ -352,18 +374,28 @@ toki settings sync disable --keep       # Keep remote data, only disable locally
 
 ### Privacy
 
-Sync is opt-in and off by default. When enabled, only token counts and metadata (model, session ID, project name) are transmitted — never prompts or responses. TLS encrypts all traffic. Each user's data is isolated on the server via label injection.
+Sync is opt-in and off by default. When enabled, only token counts and routing/window metadata (model, provider, session/project/message identity, timestamps, device, limit/account/plan fields) are transmitted — never prompts or responses. TLS encrypts traffic unless the explicitly insecure development-only `--no-tls` mode is selected. Each user's data is isolated on the server via label injection.
+
+### Current remote-query limitations
+
+The sync API does not yet have cursor pagination, so the server caps large
+event scans and very large ranges can be partial without a CLI truncation
+warning. The server also does not yet
+accept every RFC 3339 bound supported by local queries. Prefer explicit,
+bounded numeric/date ranges for remote queries.
 
 ---
 
 ## Cost calculation
 
-All outputs include estimated cost (USD) per model, sourced from [LiteLLM](https://github.com/BerriAI/litellm) community pricing.
+Usage/event outputs include estimated cost (USD) per model when a usable price is available, sourced from [LiteLLM](https://github.com/BerriAI/litellm) community pricing.
 
 - **First run**: downloads LiteLLM JSON → filters by `litellm_provider` (Anthropic, OpenAI, Gemini) → caches to `~/.config/toki/pricing.json`
 - **Subsequent runs**: HTTP ETag conditional request → 304 if unchanged (~50 ms, no body)
 - **Offline**: uses cached data; if no cache, cost column is omitted
-- **`--no-cost`**: skips price fetch entirely
+- **`--no-cost`**: report/query skip their price fetch; trace only removes `cost_usd` from its output because pricing is owned by the daemon
+- **Missing cache-read rate**: conservatively uses the normal input rate instead of assuming cached input is free
+- **Claude fast mode**: if LiteLLM has no exact `-fast` row, known Opus fast variants use the provider multiplier; an exact published row always wins
 
 ---
 
@@ -375,7 +407,7 @@ All outputs include estimated cost (USD) per model, sourced from [LiteLLM](https
 | `codex` | [Codex CLI](https://github.com/openai/codex) | JSONL (append-only) | Supported |
 | *(gemini)* | [Gemini CLI](https://github.com/google-gemini/gemini-cli) | JSON (full rewrite) | Planned |
 
-Each provider gets its own isolated database (`~/.config/toki/<provider>.fjall`). Reports merge results across all enabled providers by default, or filter to a single provider with `--provider`.
+Each provider gets an isolated event database (`~/.config/toki/<provider>.fjall`) and a separate non-rebuildable window-history database (`~/.config/toki/<provider>.windows.fjall`). Reports query all enabled providers by default, or filter to one with `--provider`.
 
 ---
 
@@ -394,7 +426,7 @@ Have a feature request or found a bug? [Open an issue](https://github.com/korjwl
 
 | Document | Description |
 |----------|-------------|
-| **[Architecture and design](docs/DESIGN.md)** | Daemon threads, TSDB schema, rollup strategy, checkpoint recovery, data flow |
+| **[Architecture and design](docs/DESIGN.md)** | Daemon workers, event/window storage, checkpoint recovery, data flow |
 | **[Usage guide](docs/USAGE.md)** | Detailed command reference, output formats, library API, examples |
 | **[JSONL format reference](docs/claude-code-jsonl-format.md)** | Claude Code JSONL structure, line types, parsing optimizations |
 | **[Benchmark details](benches/COMPARISON.md)** | Full comparison methodology, architecture analysis, scaling predictions |
@@ -417,7 +449,7 @@ Have a feature request or found a bug? [Open an issue](https://github.com/korjwl
 | Hashing | xxhash-rust 0.8 (xxh3) | Checkpoint line identification (30 GB/s) |
 | HTTP | ureq 2.x | Synchronous, ETag conditional requests |
 | CLI | clap 4.x | Subcommands, global options |
-| Tables | comfy-table 7.1 | Unicode table rendering |
+| Tables | comfy-table 7.x | Unicode table rendering |
 | Sync protocol | toki-sync-protocol (shared crate) | Wire-compatible types, bincode serialization |
 | TLS | native-tls 0.2 | Platform TLS for sync connections |
 | IPC | Unix Domain Socket | Daemon-client NDJSON streaming |
@@ -431,7 +463,7 @@ src/
 ├── lib.rs                          # Public API: start(), Handle
 ├── main.rs                         # CLI binary (clap)
 ├── config.rs                       # Config + file-based settings
-├── db.rs                           # fjall wrapper (7 keyspaces)
+├── db.rs                           # Event DB + separate window-history DB
 ├── engine.rs                       # TrackerEngine: cold_start + watch_loop
 ├── writer.rs                       # DB writer thread (DbOp channel)
 ├── query.rs                        # TSDB query engine (report)
@@ -439,6 +471,9 @@ src/
 ├── retention.rs                    # Data retention policy
 ├── checkpoint.rs                   # Reverse-scan, xxHash3 matching
 ├── pricing.rs                      # LiteLLM price fetch, ETag caching
+├── windows.rs                      # Versioned rate-limit window tracking/storage shape
+├── claude_poll.rs                  # Activity-gated Claude usage/profile polling
+├── update.rs                       # Non-blocking release update check/cache
 ├── settings.rs                     # Cursive TUI settings
 ├── common/
 │   ├── types.rs                    # Shared types & traits
@@ -478,10 +513,11 @@ src/
 
 If toki is useful to you, consider sponsoring to support development.
 
-For commercial use in paid products, please sponsor or [reach out](mailto:korjwl1@gmail.com).
+Commercial use is permitted by the MIT license; sponsorship is optional and
+helps fund continued maintenance.
 
 ---
 
 ## License
 
-[FSL-1.1-Apache-2.0](LICENSE)
+[MIT](LICENSE)

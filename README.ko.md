@@ -6,7 +6,7 @@
 
 <p align="center">
   <b>Claude Code와 Codex CLI를 위한 토큰 사용량 트래커</b><br>
-  Rust로 구축. 데몬 기반. idle 5MB. 리포트 7ms. 작업을 전혀 방해하지 않습니다.
+  Rust로 구축. 데몬 기반. 증분 처리 중심. 작업 흐름을 가볍게 유지합니다.
 </p>
 
 <p align="center">
@@ -53,7 +53,7 @@
 설치부터 첫 리포트까지 30초 안에:
 
 ```bash
-# 1. 설치 (macOS)
+# 1. 설치 (macOS 또는 Homebrew를 사용하는 Linux)
 brew tap korjwl1/tap
 brew install toki
 
@@ -89,15 +89,15 @@ toki trace            # 실시간 스트림        (≈ docker logs -f)
 toki report           # 즉시 TSDB 조회      (≈ docker ps)
 ```
 
-- **daemon** — 설정된 provider(Claude Code, Codex CLI)의 세션 로그를 감시하고, 이벤트를 파싱해서 provider별 내장 TSDB(fjall)에 기록합니다. 기본 4스레드 + trace 클라이언트당 2스레드. trace 클라이언트가 없으면 Sink 오버헤드는 0입니다.
+- **daemon** — 설정된 provider(Claude Code, Codex CLI)의 세션 로그를 감시하고 이벤트를 provider별 내장 TSDB(fjall)에 기록하며, rate-limit window 추적과 선택적 동기화를 수행합니다. writer/sync worker는 활성 provider별로 생성되고, 선택 기능의 poller/backfill worker는 필요할 때만 동작합니다.
 - **trace** — UDS로 데몬에 연결해서 실시간 JSONL 이벤트 스트림을 받습니다. `--sink` 옵션으로 UDS나 HTTP로 다른 서비스에 중계할 수도 있습니다.
-- **report** — 데몬에 쿼리를 보내고, 모든 provider TSDB의 결과를 병합하여 받습니다. 언제나 빠르고, 언제나 색인된 상태. `--provider`로 단일 provider만 조회할 수도 있습니다.
+- **report** — 데몬에 쿼리를 보내 provider DB별 결과를 받습니다. Provider마다 다른 토큰 column은 분리해서 유지하며 `--provider`로 하나만 조회할 수 있습니다.
 
 ---
 
 ## 성능
 
-idle 5MB, CPU 0%, 리포트 7ms. 대부분의 대안은 실행할 때마다 전체 파일을 처음부터 다시 읽습니다. toki는 한 번 색인하고 그 뒤로는 사라집니다.
+아래 벤치마크 스냅샷에서는 idle 5MB, CPU 약 0%, 측정한 리포트 약 7ms를 기록했습니다. 대부분의 대안은 실행할 때마다 원본 JSONL을 처음부터 다시 읽지만 toki는 색인된 이벤트 DB를 조회합니다.
 
 [ccusage](https://github.com/ryoppippi/ccusage) (Node.js), [zzusage](https://github.com/joelreymont/zzusage) (Zig)와 동일 데이터셋, `sudo purge` 후 측정.
 
@@ -138,13 +138,15 @@ ccusage보다 **14배 빠르고**, zzusage와 비슷한 속도에 **메모리는
 | 1 GB | 119 MB | 127 MB | 1,209 MB |
 | 2 GB | 166 MB | 126 MB | **2,311 MB** |
 
-> **zzusage와 속도가 비슷한데 의미가 있나?** toki는 라인마다 더 많은 일을 합니다 — TSDB 쓰기, rollup 집계, 체크포인트 저장, 스키마 검증. zzusage는 이걸 전부 생략하고 순수 파싱만 합니다. 그런데도 실행 시간은 거의 같습니다.
+> **zzusage와 속도가 비슷한데 의미가 있나?** toki는 라인마다 이벤트/인덱스 쓰기, 체크포인트 저장, 중복 제거, 스키마 검증을 추가로 수행합니다. zzusage는 이를 생략하지만 이 벤치마크에서는 실행 시간이 거의 같습니다.
 
 </details>
 
-### 리포트 속도 (색인 TSDB 조회 vs 전체 재스캔)
+### 저장된 벤치마크의 리포트 속도 (색인 이벤트 DB vs 원본 재스캔)
 
-데이터 크기와 무관하게 **~7ms**. 2GB 기준 ccusage보다 **1,742배** 빠릅니다.
+이 데이터셋에서는 **약 7ms**, 2GB 기준 ccusage보다 **1,742배** 빨랐습니다.
+현재 report는 matching usage event를 스캔하므로 이 표는 측정 스냅샷이지
+constant-time 보장은 아닙니다.
 
 <p align="center">
   <img src="docs/bench_report.png" alt="리포트 벤치마크" width="900" />
@@ -204,8 +206,8 @@ idle 상태가 있는 건 toki뿐입니다. 나머지는 실행할 때마다 전
 
 toki는 정책이 아닌 아키텍처로 프라이버시를 보장합니다.
 
-- **프롬프트 접근 없음**: JSONL 파서는 `"assistant"` 라인에서 토큰 수와 모델명만 추출합니다. 프롬프트, 응답, 파일 내용, thinking 블록은 메모리에 로드되지 않습니다 — serde가 힙 할당 없이 건너뜁니다.
-- **데이터 전송 없음**: 모든 처리는 로컬에서 이루어집니다. 유일한 외부 요청은 LiteLLM 가격표 fetch뿐입니다 (`--no-cost`로 비활성화).
+- **프롬프트/body 저장 없음**: provider parser는 필요한 usage와 routing 메타데이터(예: Claude `assistant` usage, Codex `token_count`/turn metadata)만 역직렬화합니다. Prompt text, response body, 편집 파일, thinking block은 무시하며 toki DB에 쓰지 않습니다.
+- **기본은 로컬 처리**: 파싱과 로컬 리포트는 기기 안에서 처리합니다. 데몬은 GitHub 릴리즈 확인과 LiteLLM 가격표 요청을 할 수 있습니다. Report/query `--no-cost`는 해당 가격 요청을 건너뛰지만 trace `--no-cost`는 field만 제거하며 daemon은 시작할 때 가격을 가져옵니다. opt-in sync를 켜면 토큰 이벤트와 window 메타데이터를 설정한 toki-sync 서버에 보냅니다. 기본 활성화된 Claude window polling은 로컬 Claude 활동 뒤에만 Claude usage/profile endpoint를 호출하며 `window_polling=false`로 끌 수 있습니다.
 - **대화 내용 로깅 없음**: TSDB에는 타임스탬프, 모델명, 세션 ID, 소스 파일 경로, 프로젝트명, 토큰 수 정수만 저장됩니다.
 - **읽기 전용 접근**: toki는 세션 파일을 읽기만 합니다. CLI 도구의 데이터를 수정하거나 삭제하지 않습니다.
 
@@ -235,7 +237,9 @@ toki daemon start --foreground   # 포그라운드 실행 (디버그용)
 toki daemon stop                 # 데몬 중지
 toki daemon restart              # 중지 + 재시작 (설정 변경 반영)
 toki daemon status               # 실행 상태 확인
-toki daemon reset                # DB 전체 삭제 + 초기화
+toki daemon reset                # 이벤트 DB 재구축; 설정/window 이력 보존
+toki daemon enable               # 로그인 시 자동 시작 활성화
+toki daemon disable              # 로그인 자동 시작 비활성화
 ```
 
 ### Report
@@ -255,18 +259,21 @@ toki report monthly
 toki report --group-by-session
 toki report --project toki
 
-# 범위 쿼리 (--start/--end 시간 윈도우)
-toki report --start 20260301 --end 20260331 query 'sum(usage[1d]) by (project)'
-toki report --start 20260320 query 'events'
-toki report query 'usage[1d] offset 7d'
+# PromQL 쿼리는 최상위 `query` 명령 사용
+toki query --start 20260301 --end 20260331 'sum(usage[1d]) by (project)'
+toki query --start 20260320 'events'
+toki query 'usage[1d] offset 7d'
 ```
 
 ### Query
 
 ```bash
-# Instant PromQL 쿼리 (최상위 명령어, --start/--end 없음)
+# Instant PromQL 쿼리
 toki query 'sum by (model)(toki_tokens_total[1h])'
 toki query -z Asia/Seoul 'sum by (model)(toki_tokens_total[1d])'
+
+# 명시적 범위; --step은 원격 range-query 버킷을 제어
+toki query --start 2026-03-01 --end 2026-03-31 --step 1d 'sum by (model)(toki_tokens_total[1d])'
 
 # type 필터와 =~ 정규식 연산자
 toki query 'sum(toki_tokens_total{type=~"input|output"}[1h])'
@@ -275,12 +282,23 @@ toki query 'sum(toki_tokens_total{type=~"input|output"}[1h])'
 toki query --remote 'sum by (model)(toki_tokens_total[1h])'
 
 # 출력 형식 및 옵션
-toki query -w 'sum by (model)(toki_tokens_total[1d])'   # 넓은 테이블
+toki query -w tue 'sum by (model)(toki_tokens_total[1w])' # 화요일을 주 시작으로 사용
 toki query --output-format json 'toki_tokens_total[1h]'
 toki query --no-cost 'toki_tokens_total[1h]'
 ```
 
-> `toki report query`는 `--start`/`--end` 시간 윈도우를 사용하는 범위 쿼리에서 여전히 사용할 수 있습니다.
+> `toki report query`는 제거되었습니다. `--start`와 `--end`를 직접 지원하는 최상위 `toki query`를 사용하세요.
+
+### Rate-limit windows
+
+```bash
+toki windows                         # `windows status`와 동일
+toki windows status --fresh          # 제한 시간 내 live refresh 요청
+toki windows status --json
+toki windows list                    # 기본 최근 28일 이력
+toki windows list --start 2026-08-01 --end 2026-08-31 --json
+toki query windows                   # query 경로로 동일 저장 이력 조회
+```
 
 ### Trace
 
@@ -308,6 +326,7 @@ toki settings sync disable --keep       # 원격 데이터를 유지하고 로�
 toki settings sync status                                          # 연결 정보 확인
 toki settings sync devices                                         # 등록된 디바이스 목록
 toki settings sync rename <new-name>                               # 이 디바이스의 이름 변경
+toki settings sync remove <device-id>                              # 다른 디바이스 제거
 ```
 
 </details>
@@ -333,6 +352,9 @@ toki settings sync status
 # 등록된 디바이스 목록
 toki settings sync devices
 
+# ID로 등록 디바이스 제거
+toki settings sync remove <device-id>
+
 # CLI에서 서버 데이터 쿼리
 toki query --remote 'sum by (model)(toki_tokens_total)'
 
@@ -352,18 +374,27 @@ toki settings sync disable --keep       # 원격 데이터를 유지하고 로�
 
 ### 프라이버시
 
-동기화는 opt-in이며 기본적으로 꺼져 있습니다. 활성화하면 토큰 수와 메타데이터(모델, 세션 ID, 프로젝트명)만 전송됩니다 — 프롬프트나 응답은 절대 전송되지 않습니다. TLS로 모든 트래픽을 암호화합니다. 서버에서 사용자별 데이터는 label injection으로 격리됩니다.
+동기화는 opt-in이며 기본적으로 꺼져 있습니다. 활성화하면 토큰 수와 routing/window 메타데이터(모델, provider, session/project/message identity, timestamp, device, limit/account/plan field)만 전송하며 프롬프트나 응답은 전송하지 않습니다. 명시적으로 insecure한 개발용 `--no-tls`를 선택하지 않는 한 TLS로 암호화합니다. 서버에서 사용자별 데이터는 label injection으로 격리됩니다.
+
+### 현재 원격 쿼리 제한
+
+Sync API에는 아직 cursor pagination이 없어 server가 큰 event scan을 제한하며,
+매우 큰 범위는 CLI truncation 경고 없이 부분 결과가 될 수 있습니다. Server는 로컬 query가 지원하는 모든
+RFC 3339 bound도 아직 받지 않습니다. 원격 query에는 명시적인 bounded 숫자/date
+범위를 권장합니다.
 
 ---
 
 ## 비용 계산
 
-모든 출력에 모델별 추정 비용(USD)이 포함됩니다. 가격 데이터는 [LiteLLM](https://github.com/BerriAI/litellm) 커뮤니티 가격표에서 가져옵니다.
+사용 가능한 가격이 있을 때 usage/event 출력에 모델별 추정 비용(USD)을 포함합니다. 가격 데이터는 [LiteLLM](https://github.com/BerriAI/litellm) 커뮤니티 가격표에서 가져옵니다.
 
 - **최초 실행**: LiteLLM JSON 다운로드 → `litellm_provider` 기준 필터 (Anthropic, OpenAI, Gemini) → 파일 캐시 (`~/.config/toki/pricing.json`)
 - **이후 실행**: HTTP ETag 조건부 요청 → 변경 없으면 304 (바디 없이 ~50ms)
 - **오프라인**: 캐시된 데이터로 동작. 캐시가 없으면 Cost 컬럼 생략
-- **`--no-cost`**: 가격 fetch를 건너뜁니다
+- **`--no-cost`**: report/query는 해당 가격 fetch를 건너뛰고, trace는 가격을 daemon이 소유하므로 출력의 `cost_usd`만 제거
+- **cache-read 가격 누락**: cached input을 무료로 보지 않고 일반 input 가격을 보수적으로 적용
+- **Claude fast mode**: LiteLLM에 정확한 `-fast` 행이 없으면 알려진 Opus fast 배수를 적용하며, 정확한 공개 행이 있으면 그 값이 우선
 
 ---
 
@@ -375,7 +406,7 @@ toki settings sync disable --keep       # 원격 데이터를 유지하고 로�
 | `codex` | [Codex CLI](https://github.com/openai/codex) | JSONL (append-only) | 지원 |
 | *(gemini)* | [Gemini CLI](https://github.com/google-gemini/gemini-cli) | JSON (full rewrite) | 예정 |
 
-각 provider는 독립된 데이터베이스(`~/.config/toki/<provider>.fjall`)를 가집니다. 리포트는 기본적으로 모든 활성 provider의 결과를 병합하며, `--provider`로 단일 provider만 필터링할 수 있습니다.
+각 provider는 이벤트 DB(`~/.config/toki/<provider>.fjall`)와 별도의 비재구축형 window 이력 DB(`~/.config/toki/<provider>.windows.fjall`)를 가집니다. 리포트는 기본적으로 모든 활성 provider를 조회하며, `--provider`로 하나만 필터링할 수 있습니다.
 
 ---
 
@@ -393,7 +424,7 @@ toki settings sync disable --keep       # 원격 데이터를 유지하고 로�
 
 | 문서 | 설명 |
 |------|------|
-| **[아키텍처 & 설계](docs/DESIGN.ko.md)** | 데몬 스레드, TSDB 스키마, rollup 전략, 체크포인트 복구, 데이터 흐름 |
+| **[아키텍처 & 설계](docs/DESIGN.ko.md)** | 데몬 worker, 이벤트/window 저장소, 체크포인트 복구, 데이터 흐름 |
 | **[사용법 가이드](docs/USAGE.ko.md)** | 상세 명령어 레퍼런스, 출력 형식, 라이브러리 API, 예제 |
 | **[JSONL 형식 레퍼런스](docs/claude-code-jsonl-format.ko.md)** | Claude Code JSONL 구조, 라인 타입, 파싱 최적화 |
 | **[벤치마크 상세](benches/COMPARISON.ko.md)** | 전체 비교 방법론, 아키텍처 분석, 스케일링 예측 |
@@ -416,7 +447,7 @@ toki settings sync disable --keep       # 원격 데이터를 유지하고 로�
 | 해시 | xxhash-rust 0.8 (xxh3) | 체크포인트 줄 식별 (30GB/s) |
 | HTTP | ureq 2.x | 동기 HTTP, ETag 조건부 요청 |
 | CLI | clap 4.x | 서브커맨드, 글로벌 옵션 지원 |
-| 테이블 | comfy-table 7.1 | Unicode 테이블 렌더링 |
+| 테이블 | comfy-table 7.x | Unicode 테이블 렌더링 |
 | Sync 프로토콜 | toki-sync-protocol (공유 crate) | Wire-compatible 타입, bincode 직렬화 |
 | TLS | native-tls 0.2 | 플랫폼 TLS (sync 연결용) |
 | IPC | Unix Domain Socket | 데몬-클라이언트 NDJSON 스트리밍 |
@@ -430,7 +461,7 @@ src/
 ├── lib.rs                          # Public API: start(), Handle
 ├── main.rs                         # CLI 바이너리 (clap)
 ├── config.rs                       # Config + 파일 기반 설정
-├── db.rs                           # fjall 래퍼 (7 keyspaces)
+├── db.rs                           # 이벤트 DB + 별도 window 이력 DB
 ├── engine.rs                       # TrackerEngine: cold_start + watch_loop
 ├── writer.rs                       # DB writer thread (DbOp channel)
 ├── query.rs                        # TSDB 쿼리 엔진 (report용)
@@ -438,6 +469,9 @@ src/
 ├── retention.rs                    # 데이터 보존 정책
 ├── checkpoint.rs                   # 역순 라인 스캔, xxHash3 매칭
 ├── pricing.rs                      # LiteLLM 가격 fetch, ETag 캐싱
+├── windows.rs                      # 버전된 rate-limit window 추적/저장 형식
+├── claude_poll.rs                  # 활동 기반 Claude usage/profile polling
+├── update.rs                       # 비차단 릴리즈 업데이트 확인/캐시
 ├── settings.rs                     # Cursive TUI 설정 페이지
 ├── common/
 │   ├── types.rs                    # 공통 타입, trait 정의
@@ -477,10 +511,11 @@ src/
 
 toki가 도움이 됐다면 후원으로 개발을 지원해주세요.
 
-유료 제품에 toki를 사용하시려면 후원 또는 [연락](mailto:korjwl1@gmail.com)을 부탁드립니다.
+MIT 라이선스는 상업적 사용을 허용합니다. 후원은 선택 사항이며 지속적인
+유지보수에 도움이 됩니다.
 
 ---
 
 ## 라이선스
 
-[FSL-1.1-Apache-2.0](LICENSE)
+[MIT](LICENSE)

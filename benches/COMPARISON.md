@@ -53,7 +53,7 @@ python3 benches/benchmark.py all
 2. **Parsing performance (3-5x)**: Rust serde_json is 2-5x faster per line vs Node.js JSON.parse + Valibot validation.
 3. **Memory**: toki accumulates events immediately (O(M) for model count).
    ccusage collects all entries into an array then groupBy → O(N) memory.
-4. **Extra overhead**: toki writes events/rollups to TSDB + stores checkpoints.
+4. **Extra overhead**: toki writes events, indexes, dictionaries, and checkpoints to TSDB.
    ccusage just outputs and exits. Despite this overhead, toki is faster.
 
 ---
@@ -65,14 +65,14 @@ python3 benches/benchmark.py all
 
 | Scenario | toki | ccusage |
 |----------|------|---------|
-| Full summary | TSDB rollup query | Full file re-scan |
-| daily/weekly/monthly | TSDB time-range query | Full file re-scan + grouping |
+| Full summary | Indexed event DB range scan | Full source-file re-scan |
+| daily/weekly/monthly | Indexed event DB range scan + grouping | Full source-file re-scan + grouping |
 | Session/project filter | TSDB index lookup | Full file re-scan + filter |
 | PromQL query | TSDB query engine | Not supported |
 
 ```
-toki report:   O(R)     R = rollup count (time buckets × model count, typically hundreds)
-ccusage:       O(N)     N = total line count (tens to hundreds of thousands)
+toki report:   O(E)     E = stored events in the selected range
+ccusage:       O(N)     N = all source JSONL lines, including non-usage lines
 ```
 
 ---
@@ -86,7 +86,9 @@ ccusage:       O(N)     N = total line count (tens to hundreds of thousands)
 | Large | 500K | ~20s | ~2min+ | ~5ms | ~2min+ |
 | Very Large | 5M | ~3min | OOM risk | ~5ms | OOM |
 
-> toki report queries TSDB rollups, so it's **~5ms regardless of source data size**.
+> These are projections from the recorded benchmark snapshot, not a complexity
+> guarantee. Current reports scan stored usage events, so runtime grows with
+> matching events even though it avoids reparsing every source JSONL line.
 
 ---
 

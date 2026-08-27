@@ -13,5 +13,7 @@
 ## Checklist
 
 - [ ] `cargo test` passes
-- [ ] `cargo clippy` has no warnings
-- [ ] `cargo fmt` applied
+- [ ] `cargo clippy --all-targets --all-features` reviewed; no new warnings
+- [ ] `cargo fmt --check` passes
+- [ ] CLI/documentation changes were checked against generated `--help`
+- [ ] Event/window schema and local/remote compatibility were considered

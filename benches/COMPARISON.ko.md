@@ -54,7 +54,7 @@ python3 benches/benchmark.py all
    라인당 2-5x 빠름.
 3. **메모리**: toki는 이벤트를 즉시 accumulate (O(M) 모델 수만큼).
    ccusage는 모든 entry를 배열에 수집 후 groupBy → O(N) 메모리.
-4. **추가 오버헤드**: toki는 TSDB에 이벤트/rollup 기록 + 체크포인트 저장.
+4. **추가 오버헤드**: toki는 TSDB에 이벤트, 인덱스, dictionary, 체크포인트를 저장.
    ccusage는 출력만 하고 종료. 이 오버헤드에도 불구하고 toki가 빠름.
 
 ---
@@ -66,14 +66,14 @@ python3 benches/benchmark.py all
 
 | 시나리오 | toki 동작 | ccusage 동작 |
 |----------|-----------|-------------|
-| 전체 요약 | TSDB rollup 조회 | 전체 파일 재스캔 |
-| daily/weekly/monthly | TSDB 시간 범위 쿼리 | 전체 파일 재스캔 + 그룹핑 |
+| 전체 요약 | 색인된 이벤트 DB 범위 스캔 | 전체 원본 파일 재스캔 |
+| daily/weekly/monthly | 색인된 이벤트 DB 범위 스캔 + 그룹핑 | 전체 원본 파일 재스캔 + 그룹핑 |
 | 세션/프로젝트 필터 | TSDB 인덱스 lookup | 전체 파일 재스캔 + 필터 |
 | PromQL 쿼리 | TSDB 쿼리 엔진 | 지원 안 함 |
 
 ```
-toki report:   O(R)     R = rollup 수 (시간 버킷 × 모델 수, 보통 수백 개)
-ccusage:       O(N)     N = 전체 라인 수 (수만~수십만)
+toki report:   O(E)     E = 선택 범위에 저장된 usage event 수
+ccusage:       O(N)     N = usage 이외 line까지 포함한 전체 원본 JSONL line 수
 ```
 
 ---
@@ -87,7 +87,9 @@ ccusage:       O(N)     N = 전체 라인 수 (수만~수십만)
 | 대규모 | 500K | ~20s | ~2min+ | ~5ms | ~2min+ |
 | 초대규모 | 5M | ~3min | OOM 위험 | ~5ms | OOM |
 
-> toki report는 TSDB rollup 조회이므로 **원본 데이터 규모와 무관하게 ~5ms**.
+> 이 표는 저장된 벤치마크 스냅샷에서 얻은 예측이며 복잡도 보장이 아니다.
+> 현재 report는 저장된 usage event를 스캔하므로 원본 JSONL 전체를 재파싱하지는
+> 않지만 matching event 수에 따라 실행 시간이 증가한다.
 
 ---
 

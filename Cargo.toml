@@ -3,7 +3,7 @@ name = "toki"
 version = "2.2.0"
 edition = "2021"
 description = "AI CLI tool token usage tracker module"
-license = "FSL-1.1-Apache-2.0"
+license = "MIT"
 repository = "https://github.com/korjwl1/toki"
 homepage = "https://github.com/korjwl1/toki"
 
