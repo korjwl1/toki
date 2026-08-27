@@ -1007,9 +1007,11 @@ fn sync_new_events(
 
         let items: Vec<SyncItem> = events.iter().map(|(ts_ms, msg_id, event)| {
             let usage_total = match provider {
-                "codex" => event.input_tokens + event.output_tokens,
-                _ => event.input_tokens + event.output_tokens
-                    + event.cache_creation_input_tokens + event.cache_read_input_tokens,
+                "codex" => event.input_tokens.saturating_add(event.output_tokens),
+                _ => event.input_tokens
+                    .saturating_add(event.output_tokens)
+                    .saturating_add(event.cache_creation_input_tokens)
+                    .saturating_add(event.cache_read_input_tokens),
             };
 
             SyncItem {

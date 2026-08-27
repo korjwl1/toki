@@ -148,7 +148,9 @@ impl Sink for PrintSink {
         for s in &sorted {
             let tokens = schema.extract_tokens(s);
             let total = schema.total_tokens(s);
-            let cost = pricing.and_then(|p| p.summary_cost(s)).or(s.cost_usd);
+            let cost = pricing
+                .and_then(|p| p.summary_cost_for_schema(s, schema))
+                .or(s.cost_usd);
             let mut row = vec![Cell::new(&s.model)];
             for (i, &t) in tokens.iter().enumerate() {
                 row.push(Cell::new(format_number(t)));
@@ -246,7 +248,9 @@ impl Sink for PrintSink {
                 for (i, s) in sorted.iter().enumerate() {
                     let tokens = schema.extract_tokens(s);
                     let total = schema.total_tokens(s);
-                    let cost = pricing.and_then(|p| p.summary_cost(s)).or(s.cost_usd);
+                    let cost = pricing
+                        .and_then(|p| p.summary_cost_for_schema(s, schema))
+                        .or(s.cost_usd);
                     let display_key = if is_session { shorten_id(bucket).to_string() } else { bucket.to_string() };
                     let period_cell = if i == 0 {
                         Cell::new(&display_key)
@@ -333,7 +337,7 @@ impl Sink for PrintSink {
 
         let schema = effective_schema(schema);
         let columns = schema.columns();
-        let cost = pricing.and_then(|p| p.event_cost_with_ts(event));
+        let cost = pricing.and_then(|p| p.event_cost_with_ts_for_schema(event, schema));
         let label = format_source_label(&event.source_file);
 
         // Build token summary from schema columns
@@ -400,7 +404,9 @@ impl Sink for PrintSink {
             };
             let tokens = schema.extract_tokens(&summary);
             let total = schema.total_tokens(&summary);
-            let cost = e.cost_usd.or_else(|| pricing.and_then(|p| p.summary_cost(&summary)));
+            let cost = e.cost_usd.or_else(|| {
+                pricing.and_then(|p| p.summary_cost_for_schema(&summary, schema))
+            });
 
             let mut row = vec![
                 Cell::new(&e.timestamp),

@@ -115,11 +115,15 @@ impl ColdStartParsed {
         source_file: Arc<str>,
         project_name: Option<Arc<str>>,
     ) -> ColdStartEvent {
-        summary.input_tokens += self.tokens.input_tokens;
-        summary.output_tokens += self.tokens.output_tokens;
-        summary.cache_creation_input_tokens += self.tokens.cache_creation_input_tokens;
-        summary.cache_read_input_tokens += self.tokens.cache_read_input_tokens;
-        summary.event_count += 1;
+        summary.input_tokens = summary.input_tokens.saturating_add(self.tokens.input_tokens);
+        summary.output_tokens = summary.output_tokens.saturating_add(self.tokens.output_tokens);
+        summary.cache_creation_input_tokens = summary
+            .cache_creation_input_tokens
+            .saturating_add(self.tokens.cache_creation_input_tokens);
+        summary.cache_read_input_tokens = summary
+            .cache_read_input_tokens
+            .saturating_add(self.tokens.cache_read_input_tokens);
+        summary.event_count = summary.event_count.saturating_add(1);
 
         ColdStartEvent {
             ts_ms: self.ts_ms,

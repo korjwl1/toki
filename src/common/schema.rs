@@ -17,6 +17,15 @@ pub trait ProviderSchema: Send + Sync {
     fn extract_tokens(&self, s: &ModelUsageSummary) -> Vec<u64>;
     /// Compute total tokens from a ModelUsageSummary.
     fn total_tokens(&self, s: &ModelUsageSummary) -> u64;
+    /// Return mutually exclusive billable input/output/cache buckets.
+    fn billing_tokens(&self, s: &ModelUsageSummary) -> (u64, u64, u64, u64) {
+        (
+            s.input_tokens,
+            s.output_tokens,
+            s.cache_creation_input_tokens,
+            s.cache_read_input_tokens,
+        )
+    }
 }
 
 // ── Claude Code schema ──────────────────────────────────────────────────────
@@ -44,7 +53,10 @@ impl ProviderSchema for ClaudeCodeSchema {
     }
 
     fn total_tokens(&self, s: &ModelUsageSummary) -> u64 {
-        s.input_tokens + s.output_tokens + s.cache_creation_input_tokens + s.cache_read_input_tokens
+        s.input_tokens
+            .saturating_add(s.output_tokens)
+            .saturating_add(s.cache_creation_input_tokens)
+            .saturating_add(s.cache_read_input_tokens)
     }
 }
 
@@ -76,7 +88,19 @@ impl ProviderSchema for CodexSchema {
 
     fn total_tokens(&self, s: &ModelUsageSummary) -> u64 {
         // cached_input ⊂ input, reasoning_output ⊂ output — don't double-count
-        s.input_tokens + s.output_tokens
+        s.input_tokens.saturating_add(s.output_tokens)
+    }
+
+    fn billing_tokens(&self, s: &ModelUsageSummary) -> (u64, u64, u64, u64) {
+        // LiteLLM's cache-read rate replaces the normal input rate for cached
+        // tokens. Reasoning is already included in output and has no separate
+        // billing bucket.
+        (
+            s.input_tokens.saturating_sub(s.cache_read_input_tokens),
+            s.output_tokens,
+            0,
+            s.cache_read_input_tokens,
+        )
     }
 }
 
@@ -107,6 +131,32 @@ mod tests {
         assert_eq!(schema.columns().len(), 4);
         assert_eq!(schema.columns()[2].json_key, "cached_input_tokens");
         assert_eq!(schema.columns()[3].json_key, "reasoning_output_tokens");
+    }
+
+    #[test]
+    fn codex_billing_tokens_do_not_double_count_subsets() {
+        let schema = CodexSchema;
+        let summary = ModelUsageSummary {
+            input_tokens: 100,
+            output_tokens: 20,
+            cache_creation_input_tokens: 10,
+            cache_read_input_tokens: 60,
+            ..Default::default()
+        };
+        assert_eq!(schema.billing_tokens(&summary), (40, 20, 0, 60));
+    }
+
+    #[test]
+    fn displayed_totals_saturate_instead_of_wrapping() {
+        let summary = ModelUsageSummary {
+            input_tokens: u64::MAX,
+            output_tokens: 1,
+            cache_creation_input_tokens: 1,
+            cache_read_input_tokens: 1,
+            ..Default::default()
+        };
+        assert_eq!(ClaudeCodeSchema.total_tokens(&summary), u64::MAX);
+        assert_eq!(CodexSchema.total_tokens(&summary), u64::MAX);
     }
 
     #[test]

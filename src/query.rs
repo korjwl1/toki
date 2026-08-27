@@ -70,11 +70,15 @@ fn filter_range(filter: ReportFilter) -> (i64, i64) {
 
 /// Accumulate a StoredEvent's token counts into a ModelUsageSummary.
 fn accumulate_event(entry: &mut ModelUsageSummary, event: &crate::common::types::StoredEvent) {
-    entry.input_tokens += event.input_tokens;
-    entry.output_tokens += event.output_tokens;
-    entry.cache_creation_input_tokens += event.cache_creation_input_tokens;
-    entry.cache_read_input_tokens += event.cache_read_input_tokens;
-    entry.event_count += 1;
+    entry.input_tokens = entry.input_tokens.saturating_add(event.input_tokens);
+    entry.output_tokens = entry.output_tokens.saturating_add(event.output_tokens);
+    entry.cache_creation_input_tokens = entry
+        .cache_creation_input_tokens
+        .saturating_add(event.cache_creation_input_tokens);
+    entry.cache_read_input_tokens = entry
+        .cache_read_input_tokens
+        .saturating_add(event.cache_read_input_tokens);
+    entry.event_count = entry.event_count.saturating_add(1);
 }
 
 /// Report grouped by session from TSDB events (streaming).
@@ -105,11 +109,15 @@ fn apply_aggregation_flat(summaries: &mut SummaryMap, func: AggregationFunc) {
     // Sum all values
     let mut total = ModelUsageSummary::default();
     for s in summaries.values() {
-        total.input_tokens += s.input_tokens;
-        total.output_tokens += s.output_tokens;
-        total.cache_creation_input_tokens += s.cache_creation_input_tokens;
-        total.cache_read_input_tokens += s.cache_read_input_tokens;
-        total.event_count += s.event_count;
+        total.input_tokens = total.input_tokens.saturating_add(s.input_tokens);
+        total.output_tokens = total.output_tokens.saturating_add(s.output_tokens);
+        total.cache_creation_input_tokens = total
+            .cache_creation_input_tokens
+            .saturating_add(s.cache_creation_input_tokens);
+        total.cache_read_input_tokens = total
+            .cache_read_input_tokens
+            .saturating_add(s.cache_read_input_tokens);
+        total.event_count = total.event_count.saturating_add(s.event_count);
     }
 
     match func {
@@ -372,7 +380,7 @@ pub fn execute_parsed_query(
                                 model: model.clone(), ..Default::default()
                             });
                             if is_events_metric {
-                                entry.event_count += 1;
+                                entry.event_count = entry.event_count.saturating_add(1);
                             } else {
                                 accumulate_event(entry, &event);
                             }
@@ -458,7 +466,7 @@ pub fn execute_parsed_query(
                                 model: inner_key, ..Default::default()
                             });
                         if is_events_metric {
-                            entry.event_count += 1;
+                            entry.event_count = entry.event_count.saturating_add(1);
                         } else {
                             accumulate_event(entry, &event);
                         }
@@ -560,7 +568,10 @@ pub fn parse_range_time(value: &str, is_until: bool, tz: Option<Tz>) -> Result<N
         let day: u32   = value[6..8].parse().map_err(|_| "invalid day")?;
         let date = chrono::NaiveDate::from_ymd_opt(year, month, day).ok_or("invalid date")?;
         let time = if is_until {
-            chrono::NaiveTime::from_hms_opt(23, 59, 59).unwrap()
+            // The event store treats `until_ms` as inclusive. Use the final
+            // representable millisecond of the requested date so events in
+            // 23:59:59.xxx are not silently omitted.
+            chrono::NaiveTime::from_hms_milli_opt(23, 59, 59, 999).unwrap()
         } else {
             chrono::NaiveTime::from_hms_opt(0, 0, 0).unwrap()
         };
@@ -790,6 +801,34 @@ mod tests {
     use crate::common::types::StoredEvent;
 
     #[test]
+    fn stored_event_accumulation_saturates_instead_of_wrapping() {
+        let mut summary = ModelUsageSummary {
+            input_tokens: u64::MAX,
+            output_tokens: u64::MAX,
+            cache_creation_input_tokens: u64::MAX,
+            cache_read_input_tokens: u64::MAX,
+            event_count: u64::MAX,
+            ..Default::default()
+        };
+        let event = StoredEvent {
+            model_id: 0,
+            session_id: 0,
+            source_file_id: 0,
+            project_name_id: 0,
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_creation_input_tokens: 1,
+            cache_read_input_tokens: 1,
+        };
+        accumulate_event(&mut summary, &event);
+        assert_eq!(summary.input_tokens, u64::MAX);
+        assert_eq!(summary.output_tokens, u64::MAX);
+        assert_eq!(summary.cache_creation_input_tokens, u64::MAX);
+        assert_eq!(summary.cache_read_input_tokens, u64::MAX);
+        assert_eq!(summary.event_count, u64::MAX);
+    }
+
+    #[test]
     fn test_report_by_session_from_db() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::open(&dir.path().join("test.fjall")).unwrap();
@@ -826,6 +865,7 @@ mod tests {
         assert_eq!(dt.format("%Y-%m-%d %H:%M:%S").to_string(), "2026-03-01 00:00:00");
         let dt_until = parse_range_time("20260301", true, None).unwrap();
         assert_eq!(dt_until.format("%H:%M:%S").to_string(), "23:59:59");
+        assert_eq!(dt_until.and_utc().timestamp_subsec_millis(), 999);
     }
 
     #[test]

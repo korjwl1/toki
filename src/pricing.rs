@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::common::schema::ProviderSchema;
 use crate::common::types::{ModelUsageSummary, UsageEvent};
 
 const LITELLM_URL: &str =
@@ -90,6 +91,16 @@ impl PricingTable {
         ))
     }
 
+    pub fn summary_cost_for_schema(
+        &self,
+        s: &ModelUsageSummary,
+        schema: &dyn ProviderSchema,
+    ) -> Option<f64> {
+        let (input, output, cache_create, cache_read) = schema.billing_tokens(s);
+        self.get(&s.model)
+            .map(|p| p.cost(input, output, cache_create, cache_read))
+    }
+
     /// Calculate cost for a single UsageEvent.
     pub fn event_cost(&self, e: &UsageEvent) -> Option<f64> {
         self.get(&e.model).map(|p| p.cost(
@@ -104,6 +115,23 @@ impl PricingTable {
             e.input_tokens, e.output_tokens,
             e.cache_creation_input_tokens, e.cache_read_input_tokens,
         ))
+    }
+
+    pub fn event_cost_with_ts_for_schema(
+        &self,
+        e: &crate::common::types::UsageEventWithTs,
+        schema: &dyn ProviderSchema,
+    ) -> Option<f64> {
+        let summary = ModelUsageSummary {
+            model: e.model.clone(),
+            input_tokens: e.input_tokens,
+            output_tokens: e.output_tokens,
+            cache_creation_input_tokens: e.cache_creation_input_tokens,
+            cache_read_input_tokens: e.cache_read_input_tokens,
+            event_count: 0,
+            cost_usd: None,
+        };
+        self.summary_cost_for_schema(&summary, schema)
     }
 }
 
@@ -429,6 +457,34 @@ mod tests {
         let cost = table.summary_cost(&summary).unwrap();
         // 1000*0.000003 + 500*0.000015 + 200*0.00000375 + 3000*0.0000003 = 0.01215
         assert!((cost - 0.01215).abs() < 1e-10);
+    }
+
+    #[test]
+    fn codex_summary_cost_replaces_cached_input_rate() {
+        use crate::common::schema::CodexSchema;
+
+        let table = PricingTable::new(HashMap::from([(
+            "gpt-test".to_string(),
+            ModelPricing {
+                input_cost_per_token: 1.0,
+                output_cost_per_token: 2.0,
+                cache_creation_input_token_cost: Some(10.0),
+                cache_read_input_token_cost: Some(0.25),
+            },
+        )]));
+        let summary = ModelUsageSummary {
+            model: "gpt-test".to_string(),
+            input_tokens: 100,
+            output_tokens: 20,
+            cache_creation_input_tokens: 10,
+            cache_read_input_tokens: 60,
+            ..Default::default()
+        };
+
+        let cost = table
+            .summary_cost_for_schema(&summary, &CodexSchema)
+            .unwrap();
+        assert_eq!(cost, 95.0);
     }
 
     #[test]

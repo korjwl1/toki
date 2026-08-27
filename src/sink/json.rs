@@ -22,7 +22,8 @@ pub fn summary_to_json(s: &ModelUsageSummary, pricing: Option<&PricingTable>, sc
     entry["events"] = serde_json::json!(s.event_count);
 
     // Pre-computed cost (e.g. from server) takes priority over local pricing
-    if let Some(cost) = s.cost_usd.filter(|c| *c > 0.0).or_else(|| pricing.and_then(|p| p.summary_cost(s))) {
+    if let Some(cost) = s.cost_usd.filter(|c| *c > 0.0)
+        .or_else(|| pricing.and_then(|p| p.summary_cost_for_schema(s, schema))) {
         entry["cost_usd"] = serde_json::json!(cost);
     }
     entry
@@ -80,7 +81,7 @@ pub fn event_to_json(event: &UsageEventWithTs, pricing: Option<&PricingTable>, s
     };
     let tokens = schema.extract_tokens(&summary);
 
-    let cost = pricing.and_then(|p| p.event_cost_with_ts(event));
+    let cost = pricing.and_then(|p| p.event_cost_with_ts_for_schema(event, schema));
     let mut data = serde_json::json!({
         "model": event.model,
         "source": format_source_label(&event.source_file),
@@ -131,7 +132,8 @@ pub fn events_batch_to_json(
         }
         entry["total_tokens"] = serde_json::json!(total);
 
-        if let Some(cost) = e.cost_usd.or_else(|| pricing.and_then(|p| p.summary_cost(&summary))) {
+        if let Some(cost) = e.cost_usd
+            .or_else(|| pricing.and_then(|p| p.summary_cost_for_schema(&summary, schema))) {
             entry["cost_usd"] = serde_json::json!(cost);
         }
         entry
