@@ -23,11 +23,26 @@ pub struct ModelPricing {
 
 impl ModelPricing {
     /// Calculate cost from token counts.
+    /// Rate to charge cached-input tokens at when LiteLLM publishes no
+    /// `cache_read_input_token_cost` for the model.
+    ///
+    /// Falling back to 0.0 would be a silent guess that cached input is free.
+    /// It never is, and for schemas that move cached tokens *out* of the input
+    /// bucket (see `CodexSchema`) a zero rate deletes the bulk of the bill:
+    /// cached input is routinely 90%+ of a Codex prompt. The undiscounted
+    /// input rate is the conservative choice — it is the same number these
+    /// tokens were billed at before the bucket split, so a missing discount
+    /// costs us the discount, not the charge.
+    fn cache_read_rate(&self) -> f64 {
+        self.cache_read_input_token_cost
+            .unwrap_or(self.input_cost_per_token)
+    }
+
     fn cost(&self, input: u64, output: u64, cache_create: u64, cache_read: u64) -> f64 {
         (input as f64) * self.input_cost_per_token
             + (output as f64) * self.output_cost_per_token
             + (cache_create as f64) * self.cache_creation_input_token_cost.unwrap_or(0.0)
-            + (cache_read as f64) * self.cache_read_input_token_cost.unwrap_or(0.0)
+            + (cache_read as f64) * self.cache_read_rate()
     }
 }
 
@@ -485,6 +500,56 @@ mod tests {
             .summary_cost_for_schema(&summary, &CodexSchema)
             .unwrap();
         assert_eq!(cost, 95.0);
+    }
+
+    #[test]
+    fn unpriced_cached_input_is_not_billed_at_zero() {
+        use crate::common::schema::CodexSchema;
+
+        // gpt-5-pro and gpt-5.2-pro (among 75 of 224 rows in the real LiteLLM
+        // cache) publish no cache_read cost. The codex schema moves cached
+        // tokens OUT of the input bucket, so a 0.0 fallback prices 90%+ of a
+        // typical prompt at nothing — and these are the most expensive input
+        // rates in the table.
+        let table = PricingTable::new(HashMap::from([(
+            "gpt-pro-test".to_string(),
+            ModelPricing {
+                input_cost_per_token: 3.0,
+                output_cost_per_token: 5.0,
+                cache_creation_input_token_cost: None,
+                cache_read_input_token_cost: None,
+            },
+        )]));
+        let summary = ModelUsageSummary {
+            model: "gpt-pro-test".to_string(),
+            input_tokens: 1000,
+            output_tokens: 10,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 900,
+            ..Default::default()
+        };
+
+        // Billed as (1000 - 900) input + 10 output + 900 cached, with cached
+        // falling back to the undiscounted input rate: 300 + 50 + 2700.
+        let cost = table
+            .summary_cost_for_schema(&summary, &CodexSchema)
+            .unwrap();
+        assert_eq!(cost, 3050.0);
+
+        // The pre-fix formula silently dropped the 900 cached tokens entirely.
+        assert_ne!(cost, 350.0);
+    }
+
+    #[test]
+    fn a_published_cache_read_rate_still_wins_over_the_fallback() {
+        let priced = ModelPricing {
+            input_cost_per_token: 3.0,
+            output_cost_per_token: 5.0,
+            cache_creation_input_token_cost: None,
+            cache_read_input_token_cost: Some(0.3),
+        };
+        // The discount is applied, not the input rate.
+        assert_eq!(priced.cost(0, 0, 0, 100), 30.0);
     }
 
     #[test]

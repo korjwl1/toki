@@ -147,6 +147,51 @@ mod tests {
     }
 
     #[test]
+    fn claude_billing_tokens_keep_the_four_buckets_disjoint() {
+        // Anthropic and OpenAI use OPPOSITE conventions, and nothing pinned
+        // the Anthropic side: cache_creation_input_tokens and
+        // cache_read_input_tokens are separate, separately-priced fields that
+        // are NOT contained in input_tokens. Applying the codex subtraction
+        // here would under-bill every Claude event, and would have passed the
+        // entire suite before this test existed.
+        let schema = ClaudeCodeSchema;
+        let summary = ModelUsageSummary {
+            input_tokens: 100,
+            output_tokens: 20,
+            cache_creation_input_tokens: 10,
+            cache_read_input_tokens: 60,
+            ..Default::default()
+        };
+        assert_eq!(schema.billing_tokens(&summary), (100, 20, 10, 60));
+
+        // Stated as the invariant rather than the numbers: the input bucket is
+        // passed through untouched, and the cache buckets are billed in full.
+        let (input, output, cache_create, cache_read) = schema.billing_tokens(&summary);
+        assert_eq!(input, summary.input_tokens);
+        assert_eq!(output, summary.output_tokens);
+        assert_eq!(cache_create, summary.cache_creation_input_tokens);
+        assert_eq!(cache_read, summary.cache_read_input_tokens);
+    }
+
+    #[test]
+    fn the_two_providers_do_not_share_a_billing_convention() {
+        // A single summary must bill differently under each schema. If a
+        // future edit collapses them into one rule, this fails loudly rather
+        // than silently moving everyone's numbers.
+        let summary = ModelUsageSummary {
+            input_tokens: 100,
+            output_tokens: 20,
+            cache_creation_input_tokens: 10,
+            cache_read_input_tokens: 60,
+            ..Default::default()
+        };
+        assert_ne!(
+            ClaudeCodeSchema.billing_tokens(&summary),
+            CodexSchema.billing_tokens(&summary)
+        );
+    }
+
+    #[test]
     fn displayed_totals_saturate_instead_of_wrapping() {
         let summary = ModelUsageSummary {
             input_tokens: u64::MAX,
