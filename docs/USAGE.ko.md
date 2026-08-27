@@ -29,11 +29,7 @@ toki는 데몬/클라이언트 구조로 동작한다:
 
 ## 소스에서 빌드
 
-현재 개발 branch는 v1.1.0 tag 전까지 protocol repository의 sibling checkout이
-필요하다:
-
 ```bash
-git clone https://github.com/korjwl1/toki-sync-protocol.git toki_sync_protocol
 git clone https://github.com/korjwl1/toki.git toki
 cd toki
 cargo build --release

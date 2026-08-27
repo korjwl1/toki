@@ -197,10 +197,8 @@ policies are captured at startup and require a restart.
 Credentials use macOS Keychain on macOS and a permission-restricted JSON file
 on Linux. Stable device identity lives at `~/.config/toki/device_id`.
 
-The protocol dependency is temporarily patched to the sibling
-`../toki_sync_protocol` checkout because `SyncWindows`/`WireWindow` are newer
-than the latest `v1.0.0` tag. Release order is protocol v1.1.0 tag, repin both
-consumers, remove both patches, then daemon before monitor.
+The protocol dependency is pinned to `toki-sync-protocol` v1.1.0, which carries
+the `SyncWindows`/`WireWindow` contract used by the daemon and sync server.
 
 ## Retention and recovery
 

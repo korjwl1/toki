@@ -138,15 +138,10 @@ Before merging:
 
 ## Release dependency gate
 
-The development branch currently uses protocol types newer than the published
-v1.0.0 tag and patches to `../toki_sync_protocol`. A release checkout cannot use
-that sibling path. The mandatory order is:
-
-1. tag toki-sync-protocol v1.1.0;
-2. repin toki and toki_sync to v1.1.0;
-3. remove both local patch sections;
-4. verify clean standalone builds;
-5. release the sync daemon before consumers that read its window data.
+Release builds pin `toki-sync-protocol` v1.1.0 and must resolve it from the
+published Git tag without a sibling path patch. Protocol layout changes require
+a new tagged protocol version, clean standalone consumer builds, and a server/
+daemon release before monitor consumers that read the new wire data.
 
 ## Governance
 

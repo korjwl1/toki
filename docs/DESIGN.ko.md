@@ -185,9 +185,8 @@ sync enable/disable과 Claude window polling toggle은 daemon 재시작 없이
 인증 정보는 macOS Keychain 또는 Linux permission-restricted JSON에 저장한다.
 Stable device identity는 `~/.config/toki/device_id`에 있다.
 
-Protocol dependency는 `SyncWindows`/`WireWindow`가 최신 `v1.0.0` tag보다 새로워
-임시로 sibling `../toki_sync_protocol` checkout을 patch한다. Release 순서는
-protocol v1.1.0 tag → 두 consumer repin → 두 patch 제거 → daemon → monitor다.
+Protocol dependency는 daemon과 sync server가 사용하는 `SyncWindows`/
+`WireWindow` contract를 포함한 `toki-sync-protocol` v1.1.0에 고정돼 있다.
 
 ## Retention과 복구
 

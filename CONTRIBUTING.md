@@ -15,7 +15,6 @@ The fastest path in:
 - Rust toolchain (latest stable). `Cargo.toml` does not pin an MSRV, so the latest stable from [rustup](https://rustup.rs/) is the safest choice. If you hit a build error on an older toolchain, upgrade before filing a bug.
 - `cargo` (bundled with rustup).
 - macOS or Linux. The current CLI/daemon IPC uses Unix domain sockets; Windows is not a supported build yet.
-- A sibling checkout of `toki_sync_protocol` at `../toki_sync_protocol`. Until protocol v1.1.0 is tagged, `Cargo.toml` deliberately patches the git dependency to that path because the client uses `SyncWindows` and `WireWindow`.
 
 ### Build and run
 

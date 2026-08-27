@@ -29,11 +29,7 @@ toki operates with a daemon/client architecture:
 
 ## Build from source
 
-The current development branch needs the protocol repository as a sibling
-checkout until v1.1.0 is tagged:
-
 ```bash
-git clone https://github.com/korjwl1/toki-sync-protocol.git toki_sync_protocol
 git clone https://github.com/korjwl1/toki.git toki
 cd toki
 cargo build --release

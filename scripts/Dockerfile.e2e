@@ -1,7 +1,6 @@
 FROM rust:1.92-slim-bookworm AS builder
 RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
-COPY toki_sync_protocol /toki_sync_protocol
 COPY toki_sync/Cargo.toml toki_sync/Cargo.lock ./
 COPY toki_sync/src ./src
 COPY toki_sync/static ./static

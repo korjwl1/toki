@@ -20,7 +20,7 @@ When the user runs `/release`, follow these steps:
 - Check `git status` to ensure the working tree is clean (no uncommitted changes)
 - Check that the tag `v{VERSION}` doesn't already exist: `git tag -l v{VERSION}`
 - Confirm `Cargo.toml` has no local `[patch."https://github.com/korjwl1/toki-sync-protocol.git"]` section. A tagged release/Actions checkout has no sibling `../toki_sync_protocol`, so releasing with the patch is guaranteed to fail.
-- Confirm the protocol dependency is pinned to a published tag containing every wire type the client uses. For the current branch the required sequence is: tag `toki-sync-protocol` v1.1.0, repin toki and toki_sync to v1.1.0, remove both local patches, then release toki_sync before toki_monitor.
+- Confirm the protocol dependency is pinned to a published tag containing every wire type the client uses. The current baseline is `toki-sync-protocol` v1.1.0; release `toki-sync` before consumers when a future protocol change adds server capabilities.
 
 If any check fails, report the issue and stop.
 

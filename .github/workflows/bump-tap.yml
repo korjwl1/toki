@@ -30,7 +30,7 @@ permissions:
 jobs:
   bump-formula:
     # `release: published` also fires for prereleases, but the version/filename
-    # regexes only handle numeric-dot versions — a tag like v2.2.0-rc.1 would hang
+    # regexes only handle numeric-dot versions — a tag like v2.3.0-rc.1 would hang
     # waiting for assets or write broken keys. Never bump the formula for a
     # prerelease (matches the CLI/app policy of never offering prereleases).
     if: github.event.release.prerelease == false
@@ -116,12 +116,18 @@ jobs:
           lines = open(path).readlines()
 
           done_version = False
+          done_license = False
           for idx, line in enumerate(lines):
               if not done_version and re.match(r'\s*version ".*"', line):
                   lines[idx] = re.sub(r'(version ")[^"]*(")', r'\g<1>' + version + r'\g<2>', line)
                   done_version = True
+              if not done_license and re.match(r'\s*license ".*"', line):
+                  lines[idx] = re.sub(r'(license ")[^"]*(")', r'\g<1>MIT\g<2>', line)
+                  done_license = True
           if not done_version:
               sys.exit("no version line found in formula")
+          if not done_license:
+              sys.exit("no license line found in formula")
 
           rewritten = set()
           for idx, line in enumerate(lines):

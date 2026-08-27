@@ -2747,7 +2747,7 @@ dependencies = [
 
 [[package]]
 name = "toki"
-version = "2.2.0"
+version = "2.3.0"
 dependencies = [
  "bincode",
  "chrono",
@@ -2782,6 +2782,7 @@ dependencies = [
 [[package]]
 name = "toki-sync-protocol"
 version = "1.1.0"
+source = "git+https://github.com/korjwl1/toki-sync-protocol.git?tag=v1.1.0#351e5fb20200bcb431db2bda34608b6b27905db9"
 dependencies = [
  "serde",
 ]

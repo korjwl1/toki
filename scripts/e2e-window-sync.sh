@@ -5,8 +5,8 @@
 # framing, server-side storage, and read-back. The client-side unit tests stop
 # at the sender trait; the server-side ones start at an already-decoded frame.
 #
-# Build the image first (the server's Cargo.toml uses a local [patch] for
-# toki-sync-protocol, so the build context must include that crate):
+# Build the image first from the workspace root with the release-pinned
+# toki-sync-protocol dependency:
 #   cd ~/Documents/toki_projects
 #   docker build -f toki/scripts/Dockerfile.e2e -t toki-sync:e2e .
 #
